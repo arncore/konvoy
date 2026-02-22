@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Build orchestration, cache keying, and artifact store for Konvoy.
 
 pub mod artifact;
