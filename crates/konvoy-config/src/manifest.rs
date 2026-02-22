@@ -1,5 +1,7 @@
-use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 /// The `konvoy.toml` project manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7,6 +9,8 @@ use std::path::Path;
 pub struct Manifest {
     pub package: Package,
     pub toolchain: Toolchain,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dependencies: BTreeMap<String, DependencySpec>,
 }
 
 /// Toolchain specification declaring the Kotlin/Native version.
@@ -17,12 +21,37 @@ pub struct Toolchain {
     pub kotlin: String,
 }
 
+/// Whether this package produces an executable or a library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackageKind {
+    /// A native executable (default).
+    #[default]
+    Bin,
+    /// A Kotlin/Native library (`.klib`).
+    Lib,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Package {
     pub name: String,
+    #[serde(default)]
+    pub kind: PackageKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     #[serde(default = "default_entrypoint")]
     pub entrypoint: String,
+}
+
+/// Specification for a single dependency.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencySpec {
+    /// Path to the dependency project, relative to this manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    // Future: git, tag, branch, rev fields for git dependencies.
 }
 
 fn default_entrypoint() -> String {
@@ -55,7 +84,10 @@ fn validate(manifest: &Manifest, path: &str) -> Result<(), ManifestError> {
             name: manifest.package.name.clone(),
         });
     }
-    if !is_valid_entrypoint(&manifest.package.entrypoint) {
+    // Only validate entrypoint for binary projects.
+    if manifest.package.kind == PackageKind::Bin
+        && !is_valid_entrypoint(&manifest.package.entrypoint)
+    {
         return Err(ManifestError::InvalidEntrypoint {
             path: path.to_owned(),
             entrypoint: manifest.package.entrypoint.clone(),
@@ -66,6 +98,27 @@ fn validate(manifest: &Manifest, path: &str) -> Result<(), ManifestError> {
             path: path.to_owned(),
             message: "kotlin version must not be empty".to_owned(),
         });
+    }
+    // Validate dependencies.
+    for (name, spec) in &manifest.dependencies {
+        if !is_valid_name(name) {
+            return Err(ManifestError::DependencyInvalidName {
+                path: path.to_owned(),
+                name: name.clone(),
+            });
+        }
+        if name == &manifest.package.name {
+            return Err(ManifestError::DependencySelfReference {
+                path: path.to_owned(),
+                name: name.clone(),
+            });
+        }
+        if spec.path.is_none() {
+            return Err(ManifestError::DependencyNoSource {
+                path: path.to_owned(),
+                name: name.clone(),
+            });
+        }
     }
     Ok(())
 }
@@ -130,6 +183,12 @@ pub enum ManifestError {
     InvalidEntrypoint { path: String, entrypoint: String },
     #[error("invalid [toolchain] in {path}: {message}")]
     InvalidToolchain { path: String, message: String },
+    #[error("dependency `{name}` has no source (set `path`) in {path}")]
+    DependencyNoSource { path: String, name: String },
+    #[error("dependency name `{name}` contains invalid characters in {path}")]
+    DependencyInvalidName { path: String, name: String },
+    #[error("dependency `{name}` references itself in {path}")]
+    DependencySelfReference { path: String, name: String },
 }
 
 #[cfg(test)]
@@ -287,5 +346,151 @@ entrypoint = "src/app.kt"
         assert!(!is_valid_name("hello world"));
         assert!(!is_valid_name("hello!"));
         assert!(!is_valid_name("hello.world"));
+    }
+
+    #[test]
+    fn parse_lib_manifest() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-lib"
+kind = "lib"
+version = "0.1.0"
+{TOOLCHAIN}"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(manifest.package.kind, PackageKind::Lib);
+        assert_eq!(manifest.package.version.as_deref(), Some("0.1.0"));
+    }
+
+    #[test]
+    fn default_kind_is_bin() {
+        let toml = format!(
+            r#"
+[package]
+name = "implicit-bin"
+{TOOLCHAIN}"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(manifest.package.kind, PackageKind::Bin);
+    }
+
+    #[test]
+    fn lib_skips_entrypoint_validation() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-lib"
+kind = "lib"
+entrypoint = "not-a-kt-file"
+{TOOLCHAIN}"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_dependencies() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+my-utils = {{ path = "../my-utils" }}
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(manifest.dependencies.len(), 1);
+        let dep = manifest
+            .dependencies
+            .get("my-utils")
+            .unwrap_or_else(|| panic!("missing dep"));
+        assert_eq!(dep.path.as_deref(), Some("../my-utils"));
+    }
+
+    #[test]
+    fn reject_dependency_without_source() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+bad-dep = {{}}
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("no source"), "error was: {err}");
+    }
+
+    #[test]
+    fn reject_self_referencing_dependency() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+my-app = {{ path = "." }}
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("itself"), "error was: {err}");
+    }
+
+    #[test]
+    fn reject_invalid_dependency_name() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+"bad dep!" = {{ path = "../bad" }}
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid characters"), "error was: {err}");
+    }
+
+    #[test]
+    fn round_trip_with_deps() {
+        let toml = format!(
+            r#"
+[package]
+name = "with-deps"
+{TOOLCHAIN}
+[dependencies]
+utils = {{ path = "../utils" }}
+"#
+        );
+        let original = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let serialized = original.to_toml().unwrap_or_else(|e| panic!("{e}"));
+        let reparsed =
+            Manifest::from_str(&serialized, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(original, reparsed);
+    }
+
+    #[test]
+    fn no_deps_omitted_in_toml() {
+        let toml = format!(
+            r#"
+[package]
+name = "no-deps"
+{TOOLCHAIN}"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let serialized = manifest.to_toml().unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            !serialized.contains("[dependencies]"),
+            "serialized was: {serialized}"
+        );
     }
 }

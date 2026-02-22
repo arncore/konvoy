@@ -28,6 +28,8 @@ pub struct CacheInputs {
     pub os: String,
     /// Architecture identifier.
     pub arch: String,
+    /// SHA-256 hashes of dependency `.klib` files (empty for projects with no deps).
+    pub dependency_hashes: Vec<String>,
 }
 
 impl CacheInputs {
@@ -54,7 +56,7 @@ impl CacheKey {
     pub fn compute(inputs: &CacheInputs) -> Result<Self, EngineError> {
         let source_hash = konvoy_util::hash::sha256_dir(&inputs.source_dir, &inputs.source_glob)?;
 
-        let composite = konvoy_util::hash::sha256_multi(&[
+        let mut parts: Vec<&str> = vec![
             &inputs.manifest_content,
             &inputs.lockfile_content,
             &inputs.konanc_version,
@@ -64,7 +66,13 @@ impl CacheKey {
             &source_hash,
             &inputs.os,
             &inputs.arch,
-        ]);
+        ];
+        // Include dependency hashes so cache key changes when deps are rebuilt.
+        for h in &inputs.dependency_hashes {
+            parts.push(h);
+        }
+
+        let composite = konvoy_util::hash::sha256_multi(&parts);
 
         Ok(Self(composite))
     }
@@ -106,6 +114,7 @@ mod tests {
             source_glob: "**/*.kt".to_owned(),
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
+            dependency_hashes: Vec::new(),
         }
     }
 

@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use konvoy_config::manifest::{Manifest, Package, Toolchain};
+use konvoy_config::manifest::{Manifest, Package, PackageKind, Toolchain};
 
 use crate::error::EngineError;
 
@@ -17,6 +17,18 @@ use crate::error::EngineError;
 /// - The directory or files cannot be created
 /// - The manifest cannot be serialized
 pub fn init_project(name: &str, dir: &Path) -> Result<(), EngineError> {
+    init_project_with_kind(name, dir, PackageKind::Bin)
+}
+
+/// Scaffold a new Konvoy project with a specific package kind.
+///
+/// # Errors
+/// Returns an error if the project directory cannot be created or a manifest already exists.
+pub fn init_project_with_kind(
+    name: &str,
+    dir: &Path,
+    kind: PackageKind,
+) -> Result<(), EngineError> {
     let manifest_path = dir.join("konvoy.toml");
 
     if manifest_path.exists() {
@@ -33,11 +45,18 @@ pub fn init_project(name: &str, dir: &Path) -> Result<(), EngineError> {
     let manifest = Manifest {
         package: Package {
             name: name.to_owned(),
+            kind,
+            version: if kind == PackageKind::Lib {
+                Some("0.1.0".to_owned())
+            } else {
+                None
+            },
             entrypoint: "src/main.kt".to_owned(),
         },
         toolchain: Toolchain {
             kotlin: "2.1.0".to_owned(),
         },
+        dependencies: std::collections::BTreeMap::new(),
     };
     let toml_content = manifest.to_toml()?;
     std::fs::write(&manifest_path, toml_content).map_err(|source| EngineError::Io {
@@ -45,11 +64,21 @@ pub fn init_project(name: &str, dir: &Path) -> Result<(), EngineError> {
         source,
     })?;
 
-    // Generate and write src/main.kt.
-    let main_kt = format!("fun main() {{\n    println(\"Hello, {name}!\")\n}}\n");
-    let main_kt_path = src_dir.join("main.kt");
-    std::fs::write(&main_kt_path, main_kt).map_err(|source| EngineError::Io {
-        path: main_kt_path.display().to_string(),
+    // Generate and write source file.
+    let (source_name, source_content) = if kind == PackageKind::Lib {
+        (
+            "lib.kt",
+            format!("// {name} library\n\nfun greet(who: String): String {{\n    return \"Hello, $who!\"\n}}\n"),
+        )
+    } else {
+        (
+            "main.kt",
+            format!("fun main() {{\n    println(\"Hello, {name}!\")\n}}\n"),
+        )
+    };
+    let source_path = src_dir.join(source_name);
+    std::fs::write(&source_path, source_content).map_err(|source| EngineError::Io {
+        path: source_path.display().to_string(),
         source,
     })?;
 
@@ -130,5 +159,33 @@ mod tests {
         init_project("project", &project_dir).unwrap();
 
         assert!(project_dir.join("konvoy.toml").exists());
+    }
+
+    #[test]
+    fn init_lib_creates_lib_kt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("my-lib");
+
+        init_project_with_kind("my-lib", &project_dir, PackageKind::Lib).unwrap();
+
+        assert!(project_dir.join("konvoy.toml").exists());
+        assert!(project_dir.join("src").join("lib.kt").exists());
+        assert!(!project_dir.join("src").join("main.kt").exists());
+
+        let manifest = Manifest::from_path(&project_dir.join("konvoy.toml")).unwrap();
+        assert_eq!(manifest.package.kind, PackageKind::Lib);
+        assert_eq!(manifest.package.version.as_deref(), Some("0.1.0"));
+    }
+
+    #[test]
+    fn init_bin_has_no_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("my-bin");
+
+        init_project("my-bin", &project_dir).unwrap();
+
+        let manifest = Manifest::from_path(&project_dir.join("konvoy.toml")).unwrap();
+        assert_eq!(manifest.package.kind, PackageKind::Bin);
+        assert!(manifest.package.version.is_none());
     }
 }

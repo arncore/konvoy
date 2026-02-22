@@ -45,4 +45,24 @@ pub enum EngineError {
     /// Compilation failed.
     #[error("compilation failed with {error_count} error(s)")]
     CompilationFailed { error_count: usize },
+
+    /// A dependency cycle was detected.
+    #[error("dependency cycle detected: {cycle}")]
+    DependencyCycle { cycle: String },
+
+    /// A dependency project was not found on disk.
+    #[error("dependency `{name}` not found at {path}")]
+    DependencyNotFound { name: String, path: String },
+
+    /// A dependency is not a library project.
+    #[error("dependency `{name}` must have kind = \"lib\" (found kind = \"bin\" at {path})")]
+    DependencyNotLib { name: String, path: String },
+
+    /// A dependency uses a different Kotlin version than the root project.
+    #[error("dependency `{name}` requires Kotlin {dep_version}, but root project requires {root_version}")]
+    DependencyToolchainMismatch {
+        name: String,
+        dep_version: String,
+        root_version: String,
+    },
 }

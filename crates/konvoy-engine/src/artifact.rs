@@ -219,6 +219,7 @@ mod tests {
             source_glob: "**/*.kt".to_owned(),
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
+            dependency_hashes: Vec::new(),
         };
         CacheKey::compute(&inputs).unwrap()
     }

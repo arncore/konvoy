@@ -4,14 +4,15 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use konvoy_config::lockfile::Lockfile;
-use konvoy_config::manifest::Manifest;
+use konvoy_config::manifest::{Manifest, PackageKind};
 use konvoy_konanc::detect::{resolve_konanc, KonancInfo};
-use konvoy_konanc::invoke::{DiagnosticLevel, KonancCommand};
+use konvoy_konanc::invoke::{DiagnosticLevel, KonancCommand, ProduceKind};
 use konvoy_targets::{host_target, Target};
 
 use crate::artifact::{ArtifactStore, BuildMetadata};
 use crate::cache::{CacheInputs, CacheKey};
 use crate::error::EngineError;
+use crate::resolve::resolve_dependencies;
 
 /// Options controlling a build invocation.
 #[derive(Debug, Clone)]
@@ -78,7 +79,66 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     let target = resolve_target(&options.target)?;
     let profile = if options.release { "release" } else { "debug" };
 
-    // 4. Collect source files (before compiler detection for fast failure).
+    // 4. Resolve managed konanc toolchain.
+    let resolved = resolve_konanc(&manifest.toolchain.kotlin).map_err(EngineError::Konanc)?;
+    let konanc = resolved.info;
+
+    // 5. Resolve dependencies and build them in topological order.
+    let dep_graph = resolve_dependencies(project_root, &manifest)?;
+    let mut library_paths: Vec<PathBuf> = Vec::new();
+
+    for dep in &dep_graph.order {
+        let dep_output = build_single(
+            &dep.project_root,
+            &dep.manifest,
+            &konanc,
+            &target,
+            profile,
+            options,
+            &library_paths,
+        )?;
+        library_paths.push(dep_output);
+    }
+
+    // 6. Build the root project.
+    let result = build_single(
+        project_root,
+        &manifest,
+        &konanc,
+        &target,
+        profile,
+        options,
+        &library_paths,
+    )?;
+
+    // 7. Update lockfile if toolchain version changed.
+    update_lockfile_if_needed(
+        &lockfile,
+        &konanc,
+        resolved.tarball_sha256.as_deref(),
+        &lockfile_path,
+    )?;
+
+    Ok(BuildResult {
+        outcome: BuildOutcome::Fresh,
+        output_path: result,
+        duration: start.elapsed(),
+    })
+}
+
+/// Build a single project (either root or a dependency).
+///
+/// Returns the path to the output artifact.
+fn build_single(
+    project_root: &Path,
+    manifest: &Manifest,
+    konanc: &KonancInfo,
+    target: &Target,
+    profile: &str,
+    options: &BuildOptions,
+    library_paths: &[PathBuf],
+) -> Result<PathBuf, EngineError> {
+    // Collect source files.
     let src_dir = project_root.join("src");
     let sources = konvoy_util::fs::collect_files(&src_dir, "kt")?;
     if sources.is_empty() {
@@ -87,13 +147,9 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         });
     }
 
-    // 5. Resolve managed konanc toolchain.
-    let resolved = resolve_konanc(&manifest.toolchain.kotlin).map_err(EngineError::Konanc)?;
-    let konanc = resolved.info;
+    let is_lib = manifest.package.kind == PackageKind::Lib;
 
-    // 6. Compute cache key.
-    // Use the effective lockfile (with detected konanc version) so the cache key
-    // is stable between the first build (no lockfile) and subsequent builds.
+    // Compute cache key.
     let manifest_content = manifest.to_toml()?;
     let effective_lockfile = Lockfile::with_toolchain(&konanc.version);
     let lockfile_content = lockfile_toml_content(&effective_lockfile);
@@ -108,41 +164,57 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         source_glob: "**/*.kt".to_owned(),
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
+        dependency_hashes: library_paths
+            .iter()
+            .filter_map(|p| konvoy_util::hash::sha256_file(p).ok())
+            .collect(),
     };
     let cache_key = CacheKey::compute(&cache_inputs)?;
 
-    // Output path: .konvoy/build/<target>/<profile>/<name>
+    // Output path: for deps, put .klib in deps/ subdir; for root, keep existing layout.
+    let output_name = if is_lib {
+        format!("{}.klib", manifest.package.name)
+    } else {
+        manifest.package.name.clone()
+    };
     let output_path = project_root
         .join(".konvoy")
         .join("build")
         .join(target.to_konanc_arg())
         .join(profile)
-        .join(&manifest.package.name);
+        .join(&output_name);
 
     let store = ArtifactStore::new(project_root);
 
-    // 7. Check cache.
+    // Check cache.
     if store.has(&cache_key) {
         eprintln!("    Fresh {} (cached)", manifest.package.name);
-        store.materialize(&cache_key, &manifest.package.name, &output_path)?;
-
-        return Ok(BuildResult {
-            outcome: BuildOutcome::Cached,
-            output_path,
-            duration: start.elapsed(),
-        });
+        store.materialize(&cache_key, &output_name, &output_path)?;
+        return Ok(output_path);
     }
 
-    // 8. Compile.
+    // Compile.
     eprintln!(
         "    Compiling {} \u{2192} {}",
         manifest.package.name,
         output_path.display()
     );
 
-    let compile_output = compile(&konanc, &sources, &target, &output_path, options)?;
+    let compile_output = compile(
+        konanc,
+        &sources,
+        target,
+        &output_path,
+        options,
+        if is_lib {
+            ProduceKind::Library
+        } else {
+            ProduceKind::Program
+        },
+        library_paths,
+    )?;
 
-    // 9. Store artifact in cache.
+    // Store artifact in cache.
     let metadata = BuildMetadata {
         target: target.to_string(),
         profile: profile.to_owned(),
@@ -151,24 +223,12 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     };
     store.store(&cache_key, &compile_output, &metadata)?;
 
-    // 10. Materialize to the canonical output path (if compile output differs).
+    // Materialize to the canonical output path (if compile output differs).
     if compile_output != output_path {
-        store.materialize(&cache_key, &manifest.package.name, &output_path)?;
+        store.materialize(&cache_key, &output_name, &output_path)?;
     }
 
-    // 11. Update lockfile if toolchain version changed.
-    update_lockfile_if_needed(
-        &lockfile,
-        &konanc,
-        resolved.tarball_sha256.as_deref(),
-        &lockfile_path,
-    )?;
-
-    Ok(BuildResult {
-        outcome: BuildOutcome::Fresh,
-        output_path,
-        duration: start.elapsed(),
-    })
+    Ok(output_path)
 }
 
 /// Resolve the target: use the explicit `--target` value or detect the host.
@@ -179,13 +239,15 @@ fn resolve_target(target_opt: &Option<String>) -> Result<Target, EngineError> {
     }
 }
 
-/// Invoke konanc and return the path to the compiled binary.
+/// Invoke konanc and return the path to the compiled artifact.
 fn compile(
     konanc: &KonancInfo,
     sources: &[PathBuf],
     target: &Target,
     output_path: &Path,
     options: &BuildOptions,
+    produce: ProduceKind,
+    library_paths: &[PathBuf],
 ) -> Result<PathBuf, EngineError> {
     // Ensure the output directory exists.
     if let Some(parent) = output_path.parent() {
@@ -196,7 +258,9 @@ fn compile(
         .sources(sources)
         .output(output_path)
         .target(target.to_konanc_arg())
-        .release(options.release);
+        .release(options.release)
+        .produce(produce)
+        .libraries(library_paths);
 
     let result = cmd.execute(konanc).map_err(EngineError::Konanc)?;
 
@@ -229,13 +293,16 @@ fn compile(
         });
     }
 
-    // konanc appends `.kexe` on Linux. Rename to the expected path.
-    let kexe_path = output_path.with_extension("kexe");
-    if !output_path.exists() && kexe_path.exists() {
-        std::fs::rename(&kexe_path, output_path).map_err(|source| EngineError::Io {
-            path: output_path.display().to_string(),
-            source,
-        })?;
+    // konanc appends `.kexe` on Linux for programs. Rename to the expected path.
+    // Libraries produce .klib directly, so skip this for library builds.
+    if produce == ProduceKind::Program {
+        let kexe_path = output_path.with_extension("kexe");
+        if !output_path.exists() && kexe_path.exists() {
+            std::fs::rename(&kexe_path, output_path).map_err(|source| EngineError::Io {
+                path: output_path.display().to_string(),
+                source,
+            })?;
+        }
     }
 
     Ok(output_path.to_path_buf())

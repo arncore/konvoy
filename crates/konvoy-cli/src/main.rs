@@ -18,6 +18,9 @@ enum Command {
         /// Project name
         #[arg(long)]
         name: Option<String>,
+        /// Create a library project instead of a binary
+        #[arg(long)]
+        lib: bool,
     },
     /// Compile the project
     Build {
@@ -81,7 +84,7 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Command::Init { name } => cmd_init(name),
+        Command::Init { name, lib } => cmd_init(name, lib),
         Command::Build {
             target,
             release,
@@ -122,7 +125,7 @@ fn project_root() -> Result<PathBuf, String> {
     Ok(cwd)
 }
 
-fn cmd_init(name: Option<String>) -> Result<(), String> {
+fn cmd_init(name: Option<String>, lib: bool) -> Result<(), String> {
     let cwd =
         std::env::current_dir().map_err(|e| format!("cannot determine working directory: {e}"))?;
 
@@ -135,10 +138,18 @@ fn cmd_init(name: Option<String>) -> Result<(), String> {
 
     let project_dir = cwd.join(&project_name);
 
-    konvoy_engine::init_project(&project_name, &project_dir).map_err(|e| e.to_string())?;
+    let kind = if lib {
+        konvoy_config::manifest::PackageKind::Lib
+    } else {
+        konvoy_config::manifest::PackageKind::Bin
+    };
 
+    konvoy_engine::init_project_with_kind(&project_name, &project_dir, kind)
+        .map_err(|e| e.to_string())?;
+
+    let kind_label = if lib { "library" } else { "project" };
     eprintln!(
-        "    Created project `{project_name}` at {}",
+        "    Created {kind_label} `{project_name}` at {}",
         project_dir.display()
     );
     eprintln!();
@@ -179,6 +190,17 @@ fn cmd_build(target: Option<String>, release: bool, verbose: bool) -> Result<(),
 
 fn cmd_run(target: Option<String>, release: bool, args: &[String]) -> Result<(), String> {
     let root = project_root()?;
+
+    // Cannot run a library project.
+    let manifest =
+        konvoy_config::Manifest::from_path(&root.join("konvoy.toml")).map_err(|e| e.to_string())?;
+    if manifest.package.kind == konvoy_config::manifest::PackageKind::Lib {
+        return Err(
+            "cannot run a library project — only binary projects (kind = \"bin\") can be run"
+                .to_owned(),
+        );
+    }
+
     let options = konvoy_engine::BuildOptions {
         target,
         release,
