@@ -351,7 +351,9 @@ mod tests {
     #[test]
     fn path_without_symlinks_returns_false() {
         let tmp = tempfile::tempdir().unwrap();
-        let nested = tmp.path().join("a").join("b").join("c");
+        // Canonicalize to resolve any OS-level symlinks (e.g. macOS /tmp -> /private/tmp).
+        let canonical = tmp.path().canonicalize().unwrap();
+        let nested = canonical.join("a").join("b").join("c");
         fs::create_dir_all(&nested).unwrap();
         assert!(!path_contains_symlink(&nested));
     }
