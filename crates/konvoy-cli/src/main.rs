@@ -404,8 +404,8 @@ mod tests {
 
     #[test]
     fn parse_init_name_and_lib() {
-        let cli =
-            Cli::try_parse_from(["konvoy", "init", "--name", "mylib", "--lib"]).unwrap();
+        let args = ["konvoy", "init", "--name", "mylib", "--lib"];
+        let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
             Command::Init { name, lib } => {
                 assert_eq!(name.as_deref(), Some("mylib"));
@@ -505,8 +505,8 @@ mod tests {
 
     #[test]
     fn parse_run_with_passthrough_args() {
-        let cli =
-            Cli::try_parse_from(["konvoy", "run", "--", "arg1", "arg2", "--flag"]).unwrap();
+        let args = ["konvoy", "run", "--", "arg1", "arg2", "--flag"];
+        let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
             Command::Run { args, .. } => {
                 assert_eq!(args, vec!["arg1", "arg2", "--flag"]);
@@ -517,14 +517,10 @@ mod tests {
 
     #[test]
     fn parse_run_release_with_passthrough() {
-        let cli = Cli::try_parse_from([
-            "konvoy", "run", "--release", "--", "hello",
-        ])
-        .unwrap();
+        let args = ["konvoy", "run", "--release", "--", "hello"];
+        let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
-            Command::Run {
-                release, args, ..
-            } => {
+            Command::Run { release, args, .. } => {
                 assert!(release);
                 assert_eq!(args, vec!["hello"]);
             }
@@ -534,14 +530,8 @@ mod tests {
 
     #[test]
     fn parse_run_target_and_release() {
-        let cli = Cli::try_parse_from([
-            "konvoy",
-            "run",
-            "--target",
-            "macos_x64",
-            "--release",
-        ])
-        .unwrap();
+        let args = ["konvoy", "run", "--target", "macos_x64", "--release"];
+        let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
             Command::Run {
                 target, release, ..
@@ -609,8 +599,8 @@ mod tests {
 
     #[test]
     fn parse_toolchain_install_with_version() {
-        let cli =
-            Cli::try_parse_from(["konvoy", "toolchain", "install", "2.1.0"]).unwrap();
+        let args = ["konvoy", "toolchain", "install", "2.1.0"];
+        let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
             Command::Toolchain {
                 action: ToolchainAction::Install { version },
@@ -649,8 +639,8 @@ mod tests {
 
     #[test]
     fn build_flags_order_verbose_before_release() {
-        let cli =
-            Cli::try_parse_from(["konvoy", "build", "--verbose", "--release"]).unwrap();
+        let args = ["konvoy", "build", "--verbose", "--release"];
+        let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
             Command::Build {
                 release, verbose, ..
@@ -689,8 +679,8 @@ mod tests {
 
     #[test]
     fn init_flags_order_lib_before_name() {
-        let cli =
-            Cli::try_parse_from(["konvoy", "init", "--lib", "--name", "foo"]).unwrap();
+        let args = ["konvoy", "init", "--lib", "--name", "foo"];
+        let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
             Command::Init { name, lib } => {
                 assert_eq!(name.as_deref(), Some("foo"));
@@ -705,7 +695,8 @@ mod tests {
     #[test]
     fn error_no_subcommand() {
         let err = Cli::try_parse_from(["konvoy"]).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand);
+        let expected = ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand;
+        assert_eq!(err.kind(), expected);
     }
 
     #[test]
@@ -741,8 +732,8 @@ mod tests {
 
     #[test]
     fn error_unknown_toolchain_action() {
-        let err =
-            Cli::try_parse_from(["konvoy", "toolchain", "remove"]).unwrap_err();
+        let args = ["konvoy", "toolchain", "remove"];
+        let err = Cli::try_parse_from(args).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidSubcommand);
         let msg = err.to_string();
         assert!(msg.contains("remove"));
@@ -812,22 +803,22 @@ mod tests {
 
     #[test]
     fn help_flag_on_toolchain() {
-        let err =
-            Cli::try_parse_from(["konvoy", "toolchain", "--help"]).unwrap_err();
+        let args = ["konvoy", "toolchain", "--help"];
+        let err = Cli::try_parse_from(args).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayHelp);
     }
 
     #[test]
     fn help_flag_on_toolchain_install() {
-        let err =
-            Cli::try_parse_from(["konvoy", "toolchain", "install", "--help"]).unwrap_err();
+        let args = ["konvoy", "toolchain", "install", "--help"];
+        let err = Cli::try_parse_from(args).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayHelp);
     }
 
     #[test]
     fn help_flag_on_toolchain_list() {
-        let err =
-            Cli::try_parse_from(["konvoy", "toolchain", "list", "--help"]).unwrap_err();
+        let args = ["konvoy", "toolchain", "list", "--help"];
+        let err = Cli::try_parse_from(args).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayHelp);
         let output = err.to_string();
         assert!(output.contains("List installed Kotlin/Native versions"));
@@ -869,10 +860,8 @@ mod tests {
 
     #[test]
     fn run_passthrough_with_dashes() {
-        let cli = Cli::try_parse_from([
-            "konvoy", "run", "--", "--verbose", "--release",
-        ])
-        .unwrap();
+        let args = ["konvoy", "run", "--", "--verbose", "--release"];
+        let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
             Command::Run { args, .. } => {
                 assert_eq!(args, vec!["--verbose", "--release"]);
