@@ -88,6 +88,17 @@ Konvoy writes artifacts to stable paths:
 - **Actionable errors:** missing toolchain/SDK issues should be one-line fixes.
 - **Native-first:** targets are real OS/arch outputs, not JVM bytecode.
 
+## Development
+
+Konvoy is implemented in Rust as a Cargo workspace.
+
+```
+cargo build                      # build all crates
+cargo test                       # run all tests
+cargo run -- build               # run konvoy with a subcommand
+cargo test -p konvoy-config      # run tests for a single crate
+```
+
 ## Roadmap (high level)
 
 1. **MVP:** host-native executable build/run + cache

@@ -1,0 +1,9 @@
+[package]
+name = "konvoy-konanc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+konvoy-util.workspace = true
+thiserror.workspace = true

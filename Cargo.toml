@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "crates/konvoy-cli",
+    "crates/konvoy-config",
+    "crates/konvoy-engine",
+    "crates/konvoy-konanc",
+    "crates/konvoy-targets",
+    "crates/konvoy-util",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2"
+toml = "0.8"
+
+konvoy-config = { path = "crates/konvoy-config" }
+konvoy-engine = { path = "crates/konvoy-engine" }
+konvoy-konanc = { path = "crates/konvoy-konanc" }
+konvoy-targets = { path = "crates/konvoy-targets" }
+konvoy-util = { path = "crates/konvoy-util" }

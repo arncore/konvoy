@@ -1,0 +1,9 @@
+[package]
+name = "konvoy-util"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sha2.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "konvoy-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "konvoy"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+konvoy-config.workspace = true
+konvoy-engine.workspace = true
+konvoy-konanc.workspace = true
+konvoy-targets.workspace = true

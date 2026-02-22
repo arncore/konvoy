@@ -1,0 +1,38 @@
+//! Host detection and target triple mapping for Konvoy.
+
+use std::fmt;
+
+/// A Kotlin/Native compilation target.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Target {
+    pub triple: String,
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.triple)
+    }
+}
+
+/// Detect the host target triple for Kotlin/Native.
+///
+/// Maps the Rust compile-time target to the Kotlin/Native target name.
+pub fn host_target() -> Result<Target, TargetError> {
+    let triple = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "linux_x64",
+        ("linux", "aarch64") => "linux_arm64",
+        ("macos", "x86_64") => "macos_x64",
+        ("macos", "aarch64") => "macos_arm64",
+        (os, arch) => return Err(TargetError::UnsupportedHost {
+            os: os.to_string(),
+            arch: arch.to_string(),
+        }),
+    };
+    Ok(Target { triple: triple.to_string() })
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TargetError {
+    #[error("unsupported host: {os}/{arch} — Kotlin/Native does not support this platform")]
+    UnsupportedHost { os: String, arch: String },
+}

@@ -1,0 +1,12 @@
+[package]
+name = "konvoy-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+konvoy-config.workspace = true
+konvoy-konanc.workspace = true
+konvoy-targets.workspace = true
+konvoy-util.workspace = true
+thiserror.workspace = true
