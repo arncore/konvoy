@@ -536,4 +536,59 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("escapes the project tree"), "error was: {err}");
     }
+
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// Arbitrary strings as dep paths must never cause a panic.
+            #[test]
+            #[allow(clippy::unwrap_used)]
+            fn arbitrary_path_never_panics(path in "\\PC*") {
+                let dir = tempfile::tempdir().unwrap();
+                let _ = resolve_dep_path(dir.path(), "test-dep", Some(&path));
+            }
+
+            /// Any path starting with `/` must be rejected.
+            #[test]
+            #[allow(clippy::unwrap_used)]
+            fn absolute_paths_always_rejected(suffix in "[a-zA-Z0-9_./-]{0,50}") {
+                let path = format!("/{suffix}");
+                let dir = tempfile::tempdir().unwrap();
+                let result = resolve_dep_path(dir.path(), "test-dep", Some(&path));
+                prop_assert!(result.is_err());
+                let err = result.unwrap_err().to_string();
+                prop_assert!(
+                    err.contains("escapes the project tree"),
+                    "expected 'escapes the project tree' in error: {err}"
+                );
+            }
+
+            /// Paths with more than MAX_PARENT_TRAVERSAL (5) leading `..` must be rejected.
+            #[test]
+            #[allow(clippy::unwrap_used)]
+            fn deep_traversal_always_rejected(extra in 1..20usize, tail in "[a-z]{1,10}") {
+                let prefix = "../".repeat(MAX_PARENT_TRAVERSAL + extra);
+                let path = format!("{prefix}{tail}");
+                let dir = tempfile::tempdir().unwrap();
+                let result = resolve_dep_path(dir.path(), "test-dep", Some(&path));
+                prop_assert!(result.is_err());
+                let err = result.unwrap_err().to_string();
+                prop_assert!(
+                    err.contains("escapes the project tree"),
+                    "expected 'escapes the project tree' in error: {err}"
+                );
+            }
+
+            /// None path always produces an error (missing path).
+            #[test]
+            #[allow(clippy::unwrap_used)]
+            fn none_path_always_errors(name in "[a-z][a-z0-9-]{0,20}") {
+                let dir = tempfile::tempdir().unwrap();
+                let result = resolve_dep_path(dir.path(), &name, None);
+                prop_assert!(result.is_err());
+            }
+        }
+    }
 }
