@@ -1,13 +1,15 @@
 # syntax=docker/dockerfile:1
 FROM rust:1.93-slim-bookworm
 
-# System dependencies: build tools, git.
-# Note: JDK is no longer needed separately — kotlin-native-prebuilt bundles its own JRE.
+# System dependencies: build tools, git, and a JRE for konanc.
+# The kotlin-native-prebuilt tarball does NOT bundle a JRE; its run_konan
+# script requires `java` (>= 8) on PATH.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         curl \
         ca-certificates \
         git \
+        default-jre-headless \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy project source and build konvoy.
