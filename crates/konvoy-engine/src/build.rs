@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use konvoy_config::lockfile::Lockfile;
+use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile};
 use konvoy_config::manifest::{Manifest, PackageKind};
 use konvoy_konanc::detect::{resolve_konanc, KonancInfo};
 use konvoy_konanc::invoke::{DiagnosticLevel, KonancCommand, ProduceKind};
@@ -12,7 +12,7 @@ use konvoy_targets::{host_target, Target};
 use crate::artifact::{ArtifactStore, BuildMetadata};
 use crate::cache::{CacheInputs, CacheKey};
 use crate::error::EngineError;
-use crate::resolve::resolve_dependencies;
+use crate::resolve::{resolve_dependencies, ResolvedGraph};
 
 /// Options controlling a build invocation.
 #[derive(Debug, Clone)]
@@ -114,12 +114,14 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         &library_paths,
     )?;
 
-    // 7. Update lockfile if toolchain version changed.
+    // 7. Update lockfile if toolchain or dependencies changed.
     update_lockfile_if_needed(
         &lockfile,
         &konanc,
         resolved.konanc_tarball_sha256.as_deref(),
         resolved.jre_tarball_sha256.as_deref(),
+        &dep_graph,
+        project_root,
         &lockfile_path,
     )?;
 
@@ -326,22 +328,59 @@ fn lockfile_toml_content(lockfile: &Lockfile) -> String {
     toml::to_string_pretty(lockfile).unwrap_or_default()
 }
 
-/// Update konvoy.lock if the detected konanc version differs from the pinned version.
+/// Update konvoy.lock if the detected konanc version or dependency hashes differ.
 fn update_lockfile_if_needed(
     lockfile: &Lockfile,
     konanc: &KonancInfo,
     konanc_tarball_sha256: Option<&str>,
     jre_tarball_sha256: Option<&str>,
+    dep_graph: &ResolvedGraph,
+    project_root: &Path,
     lockfile_path: &Path,
 ) -> Result<(), EngineError> {
-    let needs_update = match &lockfile.toolchain {
+    // Check for dependency source hash mismatches and warn.
+    for dep in &dep_graph.order {
+        if let Some(locked) = lockfile.dependencies.iter().find(|d| d.name == dep.name) {
+            if locked.source_hash != dep.source_hash && !dep.source_hash.is_empty() {
+                eprintln!(
+                    "warning: dependency `{}` source has changed (locked: {}, current: {})",
+                    dep.name,
+                    truncate_hash(&locked.source_hash),
+                    truncate_hash(&dep.source_hash),
+                );
+            }
+        }
+    }
+
+    // Build new dependency lock entries.
+    let new_deps: Vec<DependencyLock> = dep_graph
+        .order
+        .iter()
+        .filter(|dep| !dep.source_hash.is_empty())
+        .map(|dep| {
+            let rel_path = dep
+                .project_root
+                .strip_prefix(project_root)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| dep.project_root.display().to_string());
+            DependencyLock {
+                name: dep.name.clone(),
+                source: DepSource::Path { path: rel_path },
+                source_hash: dep.source_hash.clone(),
+            }
+        })
+        .collect();
+
+    let toolchain_changed = match &lockfile.toolchain {
         Some(tc) => tc.konanc_version != konanc.version,
         None => true,
     };
 
-    if needs_update {
+    let deps_changed = lockfile.dependencies != new_deps;
+
+    if toolchain_changed || deps_changed {
         let has_sha = konanc_tarball_sha256.is_some() || jre_tarball_sha256.is_some();
-        let updated = if has_sha {
+        let mut updated = if has_sha {
             Lockfile::with_managed_toolchain(
                 &konanc.version,
                 konanc_tarball_sha256,
@@ -350,12 +389,18 @@ fn update_lockfile_if_needed(
         } else {
             Lockfile::with_toolchain(&konanc.version)
         };
+        updated.dependencies = new_deps;
         updated
             .write_to(lockfile_path)
             .map_err(|e| EngineError::Lockfile(e.to_string()))?;
     }
 
     Ok(())
+}
+
+/// Truncate a hash string for display (first 8 chars).
+fn truncate_hash(hash: &str) -> &str {
+    hash.get(..8).unwrap_or(hash)
 }
 
 /// Return the current UTC time as an ISO 8601 string.
@@ -459,7 +504,17 @@ mod tests {
             fingerprint: "abc".to_owned(),
         };
 
-        update_lockfile_if_needed(&lockfile, &konanc, None, None, &lockfile_path).unwrap();
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            tmp.path(),
+            &lockfile_path,
+        )
+        .unwrap();
         assert!(lockfile_path.exists());
         let content = fs::read_to_string(&lockfile_path).unwrap();
         assert!(content.contains("2.1.0"));
@@ -479,7 +534,17 @@ mod tests {
         };
 
         // Should not error and should not change the file.
-        update_lockfile_if_needed(&lockfile, &konanc, None, None, &lockfile_path).unwrap();
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            tmp.path(),
+            &lockfile_path,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -495,11 +560,14 @@ mod tests {
             fingerprint: "abc".to_owned(),
         };
 
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
         update_lockfile_if_needed(
             &lockfile,
             &konanc,
             Some("deadbeef"),
             Some("cafebabe"),
+            &empty_graph,
+            tmp.path(),
             &lockfile_path,
         )
         .unwrap();
@@ -517,6 +585,51 @@ mod tests {
         assert!(opts.target.is_none());
         assert!(!opts.release);
         assert!(!opts.verbose);
+    }
+
+    #[test]
+    fn update_lockfile_writes_deps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile = Lockfile::default();
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        let dep = crate::resolve::ResolvedDep {
+            name: "my-lib".to_owned(),
+            project_root: tmp.path().join("my-lib"),
+            manifest: konvoy_config::manifest::Manifest::from_str(
+                "[package]\nname = \"my-lib\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+                "konvoy.toml",
+            )
+            .unwrap(),
+            dep_names: Vec::new(),
+            source_hash: "deadbeefcafebabe".to_owned(),
+        };
+        let graph = crate::resolve::ResolvedGraph { order: vec![dep] };
+
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &graph,
+            tmp.path(),
+            &lockfile_path,
+        )
+        .unwrap();
+        let content = fs::read_to_string(&lockfile_path).unwrap();
+        assert!(
+            content.contains("my-lib"),
+            "lockfile should contain dep name: {content}"
+        );
+        assert!(
+            content.contains("deadbeefcafebabe"),
+            "lockfile should contain source_hash: {content}"
+        );
     }
 
     #[test]
