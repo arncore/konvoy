@@ -351,7 +351,12 @@ fn find_jre_root(jre_dir: &Path) -> Result<PathBuf, KonancError> {
             path: jre_dir.display().to_string(),
             source,
         })?
-        .filter_map(Result::ok)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| KonancError::Io {
+            path: jre_dir.display().to_string(),
+            source,
+        })?
+        .into_iter()
         .filter(|e| e.path().is_dir())
         .collect();
 
@@ -988,5 +993,59 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1));
         let b = temp_suffix();
         assert_ne!(a, b, "consecutive temp suffixes should differ");
+    }
+
+    #[test]
+    fn find_jre_root_single_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let jre_subdir = dir.path().join("jre-21");
+        std::fs::create_dir(&jre_subdir).unwrap();
+
+        let result = find_jre_root(dir.path());
+        assert!(result.is_ok(), "single directory should succeed");
+        assert_eq!(result.unwrap(), jre_subdir);
+    }
+
+    #[test]
+    fn find_jre_root_prefers_jdk_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("some-dir");
+        let jdk = dir.path().join("jdk-21.0.1");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::create_dir(&jdk).unwrap();
+
+        let result = find_jre_root(dir.path());
+        assert!(result.is_ok(), "jdk- prefix should be preferred");
+        assert_eq!(result.unwrap(), jdk);
+    }
+
+    #[test]
+    fn find_jre_root_zero_directories_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a file, not a directory — should be filtered out.
+        std::fs::write(dir.path().join("not-a-dir.txt"), "hello").unwrap();
+
+        let result = find_jre_root(dir.path());
+        assert!(result.is_err(), "zero directories should error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("found 0 entries"),
+            "error should mention 0 entries, got: {err}"
+        );
+    }
+
+    #[test]
+    fn find_jre_root_multiple_non_jdk_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("foo")).unwrap();
+        std::fs::create_dir(dir.path().join("bar")).unwrap();
+
+        let result = find_jre_root(dir.path());
+        assert!(result.is_err(), "multiple non-jdk dirs should error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("found 2 entries"),
+            "error should mention 2 entries, got: {err}"
+        );
     }
 }
