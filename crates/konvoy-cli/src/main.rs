@@ -35,6 +35,9 @@ enum Command {
         /// Show compiler output
         #[arg(long)]
         verbose: bool,
+        /// Allow overriding hash mismatch checks
+        #[arg(long)]
+        force: bool,
     },
     /// Build and run the project
     Run {
@@ -44,6 +47,9 @@ enum Command {
         /// Run in release mode
         #[arg(long)]
         release: bool,
+        /// Allow overriding hash mismatch checks
+        #[arg(long)]
+        force: bool,
         /// Arguments to pass to the program
         #[arg(last = true)]
         args: Vec<String>,
@@ -59,6 +65,9 @@ enum Command {
         /// Show compiler output
         #[arg(long)]
         verbose: bool,
+        /// Allow overriding hash mismatch checks
+        #[arg(long)]
+        force: bool,
     },
     /// Remove build artifacts
     Clean,
@@ -91,17 +100,20 @@ fn main() {
             target,
             release,
             verbose,
-        } => cmd_build(target, release, verbose),
+            force,
+        } => cmd_build(target, release, verbose, force),
         Command::Run {
             target,
             release,
+            force,
             args,
-        } => cmd_run(target, release, &args),
+        } => cmd_run(target, release, force, &args),
         Command::Test {
             target,
             release,
             verbose,
-        } => cmd_test(target, release, verbose),
+            force,
+        } => cmd_test(target, release, verbose, force),
         Command::Clean => cmd_clean(),
         Command::Doctor => cmd_doctor(),
         Command::Toolchain { action } => cmd_toolchain(action),
@@ -161,12 +173,18 @@ fn cmd_init(name: Option<String>, lib: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_build(target: Option<String>, release: bool, verbose: bool) -> Result<(), String> {
+fn cmd_build(
+    target: Option<String>,
+    release: bool,
+    verbose: bool,
+    force: bool,
+) -> Result<(), String> {
     let root = project_root()?;
     let options = konvoy_engine::BuildOptions {
         target,
         release,
         verbose,
+        force,
     };
 
     let result = konvoy_engine::build(&root, &options).map_err(|e| e.to_string())?;
@@ -190,7 +208,12 @@ fn cmd_build(target: Option<String>, release: bool, verbose: bool) -> Result<(),
     Ok(())
 }
 
-fn cmd_run(target: Option<String>, release: bool, args: &[String]) -> Result<(), String> {
+fn cmd_run(
+    target: Option<String>,
+    release: bool,
+    force: bool,
+    args: &[String],
+) -> Result<(), String> {
     let root = project_root()?;
 
     // Cannot run a library project.
@@ -207,6 +230,7 @@ fn cmd_run(target: Option<String>, release: bool, args: &[String]) -> Result<(),
         target,
         release,
         verbose: false,
+        force,
     };
 
     let result = konvoy_engine::build(&root, &options).map_err(|e| e.to_string())?;
@@ -231,7 +255,12 @@ fn cmd_run(target: Option<String>, release: bool, args: &[String]) -> Result<(),
     Ok(())
 }
 
-fn cmd_test(target: Option<String>, release: bool, verbose: bool) -> Result<(), String> {
+fn cmd_test(
+    target: Option<String>,
+    release: bool,
+    verbose: bool,
+    force: bool,
+) -> Result<(), String> {
     // For MVP, konvoy test is essentially build + run with a test convention.
     // Kotlin/Native doesn't have a built-in test framework like cargo test,
     // so for now we compile and run the project and report the result.
@@ -242,6 +271,7 @@ fn cmd_test(target: Option<String>, release: bool, verbose: bool) -> Result<(), 
         target,
         release,
         verbose,
+        force,
     };
 
     let result = konvoy_engine::build(&root, &options).map_err(|e| e.to_string())?;
@@ -423,10 +453,12 @@ mod tests {
                 target,
                 release,
                 verbose,
+                force,
             } => {
                 assert!(target.is_none());
                 assert!(!release);
                 assert!(!verbose);
+                assert!(!force);
             }
             other => panic!("expected Build, got {other:?}"),
         }
@@ -470,6 +502,7 @@ mod tests {
             "linux_x64",
             "--release",
             "--verbose",
+            "--force",
         ])
         .unwrap();
         match cli.command {
@@ -477,10 +510,12 @@ mod tests {
                 target,
                 release,
                 verbose,
+                force,
             } => {
                 assert_eq!(target.as_deref(), Some("linux_x64"));
                 assert!(release);
                 assert!(verbose);
+                assert!(force);
             }
             other => panic!("expected Build, got {other:?}"),
         }
@@ -493,10 +528,12 @@ mod tests {
             Command::Run {
                 target,
                 release,
+                force,
                 args,
             } => {
                 assert!(target.is_none());
                 assert!(!release);
+                assert!(!force);
                 assert!(args.is_empty());
             }
             other => panic!("expected Run, got {other:?}"),
@@ -508,8 +545,9 @@ mod tests {
         let args = ["konvoy", "run", "--", "arg1", "arg2", "--flag"];
         let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
-            Command::Run { args, .. } => {
+            Command::Run { args, force, .. } => {
                 assert_eq!(args, vec!["arg1", "arg2", "--flag"]);
+                assert!(!force);
             }
             other => panic!("expected Run, got {other:?}"),
         }
@@ -551,10 +589,12 @@ mod tests {
                 target,
                 release,
                 verbose,
+                force,
             } => {
                 assert!(target.is_none());
                 assert!(!release);
                 assert!(!verbose);
+                assert!(!force);
             }
             other => panic!("expected Test, got {other:?}"),
         }
@@ -569,6 +609,7 @@ mod tests {
             "--verbose",
             "--target",
             "linux_x64",
+            "--force",
         ])
         .unwrap();
         match cli.command {
@@ -576,10 +617,12 @@ mod tests {
                 target,
                 release,
                 verbose,
+                force,
             } => {
                 assert_eq!(target.as_deref(), Some("linux_x64"));
                 assert!(release);
                 assert!(verbose);
+                assert!(force);
             }
             other => panic!("expected Test, got {other:?}"),
         }
@@ -668,6 +711,7 @@ mod tests {
                 target,
                 release,
                 verbose,
+                ..
             } => {
                 assert_eq!(target.as_deref(), Some("linux_x64"));
                 assert!(release);

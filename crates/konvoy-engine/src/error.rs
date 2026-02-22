@@ -69,4 +69,12 @@ pub enum EngineError {
     /// A dependency path escapes the project tree.
     #[error("dependency `{name}` path escapes the project tree — resolved to {path}; use a relative path within the workspace")]
     DependencyPathEscape { name: String, path: String },
+
+    /// A tarball hash in the lockfile does not match the freshly downloaded hash.
+    #[error("{kind} tarball hash mismatch — expected {expected}, got {actual}; re-run with --force to override")]
+    TarballHashMismatch {
+        kind: String,
+        expected: String,
+        actual: String,
+    },
 }
