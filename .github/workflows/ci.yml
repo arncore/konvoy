@@ -14,8 +14,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Detect whether only documentation files changed.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'tests/**'
+              - '.github/workflows/**'
+
   check:
     name: Check
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +46,8 @@ jobs:
 
   test:
     name: Test
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -37,6 +60,8 @@ jobs:
 
   fmt:
     name: Format
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +72,8 @@ jobs:
 
   clippy:
     name: Clippy
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,7 +85,8 @@ jobs:
 
   smoke:
     name: Smoke Tests
-    needs: [check]
+    needs: [changes, check]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -74,3 +102,22 @@ jobs:
           cache-to: type=gha,mode=max
       - name: Run smoke tests
         run: docker run --rm konvoy-smoke:latest bash /build/tests/smoke/tests.sh
+
+  # Single gate job for branch protection. Passes when all jobs succeed or
+  # are skipped (doc-only changes). Make this the only required check.
+  ci-pass:
+    name: CI Pass
+    if: always()
+    needs: [check, test, fmt, clippy, smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all jobs passed or were skipped
+        run: |
+          results=("${{ needs.check.result }}" "${{ needs.test.result }}" "${{ needs.fmt.result }}" "${{ needs.clippy.result }}" "${{ needs.smoke.result }}")
+          for r in "${results[@]}"; do
+            if [[ "$r" != "success" && "$r" != "skipped" ]]; then
+              echo "Job failed with result: $r"
+              exit 1
+            fi
+          done
+          echo "All jobs passed or were skipped."
