@@ -91,8 +91,11 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     let konanc = detect_konanc().map_err(EngineError::Konanc)?;
 
     // 6. Compute cache key.
+    // Use the effective lockfile (with detected konanc version) so the cache key
+    // is stable between the first build (no lockfile) and subsequent builds.
     let manifest_content = manifest.to_toml()?;
-    let lockfile_content = lockfile_toml_content(&lockfile);
+    let effective_lockfile = Lockfile::with_toolchain(&konanc.version);
+    let lockfile_content = lockfile_toml_content(&effective_lockfile);
     let cache_inputs = CacheInputs {
         manifest_content,
         lockfile_content,
@@ -218,6 +221,15 @@ fn compile(
         return Err(EngineError::CompilationFailed {
             error_count: result.error_count(),
         });
+    }
+
+    // konanc appends `.kexe` on Linux. Rename to the expected path.
+    let kexe_path = output_path.with_extension("kexe");
+    if !output_path.exists() && kexe_path.exists() {
+        std::fs::rename(&kexe_path, output_path).map_err(|source| EngineError::Io {
+            path: output_path.display().to_string(),
+            source,
+        })?;
     }
 
     Ok(output_path.to_path_buf())

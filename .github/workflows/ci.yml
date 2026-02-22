@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -51,3 +55,22 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace -- -D warnings
+
+  smoke:
+    name: Smoke Tests
+    needs: [check]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build smoke test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tests/smoke/Dockerfile
+          load: true
+          tags: konvoy-smoke:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Run smoke tests
+        run: docker run --rm konvoy-smoke:latest bash /build/tests/smoke/tests.sh

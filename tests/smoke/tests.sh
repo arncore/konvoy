@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# Konvoy smoke test suite.
+#
+# Each test_* function runs in a fresh temp directory.
+# Tests call the `konvoy` binary directly and verify behavior.
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# Framework
+# ---------------------------------------------------------------------------
+PASS=0
+FAIL=0
+TOTAL=0
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+run_test() {
+    local name="$1"
+    TOTAL=$((TOTAL + 1))
+
+    # Run each test in a subshell with a fresh temp directory.
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    if (cd "$tmpdir" && "$name") 2>&1; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}  $name"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}  $name"
+    fi
+
+    rm -rf "$tmpdir"
+}
+
+assert_contains() {
+    local haystack="$1"
+    local needle="$2"
+    if ! echo "$haystack" | grep -qF "$needle"; then
+        echo "    expected output to contain: $needle" >&2
+        echo "    got: $haystack" >&2
+        return 1
+    fi
+}
+
+assert_file_exists() {
+    local path="$1"
+    if [ ! -f "$path" ]; then
+        echo "    expected file to exist: $path" >&2
+        return 1
+    fi
+}
+
+assert_dir_exists() {
+    local path="$1"
+    if [ ! -d "$path" ]; then
+        echo "    expected directory to exist: $path" >&2
+        return 1
+    fi
+}
+
+assert_dir_not_exists() {
+    local path="$1"
+    if [ -d "$path" ]; then
+        echo "    expected directory to not exist: $path" >&2
+        return 1
+    fi
+}
+
+assert_file_contains() {
+    local path="$1"
+    local needle="$2"
+    if ! grep -qF "$needle" "$path"; then
+        echo "    expected $path to contain: $needle" >&2
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Tests: CLI basics
+# ---------------------------------------------------------------------------
+
+test_help_shows_subcommands() {
+    local output
+    output=$(konvoy --help 2>&1)
+    assert_contains "$output" "init"
+    assert_contains "$output" "build"
+    assert_contains "$output" "run"
+    assert_contains "$output" "test"
+    assert_contains "$output" "clean"
+    assert_contains "$output" "doctor"
+}
+
+test_version() {
+    local output
+    output=$(konvoy --version 2>&1)
+    assert_contains "$output" "konvoy"
+}
+
+test_init_help() {
+    konvoy init --help >/dev/null 2>&1
+}
+
+test_build_help() {
+    konvoy build --help >/dev/null 2>&1
+}
+
+test_doctor_help() {
+    konvoy doctor --help >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# Tests: konvoy init
+# ---------------------------------------------------------------------------
+
+test_init_creates_project() {
+    konvoy init --name hello >/dev/null 2>&1
+    assert_file_exists hello/konvoy.toml
+    assert_file_exists hello/src/main.kt
+    assert_file_contains hello/konvoy.toml "hello"
+    assert_file_contains hello/src/main.kt "fun main()"
+}
+
+test_init_manifest_is_valid() {
+    konvoy init --name valid-proj >/dev/null 2>&1
+    assert_file_contains valid-proj/konvoy.toml 'name = "valid-proj"'
+    assert_file_contains valid-proj/konvoy.toml "src/main.kt"
+}
+
+test_init_double_fails() {
+    konvoy init --name dup >/dev/null 2>&1
+    local output
+    if output=$(konvoy init --name dup 2>&1); then
+        echo "    expected second init to fail" >&2
+        return 1
+    fi
+    assert_contains "$output" "already exists"
+}
+
+# ---------------------------------------------------------------------------
+# Tests: konvoy doctor
+# ---------------------------------------------------------------------------
+
+test_doctor_all_ok() {
+    local output
+    output=$(konvoy doctor 2>&1)
+    assert_contains "$output" "[ok] Host target:"
+    assert_contains "$output" "[ok] konanc:"
+    assert_contains "$output" "All checks passed"
+}
+
+# ---------------------------------------------------------------------------
+# Tests: build lifecycle (combined to minimize konanc invocations)
+# ---------------------------------------------------------------------------
+
+# Single project exercises: build → cache hit → run → lockfile → clean → rebuild
+test_build_lifecycle() {
+    konvoy init --name lifecycle >/dev/null 2>&1
+    cd lifecycle
+
+    # No lockfile before first build.
+    [ ! -f konvoy.lock ] || { echo "    lockfile should not exist before build" >&2; return 1; }
+
+    # First build compiles.
+    local out1
+    out1=$(konvoy build 2>&1)
+    assert_contains "$out1" "Compiling"
+    assert_file_exists .konvoy/build/linux_x64/debug/lifecycle
+
+    # Second build is a cache hit.
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "Fresh"
+
+    # Lockfile created after build.
+    assert_file_exists konvoy.lock
+    assert_file_contains konvoy.lock "konanc_version"
+
+    # Run produces expected output.
+    local run_output
+    run_output=$(konvoy run 2>/dev/null)
+    assert_contains "$run_output" "Hello, lifecycle!"
+
+    # Clean removes artifacts.
+    assert_dir_exists .konvoy
+    konvoy clean >/dev/null 2>&1
+    assert_dir_not_exists .konvoy
+
+    # Rebuild after clean recompiles.
+    local out3
+    out3=$(konvoy build 2>&1)
+    assert_contains "$out3" "Compiling"
+}
+
+test_build_release() {
+    konvoy init --name rel >/dev/null 2>&1
+    cd rel
+    konvoy build --release 2>&1
+    assert_file_exists .konvoy/build/linux_x64/release/rel
+}
+
+test_clean_no_konvoy_dir_ok() {
+    mkdir -p src
+    printf '[package]\nname = "noop"\n' > konvoy.toml
+    konvoy clean >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# Tests: error cases
+# ---------------------------------------------------------------------------
+
+test_build_outside_project_fails() {
+    local output
+    if output=$(konvoy build 2>&1); then
+        echo "    expected build to fail outside project" >&2
+        return 1
+    fi
+    assert_contains "$output" "no konvoy.toml"
+}
+
+test_run_outside_project_fails() {
+    local output
+    if output=$(konvoy run 2>&1); then
+        echo "    expected run to fail outside project" >&2
+        return 1
+    fi
+    assert_contains "$output" "no konvoy.toml"
+}
+
+test_build_no_sources_fails() {
+    mkdir -p src
+    printf '[package]\nname = "empty"\n' > konvoy.toml
+    local output
+    if output=$(konvoy build 2>&1); then
+        echo "    expected build to fail with no sources" >&2
+        return 1
+    fi
+    assert_contains "$output" "source"
+}
+
+# ---------------------------------------------------------------------------
+# Run all tests
+# ---------------------------------------------------------------------------
+echo "Running Konvoy smoke tests..."
+echo ""
+
+# CLI basics
+run_test test_help_shows_subcommands
+run_test test_version
+run_test test_init_help
+run_test test_build_help
+run_test test_doctor_help
+
+# init
+run_test test_init_creates_project
+run_test test_init_manifest_is_valid
+run_test test_init_double_fails
+
+# doctor
+run_test test_doctor_all_ok
+
+# build lifecycle (build, cache, run, lockfile, clean, rebuild)
+run_test test_build_lifecycle
+run_test test_build_release
+run_test test_clean_no_konvoy_dir_ok
+
+# error cases
+run_test test_build_outside_project_fails
+run_test test_run_outside_project_fails
+run_test test_build_no_sources_fails
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+echo ""
+echo "---"
+echo -e "Results: ${GREEN}${PASS} passed${NC}, ${RED}${FAIL} failed${NC}, ${TOTAL} total"
+
+if [ "$FAIL" -gt 0 ]; then
+    exit 1
+fi

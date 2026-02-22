@@ -271,6 +271,7 @@ dependencies = [
  "konvoy-engine",
  "konvoy-konanc",
  "konvoy-targets",
+ "konvoy-util",
 ]
 
 [[package]]
@@ -290,7 +291,10 @@ dependencies = [
  "konvoy-konanc",
  "konvoy-targets",
  "konvoy-util",
+ "serde",
+ "tempfile",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
