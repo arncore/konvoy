@@ -7,4 +7,4 @@ pub mod toolchain;
 
 pub use detect::{resolve_konanc, KonancInfo, ResolvedKonanc};
 pub use error::KonancError;
-pub use invoke::{CompilationResult, Diagnostic, DiagnosticLevel, KonancCommand};
+pub use invoke::{CompilationResult, Diagnostic, DiagnosticLevel, KonancCommand, ProduceKind};

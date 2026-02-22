@@ -311,6 +311,58 @@ test_init_includes_toolchain() {
 }
 
 # ---------------------------------------------------------------------------
+# Tests: library projects and dependencies
+# ---------------------------------------------------------------------------
+
+test_init_lib() {
+    konvoy init --name my-lib --lib >/dev/null 2>&1
+    assert_file_exists my-lib/konvoy.toml
+    assert_file_exists my-lib/src/lib.kt
+    assert_file_contains my-lib/konvoy.toml 'kind = "lib"'
+    assert_file_contains my-lib/konvoy.toml 'version = "0.1.0"'
+}
+
+test_build_lib() {
+    konvoy init --name build-lib --lib >/dev/null 2>&1
+    cd build-lib
+    local output
+    output=$(konvoy build 2>&1)
+    assert_contains "$output" "Compiling"
+    assert_file_exists .konvoy/build/linux_x64/debug/build-lib.klib
+}
+
+test_dep_build() {
+    # Create a library project.
+    konvoy init --name utils --lib >/dev/null 2>&1
+    # Create a binary project that depends on the library.
+    konvoy init --name app >/dev/null 2>&1
+    # Add dependency to app's manifest.
+    printf '\n[dependencies]\nutils = { path = "../utils" }\n' >> app/konvoy.toml
+    # Update app's source to use the library.
+    cat > app/src/main.kt << 'KOTLIN'
+fun main() {
+    println(greet("world"))
+}
+KOTLIN
+    cd app
+    local output
+    output=$(konvoy build 2>&1)
+    assert_contains "$output" "Compiling utils"
+    assert_contains "$output" "Compiling app"
+}
+
+test_run_lib_fails() {
+    konvoy init --name run-lib --lib >/dev/null 2>&1
+    cd run-lib
+    local output
+    if output=$(konvoy run 2>&1); then
+        echo "    expected run to fail for library project" >&2
+        return 1
+    fi
+    assert_contains "$output" "library"
+}
+
+# ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
 echo "Running Konvoy smoke tests..."
@@ -344,6 +396,12 @@ run_test test_toolchain_install_from_manifest
 
 # worktree
 run_test test_worktree_cache_shared
+
+# library projects
+run_test test_init_lib
+run_test test_build_lib
+run_test test_dep_build
+run_test test_run_lib_fails
 
 # error cases
 run_test test_build_outside_project_fails

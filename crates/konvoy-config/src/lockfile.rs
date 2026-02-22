@@ -6,6 +6,8 @@ use std::path::Path;
 pub struct Lockfile {
     #[serde(default)]
     pub toolchain: Option<ToolchainLock>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<DependencyLock>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -13,6 +15,23 @@ pub struct ToolchainLock {
     pub konanc_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tarball_sha256: Option<String>,
+}
+
+/// A locked dependency entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyLock {
+    pub name: String,
+    #[serde(flatten)]
+    pub source: DepSource,
+    pub source_hash: String,
+}
+
+/// The resolved source of a dependency.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase", tag = "source_type")]
+pub enum DepSource {
+    Path { path: String },
+    // Future: Git { url: String, commit: String },
 }
 
 impl Lockfile {
@@ -43,6 +62,7 @@ impl Lockfile {
                 konanc_version: version.to_owned(),
                 tarball_sha256: None,
             }),
+            dependencies: Vec::new(),
         }
     }
 
@@ -53,6 +73,7 @@ impl Lockfile {
                 konanc_version: version.to_owned(),
                 tarball_sha256: Some(sha256.to_owned()),
             }),
+            dependencies: Vec::new(),
         }
     }
 
@@ -199,6 +220,54 @@ konanc_version = "2.1.0"
             .as_ref()
             .unwrap_or_else(|| panic!("missing toolchain"));
         assert!(toolchain.tarball_sha256.is_none());
+    }
+
+    #[test]
+    fn round_trip_with_dependencies() {
+        let dir = tempdir();
+        let path = dir.join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.dependencies.push(DependencyLock {
+            name: "my-utils".to_owned(),
+            source: DepSource::Path {
+                path: "../my-utils".to_owned(),
+            },
+            source_hash: "abcdef1234".to_owned(),
+        });
+        lockfile.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
+        let reparsed = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(lockfile, reparsed);
+        assert_eq!(reparsed.dependencies.len(), 1);
+        let dep = reparsed
+            .dependencies
+            .first()
+            .unwrap_or_else(|| panic!("missing dep"));
+        assert_eq!(dep.name, "my-utils");
+        assert_eq!(dep.source_hash, "abcdef1234");
+    }
+
+    #[test]
+    fn backward_compat_no_deps() {
+        let dir = tempdir();
+        let path = dir.join("konvoy.lock");
+        fs::write(
+            &path,
+            r#"
+[toolchain]
+konanc_version = "2.1.0"
+"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        let lockfile = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert!(lockfile.dependencies.is_empty());
+    }
+
+    #[test]
+    fn empty_deps_omitted_in_toml() {
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+        let content = toml::to_string_pretty(&lockfile).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!content.contains("dependencies"), "content was: {content}");
     }
 
     /// Create a unique temporary directory for each test invocation.

@@ -75,6 +75,16 @@ impl CompilationResult {
     }
 }
 
+/// What kind of output to produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProduceKind {
+    /// A native executable (default).
+    #[default]
+    Program,
+    /// A Kotlin/Native library (`.klib`).
+    Library,
+}
+
 /// Builder for constructing a `konanc` invocation.
 #[derive(Debug, Default)]
 pub struct KonancCommand {
@@ -82,6 +92,8 @@ pub struct KonancCommand {
     output: Option<PathBuf>,
     target: Option<String>,
     release: bool,
+    produce: ProduceKind,
+    libraries: Vec<PathBuf>,
 }
 
 impl KonancCommand {
@@ -114,6 +126,18 @@ impl KonancCommand {
         self
     }
 
+    /// Set the output kind (program or library).
+    pub fn produce(mut self, kind: ProduceKind) -> Self {
+        self.produce = kind;
+        self
+    }
+
+    /// Add dependency library paths (`.klib` files).
+    pub fn libraries(mut self, paths: &[PathBuf]) -> Self {
+        self.libraries = paths.to_vec();
+        self
+    }
+
     /// Build the argument list without executing.
     ///
     /// # Errors
@@ -141,6 +165,21 @@ impl KonancCommand {
         if let Some(target) = &self.target {
             args.push("-target".to_owned());
             args.push(target.clone());
+        }
+
+        // Produce kind
+        match self.produce {
+            ProduceKind::Program => {} // default, no flag needed
+            ProduceKind::Library => {
+                args.push("-produce".to_owned());
+                args.push("library".to_owned());
+            }
+        }
+
+        // Dependency libraries
+        for lib in &self.libraries {
+            args.push("-library".to_owned());
+            args.push(lib.display().to_string());
         }
 
         // Release optimization
@@ -538,5 +577,47 @@ mod tests {
 
         let args = cmd.build_args().unwrap();
         assert_eq!(args.len(), 6); // a.kt -o out -target linux_x64 -opt
+    }
+
+    #[test]
+    fn build_args_produce_library() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("lib.kt")])
+            .output(Path::new("out.klib"))
+            .produce(ProduceKind::Library);
+
+        let args = cmd.build_args().unwrap();
+        assert!(args.contains(&"-produce".to_owned()));
+        assert!(args.contains(&"library".to_owned()));
+    }
+
+    #[test]
+    fn build_args_produce_program_omits_flag() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("main.kt")])
+            .output(Path::new("out"))
+            .produce(ProduceKind::Program);
+
+        let args = cmd.build_args().unwrap();
+        assert!(!args.contains(&"-produce".to_owned()));
+    }
+
+    #[test]
+    fn build_args_with_libraries() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("main.kt")])
+            .output(Path::new("out"))
+            .libraries(&[PathBuf::from("dep.klib"), PathBuf::from("other.klib")]);
+
+        let args = cmd.build_args().unwrap();
+        let lib_indices: Vec<_> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.as_str() == "-library")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(lib_indices.len(), 2);
+        assert_eq!(args.get(lib_indices[0] + 1).unwrap(), "dep.klib");
+        assert_eq!(args.get(lib_indices[1] + 1).unwrap(), "other.klib");
     }
 }
