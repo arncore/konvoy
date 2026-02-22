@@ -22,8 +22,12 @@ pub struct KonancInfo {
 pub struct ResolvedKonanc {
     /// Compiler information (path, version, fingerprint).
     pub info: KonancInfo,
-    /// SHA-256 of the downloaded tarball, if this was a managed install.
-    pub tarball_sha256: Option<String>,
+    /// SHA-256 of the downloaded Kotlin/Native tarball, if this was a managed install.
+    pub konanc_tarball_sha256: Option<String>,
+    /// SHA-256 of the downloaded JRE tarball, if this was a managed install.
+    pub jre_tarball_sha256: Option<String>,
+    /// JAVA_HOME path for the bundled JRE.
+    pub jre_home: Option<PathBuf>,
 }
 
 /// Resolve a managed `konanc` installation for the given version.
@@ -38,21 +42,31 @@ pub struct ResolvedKonanc {
 pub fn resolve_konanc(version: &str) -> Result<ResolvedKonanc, KonancError> {
     let installed = toolchain::is_installed(version)?;
 
-    let tarball_sha256 = if !installed {
+    let (konanc_tarball_sha256, jre_tarball_sha256) = if !installed {
         eprintln!("    Installing Kotlin/Native {version}...");
         let result = toolchain::install(version)?;
-        if result.tarball_sha256.is_empty() {
+        let konanc_sha = if result.konanc_tarball_sha256.is_empty() {
             None
         } else {
-            Some(result.tarball_sha256)
-        }
+            Some(result.konanc_tarball_sha256)
+        };
+        let jre_sha = if result.jre_tarball_sha256.is_empty() {
+            None
+        } else {
+            Some(result.jre_tarball_sha256)
+        };
+        (konanc_sha, jre_sha)
     } else {
-        None
+        (None, None)
     };
 
     let path = toolchain::managed_konanc_path(version)?;
     check_executable(&path)?;
-    let actual_version = query_version(&path)?;
+
+    // Resolve bundled JRE for version queries and compilation.
+    let jre_home = toolchain::jre_home_path(version).ok();
+
+    let actual_version = query_version(&path, jre_home.as_deref())?;
 
     // Verify the installed version matches what was requested.
     if actual_version != version {
@@ -70,7 +84,9 @@ pub fn resolve_konanc(version: &str) -> Result<ResolvedKonanc, KonancError> {
             version: actual_version,
             fingerprint,
         },
-        tarball_sha256,
+        konanc_tarball_sha256,
+        jre_tarball_sha256,
+        jre_home,
     })
 }
 
@@ -133,9 +149,13 @@ fn check_executable(path: &Path) -> Result<(), KonancError> {
     Ok(())
 }
 
-fn query_version(path: &PathBuf) -> Result<String, KonancError> {
-    let output = Command::new(path)
-        .arg("-version")
+fn query_version(path: &PathBuf, java_home: Option<&Path>) -> Result<String, KonancError> {
+    let mut cmd = Command::new(path);
+    cmd.arg("-version");
+    if let Some(jh) = java_home {
+        cmd.env("JAVA_HOME", jh);
+    }
+    let output = cmd
         .output()
         .map_err(|source| KonancError::Exec { source })?;
 

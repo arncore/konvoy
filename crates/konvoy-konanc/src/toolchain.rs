@@ -14,8 +14,12 @@ use crate::error::KonancError;
 pub struct InstallResult {
     /// Absolute path to the `konanc` binary.
     pub konanc_path: PathBuf,
-    /// SHA-256 hex digest of the downloaded tarball.
-    pub tarball_sha256: String,
+    /// SHA-256 hex digest of the downloaded Kotlin/Native tarball.
+    pub konanc_tarball_sha256: String,
+    /// Absolute path to the bundled JRE's JAVA_HOME directory.
+    pub jre_home: PathBuf,
+    /// SHA-256 hex digest of the downloaded JRE tarball.
+    pub jre_tarball_sha256: String,
 }
 
 /// Return the root directory for managed toolchains: `~/.konvoy/toolchains/`.
@@ -43,13 +47,55 @@ pub fn managed_konanc_path(version: &str) -> Result<PathBuf, KonancError> {
     Ok(version_dir(version)?.join("bin").join("konanc"))
 }
 
-/// Check whether a specific version is already installed.
+/// Return the JRE directory for a specific toolchain version.
+///
+/// # Errors
+/// Returns an error if the home directory cannot be determined.
+pub fn jre_dir(version: &str) -> Result<PathBuf, KonancError> {
+    Ok(version_dir(version)?.join("jre"))
+}
+
+/// Return the JAVA_HOME path for the bundled JRE.
+///
+/// The JRE tarball extracts to a single directory (e.g. `jdk-21.0.10+7-jre/`).
+/// On macOS, JAVA_HOME is `<extracted>/Contents/Home/`; on Linux it's the
+/// extracted root itself.
+///
+/// # Errors
+/// Returns an error if the JRE is not installed or the home directory cannot
+/// be determined.
+pub fn jre_home_path(version: &str) -> Result<PathBuf, KonancError> {
+    let jre_root = jre_dir(version)?;
+    if !jre_root.exists() {
+        return Err(KonancError::JreInstall {
+            message: format!("JRE not found at {}", jre_root.display()),
+        });
+    }
+
+    // Find the single extracted directory inside jre/.
+    let extracted = find_jre_root(&jre_root)?;
+
+    // On macOS, the JRE uses Apple bundle layout: Contents/Home/
+    let contents_home = extracted.join("Contents").join("Home");
+    if contents_home.exists() {
+        Ok(contents_home)
+    } else {
+        Ok(extracted)
+    }
+}
+
+/// Check whether a specific version is fully installed (konanc + JRE).
 ///
 /// # Errors
 /// Returns an error if the home directory cannot be determined.
 pub fn is_installed(version: &str) -> Result<bool, KonancError> {
     let konanc = managed_konanc_path(version)?;
-    Ok(konanc.exists())
+    if !konanc.exists() {
+        return Ok(false);
+    }
+    // Also check that the JRE is present.
+    let jre_root = jre_dir(version)?;
+    Ok(jre_root.exists())
 }
 
 /// List all installed toolchain versions.
@@ -98,32 +144,132 @@ pub fn list_installed() -> Result<Vec<String>, KonancError> {
 pub fn install(version: &str) -> Result<InstallResult, KonancError> {
     let dest = version_dir(version)?;
 
-    // Already installed — find konanc and return.
+    // Check if konanc is already installed.
     let konanc_path = dest.join("bin").join("konanc");
-    if konanc_path.exists() {
-        // We don't have the tarball SHA-256 from a previous install,
-        // but we can report what we have.
-        return Ok(InstallResult {
-            konanc_path,
-            tarball_sha256: String::new(),
-        });
+    let konanc_already_installed = konanc_path.exists();
+
+    // If konanc exists, check if JRE also exists. If both present, return early.
+    if konanc_already_installed {
+        let jre_root = jre_dir(version)?;
+        if jre_root.exists() {
+            let jre_home = jre_home_path(version)?;
+            return Ok(InstallResult {
+                konanc_path,
+                konanc_tarball_sha256: String::new(),
+                jre_home,
+                jre_tarball_sha256: String::new(),
+            });
+        }
+        // konanc installed but JRE missing — fall through to install JRE only.
     }
 
-    let url = download_url(version)?;
+    // --- Install konanc if needed ---
+    let konanc_sha256 = if konanc_already_installed {
+        String::new()
+    } else {
+        let url = download_url(version)?;
+        let toolchains_root = toolchains_dir()?;
+
+        // Ensure the toolchains directory exists.
+        std::fs::create_dir_all(&toolchains_root).map_err(|source| KonancError::Io {
+            path: toolchains_root.display().to_string(),
+            source,
+        })?;
+
+        // Download to a temp file, computing SHA-256 as we go.
+        let tmp_tarball = toolchains_root.join(format!(".tmp-{version}.tar.gz"));
+        let sha256 = download_with_progress(&url, &tmp_tarball, "Kotlin/Native", version)?;
+
+        // Extract to a temp directory, then rename atomically.
+        let tmp_extract = toolchains_root.join(format!(".tmp-{version}-extract"));
+        if tmp_extract.exists() {
+            std::fs::remove_dir_all(&tmp_extract).map_err(|source| KonancError::Io {
+                path: tmp_extract.display().to_string(),
+                source,
+            })?;
+        }
+
+        extract_tarball(&tmp_tarball, &tmp_extract, "Kotlin/Native", version)?;
+
+        // Clean up tarball.
+        let _ = std::fs::remove_file(&tmp_tarball);
+
+        // The tarball extracts to a subdirectory like `kotlin-native-prebuilt-linux-x86_64-2.1.0/`.
+        let extracted_root = find_extracted_root(&tmp_extract, version)?;
+
+        // Rename extracted dir to the final version dir.
+        if dest.exists() {
+            // Race condition: another process installed while we were downloading.
+            let _ = std::fs::remove_dir_all(&tmp_extract);
+        } else {
+            std::fs::rename(&extracted_root, &dest).map_err(|source| KonancError::Io {
+                path: dest.display().to_string(),
+                source,
+            })?;
+            let _ = std::fs::remove_dir_all(&tmp_extract);
+        }
+
+        // Verify the installation.
+        let final_konanc = dest.join("bin").join("konanc");
+        if !final_konanc.exists() {
+            return Err(KonancError::CorruptToolchain {
+                path: dest,
+                version: version.to_owned(),
+            });
+        }
+
+        // Ensure konanc is executable on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(&final_konanc).map_err(|source| KonancError::Io {
+                path: final_konanc.display().to_string(),
+                source,
+            })?;
+            let mut perms = metadata.permissions();
+            let mode = perms.mode() | 0o755;
+            perms.set_mode(mode);
+            std::fs::set_permissions(&final_konanc, perms).map_err(|source| KonancError::Io {
+                path: final_konanc.display().to_string(),
+                source,
+            })?;
+        }
+
+        sha256
+    };
+
+    // --- Install JRE if needed ---
+    let (jre_home, jre_sha256) = install_jre(version)?;
+
+    Ok(InstallResult {
+        konanc_path: dest.join("bin").join("konanc"),
+        konanc_tarball_sha256: konanc_sha256,
+        jre_home,
+        jre_tarball_sha256: jre_sha256,
+    })
+}
+
+/// Download and install the bundled JRE for a toolchain version.
+///
+/// Returns `(jre_home, tarball_sha256)`. Skips download if already installed.
+fn install_jre(version: &str) -> Result<(PathBuf, String), KonancError> {
+    let jre_root = jre_dir(version)?;
+
+    // Already installed — return existing path.
+    if jre_root.exists() {
+        let home = jre_home_path(version)?;
+        return Ok((home, String::new()));
+    }
+
+    let url = jre_download_url()?;
     let toolchains_root = toolchains_dir()?;
 
-    // Ensure the toolchains directory exists.
-    std::fs::create_dir_all(&toolchains_root).map_err(|source| KonancError::Io {
-        path: toolchains_root.display().to_string(),
-        source,
-    })?;
+    // Download JRE tarball.
+    let tmp_tarball = toolchains_root.join(format!(".tmp-{version}-jre.tar.gz"));
+    let sha256 = download_with_progress(&url, &tmp_tarball, "JRE", version)?;
 
-    // Download to a temp file, computing SHA-256 as we go.
-    let tmp_tarball = toolchains_root.join(format!(".tmp-{version}.tar.gz"));
-    let sha256 = download_with_progress(&url, &tmp_tarball, version)?;
-
-    // Extract to a temp directory, then rename atomically.
-    let tmp_extract = toolchains_root.join(format!(".tmp-{version}-extract"));
+    // Extract to temp directory.
+    let tmp_extract = toolchains_root.join(format!(".tmp-{version}-jre-extract"));
     if tmp_extract.exists() {
         std::fs::remove_dir_all(&tmp_extract).map_err(|source| KonancError::Io {
             path: tmp_extract.display().to_string(),
@@ -131,58 +277,111 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
         })?;
     }
 
-    extract_tarball(&tmp_tarball, &tmp_extract, version)?;
+    extract_tarball(&tmp_tarball, &tmp_extract, "JRE", version)?;
 
     // Clean up tarball.
     let _ = std::fs::remove_file(&tmp_tarball);
 
-    // The tarball extracts to a subdirectory like `kotlin-native-prebuilt-linux-x86_64-2.1.0/`.
-    // Find it and move its contents to the version directory.
-    let extracted_root = find_extracted_root(&tmp_extract, version)?;
-
-    // Rename extracted dir to the final version dir.
-    if dest.exists() {
+    // Move extracted content to the final jre/ directory.
+    if jre_root.exists() {
         // Race condition: another process installed while we were downloading.
         let _ = std::fs::remove_dir_all(&tmp_extract);
     } else {
-        std::fs::rename(&extracted_root, &dest).map_err(|source| KonancError::Io {
-            path: dest.display().to_string(),
+        std::fs::rename(&tmp_extract, &jre_root).map_err(|source| KonancError::Io {
+            path: jre_root.display().to_string(),
             source,
         })?;
-        // Clean up the temp extract directory if it's now empty.
-        let _ = std::fs::remove_dir_all(&tmp_extract);
     }
 
-    // Verify the installation.
-    let final_konanc = dest.join("bin").join("konanc");
-    if !final_konanc.exists() {
-        return Err(KonancError::CorruptToolchain {
-            path: dest,
-            version: version.to_owned(),
+    // Verify java binary exists.
+    let home = jre_home_path(version)?;
+    let java_bin = home.join("bin").join("java");
+    if !java_bin.exists() {
+        return Err(KonancError::JreInstall {
+            message: format!("java binary not found at {}", java_bin.display()),
         });
     }
 
-    // Ensure konanc is executable on Unix.
+    // Ensure java is executable on Unix.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let metadata = std::fs::metadata(&final_konanc).map_err(|source| KonancError::Io {
-            path: final_konanc.display().to_string(),
+        let metadata = std::fs::metadata(&java_bin).map_err(|source| KonancError::Io {
+            path: java_bin.display().to_string(),
             source,
         })?;
         let mut perms = metadata.permissions();
         let mode = perms.mode() | 0o755;
         perms.set_mode(mode);
-        std::fs::set_permissions(&final_konanc, perms).map_err(|source| KonancError::Io {
-            path: final_konanc.display().to_string(),
+        std::fs::set_permissions(&java_bin, perms).map_err(|source| KonancError::Io {
+            path: java_bin.display().to_string(),
             source,
         })?;
     }
 
-    Ok(InstallResult {
-        konanc_path: final_konanc,
-        tarball_sha256: sha256,
+    Ok((home, sha256))
+}
+
+/// Find the extracted JRE root directory inside the jre/ directory.
+fn find_jre_root(jre_dir: &Path) -> Result<PathBuf, KonancError> {
+    let entries: Vec<_> = std::fs::read_dir(jre_dir)
+        .map_err(|source| KonancError::Io {
+            path: jre_dir.display().to_string(),
+            source,
+        })?
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .collect();
+
+    if entries.len() == 1 {
+        return Ok(entries
+            .into_iter()
+            .next()
+            .map(|e| e.path())
+            .unwrap_or_else(|| jre_dir.to_path_buf()));
+    }
+
+    // Look for a directory matching the JDK naming pattern.
+    for entry in &entries {
+        let name = entry.file_name();
+        if let Some(s) = name.to_str() {
+            if s.starts_with("jdk-") {
+                return Ok(entry.path());
+            }
+        }
+    }
+
+    Err(KonancError::JreInstall {
+        message: format!(
+            "expected a single JRE directory in {}, found {} entries",
+            jre_dir.display(),
+            entries.len()
+        ),
     })
+}
+
+/// Construct the download URL for an Adoptium Temurin JRE.
+fn jre_download_url() -> Result<String, KonancError> {
+    let (os, arch) = jre_platform_slug()?;
+    Ok(format!(
+        "https://api.adoptium.net/v3/binary/latest/21/ga/{os}/{arch}/jre/hotspot/normal/eclipse"
+    ))
+}
+
+/// Map the current OS and architecture to Adoptium's naming convention.
+fn jre_platform_slug() -> Result<(&'static str, &'static str), KonancError> {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+
+    match (os, arch) {
+        ("linux", "x86_64") => Ok(("linux", "x64")),
+        ("macos", "x86_64") => Ok(("mac", "x64")),
+        ("macos", "aarch64") => Ok(("mac", "aarch64")),
+        _ => Err(KonancError::UnsupportedPlatform {
+            os: os.to_owned(),
+            arch: arch.to_owned(),
+        }),
+    }
 }
 
 /// Construct the download URL for a Kotlin/Native prebuilt tarball.
@@ -210,7 +409,12 @@ fn platform_slug() -> Result<(&'static str, &'static str), KonancError> {
 }
 
 /// Download a URL to a file, showing progress on stderr and computing SHA-256.
-fn download_with_progress(url: &str, dest: &Path, version: &str) -> Result<String, KonancError> {
+fn download_with_progress(
+    url: &str,
+    dest: &Path,
+    label: &str,
+    version: &str,
+) -> Result<String, KonancError> {
     let response = ureq::get(url).call().map_err(|e| KonancError::Download {
         version: version.to_owned(),
         message: e.to_string(),
@@ -259,7 +463,7 @@ fn download_with_progress(url: &str, dest: &Path, version: &str) -> Result<Strin
                 #[allow(clippy::cast_possible_truncation)]
                 let pct = ((downloaded * 100) / total) as u8;
                 if pct != last_pct && pct.is_multiple_of(10) {
-                    eprint!("\r    Downloading Kotlin/Native {version}... {pct}%");
+                    eprint!("\r    Downloading {label} {version}... {pct}%");
                     last_pct = pct;
                 }
             }
@@ -267,18 +471,23 @@ fn download_with_progress(url: &str, dest: &Path, version: &str) -> Result<Strin
     }
 
     if content_length.is_some() {
-        eprintln!("\r    Downloading Kotlin/Native {version}... done   ");
+        eprintln!("\r    Downloading {label} {version}... done   ");
     } else {
         let mb = downloaded / (1024 * 1024);
-        eprintln!("    Downloaded Kotlin/Native {version} ({mb} MB)");
+        eprintln!("    Downloaded {label} {version} ({mb} MB)");
     }
 
     Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Extract a `.tar.gz` tarball to a directory.
-fn extract_tarball(tarball: &Path, dest: &Path, version: &str) -> Result<(), KonancError> {
-    eprintln!("    Extracting Kotlin/Native {version}...");
+fn extract_tarball(
+    tarball: &Path,
+    dest: &Path,
+    label: &str,
+    version: &str,
+) -> Result<(), KonancError> {
+    eprintln!("    Extracting {label} {version}...");
 
     let file = std::fs::File::open(tarball).map_err(|source| KonancError::Io {
         path: tarball.display().to_string(),
@@ -397,5 +606,45 @@ mod tests {
             assert!(url.contains(".tar.gz"));
             assert!(url.starts_with("https://"));
         }
+    }
+
+    #[test]
+    fn jre_dir_under_version() {
+        let dir = jre_dir("2.1.0").unwrap();
+        let s = dir.display().to_string();
+        assert!(s.contains(".konvoy"));
+        assert!(s.contains("toolchains"));
+        assert!(s.contains("2.1.0"));
+        assert!(s.contains("jre"));
+    }
+
+    #[test]
+    fn jre_download_url_format() {
+        if let Ok(url) = jre_download_url() {
+            assert!(url.contains("api.adoptium.net"));
+            assert!(url.contains("/jre/"));
+            assert!(url.contains("/21/"));
+            assert!(url.starts_with("https://"));
+        }
+    }
+
+    #[test]
+    fn jre_platform_slug_valid() {
+        if let Ok((os, arch)) = jre_platform_slug() {
+            assert!(!os.is_empty());
+            assert!(!arch.is_empty());
+            // Adoptium uses "mac" not "macos", "x64" not "x86_64"
+            assert!(matches!(
+                (os, arch),
+                ("linux", "x64") | ("mac", "x64") | ("mac", "aarch64")
+            ));
+        }
+    }
+
+    #[test]
+    fn jre_home_path_errors_when_missing() {
+        // A version that doesn't exist should error.
+        let result = jre_home_path("99.99.99");
+        assert!(result.is_err());
     }
 }

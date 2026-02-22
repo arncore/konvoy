@@ -300,13 +300,22 @@ fn cmd_doctor() -> Result<(), String> {
                 eprintln!("  [ok] Project: {}", manifest.package.name);
                 let version = &manifest.toolchain.kotlin;
                 match konvoy_konanc::toolchain::is_installed(version) {
-                    Ok(true) => match konvoy_konanc::toolchain::managed_konanc_path(version) {
-                        Ok(path) => eprintln!("  [ok] konanc: {version} ({})", path.display()),
-                        Err(e) => {
-                            eprintln!("  [!!] konanc: {e}");
-                            issues = issues.saturating_add(1);
+                    Ok(true) => {
+                        match konvoy_konanc::toolchain::managed_konanc_path(version) {
+                            Ok(path) => eprintln!("  [ok] konanc: {version} ({})", path.display()),
+                            Err(e) => {
+                                eprintln!("  [!!] konanc: {e}");
+                                issues = issues.saturating_add(1);
+                            }
                         }
-                    },
+                        match konvoy_konanc::toolchain::jre_home_path(version) {
+                            Ok(path) => eprintln!("  [ok] JRE: {}", path.display()),
+                            Err(e) => {
+                                eprintln!("  [!!] JRE: {e}");
+                                issues = issues.saturating_add(1);
+                            }
+                        }
+                    }
                     Ok(false) => {
                         eprintln!("  [!!] konanc: Kotlin/Native {version} not installed — run `konvoy toolchain install` or `konvoy build`");
                         issues = issues.saturating_add(1);
