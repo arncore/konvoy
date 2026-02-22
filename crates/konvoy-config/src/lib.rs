@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Parse and validate `konvoy.toml` and `konvoy.lock`.
 
 pub mod lockfile;

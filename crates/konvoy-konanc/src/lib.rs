@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Compiler invocation and diagnostics normalization for `konanc`.
 
 pub mod detect;

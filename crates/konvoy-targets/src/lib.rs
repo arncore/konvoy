@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Host detection and target triple mapping for Konvoy.
 //!
 //! Maps Rust compile-time platform information to Kotlin/Native target names
