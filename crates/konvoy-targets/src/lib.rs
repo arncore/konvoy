@@ -93,8 +93,10 @@ pub enum TargetError {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn host_target_returns_valid_known_target() {
@@ -237,5 +239,12 @@ mod tests {
             Err(_) => return,
         };
         assert_ne!(a, b);
+    }
+
+    proptest! {
+        #[test]
+        fn target_parsing_never_panics(s in "\\PC*") {
+            let _ = Target::from_str(&s);
+        }
     }
 }

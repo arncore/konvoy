@@ -192,8 +192,10 @@ pub enum ManifestError {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     const TOOLCHAIN: &str = "\n[toolchain]\nkotlin = \"2.1.0\"\n";
 
@@ -492,5 +494,29 @@ name = "no-deps"
             !serialized.contains("[dependencies]"),
             "serialized was: {serialized}"
         );
+    }
+
+    proptest! {
+        #[test]
+        fn package_name_validation_never_panics(name in "\\PC*") {
+            // Just call from_str - it should return Ok or Err, never panic
+            let _ = Manifest::from_str(
+                &format!(
+                    "[package]\nname = \"{}\"\n[toolchain]\nkotlin = \"2.1.0\"",
+                    name.replace('\\', "\\\\").replace('"', "\\\"")
+                ),
+                "test.toml",
+            );
+        }
+
+        #[test]
+        fn is_valid_name_never_panics(name in "\\PC*") {
+            let _ = is_valid_name(&name);
+        }
+
+        #[test]
+        fn is_valid_entrypoint_never_panics(ep in "\\PC*") {
+            let _ = is_valid_entrypoint(&ep);
+        }
     }
 }

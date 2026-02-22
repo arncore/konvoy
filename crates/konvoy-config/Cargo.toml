@@ -11,3 +11,6 @@ workspace = true
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

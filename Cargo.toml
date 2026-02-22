@@ -25,6 +25,7 @@ thiserror = "2"
 toml = "0.8"
 ureq = "3"
 
+proptest = "1"
 konvoy-config = { path = "crates/konvoy-config" }
 konvoy-engine = { path = "crates/konvoy-engine" }
 konvoy-konanc = { path = "crates/konvoy-konanc" }

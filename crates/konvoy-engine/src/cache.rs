@@ -101,6 +101,7 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use proptest::prelude::*;
 
     fn make_inputs(dir: &Path) -> CacheInputs {
         CacheInputs {
@@ -317,5 +318,53 @@ mod tests {
         let key2 = CacheKey::compute(&inputs).unwrap();
 
         assert_ne!(key1, key2);
+    }
+
+    proptest! {
+        #[test]
+        fn same_inputs_always_produce_same_key(
+            manifest in "\\PC{0,100}",
+            lockfile in "\\PC{0,100}",
+            version in "\\PC{1,20}",
+            fingerprint in "\\PC{1,20}",
+            target in "\\PC{1,20}",
+            profile in "\\PC{1,20}",
+            os in "\\PC{1,20}",
+            arch in "\\PC{1,20}",
+        ) {
+            let tmp = tempfile::tempdir().unwrap();
+            setup_sources(tmp.path());
+
+            let inputs_a = CacheInputs {
+                manifest_content: manifest.clone(),
+                lockfile_content: lockfile.clone(),
+                konanc_version: version.clone(),
+                konanc_fingerprint: fingerprint.clone(),
+                target: target.clone(),
+                profile: profile.clone(),
+                source_dir: tmp.path().to_path_buf(),
+                source_glob: "**/*.kt".to_owned(),
+                os: os.clone(),
+                arch: arch.clone(),
+                dependency_hashes: Vec::new(),
+            };
+            let inputs_b = CacheInputs {
+                manifest_content: manifest,
+                lockfile_content: lockfile,
+                konanc_version: version,
+                konanc_fingerprint: fingerprint,
+                target,
+                profile,
+                source_dir: tmp.path().to_path_buf(),
+                source_glob: "**/*.kt".to_owned(),
+                os,
+                arch,
+                dependency_hashes: Vec::new(),
+            };
+
+            let key_a = CacheKey::compute(&inputs_a).unwrap();
+            let key_b = CacheKey::compute(&inputs_b).unwrap();
+            prop_assert_eq!(key_a, key_b);
+        }
     }
 }
