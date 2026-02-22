@@ -77,4 +77,18 @@ pub enum EngineError {
         expected: String,
         actual: String,
     },
+
+    /// A dependency source hash does not match the lockfile (in --locked mode).
+    #[error("dependency `{name}` source hash mismatch — locked: {expected}, current: {actual}; remove --locked to allow lockfile updates")]
+    DependencyHashMismatch {
+        name: String,
+        expected: String,
+        actual: String,
+    },
+
+    /// The lockfile would need updating but --locked mode prevents it.
+    #[error(
+        "lockfile is out of date and --locked prevents updates; run without --locked to update"
+    )]
+    LockfileUpdateRequired,
 }
