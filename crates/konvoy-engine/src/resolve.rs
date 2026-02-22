@@ -18,6 +18,8 @@ pub struct ResolvedDep {
     pub manifest: Manifest,
     /// Names of this dependency's own dependencies.
     pub dep_names: Vec<String>,
+    /// SHA-256 hash of the dependency's source tree (`src/**/*.kt`).
+    pub source_hash: String,
 }
 
 /// The fully resolved dependency graph in topological order.
@@ -158,6 +160,10 @@ fn dfs(
     color.insert(canonical_path.to_path_buf(), 2);
     stack.pop();
 
+    // Compute source hash for integrity verification.
+    let src_dir = canonical_path.join("src");
+    let source_hash = konvoy_util::hash::sha256_dir(&src_dir, "**/*.kt").unwrap_or_default();
+
     visited.insert(
         canonical_path.to_path_buf(),
         ResolvedDep {
@@ -165,6 +171,7 @@ fn dfs(
             project_root: canonical_path.to_path_buf(),
             manifest: dep_manifest,
             dep_names,
+            source_hash,
         },
     );
     topo.push(canonical_path.to_path_buf());
@@ -392,6 +399,60 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("lib"), "error was: {err}");
+    }
+
+    #[test]
+    fn source_hash_computed_for_dependency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib_dir = tmp.path().join("my-lib");
+        write_manifest(&lib_dir, "my-lib", "lib", "");
+
+        let root_dir = tmp.path().join("root");
+        write_manifest(
+            &root_dir,
+            "root",
+            "bin",
+            "my-lib = { path = \"../my-lib\" }\n",
+        );
+
+        let manifest = Manifest::from_path(&root_dir.join("konvoy.toml")).unwrap();
+        let graph = resolve_dependencies(&root_dir, &manifest).unwrap();
+        assert_eq!(graph.order.len(), 1);
+        let dep = graph.order.first().unwrap();
+        assert!(
+            !dep.source_hash.is_empty(),
+            "source_hash should be computed"
+        );
+    }
+
+    #[test]
+    fn source_hash_changes_when_source_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib_dir = tmp.path().join("my-lib");
+        write_manifest(&lib_dir, "my-lib", "lib", "");
+
+        let root_dir = tmp.path().join("root");
+        write_manifest(
+            &root_dir,
+            "root",
+            "bin",
+            "my-lib = { path = \"../my-lib\" }\n",
+        );
+
+        let manifest = Manifest::from_path(&root_dir.join("konvoy.toml")).unwrap();
+        let graph1 = resolve_dependencies(&root_dir, &manifest).unwrap();
+        let hash1 = graph1.order.first().unwrap().source_hash.clone();
+
+        // Modify the dependency source.
+        fs::write(lib_dir.join("src/lib.kt"), "// modified").unwrap();
+
+        let graph2 = resolve_dependencies(&root_dir, &manifest).unwrap();
+        let hash2 = graph2.order.first().unwrap().source_hash.clone();
+
+        assert_ne!(
+            hash1, hash2,
+            "source_hash should change when source changes"
+        );
     }
 
     #[test]
