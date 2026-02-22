@@ -50,6 +50,13 @@ pub fn init_project(name: &str, dir: &Path) -> Result<(), EngineError> {
         source,
     })?;
 
+    // Generate .gitignore.
+    let gitignore_path = dir.join(".gitignore");
+    std::fs::write(&gitignore_path, ".konvoy/\n").map_err(|source| EngineError::Io {
+        path: gitignore_path.display().to_string(),
+        source,
+    })?;
+
     Ok(())
 }
 
@@ -69,6 +76,9 @@ mod tests {
 
         assert!(project_dir.join("konvoy.toml").exists());
         assert!(project_dir.join("src").join("main.kt").exists());
+        assert!(project_dir.join(".gitignore").exists());
+        let gitignore = fs::read_to_string(project_dir.join(".gitignore")).unwrap();
+        assert!(gitignore.contains(".konvoy/"));
     }
 
     #[test]

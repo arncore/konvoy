@@ -1,6 +1,7 @@
 //! Content-addressed artifact store for build outputs.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -27,10 +28,14 @@ pub struct ArtifactStore {
 }
 
 impl ArtifactStore {
-    /// Create a new artifact store rooted at `<project_root>/.konvoy/cache/`.
+    /// Create a new artifact store.
+    ///
+    /// If the project is inside a git worktree, the cache is shared with the
+    /// main worktree at `<main-root>/.konvoy/cache/`. Otherwise, it lives at
+    /// `<project_root>/.konvoy/cache/`.
     pub fn new(project_root: &Path) -> Self {
         Self {
-            cache_root: project_root.join(".konvoy").join("cache"),
+            cache_root: resolve_cache_root(project_root),
         }
     }
 
@@ -127,6 +132,57 @@ impl ArtifactStore {
         konvoy_util::fs::materialize(&cached_artifact, dest)?;
         Ok(())
     }
+}
+
+/// Resolve the cache root directory, sharing cache across git worktrees.
+///
+/// In a git worktree, `git rev-parse --git-common-dir` returns the `.git`
+/// directory of the main worktree. We use its parent as the shared cache root.
+/// For normal repos or non-git projects, falls back to the project root.
+fn resolve_cache_root(project_root: &Path) -> PathBuf {
+    let fallback = project_root.join(".konvoy").join("cache");
+
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(project_root)
+        .output();
+
+    let Ok(output) = output else {
+        return fallback;
+    };
+
+    if !output.status.success() {
+        return fallback;
+    }
+
+    let common_dir = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+
+    // Resolve to absolute path.
+    let common_path = if Path::new(&common_dir).is_absolute() {
+        PathBuf::from(&common_dir)
+    } else {
+        project_root.join(&common_dir)
+    };
+
+    // Canonicalize and get the parent (main worktree root).
+    let Some(main_root) = common_path
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+    else {
+        return fallback;
+    };
+
+    // If we're already in the main worktree, no need to share.
+    if let (Ok(canonical_main), Ok(canonical_project)) =
+        (main_root.canonicalize(), project_root.canonicalize())
+    {
+        if canonical_main == canonical_project {
+            return fallback;
+        }
+    }
+
+    main_root.join(".konvoy").join("cache")
 }
 
 #[cfg(test)]
@@ -255,5 +311,61 @@ mod tests {
 
         let path = store.cache_path(&key);
         assert!(path.display().to_string().contains(key.as_hex()));
+    }
+
+    #[test]
+    fn resolve_cache_root_non_git_uses_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = resolve_cache_root(tmp.path());
+        assert_eq!(root, tmp.path().join(".konvoy").join("cache"));
+    }
+
+    #[test]
+    fn resolve_cache_root_normal_repo_uses_project_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let root = resolve_cache_root(tmp.path());
+        assert_eq!(root, tmp.path().join(".konvoy").join("cache"));
+    }
+
+    #[test]
+    fn resolve_cache_root_worktree_uses_main_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_dir = tmp.path().join("main");
+        fs::create_dir_all(&main_dir).unwrap();
+
+        // Init a repo in main_dir with an initial commit.
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&main_dir)
+            .output()
+            .unwrap();
+        for cmd in &[
+            vec!["config", "user.email", "t@t.com"],
+            vec!["config", "user.name", "T"],
+            vec!["commit", "-q", "--allow-empty", "-m", "init"],
+        ] {
+            Command::new("git")
+                .args(cmd)
+                .current_dir(&main_dir)
+                .output()
+                .unwrap();
+        }
+
+        // Create a worktree.
+        let wt_dir = tmp.path().join("wt");
+        Command::new("git")
+            .args(["worktree", "add", "-q", wt_dir.display().to_string().as_str(), "-b", "wt"])
+            .current_dir(&main_dir)
+            .output()
+            .unwrap();
+
+        let root = resolve_cache_root(&wt_dir);
+        let expected = main_dir.canonicalize().unwrap().join(".konvoy").join("cache");
+        assert_eq!(root, expected);
     }
 }
