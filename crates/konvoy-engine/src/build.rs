@@ -23,6 +23,8 @@ pub struct BuildOptions {
     pub release: bool,
     /// Whether to show raw compiler output.
     pub verbose: bool,
+    /// Allow overriding hash mismatch checks.
+    pub force: bool,
 }
 
 /// Whether the build used a cached artifact or compiled fresh.
@@ -123,6 +125,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         &dep_graph,
         project_root,
         &lockfile_path,
+        options.force,
     )?;
 
     Ok(BuildResult {
@@ -331,6 +334,7 @@ fn lockfile_toml_content(lockfile: &Lockfile) -> String {
 /// Update konvoy.lock if the detected konanc version or dependency hashes differ,
 /// or if a fresh download provides new tarball hashes. When the lockfile already
 /// contains hashes and a fresh download yields different ones, emit a warning.
+#[allow(clippy::too_many_arguments)]
 fn update_lockfile_if_needed(
     lockfile: &Lockfile,
     konanc: &KonancInfo,
@@ -339,6 +343,7 @@ fn update_lockfile_if_needed(
     dep_graph: &ResolvedGraph,
     project_root: &Path,
     lockfile_path: &Path,
+    force: bool,
 ) -> Result<(), EngineError> {
     // Check for dependency source hash mismatches and warn.
     for dep in &dep_graph.order {
@@ -386,21 +391,43 @@ fn update_lockfile_if_needed(
         return Ok(());
     }
 
-    // When we have fresh download hashes and the lockfile already has hashes,
+    // When the same version is re-downloaded and the lockfile already has hashes,
     // verify they match. A mismatch could indicate a tampered or rotated tarball.
-    if let Some(tc) = &lockfile.toolchain {
-        if let (Some(existing), Some(actual)) = (&tc.konanc_tarball_sha256, konanc_tarball_sha256) {
-            if !existing.is_empty() && existing != actual {
-                eprintln!(
-                    "warning: konanc tarball hash changed — expected {existing}, got {actual}; lockfile updated"
-                );
+    // This is a hard error unless --force is used. When the version changed,
+    // different hashes are expected, so skip the check.
+    if !toolchain_changed {
+        if let Some(tc) = &lockfile.toolchain {
+            if let (Some(existing), Some(actual)) =
+                (&tc.konanc_tarball_sha256, konanc_tarball_sha256)
+            {
+                if !existing.is_empty() && existing != actual {
+                    if force {
+                        eprintln!(
+                        "warning: konanc tarball hash changed — expected {existing}, got {actual}; lockfile updated (--force)"
+                    );
+                    } else {
+                        return Err(EngineError::TarballHashMismatch {
+                            kind: "konanc".to_owned(),
+                            expected: existing.clone(),
+                            actual: actual.to_owned(),
+                        });
+                    }
+                }
             }
-        }
-        if let (Some(existing), Some(actual)) = (&tc.jre_tarball_sha256, jre_tarball_sha256) {
-            if !existing.is_empty() && existing != actual {
-                eprintln!(
-                    "warning: jre tarball hash changed — expected {existing}, got {actual}; lockfile updated"
-                );
+            if let (Some(existing), Some(actual)) = (&tc.jre_tarball_sha256, jre_tarball_sha256) {
+                if !existing.is_empty() && existing != actual {
+                    if force {
+                        eprintln!(
+                        "warning: jre tarball hash changed — expected {existing}, got {actual}; lockfile updated (--force)"
+                    );
+                    } else {
+                        return Err(EngineError::TarballHashMismatch {
+                            kind: "jre".to_owned(),
+                            expected: existing.clone(),
+                            actual: actual.to_owned(),
+                        });
+                    }
+                }
             }
         }
     }
@@ -495,6 +522,7 @@ mod tests {
             target: None,
             release: false,
             verbose: false,
+            force: false,
         };
         let result = build(tmp.path(), &options);
         assert!(result.is_err());
@@ -516,6 +544,7 @@ mod tests {
             target: None,
             release: false,
             verbose: false,
+            force: false,
         };
         let result = build(&project, &options);
         assert!(result.is_err());
@@ -560,6 +589,7 @@ mod tests {
             &empty_graph,
             tmp.path(),
             &lockfile_path,
+            false,
         )
         .unwrap();
         assert!(lockfile_path.exists());
@@ -590,6 +620,7 @@ mod tests {
             &empty_graph,
             tmp.path(),
             &lockfile_path,
+            false,
         )
         .unwrap();
     }
@@ -616,6 +647,7 @@ mod tests {
             &empty_graph,
             tmp.path(),
             &lockfile_path,
+            false,
         )
         .unwrap();
         let content = fs::read_to_string(&lockfile_path).unwrap();
@@ -642,6 +674,7 @@ mod tests {
             &empty_graph,
             tmp.path(),
             &lockfile_path,
+            false,
         )
         .unwrap();
 
@@ -661,10 +694,12 @@ mod tests {
             target: None,
             release: false,
             verbose: false,
+            force: false,
         };
         assert!(opts.target.is_none());
         assert!(!opts.release);
         assert!(!opts.verbose);
+        assert!(!opts.force);
     }
 
     #[test]
@@ -699,6 +734,7 @@ mod tests {
             &graph,
             tmp.path(),
             &lockfile_path,
+            false,
         )
         .unwrap();
         let content = fs::read_to_string(&lockfile_path).unwrap();
@@ -749,6 +785,7 @@ mod tests {
             &empty_graph,
             tmp.path(),
             &lockfile_path,
+            false,
         )
         .unwrap();
 
@@ -785,6 +822,7 @@ mod tests {
             &empty_graph,
             tmp.path(),
             &lockfile_path,
+            false,
         )
         .unwrap();
 
@@ -820,6 +858,7 @@ mod tests {
             &empty_graph,
             tmp.path(),
             &lockfile_path,
+            false,
         )
         .unwrap();
 
@@ -828,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn update_lockfile_hash_mismatch_updates_to_fresh_download_hashes() {
+    fn update_lockfile_hash_mismatch_is_hard_error() {
         let tmp = tempfile::tempdir().unwrap();
         let lockfile_path = tmp.path().join("konvoy.lock");
         let lockfile =
@@ -841,7 +880,46 @@ mod tests {
             fingerprint: "abc".to_owned(),
         };
 
-        // Current behavior warns and updates lockfile hashes.
+        // Hash mismatch without --force should be a hard error.
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        let result = update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            Some("newhash1"),
+            Some("newhash2"),
+            &empty_graph,
+            tmp.path(),
+            &lockfile_path,
+            false,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("tarball hash mismatch"),
+            "expected hash mismatch error, got: {err}"
+        );
+        assert!(
+            err.contains("--force"),
+            "error message should mention --force, got: {err}"
+        );
+    }
+
+    #[test]
+    fn update_lockfile_hash_mismatch_with_force_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile =
+            Lockfile::with_managed_toolchain("2.1.0", Some("oldhash1"), Some("oldhash2"));
+        lockfile.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        // Hash mismatch with --force should warn but succeed.
         let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
         update_lockfile_if_needed(
             &lockfile,
@@ -851,6 +929,7 @@ mod tests {
             &empty_graph,
             tmp.path(),
             &lockfile_path,
+            true,
         )
         .unwrap();
 
@@ -885,6 +964,7 @@ mod tests {
             &empty_graph,
             tmp.path(),
             &lockfile_path,
+            false,
         )
         .unwrap();
 
@@ -918,6 +998,7 @@ mod tests {
             &empty_graph,
             tmp.path(),
             &lockfile_path,
+            false,
         )
         .unwrap();
 
