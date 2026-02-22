@@ -415,7 +415,14 @@ fn download_with_progress(
     label: &str,
     version: &str,
 ) -> Result<String, KonancError> {
-    let response = ureq::get(url).call().map_err(|e| KonancError::Download {
+    let agent = ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .timeout_connect(Some(std::time::Duration::from_secs(30)))
+            .timeout_global(Some(std::time::Duration::from_secs(600)))
+            .build(),
+    );
+
+    let response = agent.get(url).call().map_err(|e| KonancError::Download {
         version: version.to_owned(),
         message: e.to_string(),
     })?;
