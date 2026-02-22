@@ -623,6 +623,39 @@ mod tests {
     }
 
     #[test]
+    fn update_lockfile_first_download_stores_hashes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile = Lockfile::default();
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            Some("first-konanc-hash"),
+            Some("first-jre-hash"),
+            &empty_graph,
+            tmp.path(),
+            &lockfile_path,
+        )
+        .unwrap();
+
+        let reparsed = Lockfile::from_path(&lockfile_path).unwrap();
+        let tc = reparsed.toolchain.as_ref().unwrap();
+        assert_eq!(tc.konanc_version, "2.1.0");
+        assert_eq!(
+            tc.konanc_tarball_sha256.as_deref(),
+            Some("first-konanc-hash")
+        );
+        assert_eq!(tc.jre_tarball_sha256.as_deref(), Some("first-jre-hash"));
+    }
+
+    #[test]
     fn build_options_defaults() {
         let opts = BuildOptions {
             target: None,
@@ -763,6 +796,71 @@ mod tests {
     }
 
     #[test]
+    fn update_lockfile_same_hash_redownload_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile =
+            Lockfile::with_managed_toolchain("2.1.0", Some("samehash1"), Some("samehash2"));
+        lockfile.write_to(&lockfile_path).unwrap();
+        let before = fs::read_to_string(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        // Fresh download returns the same hashes as the lockfile.
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            Some("samehash1"),
+            Some("samehash2"),
+            &empty_graph,
+            tmp.path(),
+            &lockfile_path,
+        )
+        .unwrap();
+
+        let after = fs::read_to_string(&lockfile_path).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn update_lockfile_hash_mismatch_updates_to_fresh_download_hashes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile =
+            Lockfile::with_managed_toolchain("2.1.0", Some("oldhash1"), Some("oldhash2"));
+        lockfile.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        // Current behavior warns and updates lockfile hashes.
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            Some("newhash1"),
+            Some("newhash2"),
+            &empty_graph,
+            tmp.path(),
+            &lockfile_path,
+        )
+        .unwrap();
+
+        let reparsed = Lockfile::from_path(&lockfile_path).unwrap();
+        let tc = reparsed.toolchain.as_ref().unwrap();
+        assert_eq!(tc.konanc_tarball_sha256.as_deref(), Some("newhash1"));
+        assert_eq!(tc.jre_tarball_sha256.as_deref(), Some("newhash2"));
+    }
+
+    #[test]
     fn update_lockfile_preserves_hashes_on_same_version_no_download() {
         // Same version, no new download — should not touch the lockfile hashes.
         let tmp = tempfile::tempdir().unwrap();
@@ -794,5 +892,39 @@ mod tests {
         let tc = reparsed.toolchain.as_ref().unwrap();
         assert_eq!(tc.konanc_tarball_sha256.as_deref(), Some("existing1"));
         assert_eq!(tc.jre_tarball_sha256.as_deref(), Some("existing2"));
+    }
+
+    #[test]
+    fn update_lockfile_version_change_without_download_clears_old_hashes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile =
+            Lockfile::with_managed_toolchain("2.0.0", Some("existing1"), Some("existing2"));
+        lockfile.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        // Version changed with no fresh download hashes: old version hashes must be cleared.
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            tmp.path(),
+            &lockfile_path,
+        )
+        .unwrap();
+
+        let reparsed = Lockfile::from_path(&lockfile_path).unwrap();
+        let tc = reparsed.toolchain.as_ref().unwrap();
+        assert_eq!(tc.konanc_version, "2.1.0");
+        assert_eq!(tc.konanc_tarball_sha256, None);
+        assert_eq!(tc.jre_tarball_sha256, None);
     }
 }
