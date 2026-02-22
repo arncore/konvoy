@@ -7,6 +7,7 @@ pub mod error;
 pub mod init;
 
 pub use artifact::{ArtifactStore, BuildMetadata};
+pub use build::{build, BuildOptions, BuildOutcome, BuildResult};
 pub use cache::{CacheInputs, CacheKey};
 pub use error::EngineError;
 pub use init::init_project;
