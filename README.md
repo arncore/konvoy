@@ -23,7 +23,7 @@ Early-stage prototype / design-driven build. Expect rapid iteration and breaking
 
 ## Requirements
 
-- Kotlin/Native compiler (`konanc`) available on your machine (`PATH` or configured via `KONANC_HOME` env var)
+- **No manual Kotlin/Java installation needed.** Konvoy automatically downloads and manages the Kotlin/Native compiler and a bundled JRE.
 - Platform toolchain installed for your host OS:
   - **macOS:** Xcode Command Line Tools (`xcode-select --install`)
   - **Linux:** GCC/build-essential (`sudo apt install build-essential` on Debian/Ubuntu)
@@ -53,8 +53,8 @@ konvoy run
 
 Konvoy projects use:
 
-- `konvoy.toml` — project manifest (name, entrypoint, targets)
-- `konvoy.lock` — pinned toolchain + (later) dependencies
+- `konvoy.toml` — project manifest (name, kind, toolchain, dependencies)
+- `konvoy.lock` — pinned toolchain versions and dependency hashes
 - `.konvoy/` — build outputs + cache
 
 Example:
@@ -68,24 +68,27 @@ hello/
   .konvoy/
     build/
     cache/
-    logs/
 ```
 
 ## Commands
 
-- `konvoy init [--name <name>]`
-- `konvoy build [--target <triple|host>] [--release] [--verbose]`
-- `konvoy run [--target <triple|host>] [--release] [-- <args…>]`
-- `konvoy test [--target <triple|host>] [--release] [--verbose]`
-- `konvoy clean`
-- `konvoy doctor`
+- `konvoy init [--name <name>] [--lib]` — create a new binary or library project
+- `konvoy build [--target <triple|host>] [--release] [--verbose]` — compile the project
+- `konvoy run [--target <triple|host>] [--release] [-- <args…>]` — build and run
+- `konvoy test [--target <triple|host>] [--release] [--verbose]` — build and run as test
+- `konvoy clean` — remove build artifacts
+- `konvoy doctor` — check environment and toolchain setup
+- `konvoy toolchain install [<version>]` — install a Kotlin/Native version
+- `konvoy toolchain list` — list installed toolchain versions
 
 ## Output contract
 
 Konvoy writes artifacts to stable paths:
 
-- **Debug:** `.konvoy/build/<target>/debug/<name>`
-- **Release:** `.konvoy/build/<target>/release/<name>`
+- **Binary debug:** `.konvoy/build/<target>/debug/<name>`
+- **Binary release:** `.konvoy/build/<target>/release/<name>`
+- **Library debug:** `.konvoy/build/<target>/debug/<name>.klib`
+- **Library release:** `.konvoy/build/<target>/release/<name>.klib`
 
 ## Design goals
 
@@ -112,11 +115,32 @@ CI runs check, test (Linux + macOS), clippy, and rustfmt on every push and PR to
 
 See [docs/code-style.md](docs/code-style.md) for coding conventions.
 
+## Dependencies
+
+Library projects can depend on other Konvoy projects via path dependencies:
+
+```toml
+[package]
+name = "my-app"
+
+[toolchain]
+kotlin = "2.1.0"
+
+[dependencies]
+my-utils = { path = "../my-utils" }
+```
+
+Library projects are created with `konvoy init --lib` and produce `.klib` files.
+
+## Managed toolchains
+
+Konvoy automatically downloads and manages Kotlin/Native toolchains. The first `konvoy build` (or `konvoy toolchain install`) downloads the compiler and a bundled JRE to `~/.konvoy/toolchains/<version>/`. No manual Kotlin or Java installation is required.
+
 ## Roadmap (high level)
 
-1. **MVP:** host-native executable build/run + cache
+1. ~~**MVP:** host-native executable build/run + cache~~ done
 2. **Tests:** minimal native test runner model
-3. **Targets:** explicit target triples
-4. **Dependencies:** path → git → url+sha → registry
-5. **Toolchain install/pinning**
+3. ~~**Targets:** explicit target triples~~ done
+4. **Dependencies:** ~~path~~ done → git → url+sha → registry
+5. ~~**Toolchain install/pinning**~~ done
 6. **Remote cache** (later)
