@@ -323,18 +323,16 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
-        fn arb_cache_inputs(
-            dir: &Path,
-        ) -> impl Strategy<Value = CacheInputs> + use<'_> {
+        fn arb_cache_inputs(dir: &Path) -> impl Strategy<Value = CacheInputs> + use<'_> {
             (
-                "[a-zA-Z0-9 =\n.]{1,100}",  // manifest_content
-                "[a-zA-Z0-9 =\n.]{0,100}",   // lockfile_content
-                "[0-9]{1,2}\\.[0-9]{1,2}\\.[0-9]{1,2}", // konanc_version
-                "[a-f0-9]{8,16}",             // konanc_fingerprint
+                "[a-zA-Z0-9 =\n.]{1,100}",                            // manifest_content
+                "[a-zA-Z0-9 =\n.]{0,100}",                            // lockfile_content
+                "[0-9]{1,2}\\.[0-9]{1,2}\\.[0-9]{1,2}",               // konanc_version
+                "[a-f0-9]{8,16}",                                     // konanc_fingerprint
                 prop_oneof!["linux_x64", "macos_arm64", "macos_x64"], // target
-                prop_oneof!["debug", "release"],  // profile
-                prop_oneof!["linux", "macos", "windows"], // os
-                prop_oneof!["x86_64", "aarch64"],  // arch
+                prop_oneof!["debug", "release"],                      // profile
+                prop_oneof!["linux", "macos", "windows"],             // os
+                prop_oneof!["x86_64", "aarch64"],                     // arch
             )
                 .prop_map(
                     move |(
