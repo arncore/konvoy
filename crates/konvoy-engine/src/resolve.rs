@@ -183,7 +183,7 @@ fn dfs(
 ///
 /// This allows sibling dependencies (e.g. `../my-lib`) and reasonable workspace
 /// layouts while blocking deeply nested traversals that escape the project tree.
-const MAX_PARENT_TRAVERSAL: usize = 5;
+const MAX_PARENT_TRAVERSAL: usize = 3;
 
 /// Resolve a dependency path relative to the parent project root.
 fn resolve_dep_path(
@@ -520,6 +520,52 @@ mod tests {
     }
 
     #[test]
+    fn three_parent_traversals_accepted() {
+        // Exactly MAX_PARENT_TRAVERSAL (3) leading `..` components should be allowed.
+        // Layout:
+        //   tmp/ws/lib/           <- the dependency library
+        //   tmp/ws/a/b/c/root/    <- the project root
+        // From root, `../../../lib` traverses 3 parent dirs (c -> b -> a -> ws) then into lib.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+
+        let lib_dir = ws.join("a/lib");
+        write_manifest(&lib_dir, "lib", "lib", "");
+
+        let root_dir = ws.join("a/b/c/root");
+        write_manifest(
+            &root_dir,
+            "root",
+            "bin",
+            "lib = { path = \"../../../lib\" }\n",
+        );
+
+        let manifest = Manifest::from_path(&root_dir.join("konvoy.toml")).unwrap();
+        let graph = resolve_dependencies(&root_dir, &manifest).unwrap();
+        assert_eq!(graph.order.len(), 1);
+        assert_eq!(graph.order.first().unwrap().name, "lib");
+    }
+
+    #[test]
+    fn four_parent_traversals_rejected() {
+        // One more than MAX_PARENT_TRAVERSAL (3) must be rejected.
+        let tmp = tempfile::tempdir().unwrap();
+        let root_dir = tmp.path().join("root");
+        write_manifest(
+            &root_dir,
+            "root",
+            "bin",
+            "evil = { path = \"../../../../somewhere/lib\" }\n",
+        );
+
+        let manifest = Manifest::from_path(&root_dir.join("konvoy.toml")).unwrap();
+        let result = resolve_dependencies(&root_dir, &manifest);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("escapes the project tree"), "error was: {err}");
+    }
+
+    #[test]
     fn absolute_path_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let root_dir = tmp.path().join("root");
@@ -565,7 +611,7 @@ mod tests {
                 );
             }
 
-            /// Paths with more than MAX_PARENT_TRAVERSAL (5) leading `..` must be rejected.
+            /// Paths with more than MAX_PARENT_TRAVERSAL (3) leading `..` must be rejected.
             #[test]
             #[allow(clippy::unwrap_used)]
             fn deep_traversal_always_rejected(extra in 1..20usize, tail in "[a-z]{1,10}") {
