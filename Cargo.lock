@@ -396,6 +396,7 @@ dependencies = [
  "konvoy-util",
  "sha2",
  "tar",
+ "tempfile",
  "thiserror",
  "ureq",
 ]
