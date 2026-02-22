@@ -26,3 +26,92 @@ konvoy-engine = { path = "crates/konvoy-engine" }
 konvoy-konanc = { path = "crates/konvoy-konanc" }
 konvoy-targets = { path = "crates/konvoy-targets" }
 konvoy-util = { path = "crates/konvoy-util" }
+
+[workspace.lints.rust]
+# -- Kotlin treats unused code as errors --
+dead_code = "warn"
+unused_imports = "warn"
+unused_variables = "warn"
+unused_mut = "warn"
+
+[workspace.lints.clippy]
+
+# == Null-safety / crash-safety (like Kotlin's null-safety) ==
+# Kotlin forces you to handle nulls; Rust should force you to handle Results/Options.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+# Index out-of-bounds can panic — use .get() instead, like Kotlin's getOrNull()
+indexing_slicing = "deny"
+
+# == Immutability preference (Kotlin's val-by-default) ==
+# Flag unnecessary mutability — prefer val over var
+needless_pass_by_value = "warn"
+mut_mut = "warn"
+redundant_clone = "warn"
+implicit_clone = "warn"
+
+# == Expression-oriented style (Kotlin is expression-first) ==
+# Kotlin returns last expression; Rust should too
+needless_return = "warn"
+# Enforce semicolons on unit-returning expressions for clarity
+semicolon_if_nothing_returned = "warn"
+# Use let-else pattern (similar to Kotlin's val x = y ?: return)
+manual_let_else = "warn"
+
+# == Explicit over implicit (Kotlin avoids magic) ==
+# No wildcard imports — Kotlin style guide discourages import *
+wildcard_imports = "warn"
+# Make type conversions explicit
+cast_lossless = "warn"
+# Simplify closures like Kotlin's method references (::method)
+redundant_closure_for_method_calls = "warn"
+
+# == Clean code (Kotlin's concise-but-clear philosophy) ==
+# Use if-let instead of match with one arm (like Kotlin's if/when simplification)
+single_match_else = "warn"
+# Flag manual implementations of standard operations
+manual_is_ascii_check = "warn"
+# Unnecessary wrapping in Some/Ok
+unnecessary_wraps = "warn"
+# Catch redundant field names in struct init (like Kotlin's property shorthand)
+redundant_field_names = "warn"
+# Use consistent map/filter/for_each style (like Kotlin collections API)
+manual_filter_map = "warn"
+manual_find_map = "warn"
+
+# == Safe casting (Kotlin's .toInt(), .toByte() are explicit) ==
+# Silent integer truncation: 300u32 as u8 gives 44 with no error
+cast_possible_truncation = "deny"
+# Silent sign loss: -1i32 as u32 wraps silently
+cast_sign_loss = "deny"
+# Silent precision loss: large i64 as f64 loses bits
+cast_precision_loss = "warn"
+# Unsigned-to-signed wrap: u32 as i32 can go negative
+cast_possible_wrap = "warn"
+
+# == Float safety ==
+# NaN != NaN breaks equality; use epsilon comparison instead
+float_cmp = "deny"
+
+# == Shadowing (Kotlin doesn't allow redeclaring val in same scope) ==
+# Reusing a name for an unrelated value is confusing
+shadow_unrelated = "warn"
+
+# == Memory safety ==
+# Large arrays on the stack can overflow — allocate on the heap instead
+large_stack_arrays = "warn"
+
+# == String allocation awareness ==
+# .cloned() on Copy types is misleading — use .copied()
+cloned_instead_of_copied = "warn"
+# format!("{}", format!(...)) is a nested allocation
+format_in_format_args = "warn"
+# Use .to_owned() on &str to be explicit about the heap allocation
+str_to_string = "warn"
+
+# == Documentation (Kotlin's KDoc expectations) ==
+# Public items should document errors they return
+missing_errors_doc = "warn"
+# Public items should document when they panic (shouldn't with our deny rules, but just in case)
+missing_panics_doc = "warn"

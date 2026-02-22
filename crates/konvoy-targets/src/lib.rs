@@ -17,6 +17,9 @@ impl fmt::Display for Target {
 /// Detect the host target triple for Kotlin/Native.
 ///
 /// Maps the Rust compile-time target to the Kotlin/Native target name.
+///
+/// # Errors
+/// Returns an error if the current OS/arch is not supported by Kotlin/Native.
 pub fn host_target() -> Result<Target, TargetError> {
     let triple = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => "linux_x64",
@@ -25,13 +28,13 @@ pub fn host_target() -> Result<Target, TargetError> {
         ("macos", "aarch64") => "macos_arm64",
         (os, arch) => {
             return Err(TargetError::UnsupportedHost {
-                os: os.to_string(),
-                arch: arch.to_string(),
+                os: os.to_owned(),
+                arch: arch.to_owned(),
             })
         }
     };
     Ok(Target {
-        triple: triple.to_string(),
+        triple: triple.to_owned(),
     })
 }
 

@@ -15,11 +15,14 @@ pub struct Package {
 }
 
 fn default_entrypoint() -> String {
-    "src/main.kt".to_string()
+    "src/main.kt".to_owned()
 }
 
 impl Manifest {
     /// Read and parse a `konvoy.toml` from the given path.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be read or contains invalid TOML.
     pub fn from_path(path: &Path) -> Result<Self, ManifestError> {
         let content = std::fs::read_to_string(path).map_err(|e| ManifestError::Read {
             path: path.display().to_string(),

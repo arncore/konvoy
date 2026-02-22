@@ -11,6 +11,9 @@ pub struct KonancInfo {
 /// Locate `konanc` and determine its version.
 ///
 /// Checks `KONANC_HOME` env var first, then falls back to `PATH`.
+///
+/// # Errors
+/// Returns an error if `konanc` is not found or cannot be executed.
 pub fn detect_konanc() -> Result<KonancInfo, KonancError> {
     let path = if let Ok(home) = std::env::var("KONANC_HOME") {
         let p = PathBuf::from(home).join("bin").join("konanc");
@@ -28,7 +31,7 @@ pub fn detect_konanc() -> Result<KonancInfo, KonancError> {
         .map_err(|e| KonancError::Exec { source: e })?;
 
     let version_str = String::from_utf8_lossy(&output.stdout);
-    let version = version_str.trim().to_string();
+    let version = version_str.trim().to_owned();
 
     Ok(KonancInfo { path, version })
 }
