@@ -488,6 +488,9 @@ fn download_with_progress(
 }
 
 /// Extract a `.tar.gz` tarball to a directory.
+///
+/// Each entry's path is validated to ensure it stays within `dest`,
+/// preventing zip-slip (path traversal) attacks from malicious tarballs.
 fn extract_tarball(
     tarball: &Path,
     dest: &Path,
@@ -496,6 +499,16 @@ fn extract_tarball(
 ) -> Result<(), KonancError> {
     eprintln!("    Extracting {label} {version}...");
 
+    std::fs::create_dir_all(dest).map_err(|source| KonancError::Io {
+        path: dest.display().to_string(),
+        source,
+    })?;
+
+    let canonical_dest = std::fs::canonicalize(dest).map_err(|source| KonancError::Io {
+        path: dest.display().to_string(),
+        source,
+    })?;
+
     let file = std::fs::File::open(tarball).map_err(|source| KonancError::Io {
         path: tarball.display().to_string(),
         source,
@@ -503,10 +516,54 @@ fn extract_tarball(
     let decoder = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
 
-    archive.unpack(dest).map_err(|e| KonancError::Extract {
+    let entries = archive.entries().map_err(|e| KonancError::Extract {
         version: version.to_owned(),
         message: e.to_string(),
     })?;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|e| KonancError::Extract {
+            version: version.to_owned(),
+            message: e.to_string(),
+        })?;
+
+        let entry_path = entry.path().map_err(|e| KonancError::Extract {
+            version: version.to_owned(),
+            message: e.to_string(),
+        })?;
+
+        // Reject any path component that attempts directory traversal.
+        for component in entry_path.components() {
+            if matches!(component, std::path::Component::ParentDir) {
+                return Err(KonancError::PathTraversal {
+                    entry_path: entry_path.display().to_string(),
+                    dest: canonical_dest.display().to_string(),
+                });
+            }
+        }
+
+        // Verify the resolved path stays within the destination.
+        let target = canonical_dest.join(&*entry_path);
+        if !target.starts_with(&canonical_dest) {
+            return Err(KonancError::PathTraversal {
+                entry_path: entry_path.display().to_string(),
+                dest: canonical_dest.display().to_string(),
+            });
+        }
+
+        // Ensure parent directories exist before unpacking the entry.
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| KonancError::Io {
+                path: parent.display().to_string(),
+                source,
+            })?;
+        }
+
+        entry.unpack(&target).map_err(|e| KonancError::Extract {
+            version: version.to_owned(),
+            message: e.to_string(),
+        })?;
+    }
 
     Ok(())
 }
@@ -653,5 +710,144 @@ mod tests {
         // A version that doesn't exist should error.
         let result = jre_home_path("99.99.99");
         assert!(result.is_err());
+    }
+
+    /// Helper: create a `.tar.gz` archive from a list of `(path, content)` entries.
+    ///
+    /// Writes raw USTAR tar headers so that malicious paths (containing `..`)
+    /// are preserved verbatim — the `tar` crate's `Builder::append_data` rejects
+    /// such paths, which would prevent us from testing our own validation.
+    fn create_test_tarball(entries: &[(&str, &[u8])]) -> tempfile::NamedTempFile {
+        use std::io::Write;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+
+        {
+            let gz = flate2::write::GzEncoder::new(&tmp, flate2::Compression::fast());
+            let mut out = std::io::BufWriter::new(gz);
+
+            for &(path, content) in entries {
+                let mut header = [0u8; 512];
+
+                // name: bytes 0..100
+                let path_bytes = path.as_bytes();
+                let len = path_bytes.len().min(99);
+                header
+                    .get_mut(..len)
+                    .unwrap()
+                    .copy_from_slice(path_bytes.get(..len).unwrap());
+
+                // mode: bytes 100..108
+                header
+                    .get_mut(100..108)
+                    .unwrap()
+                    .copy_from_slice(b"0000644\0");
+                // uid: bytes 108..116
+                header
+                    .get_mut(108..116)
+                    .unwrap()
+                    .copy_from_slice(b"0001000\0");
+                // gid: bytes 116..124
+                header
+                    .get_mut(116..124)
+                    .unwrap()
+                    .copy_from_slice(b"0001000\0");
+
+                // size: bytes 124..136 (octal, 11 digits + NUL)
+                #[allow(clippy::cast_possible_truncation)]
+                let size_str = format!("{:011o}\0", content.len());
+                header
+                    .get_mut(124..136)
+                    .unwrap()
+                    .copy_from_slice(size_str.as_bytes().get(..12).unwrap());
+
+                // mtime: bytes 136..148
+                header
+                    .get_mut(136..148)
+                    .unwrap()
+                    .copy_from_slice(b"00000000000\0");
+
+                // typeflag: byte 156 — '0' = regular file
+                header[156] = b'0';
+
+                // magic: bytes 257..263
+                header
+                    .get_mut(257..263)
+                    .unwrap()
+                    .copy_from_slice(b"ustar\0");
+                // version: bytes 263..265
+                header.get_mut(263..265).unwrap().copy_from_slice(b"00");
+
+                // Compute checksum: treat bytes 148..156 as spaces.
+                header
+                    .get_mut(148..156)
+                    .unwrap()
+                    .copy_from_slice(b"        ");
+                let cksum: u32 = header.iter().map(|&b| u32::from(b)).sum();
+                let cksum_str = format!("{cksum:06o}\0 ");
+                header
+                    .get_mut(148..156)
+                    .unwrap()
+                    .copy_from_slice(cksum_str.as_bytes().get(..8).unwrap());
+
+                out.write_all(&header).unwrap();
+                out.write_all(content).unwrap();
+
+                // Pad content to a 512-byte boundary.
+                let remainder = content.len() % 512;
+                if remainder != 0 {
+                    let pad = vec![0u8; 512 - remainder];
+                    out.write_all(&pad).unwrap();
+                }
+            }
+
+            // Two 512-byte zero blocks mark end of archive.
+            out.write_all(&[0u8; 1024]).unwrap();
+            out.flush().unwrap();
+        }
+
+        tmp
+    }
+
+    #[test]
+    fn extract_tarball_safe_path_succeeds() {
+        let tarball = create_test_tarball(&[("subdir/hello.txt", b"hello")]);
+        let dest = tempfile::tempdir().unwrap();
+
+        let result = extract_tarball(tarball.path(), dest.path(), "test", "0.0.0");
+        assert!(result.is_ok());
+        assert!(dest.path().join("subdir").join("hello.txt").exists());
+    }
+
+    #[test]
+    fn extract_tarball_rejects_parent_dir_traversal() {
+        let tarball = create_test_tarball(&[("../../etc/evil.txt", b"pwned")]);
+        let dest = tempfile::tempdir().unwrap();
+
+        let result = extract_tarball(tarball.path(), dest.path(), "test", "0.0.0");
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("path traversal"),
+            "expected path traversal error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn extract_tarball_rejects_dotdot_in_middle() {
+        let tarball = create_test_tarball(&[("foo/../../../escape.txt", b"pwned")]);
+        let dest = tempfile::tempdir().unwrap();
+
+        let result = extract_tarball(tarball.path(), dest.path(), "test", "0.0.0");
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("path traversal"),
+            "expected path traversal error, got: {msg}"
+        );
     }
 }

@@ -63,6 +63,10 @@ pub enum KonancError {
     #[error("cannot extract Kotlin/Native {version}: {message}")]
     Extract { version: String, message: String },
 
+    /// A tarball entry attempted to escape the extraction directory.
+    #[error("tarball contains path traversal entry \"{entry_path}\" that escapes {dest}")]
+    PathTraversal { entry_path: String, dest: String },
+
     /// The installed toolchain version does not match the expected version.
     #[error("expected Kotlin/Native {expected} but found {actual}")]
     VersionMismatch { expected: String, actual: String },
