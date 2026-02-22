@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use konvoy_config::lockfile::Lockfile;
 use konvoy_config::manifest::Manifest;
-use konvoy_konanc::detect::{detect_konanc, KonancInfo};
+use konvoy_konanc::detect::{resolve_konanc, KonancInfo};
 use konvoy_konanc::invoke::{DiagnosticLevel, KonancCommand};
 use konvoy_targets::{host_target, Target};
 
@@ -87,8 +87,9 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         });
     }
 
-    // 5. Detect konanc.
-    let konanc = detect_konanc().map_err(EngineError::Konanc)?;
+    // 5. Resolve managed konanc toolchain.
+    let resolved = resolve_konanc(&manifest.toolchain.kotlin).map_err(EngineError::Konanc)?;
+    let konanc = resolved.info;
 
     // 6. Compute cache key.
     // Use the effective lockfile (with detected konanc version) so the cache key
@@ -156,7 +157,12 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     }
 
     // 11. Update lockfile if toolchain version changed.
-    update_lockfile_if_needed(&lockfile, &konanc, &lockfile_path)?;
+    update_lockfile_if_needed(
+        &lockfile,
+        &konanc,
+        resolved.tarball_sha256.as_deref(),
+        &lockfile_path,
+    )?;
 
     Ok(BuildResult {
         outcome: BuildOutcome::Fresh,
@@ -244,6 +250,7 @@ fn lockfile_toml_content(lockfile: &Lockfile) -> String {
 fn update_lockfile_if_needed(
     lockfile: &Lockfile,
     konanc: &KonancInfo,
+    tarball_sha256: Option<&str>,
     lockfile_path: &Path,
 ) -> Result<(), EngineError> {
     let needs_update = match &lockfile.toolchain {
@@ -252,7 +259,10 @@ fn update_lockfile_if_needed(
     };
 
     if needs_update {
-        let updated = Lockfile::with_toolchain(&konanc.version);
+        let updated = match tarball_sha256 {
+            Some(sha) => Lockfile::with_managed_toolchain(&konanc.version, sha),
+            None => Lockfile::with_toolchain(&konanc.version),
+        };
         updated
             .write_to(lockfile_path)
             .map_err(|e| EngineError::Lockfile(e.to_string()))?;
@@ -316,7 +326,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("empty-proj");
         fs::create_dir_all(project.join("src")).unwrap();
-        fs::write(project.join("konvoy.toml"), "[package]\nname = \"empty\"\n").unwrap();
+        fs::write(
+            project.join("konvoy.toml"),
+            "[package]\nname = \"empty\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+        )
+        .unwrap();
         // No .kt files in src/
 
         let options = BuildOptions {
@@ -358,7 +372,7 @@ mod tests {
             fingerprint: "abc".to_owned(),
         };
 
-        update_lockfile_if_needed(&lockfile, &konanc, &lockfile_path).unwrap();
+        update_lockfile_if_needed(&lockfile, &konanc, None, &lockfile_path).unwrap();
         assert!(lockfile_path.exists());
         let content = fs::read_to_string(&lockfile_path).unwrap();
         assert!(content.contains("2.1.0"));
@@ -378,7 +392,7 @@ mod tests {
         };
 
         // Should not error and should not change the file.
-        update_lockfile_if_needed(&lockfile, &konanc, &lockfile_path).unwrap();
+        update_lockfile_if_needed(&lockfile, &konanc, None, &lockfile_path).unwrap();
     }
 
     #[test]
@@ -394,7 +408,7 @@ mod tests {
             fingerprint: "abc".to_owned(),
         };
 
-        update_lockfile_if_needed(&lockfile, &konanc, &lockfile_path).unwrap();
+        update_lockfile_if_needed(&lockfile, &konanc, Some("deadbeef"), &lockfile_path).unwrap();
         let content = fs::read_to_string(&lockfile_path).unwrap();
         assert!(content.contains("2.1.0"));
     }

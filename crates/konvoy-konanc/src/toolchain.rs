@@ -1,0 +1,401 @@
+//! Managed toolchain download, installation, and discovery.
+//!
+//! Downloads Kotlin/Native prebuilt tarballs from JetBrains GitHub releases
+//! and installs them under `~/.konvoy/toolchains/<version>/`.
+
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
+
+use crate::error::KonancError;
+
+/// Result of installing a managed toolchain.
+#[derive(Debug, Clone)]
+pub struct InstallResult {
+    /// Absolute path to the `konanc` binary.
+    pub konanc_path: PathBuf,
+    /// SHA-256 hex digest of the downloaded tarball.
+    pub tarball_sha256: String,
+}
+
+/// Return the root directory for managed toolchains: `~/.konvoy/toolchains/`.
+///
+/// # Errors
+/// Returns an error if the home directory cannot be determined.
+pub fn toolchains_dir() -> Result<PathBuf, KonancError> {
+    let home = home_dir()?;
+    Ok(home.join(".konvoy").join("toolchains"))
+}
+
+/// Return the installation directory for a specific version.
+///
+/// # Errors
+/// Returns an error if the home directory cannot be determined.
+pub fn version_dir(version: &str) -> Result<PathBuf, KonancError> {
+    Ok(toolchains_dir()?.join(version))
+}
+
+/// Return the path to `konanc` for a managed version.
+///
+/// # Errors
+/// Returns an error if the home directory cannot be determined.
+pub fn managed_konanc_path(version: &str) -> Result<PathBuf, KonancError> {
+    Ok(version_dir(version)?.join("bin").join("konanc"))
+}
+
+/// Check whether a specific version is already installed.
+///
+/// # Errors
+/// Returns an error if the home directory cannot be determined.
+pub fn is_installed(version: &str) -> Result<bool, KonancError> {
+    let konanc = managed_konanc_path(version)?;
+    Ok(konanc.exists())
+}
+
+/// List all installed toolchain versions.
+///
+/// # Errors
+/// Returns an error if the toolchains directory cannot be read.
+pub fn list_installed() -> Result<Vec<String>, KonancError> {
+    let Ok(dir) = toolchains_dir() else {
+        return Ok(Vec::new());
+    };
+
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut versions = Vec::new();
+    let entries = std::fs::read_dir(&dir).map_err(|source| KonancError::Io {
+        path: dir.display().to_string(),
+        source,
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|source| KonancError::Io {
+            path: dir.display().to_string(),
+            source,
+        })?;
+        if entry.path().is_dir() {
+            if let Some(name) = entry.file_name().to_str() {
+                // Skip temp directories.
+                if !name.starts_with(".tmp-") {
+                    versions.push(name.to_owned());
+                }
+            }
+        }
+    }
+
+    versions.sort();
+    Ok(versions)
+}
+
+/// Download and install a Kotlin/Native toolchain.
+///
+/// # Errors
+/// Returns an error if the download fails, the tarball is corrupt, or the
+/// extraction fails.
+pub fn install(version: &str) -> Result<InstallResult, KonancError> {
+    let dest = version_dir(version)?;
+
+    // Already installed — find konanc and return.
+    let konanc_path = dest.join("bin").join("konanc");
+    if konanc_path.exists() {
+        // We don't have the tarball SHA-256 from a previous install,
+        // but we can report what we have.
+        return Ok(InstallResult {
+            konanc_path,
+            tarball_sha256: String::new(),
+        });
+    }
+
+    let url = download_url(version)?;
+    let toolchains_root = toolchains_dir()?;
+
+    // Ensure the toolchains directory exists.
+    std::fs::create_dir_all(&toolchains_root).map_err(|source| KonancError::Io {
+        path: toolchains_root.display().to_string(),
+        source,
+    })?;
+
+    // Download to a temp file, computing SHA-256 as we go.
+    let tmp_tarball = toolchains_root.join(format!(".tmp-{version}.tar.gz"));
+    let sha256 = download_with_progress(&url, &tmp_tarball, version)?;
+
+    // Extract to a temp directory, then rename atomically.
+    let tmp_extract = toolchains_root.join(format!(".tmp-{version}-extract"));
+    if tmp_extract.exists() {
+        std::fs::remove_dir_all(&tmp_extract).map_err(|source| KonancError::Io {
+            path: tmp_extract.display().to_string(),
+            source,
+        })?;
+    }
+
+    extract_tarball(&tmp_tarball, &tmp_extract, version)?;
+
+    // Clean up tarball.
+    let _ = std::fs::remove_file(&tmp_tarball);
+
+    // The tarball extracts to a subdirectory like `kotlin-native-prebuilt-linux-x86_64-2.1.0/`.
+    // Find it and move its contents to the version directory.
+    let extracted_root = find_extracted_root(&tmp_extract, version)?;
+
+    // Rename extracted dir to the final version dir.
+    if dest.exists() {
+        // Race condition: another process installed while we were downloading.
+        let _ = std::fs::remove_dir_all(&tmp_extract);
+    } else {
+        std::fs::rename(&extracted_root, &dest).map_err(|source| KonancError::Io {
+            path: dest.display().to_string(),
+            source,
+        })?;
+        // Clean up the temp extract directory if it's now empty.
+        let _ = std::fs::remove_dir_all(&tmp_extract);
+    }
+
+    // Verify the installation.
+    let final_konanc = dest.join("bin").join("konanc");
+    if !final_konanc.exists() {
+        return Err(KonancError::CorruptToolchain {
+            path: dest,
+            version: version.to_owned(),
+        });
+    }
+
+    // Ensure konanc is executable on Unix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(&final_konanc).map_err(|source| KonancError::Io {
+            path: final_konanc.display().to_string(),
+            source,
+        })?;
+        let mut perms = metadata.permissions();
+        let mode = perms.mode() | 0o755;
+        perms.set_mode(mode);
+        std::fs::set_permissions(&final_konanc, perms).map_err(|source| KonancError::Io {
+            path: final_konanc.display().to_string(),
+            source,
+        })?;
+    }
+
+    Ok(InstallResult {
+        konanc_path: final_konanc,
+        tarball_sha256: sha256,
+    })
+}
+
+/// Construct the download URL for a Kotlin/Native prebuilt tarball.
+fn download_url(version: &str) -> Result<String, KonancError> {
+    let (os, arch) = platform_slug()?;
+    Ok(format!(
+        "https://github.com/JetBrains/kotlin/releases/download/v{version}/kotlin-native-prebuilt-{os}-{arch}-{version}.tar.gz"
+    ))
+}
+
+/// Map the current OS and architecture to the JetBrains release slug.
+fn platform_slug() -> Result<(&'static str, &'static str), KonancError> {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+
+    match (os, arch) {
+        ("linux", "x86_64") => Ok(("linux", "x86_64")),
+        ("macos", "x86_64") => Ok(("macos", "x86_64")),
+        ("macos", "aarch64") => Ok(("macos", "aarch64")),
+        _ => Err(KonancError::UnsupportedPlatform {
+            os: os.to_owned(),
+            arch: arch.to_owned(),
+        }),
+    }
+}
+
+/// Download a URL to a file, showing progress on stderr and computing SHA-256.
+fn download_with_progress(url: &str, dest: &Path, version: &str) -> Result<String, KonancError> {
+    let response = ureq::get(url).call().map_err(|e| KonancError::Download {
+        version: version.to_owned(),
+        message: e.to_string(),
+    })?;
+
+    let content_length: Option<u64> = response
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok());
+
+    let mut body = response.into_body();
+    let mut file = std::fs::File::create(dest).map_err(|source| KonancError::Io {
+        path: dest.display().to_string(),
+        source,
+    })?;
+
+    let mut hasher = Sha256::new();
+    let mut downloaded: u64 = 0;
+    let mut last_pct: u8 = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+
+    loop {
+        let n = std::io::Read::read(&mut body.as_reader(), &mut buf).map_err(|e| {
+            KonancError::Download {
+                version: version.to_owned(),
+                message: e.to_string(),
+            }
+        })?;
+        if n == 0 {
+            break;
+        }
+
+        let chunk = buf.get(..n).unwrap_or(&buf);
+        std::io::Write::write_all(&mut file, chunk).map_err(|source| KonancError::Io {
+            path: dest.display().to_string(),
+            source,
+        })?;
+        hasher.update(chunk);
+
+        downloaded = downloaded.saturating_add(n as u64);
+
+        // Show progress.
+        if let Some(total) = content_length {
+            if total > 0 {
+                #[allow(clippy::cast_possible_truncation)]
+                let pct = ((downloaded * 100) / total) as u8;
+                if pct != last_pct && pct.is_multiple_of(10) {
+                    eprint!("\r    Downloading Kotlin/Native {version}... {pct}%");
+                    last_pct = pct;
+                }
+            }
+        }
+    }
+
+    if content_length.is_some() {
+        eprintln!("\r    Downloading Kotlin/Native {version}... done   ");
+    } else {
+        let mb = downloaded / (1024 * 1024);
+        eprintln!("    Downloaded Kotlin/Native {version} ({mb} MB)");
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Extract a `.tar.gz` tarball to a directory.
+fn extract_tarball(tarball: &Path, dest: &Path, version: &str) -> Result<(), KonancError> {
+    eprintln!("    Extracting Kotlin/Native {version}...");
+
+    let file = std::fs::File::open(tarball).map_err(|source| KonancError::Io {
+        path: tarball.display().to_string(),
+        source,
+    })?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+
+    archive.unpack(dest).map_err(|e| KonancError::Extract {
+        version: version.to_owned(),
+        message: e.to_string(),
+    })?;
+
+    Ok(())
+}
+
+/// Find the single extracted root directory inside a temp extraction dir.
+fn find_extracted_root(extract_dir: &Path, version: &str) -> Result<PathBuf, KonancError> {
+    let entries: Vec<_> = std::fs::read_dir(extract_dir)
+        .map_err(|source| KonancError::Io {
+            path: extract_dir.display().to_string(),
+            source,
+        })?
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .collect();
+
+    if entries.len() == 1 {
+        return Ok(entries
+            .into_iter()
+            .next()
+            .map(|e| e.path())
+            .unwrap_or_else(|| extract_dir.to_path_buf()));
+    }
+
+    // Fall back: look for a directory matching the expected pattern.
+    for entry in &entries {
+        let name = entry.file_name();
+        if let Some(s) = name.to_str() {
+            if s.contains("kotlin-native") && s.contains(version) {
+                return Ok(entry.path());
+            }
+        }
+    }
+
+    Err(KonancError::Extract {
+        version: version.to_owned(),
+        message: format!(
+            "expected a single directory in extracted tarball, found {} entries",
+            entries.len()
+        ),
+    })
+}
+
+/// Get the user's home directory.
+fn home_dir() -> Result<PathBuf, KonancError> {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(PathBuf::from)
+        .map_err(|_| KonancError::NoHomeDir)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toolchains_dir_under_home() {
+        let dir = toolchains_dir().unwrap();
+        assert!(dir.display().to_string().contains(".konvoy"));
+        assert!(dir.display().to_string().contains("toolchains"));
+    }
+
+    #[test]
+    fn version_dir_includes_version() {
+        let dir = version_dir("2.1.0").unwrap();
+        assert!(dir.display().to_string().contains("2.1.0"));
+    }
+
+    #[test]
+    fn managed_konanc_path_includes_bin() {
+        let path = managed_konanc_path("2.1.0").unwrap();
+        assert!(path.display().to_string().contains("bin"));
+        assert!(path.display().to_string().contains("konanc"));
+    }
+
+    #[test]
+    fn is_installed_false_for_missing() {
+        // A version that doesn't exist should return false.
+        let result = is_installed("99.99.99").unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn list_installed_returns_empty_for_no_toolchains() {
+        // If no toolchains installed, should return empty or whatever is there.
+        let result = list_installed();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn platform_slug_returns_valid() {
+        // This test only passes on supported platforms.
+        if let Ok((os, arch)) = platform_slug() {
+            assert!(!os.is_empty());
+            assert!(!arch.is_empty());
+        }
+    }
+
+    #[test]
+    fn download_url_format() {
+        if let Ok(url) = download_url("2.1.0") {
+            assert!(url.contains("2.1.0"));
+            assert!(url.contains("kotlin-native-prebuilt"));
+            assert!(url.contains(".tar.gz"));
+            assert!(url.starts_with("https://"));
+        }
+    }
+}

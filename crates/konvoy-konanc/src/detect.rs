@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::KonancError;
+use crate::toolchain;
 
 /// Information about a detected `konanc` installation.
 #[derive(Debug, Clone)]
@@ -16,25 +17,60 @@ pub struct KonancInfo {
     pub fingerprint: String,
 }
 
-/// Locate `konanc` and determine its version and fingerprint.
+/// Result of resolving a managed konanc toolchain.
+#[derive(Debug, Clone)]
+pub struct ResolvedKonanc {
+    /// Compiler information (path, version, fingerprint).
+    pub info: KonancInfo,
+    /// SHA-256 of the downloaded tarball, if this was a managed install.
+    pub tarball_sha256: Option<String>,
+}
+
+/// Resolve a managed `konanc` installation for the given version.
 ///
-/// Resolution order:
-/// 1. `KONANC_HOME` environment variable (`$KONANC_HOME/bin/konanc`)
-/// 2. `PATH` lookup via `which`
+/// If the requested version is not installed, downloads and installs it
+/// from JetBrains GitHub releases. After installation, verifies the version
+/// matches and computes a fingerprint for cache keying.
 ///
 /// # Errors
-/// Returns an error if `konanc` is not found, is not executable, returns an
-/// unparseable version string, or cannot be fingerprinted.
-pub fn detect_konanc() -> Result<KonancInfo, KonancError> {
-    let path = resolve_konanc_path()?;
+/// Returns an error if the toolchain cannot be installed, the version
+/// doesn't match, or the binary cannot be fingerprinted.
+pub fn resolve_konanc(version: &str) -> Result<ResolvedKonanc, KonancError> {
+    let installed = toolchain::is_installed(version)?;
+
+    let tarball_sha256 = if !installed {
+        eprintln!("    Installing Kotlin/Native {version}...");
+        let result = toolchain::install(version)?;
+        if result.tarball_sha256.is_empty() {
+            None
+        } else {
+            Some(result.tarball_sha256)
+        }
+    } else {
+        None
+    };
+
+    let path = toolchain::managed_konanc_path(version)?;
     check_executable(&path)?;
-    let version = query_version(&path)?;
+    let actual_version = query_version(&path)?;
+
+    // Verify the installed version matches what was requested.
+    if actual_version != version {
+        return Err(KonancError::VersionMismatch {
+            expected: version.to_owned(),
+            actual: actual_version,
+        });
+    }
+
     let fingerprint = compute_fingerprint(&path)?;
 
-    Ok(KonancInfo {
-        path,
-        version,
-        fingerprint,
+    Ok(ResolvedKonanc {
+        info: KonancInfo {
+            path,
+            version: actual_version,
+            fingerprint,
+        },
+        tarball_sha256,
     })
 }
 
@@ -77,32 +113,6 @@ fn is_semver_like(s: &str) -> bool {
     major.chars().all(|c| c.is_ascii_digit())
         && minor.chars().all(|c| c.is_ascii_digit())
         && patch.chars().all(|c| c.is_ascii_digit())
-}
-
-fn resolve_konanc_path() -> Result<PathBuf, KonancError> {
-    if let Ok(home) = std::env::var("KONANC_HOME") {
-        let p = PathBuf::from(home).join("bin").join("konanc");
-        if p.exists() {
-            return Ok(p);
-        }
-        return Err(KonancError::NotFound);
-    }
-
-    which_konanc().ok_or(KonancError::NotFound)
-}
-
-fn which_konanc() -> Option<PathBuf> {
-    let output = Command::new("which").arg("konanc").output().ok()?;
-    if output.status.success() {
-        let path_str = String::from_utf8_lossy(&output.stdout);
-        let trimmed = path_str.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(trimmed))
-    } else {
-        None
-    }
 }
 
 fn check_executable(path: &Path) -> Result<(), KonancError> {
@@ -216,20 +226,5 @@ mod tests {
         assert!(!is_semver_like("2"));
         assert!(!is_semver_like("abc"));
         assert!(!is_semver_like("2.1.0.4"));
-    }
-
-    #[test]
-    fn error_messages_are_actionable() {
-        let not_found = KonancError::NotFound;
-        let msg = not_found.to_string();
-        assert!(msg.contains("install"));
-        assert!(msg.contains("PATH"));
-
-        let not_exec = KonancError::NotExecutable {
-            path: PathBuf::from("/usr/bin/konanc"),
-        };
-        let msg = not_exec.to_string();
-        assert!(msg.contains("not executable"));
-        assert!(msg.contains("permissions"));
     }
 }

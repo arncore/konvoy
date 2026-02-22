@@ -6,6 +6,15 @@ use std::path::Path;
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub package: Package,
+    pub toolchain: Toolchain,
+}
+
+/// Toolchain specification declaring the Kotlin/Native version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Toolchain {
+    /// Kotlin/Native version, e.g. "2.1.0".
+    pub kotlin: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +59,12 @@ fn validate(manifest: &Manifest, path: &str) -> Result<(), ManifestError> {
         return Err(ManifestError::InvalidEntrypoint {
             path: path.to_owned(),
             entrypoint: manifest.package.entrypoint.clone(),
+        });
+    }
+    if manifest.toolchain.kotlin.is_empty() {
+        return Err(ManifestError::InvalidToolchain {
+            path: path.to_owned(),
+            message: "kotlin version must not be empty".to_owned(),
         });
     }
     Ok(())
@@ -113,37 +128,71 @@ pub enum ManifestError {
     InvalidName { path: String, name: String },
     #[error("entrypoint `{entrypoint}` must end with .kt in {path}")]
     InvalidEntrypoint { path: String, entrypoint: String },
+    #[error("invalid [toolchain] in {path}: {message}")]
+    InvalidToolchain { path: String, message: String },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const TOOLCHAIN: &str = "\n[toolchain]\nkotlin = \"2.1.0\"\n";
+
     #[test]
     fn parse_valid_manifest() {
-        let toml = r#"
+        let toml = format!(
+            r#"
 [package]
 name = "my-project"
 entrypoint = "src/main.kt"
-"#;
-        let manifest = Manifest::from_str(toml, "konvoy.toml");
+{TOOLCHAIN}"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml");
         assert!(manifest.is_ok());
         let manifest = manifest.unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(manifest.package.name, "my-project");
         assert_eq!(manifest.package.entrypoint, "src/main.kt");
+        assert_eq!(manifest.toolchain.kotlin, "2.1.0");
     }
 
     #[test]
     fn parse_minimal_manifest() {
-        let toml = r#"
+        let toml = format!(
+            r#"
 [package]
 name = "minimal"
-"#;
-        let manifest = Manifest::from_str(toml, "konvoy.toml");
+{TOOLCHAIN}"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml");
         assert!(manifest.is_ok());
         let manifest = manifest.unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(manifest.package.name, "minimal");
         assert_eq!(manifest.package.entrypoint, "src/main.kt");
+    }
+
+    #[test]
+    fn reject_missing_toolchain() {
+        let toml = r#"
+[package]
+name = "no-toolchain"
+"#;
+        let result = Manifest::from_str(toml, "konvoy.toml");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn reject_empty_kotlin_version() {
+        let toml = r#"
+[package]
+name = "empty-ver"
+
+[toolchain]
+kotlin = ""
+"#;
+        let result = Manifest::from_str(toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("empty"), "error was: {err}");
     }
 
     #[test]
@@ -158,11 +207,13 @@ key = "value"
 
     #[test]
     fn reject_empty_name() {
-        let toml = r#"
+        let toml = format!(
+            r#"
 [package]
 name = ""
-"#;
-        let result = Manifest::from_str(toml, "konvoy.toml");
+{TOOLCHAIN}"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("empty"), "error was: {err}");
@@ -170,11 +221,13 @@ name = ""
 
     #[test]
     fn reject_invalid_name_chars() {
-        let toml = r#"
+        let toml = format!(
+            r#"
 [package]
 name = "my project!"
-"#;
-        let result = Manifest::from_str(toml, "konvoy.toml");
+{TOOLCHAIN}"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("invalid characters"), "error was: {err}");
@@ -182,12 +235,14 @@ name = "my project!"
 
     #[test]
     fn reject_invalid_entrypoint() {
-        let toml = r#"
+        let toml = format!(
+            r#"
 [package]
 name = "my-project"
 entrypoint = "src/main.java"
-"#;
-        let result = Manifest::from_str(toml, "konvoy.toml");
+{TOOLCHAIN}"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains(".kt"), "error was: {err}");
@@ -195,23 +250,27 @@ entrypoint = "src/main.java"
 
     #[test]
     fn reject_unknown_keys() {
-        let toml = r#"
+        let toml = format!(
+            r#"
 [package]
 name = "my-project"
 unknown_field = true
-"#;
-        let result = Manifest::from_str(toml, "konvoy.toml");
+{TOOLCHAIN}"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
         assert!(result.is_err());
     }
 
     #[test]
     fn round_trip() {
-        let toml = r#"
+        let toml = format!(
+            r#"
 [package]
 name = "round-trip"
 entrypoint = "src/app.kt"
-"#;
-        let original = Manifest::from_str(toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+{TOOLCHAIN}"#
+        );
+        let original = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
         let serialized = original.to_toml().unwrap_or_else(|e| panic!("{e}"));
         let reparsed =
             Manifest::from_str(&serialized, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
