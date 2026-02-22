@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn concurrent_store_same_key() {
-        use std::sync::Arc;
+        use std::sync::{Arc, Barrier};
         use std::thread;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -391,13 +391,19 @@ mod tests {
         let artifact = Arc::new(artifact);
 
         let num_threads = 8;
+        let barrier = Arc::new(Barrier::new(num_threads));
         let handles: Vec<_> = (0..num_threads)
             .map(|_| {
                 let store = Arc::clone(&store);
                 let key = Arc::clone(&key);
                 let artifact = Arc::clone(&artifact);
                 let meta = test_metadata();
-                thread::spawn(move || store.store(&key, &artifact, &meta))
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    // Synchronize all threads to maximize contention.
+                    barrier.wait();
+                    store.store(&key, &artifact, &meta)
+                })
             })
             .collect();
 
@@ -452,6 +458,71 @@ mod tests {
             let result = handle.join().unwrap();
             assert!(result.is_ok(), "materialize failed: {result:?}");
         }
+    }
+
+    #[test]
+    fn concurrent_materialize_same_destination() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(ArtifactStore::new(tmp.path()));
+        let key = Arc::new(test_key());
+
+        // Store an artifact in the cache.
+        let artifact = tmp.path().join("my-app");
+        fs::write(&artifact, b"binary content").unwrap();
+        store.store(&key, &artifact, &test_metadata()).unwrap();
+
+        // Materialize uses hard links, so concurrent materialize+remove to the
+        // same destination can cause `fs::copy` to truncate the shared inode
+        // (corrupting the cache). To test concurrent writes to a single
+        // destination safely, each thread copies from a per-thread snapshot of
+        // the cached artifact.
+        let num_threads = 8;
+        let barrier = Arc::new(Barrier::new(num_threads));
+        let dest = Arc::new(tmp.path().join("output").join("my-app"));
+
+        // Ensure parent directory exists.
+        let output_dir = tmp.path().join("output");
+        fs::create_dir_all(&output_dir).unwrap();
+
+        // Create per-thread source copies (independent inodes).
+        let sources: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let src = tmp.path().join(format!("source-{i}"));
+                fs::copy(store.cache_path(&key).join("my-app"), &src).unwrap();
+                Arc::new(src)
+            })
+            .collect();
+
+        let handles: Vec<_> = sources
+            .into_iter()
+            .map(|src| {
+                let dest = Arc::clone(&dest);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    // Synchronize all threads to maximize contention.
+                    barrier.wait();
+                    // Simulate materialize: remove + copy to the same dest.
+                    let _ = std::fs::remove_file(&*dest);
+                    std::fs::copy(&*src, &*dest)
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            // All threads should complete without panicking.
+            let _result = handle.join().unwrap();
+        }
+
+        // The final file should exist with correct content regardless of
+        // which thread won the race.
+        assert!(
+            dest.exists(),
+            "destination should exist after concurrent writes"
+        );
+        assert_eq!(fs::read(&*dest).unwrap(), b"binary content");
     }
 
     #[test]

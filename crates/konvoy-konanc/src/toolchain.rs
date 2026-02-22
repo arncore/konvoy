@@ -908,6 +908,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::panic)]
     fn concurrent_rename_race_simulation() {
         use std::sync::{Arc, Barrier};
         use std::thread;
