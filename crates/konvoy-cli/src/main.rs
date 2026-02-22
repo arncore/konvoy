@@ -5,7 +5,7 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(name = "konvoy", about = "A native-first Kotlin build tool")]
 #[command(version)]
 struct Cli {
@@ -13,7 +13,7 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Create a new Konvoy project
     Init {
@@ -71,7 +71,7 @@ enum Command {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum ToolchainAction {
     /// Install a Kotlin/Native version
     Install {
@@ -357,6 +357,517 @@ fn cmd_doctor() -> Result<(), String> {
     } else {
         eprintln!("All checks passed");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::error::ErrorKind;
+    use clap::CommandFactory;
+    use clap::Parser;
+
+    // ── Subcommand parsing ─────────────────────────────────────────
+
+    #[test]
+    fn parse_init_defaults() {
+        let cli = Cli::try_parse_from(["konvoy", "init"]).unwrap();
+        match cli.command {
+            Command::Init { name, lib } => {
+                assert!(name.is_none());
+                assert!(!lib);
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_init_with_name() {
+        let cli = Cli::try_parse_from(["konvoy", "init", "--name", "my-app"]).unwrap();
+        match cli.command {
+            Command::Init { name, lib } => {
+                assert_eq!(name.as_deref(), Some("my-app"));
+                assert!(!lib);
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_init_lib() {
+        let cli = Cli::try_parse_from(["konvoy", "init", "--lib"]).unwrap();
+        match cli.command {
+            Command::Init { lib, .. } => assert!(lib),
+            other => panic!("expected Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_init_name_and_lib() {
+        let args = ["konvoy", "init", "--name", "mylib", "--lib"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Command::Init { name, lib } => {
+                assert_eq!(name.as_deref(), Some("mylib"));
+                assert!(lib);
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_build_defaults() {
+        let cli = Cli::try_parse_from(["konvoy", "build"]).unwrap();
+        match cli.command {
+            Command::Build {
+                target,
+                release,
+                verbose,
+            } => {
+                assert!(target.is_none());
+                assert!(!release);
+                assert!(!verbose);
+            }
+            other => panic!("expected Build, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_build_release() {
+        let cli = Cli::try_parse_from(["konvoy", "build", "--release"]).unwrap();
+        match cli.command {
+            Command::Build { release, .. } => assert!(release),
+            other => panic!("expected Build, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_build_verbose() {
+        let cli = Cli::try_parse_from(["konvoy", "build", "--verbose"]).unwrap();
+        match cli.command {
+            Command::Build { verbose, .. } => assert!(verbose),
+            other => panic!("expected Build, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_build_target() {
+        let cli = Cli::try_parse_from(["konvoy", "build", "--target", "macos_arm64"]).unwrap();
+        match cli.command {
+            Command::Build { target, .. } => {
+                assert_eq!(target.as_deref(), Some("macos_arm64"));
+            }
+            other => panic!("expected Build, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_build_all_flags() {
+        let cli = Cli::try_parse_from([
+            "konvoy",
+            "build",
+            "--target",
+            "linux_x64",
+            "--release",
+            "--verbose",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Build {
+                target,
+                release,
+                verbose,
+            } => {
+                assert_eq!(target.as_deref(), Some("linux_x64"));
+                assert!(release);
+                assert!(verbose);
+            }
+            other => panic!("expected Build, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_run_defaults() {
+        let cli = Cli::try_parse_from(["konvoy", "run"]).unwrap();
+        match cli.command {
+            Command::Run {
+                target,
+                release,
+                args,
+            } => {
+                assert!(target.is_none());
+                assert!(!release);
+                assert!(args.is_empty());
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_run_with_passthrough_args() {
+        let args = ["konvoy", "run", "--", "arg1", "arg2", "--flag"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Command::Run { args, .. } => {
+                assert_eq!(args, vec!["arg1", "arg2", "--flag"]);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_run_release_with_passthrough() {
+        let args = ["konvoy", "run", "--release", "--", "hello"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Command::Run { release, args, .. } => {
+                assert!(release);
+                assert_eq!(args, vec!["hello"]);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_run_target_and_release() {
+        let args = ["konvoy", "run", "--target", "macos_x64", "--release"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Command::Run {
+                target, release, ..
+            } => {
+                assert_eq!(target.as_deref(), Some("macos_x64"));
+                assert!(release);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_test_defaults() {
+        let cli = Cli::try_parse_from(["konvoy", "test"]).unwrap();
+        match cli.command {
+            Command::Test {
+                target,
+                release,
+                verbose,
+            } => {
+                assert!(target.is_none());
+                assert!(!release);
+                assert!(!verbose);
+            }
+            other => panic!("expected Test, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_test_all_flags() {
+        let cli = Cli::try_parse_from([
+            "konvoy",
+            "test",
+            "--release",
+            "--verbose",
+            "--target",
+            "linux_x64",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Test {
+                target,
+                release,
+                verbose,
+            } => {
+                assert_eq!(target.as_deref(), Some("linux_x64"));
+                assert!(release);
+                assert!(verbose);
+            }
+            other => panic!("expected Test, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_clean() {
+        let cli = Cli::try_parse_from(["konvoy", "clean"]).unwrap();
+        assert!(matches!(cli.command, Command::Clean));
+    }
+
+    #[test]
+    fn parse_doctor() {
+        let cli = Cli::try_parse_from(["konvoy", "doctor"]).unwrap();
+        assert!(matches!(cli.command, Command::Doctor));
+    }
+
+    #[test]
+    fn parse_toolchain_install_with_version() {
+        let args = ["konvoy", "toolchain", "install", "2.1.0"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Command::Toolchain {
+                action: ToolchainAction::Install { version },
+            } => {
+                assert_eq!(version.as_deref(), Some("2.1.0"));
+            }
+            other => panic!("expected Toolchain Install, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_toolchain_install_no_version() {
+        let cli = Cli::try_parse_from(["konvoy", "toolchain", "install"]).unwrap();
+        match cli.command {
+            Command::Toolchain {
+                action: ToolchainAction::Install { version },
+            } => {
+                assert!(version.is_none());
+            }
+            other => panic!("expected Toolchain Install, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_toolchain_list() {
+        let cli = Cli::try_parse_from(["konvoy", "toolchain", "list"]).unwrap();
+        match cli.command {
+            Command::Toolchain {
+                action: ToolchainAction::List,
+            } => {}
+            other => panic!("expected Toolchain List, got {other:?}"),
+        }
+    }
+
+    // ── Flag order independence ────────────────────────────────────
+
+    #[test]
+    fn build_flags_order_verbose_before_release() {
+        let args = ["konvoy", "build", "--verbose", "--release"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Command::Build {
+                release, verbose, ..
+            } => {
+                assert!(release);
+                assert!(verbose);
+            }
+            other => panic!("expected Build, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_flags_order_target_between() {
+        let cli = Cli::try_parse_from([
+            "konvoy",
+            "build",
+            "--release",
+            "--target",
+            "linux_x64",
+            "--verbose",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Build {
+                target,
+                release,
+                verbose,
+            } => {
+                assert_eq!(target.as_deref(), Some("linux_x64"));
+                assert!(release);
+                assert!(verbose);
+            }
+            other => panic!("expected Build, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_flags_order_lib_before_name() {
+        let args = ["konvoy", "init", "--lib", "--name", "foo"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Command::Init { name, lib } => {
+                assert_eq!(name.as_deref(), Some("foo"));
+                assert!(lib);
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+    }
+
+    // ── Invalid arguments ──────────────────────────────────────────
+
+    #[test]
+    fn error_no_subcommand() {
+        let err = Cli::try_parse_from(["konvoy"]).unwrap_err();
+        let expected = ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand;
+        assert_eq!(err.kind(), expected);
+    }
+
+    #[test]
+    fn error_unknown_subcommand() {
+        let err = Cli::try_parse_from(["konvoy", "deploy"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn error_unknown_flag_on_build() {
+        let err = Cli::try_parse_from(["konvoy", "build", "--optimize"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        let msg = err.to_string();
+        assert!(msg.contains("--optimize"));
+        assert!(msg.contains("Usage:"));
+    }
+
+    #[test]
+    fn error_target_missing_value() {
+        let err = Cli::try_parse_from(["konvoy", "build", "--target"]).unwrap_err();
+        // clap reports this as either invalid or missing argument depending on version.
+        assert!(
+            err.kind() == ErrorKind::InvalidValue
+                || err.kind() == ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn error_unknown_flag_on_init() {
+        let err = Cli::try_parse_from(["konvoy", "init", "--force"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn error_unknown_toolchain_action() {
+        let args = ["konvoy", "toolchain", "remove"];
+        let err = Cli::try_parse_from(args).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidSubcommand);
+        let msg = err.to_string();
+        assert!(msg.contains("remove"));
+        assert!(msg.contains("Usage:"));
+    }
+
+    #[test]
+    fn error_clean_takes_no_args() {
+        let err = Cli::try_parse_from(["konvoy", "clean", "--all"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn error_doctor_takes_no_args() {
+        let err = Cli::try_parse_from(["konvoy", "doctor", "--fix"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+    }
+
+    // ── Help and version output ────────────────────────────────────
+
+    #[test]
+    fn help_flag_on_root() {
+        let err = Cli::try_parse_from(["konvoy", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+        let output = err.to_string();
+        assert!(output.contains("A native-first Kotlin build tool"));
+        assert!(output.contains("Commands:"));
+        assert!(output.contains("build"));
+        assert!(output.contains("toolchain"));
+    }
+
+    #[test]
+    fn help_flag_on_build() {
+        let err = Cli::try_parse_from(["konvoy", "build", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn help_flag_on_init() {
+        let err = Cli::try_parse_from(["konvoy", "init", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn help_flag_on_run() {
+        let err = Cli::try_parse_from(["konvoy", "run", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn help_flag_on_test() {
+        let err = Cli::try_parse_from(["konvoy", "test", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn help_flag_on_clean() {
+        let err = Cli::try_parse_from(["konvoy", "clean", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn help_flag_on_doctor() {
+        let err = Cli::try_parse_from(["konvoy", "doctor", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn help_flag_on_toolchain() {
+        let args = ["konvoy", "toolchain", "--help"];
+        let err = Cli::try_parse_from(args).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn help_flag_on_toolchain_install() {
+        let args = ["konvoy", "toolchain", "install", "--help"];
+        let err = Cli::try_parse_from(args).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn help_flag_on_toolchain_list() {
+        let args = ["konvoy", "toolchain", "list", "--help"];
+        let err = Cli::try_parse_from(args).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+        let output = err.to_string();
+        assert!(output.contains("List installed Kotlin/Native versions"));
+    }
+
+    #[test]
+    fn version_flag() {
+        let err = Cli::try_parse_from(["konvoy", "--version"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+    }
+
+    #[test]
+    fn root_help_render_includes_all_subcommands() {
+        let mut cmd = Cli::command();
+        let help = cmd.render_help().to_string();
+        for subcommand in [
+            "init",
+            "build",
+            "run",
+            "test",
+            "clean",
+            "doctor",
+            "toolchain",
+        ] {
+            assert!(help.contains(subcommand));
+        }
+    }
+
+    // ── Passthrough edge cases ─────────────────────────────────────
+
+    #[test]
+    fn run_empty_passthrough() {
+        let cli = Cli::try_parse_from(["konvoy", "run", "--"]).unwrap();
+        match cli.command {
+            Command::Run { args, .. } => assert!(args.is_empty()),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_passthrough_with_dashes() {
+        let args = ["konvoy", "run", "--", "--verbose", "--release"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Command::Run { args, .. } => {
+                assert_eq!(args, vec!["--verbose", "--release"]);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
     }
 }
 
