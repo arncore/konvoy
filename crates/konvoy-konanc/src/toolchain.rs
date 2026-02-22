@@ -923,4 +923,51 @@ mod tests {
         let b = temp_suffix();
         assert_ne!(a, b, "consecutive temp suffixes should differ");
     }
+
+    #[test]
+    fn find_jre_root_single_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("some-jre")).unwrap();
+
+        let result = find_jre_root(tmp.path()).unwrap();
+        assert_eq!(result, tmp.path().join("some-jre"));
+    }
+
+    #[test]
+    fn find_jre_root_prefers_jdk_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("other-dir")).unwrap();
+        std::fs::create_dir(tmp.path().join("jdk-21.0.10+7-jre")).unwrap();
+
+        let result = find_jre_root(tmp.path()).unwrap();
+        assert_eq!(result, tmp.path().join("jdk-21.0.10+7-jre"));
+    }
+
+    #[test]
+    fn find_jre_root_zero_directories_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create only a regular file, no subdirectories.
+        std::fs::write(tmp.path().join("not-a-dir.txt"), b"hello").unwrap();
+
+        let err = find_jre_root(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("found 0 entries"),
+            "expected zero-entry error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn find_jre_root_multiple_non_jdk_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+        std::fs::create_dir(tmp.path().join("beta")).unwrap();
+
+        let err = find_jre_root(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("found 2 entries"),
+            "expected multi-entry error, got: {msg}"
+        );
+    }
 }
