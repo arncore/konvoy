@@ -134,11 +134,32 @@ impl ArtifactStore {
     }
 }
 
+/// Check whether any component of `path` is a symlink.
+///
+/// Walks from the root toward the leaf, checking each prefix with
+/// `symlink_metadata`. Returns `true` as soon as a symlink is found.
+fn path_contains_symlink(path: &Path) -> bool {
+    let mut accumulated = PathBuf::new();
+    for component in path.components() {
+        accumulated.push(component);
+        if let Ok(meta) = std::fs::symlink_metadata(&accumulated) {
+            if meta.file_type().is_symlink() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Resolve the cache root directory, sharing cache across git worktrees.
 ///
 /// In a git worktree, `git rev-parse --git-common-dir` returns the `.git`
 /// directory of the main worktree. We use its parent as the shared cache root.
 /// For normal repos or non-git projects, falls back to the project root.
+///
+/// If the resolved shared cache path contains symlinks, a warning is emitted
+/// and the local fallback path is used instead (to avoid symlink-based
+/// redirection of cache reads/writes).
 fn resolve_cache_root(project_root: &Path) -> PathBuf {
     let fallback = project_root.join(".konvoy").join("cache");
 
@@ -182,7 +203,20 @@ fn resolve_cache_root(project_root: &Path) -> PathBuf {
         }
     }
 
-    main_root.join(".konvoy").join("cache")
+    let shared_cache = main_root.join(".konvoy").join("cache");
+
+    // Guard against symlink-based redirection of the shared cache path.
+    // A symlink in the path could redirect cache I/O to an attacker-controlled
+    // directory, so we fall back to the local project cache instead.
+    if path_contains_symlink(&shared_cache) {
+        eprintln!(
+            "warning: symlink detected in shared cache path '{}'; falling back to local cache",
+            shared_cache.display()
+        );
+        return fallback;
+    }
+
+    shared_cache
 }
 
 #[cfg(test)]
@@ -312,6 +346,32 @@ mod tests {
 
         let path = store.cache_path(&key);
         assert!(path.display().to_string().contains(key.as_hex()));
+    }
+
+    #[test]
+    fn path_without_symlinks_returns_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("a").join("b").join("c");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(!path_contains_symlink(&nested));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_with_symlink_detected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("real");
+        fs::create_dir_all(&real_dir).unwrap();
+
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
+
+        assert!(path_contains_symlink(&link));
+
+        // Also check a path that goes through the symlink.
+        let nested = link.join("child");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(path_contains_symlink(&nested));
     }
 
     #[test]
