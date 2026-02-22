@@ -66,17 +66,29 @@ fn main() {
             let name = name.as_deref().unwrap_or("my-project");
             println!("konvoy init: creating project '{name}'");
         }
-        Command::Build { target, release, verbose } => {
+        Command::Build {
+            target,
+            release,
+            verbose,
+        } => {
             let profile = if release { "release" } else { "debug" };
             let target_str = target.as_deref().unwrap_or("host");
             println!("konvoy build: target={target_str} profile={profile} verbose={verbose}");
         }
-        Command::Run { target, release, args } => {
+        Command::Run {
+            target,
+            release,
+            args,
+        } => {
             let profile = if release { "release" } else { "debug" };
             let target_str = target.as_deref().unwrap_or("host");
             println!("konvoy run: target={target_str} profile={profile} args={args:?}");
         }
-        Command::Test { target, release, verbose } => {
+        Command::Test {
+            target,
+            release,
+            verbose,
+        } => {
             let profile = if release { "release" } else { "debug" };
             let target_str = target.as_deref().unwrap_or("host");
             println!("konvoy test: target={target_str} profile={profile} verbose={verbose}");

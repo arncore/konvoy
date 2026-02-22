@@ -20,10 +20,14 @@ impl Lockfile {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| LockfileError::Read { path: path.display().to_string(), source: e })?;
-        let lockfile: Lockfile = toml::from_str(&content)
-            .map_err(|e| LockfileError::Parse { path: path.display().to_string(), source: e })?;
+        let content = std::fs::read_to_string(path).map_err(|e| LockfileError::Read {
+            path: path.display().to_string(),
+            source: e,
+        })?;
+        let lockfile: Lockfile = toml::from_str(&content).map_err(|e| LockfileError::Parse {
+            path: path.display().to_string(),
+            source: e,
+        })?;
         Ok(lockfile)
     }
 }
@@ -31,7 +35,13 @@ impl Lockfile {
 #[derive(Debug, thiserror::Error)]
 pub enum LockfileError {
     #[error("cannot read {path}: {source}")]
-    Read { path: String, source: std::io::Error },
+    Read {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("invalid konvoy.lock at {path}: {source}")]
-    Parse { path: String, source: toml::de::Error },
+    Parse {
+        path: String,
+        source: toml::de::Error,
+    },
 }

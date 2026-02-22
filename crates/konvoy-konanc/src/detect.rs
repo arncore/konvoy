@@ -35,10 +35,7 @@ pub fn detect_konanc() -> Result<KonancInfo, KonancError> {
 
 fn which_konanc() -> Option<PathBuf> {
     // Check if konanc is on PATH by trying to find it
-    let output = Command::new("which")
-        .arg("konanc")
-        .output()
-        .ok()?;
+    let output = Command::new("which").arg("konanc").output().ok()?;
     if output.status.success() {
         let path_str = String::from_utf8_lossy(&output.stdout);
         Some(PathBuf::from(path_str.trim()))

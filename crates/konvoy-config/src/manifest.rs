@@ -21,10 +21,14 @@ fn default_entrypoint() -> String {
 impl Manifest {
     /// Read and parse a `konvoy.toml` from the given path.
     pub fn from_path(path: &Path) -> Result<Self, ManifestError> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| ManifestError::Read { path: path.display().to_string(), source: e })?;
-        let manifest: Manifest = toml::from_str(&content)
-            .map_err(|e| ManifestError::Parse { path: path.display().to_string(), source: e })?;
+        let content = std::fs::read_to_string(path).map_err(|e| ManifestError::Read {
+            path: path.display().to_string(),
+            source: e,
+        })?;
+        let manifest: Manifest = toml::from_str(&content).map_err(|e| ManifestError::Parse {
+            path: path.display().to_string(),
+            source: e,
+        })?;
         Ok(manifest)
     }
 }
@@ -32,7 +36,13 @@ impl Manifest {
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
     #[error("cannot read {path}: {source}")]
-    Read { path: String, source: std::io::Error },
+    Read {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("invalid konvoy.toml at {path}: {source}")]
-    Parse { path: String, source: toml::de::Error },
+    Parse {
+        path: String,
+        source: toml::de::Error,
+    },
 }

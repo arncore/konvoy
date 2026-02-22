@@ -23,12 +23,16 @@ pub fn host_target() -> Result<Target, TargetError> {
         ("linux", "aarch64") => "linux_arm64",
         ("macos", "x86_64") => "macos_x64",
         ("macos", "aarch64") => "macos_arm64",
-        (os, arch) => return Err(TargetError::UnsupportedHost {
-            os: os.to_string(),
-            arch: arch.to_string(),
-        }),
+        (os, arch) => {
+            return Err(TargetError::UnsupportedHost {
+                os: os.to_string(),
+                arch: arch.to_string(),
+            })
+        }
     };
-    Ok(Target { triple: triple.to_string() })
+    Ok(Target {
+        triple: triple.to_string(),
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
