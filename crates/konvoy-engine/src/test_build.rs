@@ -27,8 +27,6 @@ pub struct TestOptions {
     pub force: bool,
     /// Require the lockfile to be up-to-date; error on any mismatch.
     pub locked: bool,
-    /// Filter pattern forwarded to `--ktest_filter`.
-    pub filter: Option<String>,
 }
 
 /// Result of a successful test build.
@@ -74,7 +72,7 @@ pub fn build_tests(
     // Build dependencies first (same as regular build).
     let dep_graph = resolve_dependencies(project_root, &manifest)?;
     let mut library_paths: Vec<PathBuf> = Vec::new();
-    let lockfile_content = crate::build::lockfile_toml_content(&lockfile);
+    let lockfile_content = lockfile_toml_content(&lockfile);
 
     for dep in &dep_graph.order {
         let (dep_output, _) = crate::build::build_single(
@@ -124,7 +122,6 @@ pub fn build_tests(
 
     // Compute cache key (includes test sources via source hashing).
     let manifest_content = manifest.to_toml()?;
-    let lockfile_content = lockfile_toml_content(&lockfile);
     let cache_inputs = CacheInputs {
         manifest_content,
         lockfile_content,
@@ -268,7 +265,6 @@ mod tests {
             verbose: false,
             force: false,
             locked: false,
-            filter: None,
         };
 
         let result = build_tests(&project, &options);
@@ -298,7 +294,6 @@ mod tests {
             verbose: false,
             force: false,
             locked: false,
-            filter: None,
         };
 
         let result = build_tests(&project, &options);
@@ -319,7 +314,6 @@ mod tests {
             verbose: false,
             force: false,
             locked: false,
-            filter: None,
         };
 
         let result = build_tests(tmp.path(), &options);
@@ -334,13 +328,11 @@ mod tests {
             verbose: false,
             force: false,
             locked: false,
-            filter: None,
         };
         assert!(opts.target.is_none());
         assert!(!opts.release);
         assert!(!opts.verbose);
         assert!(!opts.force);
         assert!(!opts.locked);
-        assert!(opts.filter.is_none());
     }
 }

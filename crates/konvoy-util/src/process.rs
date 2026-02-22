@@ -42,7 +42,9 @@ mod tests {
 
     #[test]
     fn run_command_success() {
-        let result = run_command(&mut Command::new("echo").arg("hello"));
+        let mut cmd = Command::new("echo");
+        cmd.arg("hello");
+        let result = run_command(&mut cmd);
         let output = result.unwrap();
         assert!(output.success);
         assert_eq!(output.stdout.trim(), "hello");
@@ -65,7 +67,9 @@ mod tests {
 
     #[test]
     fn run_command_captures_stderr() {
-        let result = run_command(&mut Command::new("sh").arg("-c").arg("echo err >&2"));
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo err >&2"]);
+        let result = run_command(&mut cmd);
         let output = result.unwrap();
         assert!(output.stderr.contains("err"));
     }

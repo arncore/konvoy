@@ -129,7 +129,7 @@ fn main() {
             force,
             locked,
             filter,
-        } => cmd_test(target, release, verbose, force, locked, filter),
+        } => cmd_test(target, release, verbose, force, locked, &filter),
         Command::Clean => cmd_clean(),
         Command::Doctor => cmd_doctor(),
         Command::Toolchain { action } => cmd_toolchain(action),
@@ -281,17 +281,15 @@ fn cmd_test(
     verbose: bool,
     force: bool,
     locked: bool,
-    filter: Option<String>,
+    filter: &Option<String>,
 ) -> Result<(), String> {
     let root = project_root()?;
-    let filter_pattern = filter.clone();
     let options = konvoy_engine::TestOptions {
         target,
         release,
         verbose,
         force,
         locked,
-        filter,
     };
 
     let result = konvoy_engine::build_tests(&root, &options).map_err(|e| e.to_string())?;
@@ -304,7 +302,7 @@ fn cmd_test(
     eprintln!("     Running `{}`", result.output_path.display());
 
     let mut cmd = std::process::Command::new(&result.output_path);
-    if let Some(ref pattern) = filter_pattern {
+    if let Some(ref pattern) = filter {
         cmd.arg(format!("--ktest_filter={pattern}"));
     }
 
