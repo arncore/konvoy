@@ -16,6 +16,7 @@ license = "MIT"
 
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
+glob = "0.3"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2"
