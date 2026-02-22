@@ -77,6 +77,9 @@ enum Command {
         /// Require the lockfile to be up-to-date; error on any mismatch
         #[arg(long)]
         locked: bool,
+        /// Only run tests matching this pattern (forwarded to --ktest_filter)
+        #[arg(long)]
+        filter: Option<String>,
     },
     /// Remove build artifacts
     Clean,
@@ -125,7 +128,8 @@ fn main() {
             verbose,
             force,
             locked,
-        } => cmd_test(target, release, verbose, force, locked),
+            filter,
+        } => cmd_test(target, release, verbose, force, locked, filter),
         Command::Clean => cmd_clean(),
         Command::Doctor => cmd_doctor(),
         Command::Toolchain { action } => cmd_toolchain(action),
@@ -277,38 +281,38 @@ fn cmd_test(
     verbose: bool,
     force: bool,
     locked: bool,
+    filter: Option<String>,
 ) -> Result<(), String> {
-    // For MVP, konvoy test is essentially build + run with a test convention.
-    // Kotlin/Native doesn't have a built-in test framework like cargo test,
-    // so for now we compile and run the project and report the result.
-    eprintln!("    Note: Kotlin/Native test support is minimal — running the project as a test");
-
     let root = project_root()?;
-    let options = konvoy_engine::BuildOptions {
+    let filter_pattern = filter.clone();
+    let options = konvoy_engine::TestOptions {
         target,
         release,
         verbose,
         force,
         locked,
+        filter,
     };
 
-    let result = konvoy_engine::build(&root, &options).map_err(|e| e.to_string())?;
+    let result = konvoy_engine::build_tests(&root, &options).map_err(|e| e.to_string())?;
 
     let profile = if release { "release" } else { "debug" };
     eprintln!(
-        "    Finished `{profile}` target in {:.2}s",
-        result.duration.as_secs_f64()
+        "    Finished `{profile}` test target in {:.2}s",
+        result.compile_duration.as_secs_f64()
     );
     eprintln!("     Running `{}`", result.output_path.display());
 
-    let status = std::process::Command::new(&result.output_path)
+    let mut cmd = std::process::Command::new(&result.output_path);
+    if let Some(ref pattern) = filter_pattern {
+        cmd.arg(format!("--ktest_filter={pattern}"));
+    }
+
+    let status = cmd
         .status()
         .map_err(|e| format!("cannot run {}: {e}", result.output_path.display()))?;
 
-    if status.success() {
-        eprintln!("    Test passed");
-    } else {
-        eprintln!("    Test failed");
+    if !status.success() {
         let code = status.code().unwrap_or(1);
         process::exit(code);
     }
@@ -616,12 +620,14 @@ mod tests {
                 verbose,
                 force,
                 locked,
+                filter,
             } => {
                 assert!(target.is_none());
                 assert!(!release);
                 assert!(!verbose);
                 assert!(!force);
                 assert!(!locked);
+                assert!(filter.is_none());
             }
             other => panic!("expected Test, got {other:?}"),
         }
@@ -638,6 +644,8 @@ mod tests {
             "linux_x64",
             "--force",
             "--locked",
+            "--filter",
+            "MathTest.*",
         ])
         .unwrap();
         match cli.command {
@@ -647,12 +655,14 @@ mod tests {
                 verbose,
                 force,
                 locked,
+                filter,
             } => {
                 assert_eq!(target.as_deref(), Some("linux_x64"));
                 assert!(release);
                 assert!(verbose);
                 assert!(force);
                 assert!(locked);
+                assert_eq!(filter.as_deref(), Some("MathTest.*"));
             }
             other => panic!("expected Test, got {other:?}"),
         }

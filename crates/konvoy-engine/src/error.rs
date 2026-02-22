@@ -91,4 +91,8 @@ pub enum EngineError {
         "lockfile is out of date and --locked prevents updates; run without --locked to update"
     )]
     LockfileUpdateRequired,
+
+    /// No test source files found.
+    #[error("no test source files found in {dir} — create test files in src/test/ using kotlin.test annotations")]
+    NoTestSources { dir: String },
 }

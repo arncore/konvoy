@@ -145,7 +145,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
 ///
 /// Returns the path to the output artifact and whether the build was cached.
 #[allow(clippy::too_many_arguments)]
-fn build_single(
+pub(crate) fn build_single(
     project_root: &Path,
     manifest: &Manifest,
     konanc: &KonancInfo,
@@ -249,7 +249,7 @@ fn build_single(
 }
 
 /// Resolve the target: use the explicit `--target` value or detect the host.
-fn resolve_target(target_opt: &Option<String>) -> Result<Target, EngineError> {
+pub(crate) fn resolve_target(target_opt: &Option<String>) -> Result<Target, EngineError> {
     match target_opt {
         Some(name) => name.parse::<Target>().map_err(EngineError::Target),
         None => host_target().map_err(EngineError::Target),
@@ -332,7 +332,7 @@ fn compile(
 }
 
 /// Serialize lockfile content for cache key computation.
-fn lockfile_toml_content(lockfile: &Lockfile) -> String {
+pub(crate) fn lockfile_toml_content(lockfile: &Lockfile) -> String {
     toml::to_string_pretty(lockfile).unwrap_or_default()
 }
 
@@ -498,7 +498,7 @@ fn truncate_hash(hash: &str) -> &str {
 }
 
 /// Return the current UTC time as an ISO 8601 string.
-fn now_iso8601() -> String {
+pub(crate) fn now_iso8601() -> String {
     // Use a simple approach without pulling in chrono.
     let duration = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
