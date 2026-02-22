@@ -3,9 +3,20 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use konvoy_config::manifest::{Manifest, PackageKind};
+use konvoy_config::manifest::{DependencySpec, Manifest, PackageKind};
 
 use crate::error::EngineError;
+
+/// Information about a resolved git dependency.
+#[derive(Debug, Clone)]
+pub struct GitDepInfo {
+    /// The git repository URL.
+    pub url: String,
+    /// The resolved commit SHA.
+    pub commit: String,
+    /// Optional subdirectory within the repository.
+    pub subdir: Option<String>,
+}
 
 /// A single resolved dependency in the build graph.
 #[derive(Debug, Clone)]
@@ -20,6 +31,8 @@ pub struct ResolvedDep {
     pub dep_names: Vec<String>,
     /// SHA-256 hash of the dependency's source tree (`src/**/*.kt`).
     pub source_hash: String,
+    /// For git dependencies: resolved URL, commit, and optional subdir. None for path deps.
+    pub git_info: Option<GitDepInfo>,
 }
 
 /// The fully resolved dependency graph in topological order.
@@ -61,11 +74,12 @@ pub fn resolve_dependencies(
     let mut topo: Vec<PathBuf> = Vec::new();
 
     for (dep_name, dep_spec) in &manifest.dependencies {
-        let dep_path = resolve_dep_path(project_root, dep_name, dep_spec.path.as_deref())?;
+        let (dep_path, git_info) = resolve_dep_source(project_root, dep_name, dep_spec)?;
 
         dfs(
             dep_name,
             &dep_path,
+            git_info,
             root_kotlin,
             &mut visited,
             &mut color,
@@ -83,9 +97,11 @@ pub fn resolve_dependencies(
 }
 
 /// DFS traversal for topological sort with cycle detection.
+#[allow(clippy::too_many_arguments)]
 fn dfs(
     name: &str,
     canonical_path: &Path,
+    git_info: Option<GitDepInfo>,
     root_kotlin: &str,
     visited: &mut HashMap<PathBuf, ResolvedDep>,
     color: &mut HashMap<PathBuf, u8>,
@@ -144,10 +160,11 @@ fn dfs(
     // Recurse into this dep's own dependencies.
     let dep_names: Vec<String> = dep_manifest.dependencies.keys().cloned().collect();
     for (sub_name, sub_spec) in &dep_manifest.dependencies {
-        let sub_path = resolve_dep_path(canonical_path, sub_name, sub_spec.path.as_deref())?;
+        let (sub_path, sub_git_info) = resolve_dep_source(canonical_path, sub_name, sub_spec)?;
         dfs(
             sub_name,
             &sub_path,
+            sub_git_info,
             root_kotlin,
             visited,
             color,
@@ -172,6 +189,7 @@ fn dfs(
             manifest: dep_manifest,
             dep_names,
             source_hash,
+            git_info,
         },
     );
     topo.push(canonical_path.to_path_buf());
@@ -183,21 +201,63 @@ fn dfs(
 ///
 /// This allows sibling dependencies (e.g. `../my-lib`) and reasonable workspace
 /// layouts while blocking deeply nested traversals that escape the project tree.
-const MAX_PARENT_TRAVERSAL: usize = 5;
+const MAX_PARENT_TRAVERSAL: usize = 3;
 
-/// Resolve a dependency path relative to the parent project root.
-fn resolve_dep_path(
+/// Resolve a dependency source (path or git) to a project root directory.
+///
+/// Returns the project root path and optional git info for git deps.
+fn resolve_dep_source(
     parent_root: &Path,
     dep_name: &str,
-    path: Option<&str>,
-) -> Result<PathBuf, EngineError> {
-    let Some(rel_path) = path else {
-        return Err(EngineError::DependencyNotFound {
-            name: dep_name.to_owned(),
-            path: "<no path specified>".to_owned(),
-        });
-    };
+    spec: &DependencySpec,
+) -> Result<(PathBuf, Option<GitDepInfo>), EngineError> {
+    if let Some(git_url) = &spec.git {
+        // Git dependency: clone/fetch, resolve ref, checkout.
+        let git_ref = if let Some(tag) = &spec.tag {
+            crate::git::GitRef::Tag(tag.clone())
+        } else if let Some(branch) = &spec.branch {
+            crate::git::GitRef::Branch(branch.clone())
+        } else if let Some(rev) = &spec.rev {
+            crate::git::GitRef::Rev(rev.clone())
+        } else {
+            crate::git::GitRef::Head
+        };
 
+        let bare_dir = crate::git::clone_or_fetch(git_url)?;
+        let commit = crate::git::resolve_ref(&bare_dir, &git_ref)?;
+        let checkout_path = crate::git::checkout_dir(git_url, &commit);
+        crate::git::checkout(&bare_dir, &commit, &checkout_path)?;
+
+        let project_path = if let Some(subdir) = &spec.subdir {
+            checkout_path.join(subdir)
+        } else {
+            checkout_path
+        };
+
+        let info = GitDepInfo {
+            url: git_url.clone(),
+            commit,
+            subdir: spec.subdir.clone(),
+        };
+
+        Ok((project_path, Some(info)))
+    } else if let Some(rel_path) = &spec.path {
+        // Path dependency.
+        resolve_path_dep(parent_root, dep_name, rel_path)
+    } else {
+        Err(EngineError::DependencyNotFound {
+            name: dep_name.to_owned(),
+            path: "<no source specified>".to_owned(),
+        })
+    }
+}
+
+/// Resolve a path-based dependency relative to the parent project root.
+fn resolve_path_dep(
+    parent_root: &Path,
+    dep_name: &str,
+    rel_path: &str,
+) -> Result<(PathBuf, Option<GitDepInfo>), EngineError> {
     // Reject absolute paths — dependencies must be relative to the project.
     if Path::new(rel_path).is_absolute() {
         return Err(EngineError::DependencyPathEscape {
@@ -219,12 +279,13 @@ fn resolve_dep_path(
     }
 
     let resolved = parent_root.join(rel_path);
-    resolved
+    let canonical = resolved
         .canonicalize()
         .map_err(|_| EngineError::DependencyNotFound {
             name: dep_name.to_owned(),
             path: resolved.display().to_string(),
-        })
+        })?;
+    Ok((canonical, None))
 }
 
 #[cfg(test)]
@@ -535,5 +596,68 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("escapes the project tree"), "error was: {err}");
+    }
+
+    #[test]
+    fn three_parent_traversals_accepted() {
+        // 3 levels of `..` is the maximum allowed by MAX_PARENT_TRAVERSAL.
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Place the lib at the top of the temp dir.
+        let lib_dir = tmp.path().join("my-lib");
+        write_manifest(&lib_dir, "my-lib", "lib", "");
+
+        // Place root 3 directories deep: tmp/a/b/root
+        let root_dir = tmp.path().join("a").join("b").join("root");
+        write_manifest(
+            &root_dir,
+            "root",
+            "bin",
+            "my-lib = { path = \"../../../my-lib\" }\n",
+        );
+
+        let manifest = Manifest::from_path(&root_dir.join("konvoy.toml")).unwrap();
+        let graph = resolve_dependencies(&root_dir, &manifest).unwrap();
+        assert_eq!(graph.order.len(), 1);
+        assert_eq!(graph.order.first().unwrap().name, "my-lib");
+    }
+
+    #[test]
+    fn four_parent_traversals_rejected() {
+        // 4 levels of `..` exceeds MAX_PARENT_TRAVERSAL (3) and must be rejected.
+        let tmp = tempfile::tempdir().unwrap();
+        let root_dir = tmp.path().join("root");
+        write_manifest(
+            &root_dir,
+            "root",
+            "bin",
+            "bad = { path = \"../../../../somewhere/lib\" }\n",
+        );
+
+        let manifest = Manifest::from_path(&root_dir.join("konvoy.toml")).unwrap();
+        let result = resolve_dependencies(&root_dir, &manifest);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("escapes the project tree"), "error was: {err}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod proptests {
+    use std::path::Path;
+
+    use super::resolve_path_dep;
+
+    use proptest::prelude::proptest;
+
+    proptest! {
+        /// Arbitrary path strings must never cause `resolve_path_dep` to panic.
+        /// It should always return Ok or Err gracefully.
+        #[test]
+        fn resolve_dep_path_never_panics(rel_path in ".*") {
+            let parent = Path::new("/tmp/fake-project");
+            let _ = resolve_path_dep(parent, "test-dep", &rel_path);
+        }
     }
 }
