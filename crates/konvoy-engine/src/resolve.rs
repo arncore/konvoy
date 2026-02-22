@@ -172,6 +172,12 @@ fn dfs(
     Ok(())
 }
 
+/// Maximum number of `..` components allowed above the parent root.
+///
+/// This allows sibling dependencies (e.g. `../my-lib`) and reasonable workspace
+/// layouts while blocking deeply nested traversals that escape the project tree.
+const MAX_PARENT_TRAVERSAL: usize = 5;
+
 /// Resolve a dependency path relative to the parent project root.
 fn resolve_dep_path(
     parent_root: &Path,
@@ -184,6 +190,26 @@ fn resolve_dep_path(
             path: "<no path specified>".to_owned(),
         });
     };
+
+    // Reject absolute paths — dependencies must be relative to the project.
+    if Path::new(rel_path).is_absolute() {
+        return Err(EngineError::DependencyPathEscape {
+            name: dep_name.to_owned(),
+            path: rel_path.to_owned(),
+        });
+    }
+
+    // Count how many leading `..` components escape above parent_root.
+    let parent_escapes = Path::new(rel_path)
+        .components()
+        .take_while(|c| matches!(c, std::path::Component::ParentDir))
+        .count();
+    if parent_escapes > MAX_PARENT_TRAVERSAL {
+        return Err(EngineError::DependencyPathEscape {
+            name: dep_name.to_owned(),
+            path: parent_root.join(rel_path).display().to_string(),
+        });
+    }
 
     let resolved = parent_root.join(rel_path);
     resolved
@@ -391,5 +417,62 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("2.0.0"), "error was: {err}");
         assert!(err.contains("2.1.0"), "error was: {err}");
+    }
+
+    #[test]
+    fn sibling_dependency_allowed() {
+        // ../sibling-lib is a common pattern and must work
+        let tmp = tempfile::tempdir().unwrap();
+        let lib_dir = tmp.path().join("sibling-lib");
+        write_manifest(&lib_dir, "sibling-lib", "lib", "");
+
+        let root_dir = tmp.path().join("root");
+        write_manifest(
+            &root_dir,
+            "root",
+            "bin",
+            "sibling-lib = { path = \"../sibling-lib\" }\n",
+        );
+
+        let manifest = Manifest::from_path(&root_dir.join("konvoy.toml")).unwrap();
+        let graph = resolve_dependencies(&root_dir, &manifest).unwrap();
+        assert_eq!(graph.order.len(), 1);
+        assert_eq!(graph.order.first().unwrap().name, "sibling-lib");
+    }
+
+    #[test]
+    fn deep_traversal_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_dir = tmp.path().join("root");
+        write_manifest(
+            &root_dir,
+            "root",
+            "bin",
+            "evil = { path = \"../../../../../../../../../../etc/passwd\" }\n",
+        );
+
+        let manifest = Manifest::from_path(&root_dir.join("konvoy.toml")).unwrap();
+        let result = resolve_dependencies(&root_dir, &manifest);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("escapes the project tree"), "error was: {err}");
+    }
+
+    #[test]
+    fn absolute_path_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_dir = tmp.path().join("root");
+        write_manifest(
+            &root_dir,
+            "root",
+            "bin",
+            "evil = { path = \"/etc/something\" }\n",
+        );
+
+        let manifest = Manifest::from_path(&root_dir.join("konvoy.toml")).unwrap();
+        let result = resolve_dependencies(&root_dir, &manifest);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("escapes the project tree"), "error was: {err}");
     }
 }

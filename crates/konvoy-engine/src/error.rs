@@ -65,4 +65,8 @@ pub enum EngineError {
         dep_version: String,
         root_version: String,
     },
+
+    /// A dependency path escapes the project tree.
+    #[error("dependency `{name}` path escapes the project tree — resolved to {path}; use a relative path within the workspace")]
+    DependencyPathEscape { name: String, path: String },
 }
