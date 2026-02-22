@@ -45,17 +45,7 @@ pub fn resolve_konanc(version: &str) -> Result<ResolvedKonanc, KonancError> {
     let (konanc_tarball_sha256, jre_tarball_sha256) = if !installed {
         eprintln!("    Installing Kotlin/Native {version}...");
         let result = toolchain::install(version)?;
-        let konanc_sha = if result.konanc_tarball_sha256.is_empty() {
-            None
-        } else {
-            Some(result.konanc_tarball_sha256)
-        };
-        let jre_sha = if result.jre_tarball_sha256.is_empty() {
-            None
-        } else {
-            Some(result.jre_tarball_sha256)
-        };
-        (konanc_sha, jre_sha)
+        (result.konanc_tarball_sha256, result.jre_tarball_sha256)
     } else {
         (None, None)
     };

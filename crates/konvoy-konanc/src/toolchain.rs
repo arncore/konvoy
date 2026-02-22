@@ -14,12 +14,14 @@ use crate::error::KonancError;
 pub struct InstallResult {
     /// Absolute path to the `konanc` binary.
     pub konanc_path: PathBuf,
-    /// SHA-256 hex digest of the downloaded Kotlin/Native tarball.
-    pub konanc_tarball_sha256: String,
+    /// SHA-256 hex digest of the downloaded Kotlin/Native tarball, or `None` if
+    /// the toolchain was already installed (no download occurred).
+    pub konanc_tarball_sha256: Option<String>,
     /// Absolute path to the bundled JRE's JAVA_HOME directory.
     pub jre_home: PathBuf,
-    /// SHA-256 hex digest of the downloaded JRE tarball.
-    pub jre_tarball_sha256: String,
+    /// SHA-256 hex digest of the downloaded JRE tarball, or `None` if the JRE
+    /// was already installed (no download occurred).
+    pub jre_tarball_sha256: Option<String>,
 }
 
 /// Return the root directory for managed toolchains: `~/.konvoy/toolchains/`.
@@ -155,9 +157,9 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
             let jre_home = jre_home_path(version)?;
             return Ok(InstallResult {
                 konanc_path,
-                konanc_tarball_sha256: String::new(),
+                konanc_tarball_sha256: None,
                 jre_home,
-                jre_tarball_sha256: String::new(),
+                jre_tarball_sha256: None,
             });
         }
         // konanc installed but JRE missing — fall through to install JRE only.
@@ -165,7 +167,7 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
 
     // --- Install konanc if needed ---
     let konanc_sha256 = if konanc_already_installed {
-        String::new()
+        None
     } else {
         let url = download_url(version)?;
         let toolchains_root = toolchains_dir()?;
@@ -245,7 +247,7 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
             })?;
         }
 
-        sha256
+        Some(sha256)
     };
 
     // --- Install JRE if needed ---
@@ -261,14 +263,15 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
 
 /// Download and install the bundled JRE for a toolchain version.
 ///
-/// Returns `(jre_home, tarball_sha256)`. Skips download if already installed.
-fn install_jre(version: &str) -> Result<(PathBuf, String), KonancError> {
+/// Returns `(jre_home, tarball_sha256)`. The SHA-256 is `None` if the JRE was
+/// already installed and no download occurred.
+fn install_jre(version: &str) -> Result<(PathBuf, Option<String>), KonancError> {
     let jre_root = jre_dir(version)?;
 
     // Already installed — return existing path.
     if jre_root.exists() {
         let home = jre_home_path(version)?;
-        return Ok((home, String::new()));
+        return Ok((home, None));
     }
 
     let url = jre_download_url()?;
@@ -338,7 +341,7 @@ fn install_jre(version: &str) -> Result<(PathBuf, String), KonancError> {
         })?;
     }
 
-    Ok((home, sha256))
+    Ok((home, Some(sha256)))
 }
 
 /// Find the extracted JRE root directory inside the jre/ directory.
