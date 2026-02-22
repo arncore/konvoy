@@ -118,8 +118,10 @@ test_init_creates_project() {
     konvoy init --name hello >/dev/null 2>&1
     assert_file_exists hello/konvoy.toml
     assert_file_exists hello/src/main.kt
+    assert_file_exists hello/.gitignore
     assert_file_contains hello/konvoy.toml "hello"
     assert_file_contains hello/src/main.kt "fun main()"
+    assert_file_contains hello/.gitignore ".konvoy/"
 }
 
 test_init_manifest_is_valid() {
@@ -207,6 +209,37 @@ test_clean_no_konvoy_dir_ok() {
 }
 
 # ---------------------------------------------------------------------------
+# Tests: git worktree cache sharing
+# ---------------------------------------------------------------------------
+
+test_worktree_cache_shared() {
+    # Set up a git repo with a konvoy project.
+    konvoy init --name wt-proj >/dev/null 2>&1
+    cd wt-proj
+    git init -q
+    git config user.email "test@test.com"
+    git config user.name "Test"
+    git add -A
+    git commit -q -m "initial"
+
+    # Build in the main worktree (populates cache).
+    local out1
+    out1=$(konvoy build 2>&1)
+    assert_contains "$out1" "Compiling"
+
+    # Create a worktree on a new branch.
+    git worktree add -q ../wt-branch -b wt-branch
+
+    # Build in the worktree — should be a cache hit.
+    local out2
+    out2=$(cd ../wt-branch && konvoy build 2>&1)
+    assert_contains "$out2" "Fresh"
+
+    # Clean up worktree.
+    git worktree remove -f ../wt-branch
+}
+
+# ---------------------------------------------------------------------------
 # Tests: error cases
 # ---------------------------------------------------------------------------
 
@@ -264,6 +297,9 @@ run_test test_doctor_all_ok
 run_test test_build_lifecycle
 run_test test_build_release
 run_test test_clean_no_konvoy_dir_ok
+
+# worktree
+run_test test_worktree_cache_shared
 
 # error cases
 run_test test_build_outside_project_fails
