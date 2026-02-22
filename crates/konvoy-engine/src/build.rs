@@ -594,8 +594,7 @@ mod tests {
     #[test]
     fn lockfile_toml_content_includes_tarball_hashes() {
         let without_hashes = Lockfile::with_toolchain("2.1.0");
-        let with_hashes =
-            Lockfile::with_managed_toolchain("2.1.0", Some("abc123"), Some("def456"));
+        let with_hashes = Lockfile::with_managed_toolchain("2.1.0", Some("abc123"), Some("def456"));
 
         let content_without = lockfile_toml_content(&without_hashes);
         let content_with = lockfile_toml_content(&with_hashes);
@@ -858,7 +857,7 @@ mod tests {
         let lockfile_content = lockfile_toml_content(&effective_lockfile);
         let cache_inputs = CacheInputs {
             manifest_content,
-            lockfile_content,
+            lockfile_content: lockfile_content.clone(),
             konanc_version: konanc.version.clone(),
             konanc_fingerprint: konanc.fingerprint.clone(),
             target: target.to_string(),
