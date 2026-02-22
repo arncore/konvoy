@@ -176,12 +176,15 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
             source,
         })?;
 
+        // Use randomized temp names to avoid collisions between concurrent installs.
+        let suffix = temp_suffix();
+
         // Download to a temp file, computing SHA-256 as we go.
-        let tmp_tarball = toolchains_root.join(format!(".tmp-{version}.tar.gz"));
+        let tmp_tarball = toolchains_root.join(format!(".tmp-{version}-{suffix}.tar.gz"));
         let sha256 = download_with_progress(&url, &tmp_tarball, "Kotlin/Native", version)?;
 
         // Extract to a temp directory, then rename atomically.
-        let tmp_extract = toolchains_root.join(format!(".tmp-{version}-extract"));
+        let tmp_extract = toolchains_root.join(format!(".tmp-{version}-{suffix}-extract"));
         if tmp_extract.exists() {
             std::fs::remove_dir_all(&tmp_extract).map_err(|source| KonancError::Io {
                 path: tmp_extract.display().to_string(),
@@ -197,16 +200,23 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
         // The tarball extracts to a subdirectory like `kotlin-native-prebuilt-linux-x86_64-2.1.0/`.
         let extracted_root = find_extracted_root(&tmp_extract, version)?;
 
-        // Rename extracted dir to the final version dir.
-        if dest.exists() {
-            // Race condition: another process installed while we were downloading.
-            let _ = std::fs::remove_dir_all(&tmp_extract);
-        } else {
-            std::fs::rename(&extracted_root, &dest).map_err(|source| KonancError::Io {
-                path: dest.display().to_string(),
-                source,
-            })?;
-            let _ = std::fs::remove_dir_all(&tmp_extract);
+        // Atomically move into place. If another process raced us, rename
+        // will fail and we verify the existing installation instead.
+        match std::fs::rename(&extracted_root, &dest) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir_all(&tmp_extract);
+            }
+            Err(_) if dest.exists() => {
+                // Another process installed while we were downloading.
+                let _ = std::fs::remove_dir_all(&tmp_extract);
+            }
+            Err(source) => {
+                let _ = std::fs::remove_dir_all(&tmp_extract);
+                return Err(KonancError::Io {
+                    path: dest.display().to_string(),
+                    source,
+                });
+            }
         }
 
         // Verify the installation.
@@ -264,12 +274,15 @@ fn install_jre(version: &str) -> Result<(PathBuf, String), KonancError> {
     let url = jre_download_url()?;
     let toolchains_root = toolchains_dir()?;
 
+    // Use randomized temp names to avoid collisions between concurrent installs.
+    let suffix = temp_suffix();
+
     // Download JRE tarball.
-    let tmp_tarball = toolchains_root.join(format!(".tmp-{version}-jre.tar.gz"));
+    let tmp_tarball = toolchains_root.join(format!(".tmp-{version}-jre-{suffix}.tar.gz"));
     let sha256 = download_with_progress(&url, &tmp_tarball, "JRE", version)?;
 
     // Extract to temp directory.
-    let tmp_extract = toolchains_root.join(format!(".tmp-{version}-jre-extract"));
+    let tmp_extract = toolchains_root.join(format!(".tmp-{version}-jre-{suffix}-extract"));
     if tmp_extract.exists() {
         std::fs::remove_dir_all(&tmp_extract).map_err(|source| KonancError::Io {
             path: tmp_extract.display().to_string(),
@@ -282,15 +295,21 @@ fn install_jre(version: &str) -> Result<(PathBuf, String), KonancError> {
     // Clean up tarball.
     let _ = std::fs::remove_file(&tmp_tarball);
 
-    // Move extracted content to the final jre/ directory.
-    if jre_root.exists() {
-        // Race condition: another process installed while we were downloading.
-        let _ = std::fs::remove_dir_all(&tmp_extract);
-    } else {
-        std::fs::rename(&tmp_extract, &jre_root).map_err(|source| KonancError::Io {
-            path: jre_root.display().to_string(),
-            source,
-        })?;
+    // Atomically move into place. If another process raced us, rename
+    // will fail and we verify the existing installation instead.
+    match std::fs::rename(&tmp_extract, &jre_root) {
+        Ok(()) => {}
+        Err(_) if jre_root.exists() => {
+            // Another process installed while we were downloading.
+            let _ = std::fs::remove_dir_all(&tmp_extract);
+        }
+        Err(source) => {
+            let _ = std::fs::remove_dir_all(&tmp_extract);
+            return Err(KonancError::Io {
+                path: jre_root.display().to_string(),
+                source,
+            });
+        }
     }
 
     // Verify java binary exists.
@@ -606,6 +625,30 @@ fn find_extracted_root(extract_dir: &Path, version: &str) -> Result<PathBuf, Kon
     })
 }
 
+/// Generate a unique suffix for temp file/directory names.
+///
+/// Combines the process ID with a random component to prevent collisions
+/// between concurrent installs (even from the same PID via fork).
+fn temp_suffix() -> String {
+    let pid = std::process::id();
+    let random: u32 = rand_u32();
+    format!("{pid}-{random:08x}")
+}
+
+/// Simple random u32 using system time as a seed source.
+/// Not cryptographically secure, but sufficient for temp name uniqueness.
+fn rand_u32() -> u32 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    std::time::SystemTime::now().hash(&mut hasher);
+    std::thread::current().id().hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    #[allow(clippy::cast_possible_truncation)]
+    let result = hasher.finish() as u32;
+    result
+}
+
 /// Get the user's home directory.
 fn home_dir() -> Result<PathBuf, KonancError> {
     std::env::var("HOME")
@@ -836,6 +879,16 @@ mod tests {
     }
 
     #[test]
+    fn temp_suffix_contains_pid() {
+        let suffix = temp_suffix();
+        let pid = std::process::id().to_string();
+        assert!(
+            suffix.starts_with(&pid),
+            "suffix {suffix} should start with PID {pid}"
+        );
+    }
+
+    #[test]
     fn extract_tarball_rejects_dotdot_in_middle() {
         let tarball = create_test_tarball(&[("foo/../../../escape.txt", b"pwned")]);
         let dest = tempfile::tempdir().unwrap();
@@ -849,5 +902,15 @@ mod tests {
             msg.contains("path traversal"),
             "expected path traversal error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn temp_suffix_has_random_component() {
+        // Two calls should produce different suffixes (random component differs).
+        let a = temp_suffix();
+        // Small sleep to ensure different time hash.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let b = temp_suffix();
+        assert_ne!(a, b, "consecutive temp suffixes should differ");
     }
 }
