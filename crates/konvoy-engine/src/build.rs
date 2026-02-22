@@ -93,7 +93,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     let mut library_paths: Vec<PathBuf> = Vec::new();
 
     for dep in &dep_graph.order {
-        let dep_output = build_single(
+        let (dep_output, _) = build_single(
             &dep.project_root,
             &dep.manifest,
             &konanc,
@@ -107,7 +107,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     }
 
     // 6. Build the root project.
-    let result = build_single(
+    let (output_path, outcome) = build_single(
         project_root,
         &manifest,
         &konanc,
@@ -132,15 +132,15 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     )?;
 
     Ok(BuildResult {
-        outcome: BuildOutcome::Fresh,
-        output_path: result,
+        outcome,
+        output_path,
         duration: start.elapsed(),
     })
 }
 
 /// Build a single project (either root or a dependency).
 ///
-/// Returns the path to the output artifact.
+/// Returns the path to the output artifact and whether the build was cached.
 #[allow(clippy::too_many_arguments)]
 fn build_single(
     project_root: &Path,
@@ -151,7 +151,7 @@ fn build_single(
     profile: &str,
     options: &BuildOptions,
     library_paths: &[PathBuf],
-) -> Result<PathBuf, EngineError> {
+) -> Result<(PathBuf, BuildOutcome), EngineError> {
     // Collect source files.
     let src_dir = project_root.join("src");
     let sources = konvoy_util::fs::collect_files(&src_dir, "kt")?;
@@ -204,7 +204,7 @@ fn build_single(
     if store.has(&cache_key) {
         eprintln!("    Fresh {} (cached)", manifest.package.name);
         store.materialize(&cache_key, &output_name, &output_path)?;
-        return Ok(output_path);
+        return Ok((output_path, BuildOutcome::Cached));
     }
 
     // Compile.
@@ -243,7 +243,7 @@ fn build_single(
         store.materialize(&cache_key, &output_name, &output_path)?;
     }
 
-    Ok(output_path)
+    Ok((output_path, BuildOutcome::Fresh))
 }
 
 /// Resolve the target: use the explicit `--target` value or detect the host.
