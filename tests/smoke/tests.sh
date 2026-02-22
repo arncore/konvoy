@@ -151,27 +151,46 @@ test_doctor_all_ok() {
 }
 
 # ---------------------------------------------------------------------------
-# Tests: konvoy build (full pipeline)
+# Tests: build lifecycle (combined to minimize konanc invocations)
 # ---------------------------------------------------------------------------
 
-test_build_produces_binary() {
-    konvoy init --name smoke-build >/dev/null 2>&1
-    cd smoke-build
-    konvoy build 2>&1
-    assert_file_exists .konvoy/build/linux_x64/debug/smoke-build
-}
+# Single project exercises: build → cache hit → run → lockfile → clean → rebuild
+test_build_lifecycle() {
+    konvoy init --name lifecycle >/dev/null 2>&1
+    cd lifecycle
 
-test_build_cache_hit() {
-    konvoy init --name cache-hit >/dev/null 2>&1
-    cd cache-hit
+    # No lockfile before first build.
+    [ ! -f konvoy.lock ] || { echo "    lockfile should not exist before build" >&2; return 1; }
 
+    # First build compiles.
     local out1
     out1=$(konvoy build 2>&1)
     assert_contains "$out1" "Compiling"
+    assert_file_exists .konvoy/build/linux_x64/debug/lifecycle
 
+    # Second build is a cache hit.
     local out2
     out2=$(konvoy build 2>&1)
     assert_contains "$out2" "Fresh"
+
+    # Lockfile created after build.
+    assert_file_exists konvoy.lock
+    assert_file_contains konvoy.lock "konanc_version"
+
+    # Run produces expected output.
+    local run_output
+    run_output=$(konvoy run 2>/dev/null)
+    assert_contains "$run_output" "Hello, lifecycle!"
+
+    # Clean removes artifacts.
+    assert_dir_exists .konvoy
+    konvoy clean >/dev/null 2>&1
+    assert_dir_not_exists .konvoy
+
+    # Rebuild after clean recompiles.
+    local out3
+    out3=$(konvoy build 2>&1)
+    assert_contains "$out3" "Compiling"
 }
 
 test_build_release() {
@@ -181,59 +200,10 @@ test_build_release() {
     assert_file_exists .konvoy/build/linux_x64/release/rel
 }
 
-# ---------------------------------------------------------------------------
-# Tests: konvoy run
-# ---------------------------------------------------------------------------
-
-test_run_executes() {
-    konvoy init --name runner >/dev/null 2>&1
-    cd runner
-    local output
-    output=$(konvoy run 2>/dev/null)
-    assert_contains "$output" "Hello, runner!"
-}
-
-# ---------------------------------------------------------------------------
-# Tests: konvoy clean
-# ---------------------------------------------------------------------------
-
-test_clean_removes_artifacts() {
-    konvoy init --name cleaner >/dev/null 2>&1
-    cd cleaner
-    konvoy build >/dev/null 2>&1
-    assert_dir_exists .konvoy
-    konvoy clean >/dev/null 2>&1
-    assert_dir_not_exists .konvoy
-}
-
-test_clean_then_rebuild() {
-    konvoy init --name rebuild >/dev/null 2>&1
-    cd rebuild
-    konvoy build >/dev/null 2>&1
-    konvoy clean >/dev/null 2>&1
-
-    local output
-    output=$(konvoy build 2>&1)
-    assert_contains "$output" "Compiling"
-}
-
 test_clean_no_konvoy_dir_ok() {
     mkdir -p src
     printf '[package]\nname = "noop"\n' > konvoy.toml
     konvoy clean >/dev/null 2>&1
-}
-
-# ---------------------------------------------------------------------------
-# Tests: lockfile
-# ---------------------------------------------------------------------------
-
-test_lockfile_created_after_build() {
-    konvoy init --name locker >/dev/null 2>&1
-    cd locker
-    [ ! -f konvoy.lock ] || { echo "    lockfile should not exist before build" >&2; return 1; }
-    konvoy build >/dev/null 2>&1
-    assert_file_exists konvoy.lock
-    assert_file_contains konvoy.lock "konanc_version"
 }
 
 # ---------------------------------------------------------------------------
@@ -290,21 +260,10 @@ run_test test_init_double_fails
 # doctor
 run_test test_doctor_all_ok
 
-# build pipeline
-run_test test_build_produces_binary
-run_test test_build_cache_hit
+# build lifecycle (build, cache, run, lockfile, clean, rebuild)
+run_test test_build_lifecycle
 run_test test_build_release
-
-# run
-run_test test_run_executes
-
-# clean
-run_test test_clean_removes_artifacts
-run_test test_clean_then_rebuild
 run_test test_clean_no_konvoy_dir_ok
-
-# lockfile
-run_test test_lockfile_created_after_build
 
 # error cases
 run_test test_build_outside_project_fails
