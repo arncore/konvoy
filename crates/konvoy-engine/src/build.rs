@@ -93,7 +93,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     let mut library_paths: Vec<PathBuf> = Vec::new();
 
     for dep in &dep_graph.order {
-        let dep_output = build_single(
+        let (dep_output, _) = build_single(
             &dep.project_root,
             &dep.manifest,
             &konanc,
@@ -107,7 +107,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     }
 
     // 6. Build the root project.
-    let result = build_single(
+    let (output_path, outcome) = build_single(
         project_root,
         &manifest,
         &konanc,
@@ -132,15 +132,15 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     )?;
 
     Ok(BuildResult {
-        outcome: BuildOutcome::Fresh,
-        output_path: result,
+        outcome,
+        output_path,
         duration: start.elapsed(),
     })
 }
 
 /// Build a single project (either root or a dependency).
 ///
-/// Returns the path to the output artifact.
+/// Returns the path to the output artifact and whether the build was cached.
 #[allow(clippy::too_many_arguments)]
 fn build_single(
     project_root: &Path,
@@ -151,7 +151,7 @@ fn build_single(
     profile: &str,
     options: &BuildOptions,
     library_paths: &[PathBuf],
-) -> Result<PathBuf, EngineError> {
+) -> Result<(PathBuf, BuildOutcome), EngineError> {
     // Collect source files.
     let src_dir = project_root.join("src");
     let sources = konvoy_util::fs::collect_files(&src_dir, "kt")?;
@@ -204,7 +204,7 @@ fn build_single(
     if store.has(&cache_key) {
         eprintln!("    Fresh {} (cached)", manifest.package.name);
         store.materialize(&cache_key, &output_name, &output_path)?;
-        return Ok(output_path);
+        return Ok((output_path, BuildOutcome::Cached));
     }
 
     // Compile.
@@ -243,7 +243,7 @@ fn build_single(
         store.materialize(&cache_key, &output_name, &output_path)?;
     }
 
-    Ok(output_path)
+    Ok((output_path, BuildOutcome::Fresh))
 }
 
 /// Resolve the target: use the explicit `--target` value or detect the host.
@@ -780,6 +780,86 @@ mod tests {
         assert_eq!(BuildOutcome::Cached, BuildOutcome::Cached);
         assert_eq!(BuildOutcome::Fresh, BuildOutcome::Fresh);
         assert_ne!(BuildOutcome::Cached, BuildOutcome::Fresh);
+    }
+
+    #[test]
+    fn build_single_returns_cached_on_cache_hit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("myapp");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("src").join("main.kt"), "fun main() {}").unwrap();
+        fs::write(
+            project.join("konvoy.toml"),
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+        )
+        .unwrap();
+
+        let manifest =
+            konvoy_config::manifest::Manifest::from_path(&project.join("konvoy.toml")).unwrap();
+        let konanc = KonancInfo {
+            path: PathBuf::from("/fake/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc123".to_owned(),
+        };
+        let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
+        let profile = "debug";
+        let options = BuildOptions {
+            target: None,
+            release: false,
+            verbose: false,
+            force: false,
+            locked: false,
+        };
+
+        // Compute the cache key that build_single would compute.
+        let manifest_content = manifest.to_toml().unwrap();
+        let effective_lockfile = Lockfile::with_toolchain(&konanc.version);
+        let lockfile_content = lockfile_toml_content(&effective_lockfile);
+        let cache_inputs = CacheInputs {
+            manifest_content,
+            lockfile_content,
+            konanc_version: konanc.version.clone(),
+            konanc_fingerprint: konanc.fingerprint.clone(),
+            target: target.to_string(),
+            profile: profile.to_owned(),
+            source_dir: project.clone(),
+            source_glob: "**/*.kt".to_owned(),
+            os: std::env::consts::OS.to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+            dependency_hashes: Vec::new(),
+        };
+        let cache_key = CacheKey::compute(&cache_inputs).unwrap();
+
+        // Pre-populate the artifact store with a fake artifact.
+        let store = ArtifactStore::new(&project);
+        let staging = tmp.path().join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let fake_artifact = staging.join("myapp");
+        fs::write(&fake_artifact, "fake-binary-content").unwrap();
+        let metadata = BuildMetadata {
+            target: target.to_string(),
+            profile: profile.to_owned(),
+            konanc_version: konanc.version.clone(),
+            built_at: now_iso8601(),
+        };
+        store.store(&cache_key, &fake_artifact, &metadata).unwrap();
+        assert!(store.has(&cache_key));
+
+        // Call build_single — it should hit cache and return Cached.
+        let (output_path, outcome) = build_single(
+            &project,
+            &manifest,
+            &konanc,
+            None,
+            &target,
+            profile,
+            &options,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(outcome, BuildOutcome::Cached);
+        assert!(output_path.exists());
     }
 
     #[test]
