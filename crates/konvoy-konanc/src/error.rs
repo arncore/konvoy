@@ -46,4 +46,35 @@ pub enum KonancError {
         message: String,
         fix_command: String,
     },
+
+    /// Could not determine user home directory.
+    #[error("cannot determine home directory — set the HOME environment variable")]
+    NoHomeDir,
+
+    /// The host platform is not supported for managed toolchain downloads.
+    #[error("unsupported platform {os}/{arch} — Kotlin/Native prebuilt binaries are not available for this platform")]
+    UnsupportedPlatform { os: String, arch: String },
+
+    /// Failed to download a toolchain tarball.
+    #[error("cannot download Kotlin/Native {version}: {message}")]
+    Download { version: String, message: String },
+
+    /// Failed to extract a toolchain tarball.
+    #[error("cannot extract Kotlin/Native {version}: {message}")]
+    Extract { version: String, message: String },
+
+    /// The installed toolchain version does not match the expected version.
+    #[error("expected Kotlin/Native {expected} but found {actual}")]
+    VersionMismatch { expected: String, actual: String },
+
+    /// The managed toolchain installation is corrupt or incomplete.
+    #[error("corrupt toolchain at {path} — run `konvoy toolchain install {version}` to reinstall")]
+    CorruptToolchain { path: PathBuf, version: String },
+
+    /// A filesystem operation failed during toolchain management.
+    #[error("cannot access {path}: {source}")]
+    Io {
+        path: String,
+        source: std::io::Error,
+    },
 }

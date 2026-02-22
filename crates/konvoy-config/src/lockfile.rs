@@ -11,6 +11,8 @@ pub struct Lockfile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolchainLock {
     pub konanc_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tarball_sha256: Option<String>,
 }
 
 impl Lockfile {
@@ -39,6 +41,17 @@ impl Lockfile {
         Self {
             toolchain: Some(ToolchainLock {
                 konanc_version: version.to_owned(),
+                tarball_sha256: None,
+            }),
+        }
+    }
+
+    /// Create a lockfile with a pinned toolchain version and tarball SHA-256.
+    pub fn with_managed_toolchain(version: &str, sha256: &str) -> Self {
+        Self {
+            toolchain: Some(ToolchainLock {
+                konanc_version: version.to_owned(),
+                tarball_sha256: Some(sha256.to_owned()),
             }),
         }
     }
@@ -143,6 +156,49 @@ konanc_version = "1.9.22"
             .as_ref()
             .unwrap_or_else(|| panic!("missing toolchain"));
         assert_eq!(toolchain.konanc_version, "1.9.22");
+        assert!(toolchain.tarball_sha256.is_none());
+    }
+
+    #[test]
+    fn with_managed_toolchain_includes_sha256() {
+        let lockfile = Lockfile::with_managed_toolchain("2.1.0", "abc123");
+        let toolchain = lockfile
+            .toolchain
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing toolchain"));
+        assert_eq!(toolchain.konanc_version, "2.1.0");
+        assert_eq!(toolchain.tarball_sha256.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn sha256_round_trip() {
+        let dir = tempdir();
+        let path = dir.join("konvoy.lock");
+        let original = Lockfile::with_managed_toolchain("2.1.0", "deadbeef");
+        original.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
+        let reparsed = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(original, reparsed);
+    }
+
+    #[test]
+    fn sha256_skipped_when_absent() {
+        let dir = tempdir();
+        let path = dir.join("konvoy.lock");
+        fs::write(
+            &path,
+            r#"
+[toolchain]
+konanc_version = "2.1.0"
+"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        let lockfile = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        let toolchain = lockfile
+            .toolchain
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing toolchain"));
+        assert!(toolchain.tarball_sha256.is_none());
     }
 
     /// Create a unique temporary directory for each test invocation.

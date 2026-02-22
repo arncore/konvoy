@@ -59,6 +59,22 @@ enum Command {
     Clean,
     /// Check environment and toolchain setup
     Doctor,
+    /// Manage Kotlin/Native toolchains
+    Toolchain {
+        #[command(subcommand)]
+        action: ToolchainAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ToolchainAction {
+    /// Install a Kotlin/Native version
+    Install {
+        /// Kotlin/Native version (e.g. "2.1.0"). If omitted, reads from konvoy.toml.
+        version: Option<String>,
+    },
+    /// List installed Kotlin/Native versions
+    List,
 }
 
 fn main() {
@@ -83,6 +99,7 @@ fn main() {
         } => cmd_test(target, release, verbose),
         Command::Clean => cmd_clean(),
         Command::Doctor => cmd_doctor(),
+        Command::Toolchain { action } => cmd_toolchain(action),
     };
 
     if let Err(msg) = result {
@@ -252,23 +269,32 @@ fn cmd_doctor() -> Result<(), String> {
         }
     }
 
-    // Check konanc.
-    match konvoy_konanc::detect_konanc() {
-        Ok(info) => {
-            eprintln!("  [ok] konanc: {} ({})", info.version, info.path.display());
-        }
-        Err(e) => {
-            eprintln!("  [!!] konanc: {e}");
-            issues = issues.saturating_add(1);
-        }
-    }
-
-    // Check for konvoy.toml in current directory.
+    // Check for konvoy.toml in current directory and report managed toolchain status.
     let cwd =
         std::env::current_dir().map_err(|e| format!("cannot determine working directory: {e}"))?;
     if cwd.join("konvoy.toml").exists() {
         match konvoy_config::Manifest::from_path(&cwd.join("konvoy.toml")) {
-            Ok(manifest) => eprintln!("  [ok] Project: {}", manifest.package.name),
+            Ok(manifest) => {
+                eprintln!("  [ok] Project: {}", manifest.package.name);
+                let version = &manifest.toolchain.kotlin;
+                match konvoy_konanc::toolchain::is_installed(version) {
+                    Ok(true) => match konvoy_konanc::toolchain::managed_konanc_path(version) {
+                        Ok(path) => eprintln!("  [ok] konanc: {version} ({})", path.display()),
+                        Err(e) => {
+                            eprintln!("  [!!] konanc: {e}");
+                            issues = issues.saturating_add(1);
+                        }
+                    },
+                    Ok(false) => {
+                        eprintln!("  [!!] konanc: Kotlin/Native {version} not installed — run `konvoy toolchain install` or `konvoy build`");
+                        issues = issues.saturating_add(1);
+                    }
+                    Err(e) => {
+                        eprintln!("  [!!] konanc: {e}");
+                        issues = issues.saturating_add(1);
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("  [!!] konvoy.toml: {e}");
                 issues = issues.saturating_add(1);
@@ -276,6 +302,19 @@ fn cmd_doctor() -> Result<(), String> {
         }
     } else {
         eprintln!("  [--] No konvoy.toml in current directory");
+        // Check if any managed toolchains are installed.
+        match konvoy_konanc::toolchain::list_installed() {
+            Ok(versions) if versions.is_empty() => {
+                eprintln!("  [--] No managed toolchains installed");
+            }
+            Ok(versions) => {
+                eprintln!("  [ok] Managed toolchains: {}", versions.join(", "));
+            }
+            Err(e) => {
+                eprintln!("  [!!] Managed toolchains: {e}");
+                issues = issues.saturating_add(1);
+            }
+        }
     }
 
     eprintln!();
@@ -285,5 +324,54 @@ fn cmd_doctor() -> Result<(), String> {
     } else {
         eprintln!("All checks passed");
         Ok(())
+    }
+}
+
+fn cmd_toolchain(action: ToolchainAction) -> Result<(), String> {
+    match action {
+        ToolchainAction::Install { version } => {
+            let version = if let Some(v) = version {
+                v
+            } else {
+                // Read version from konvoy.toml in current directory.
+                let cwd = std::env::current_dir()
+                    .map_err(|e| format!("cannot determine working directory: {e}"))?;
+                let manifest_path = cwd.join("konvoy.toml");
+                let manifest = konvoy_config::Manifest::from_path(&manifest_path)
+                    .map_err(|e| e.to_string())?;
+                manifest.toolchain.kotlin
+            };
+
+            match konvoy_konanc::toolchain::is_installed(&version) {
+                Ok(true) => {
+                    eprintln!("    Kotlin/Native {version} is already installed");
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+
+            eprintln!("    Installing Kotlin/Native {version}...");
+            let result = konvoy_konanc::toolchain::install(&version).map_err(|e| e.to_string())?;
+            eprintln!(
+                "    Installed Kotlin/Native {version} at {}",
+                result.konanc_path.display()
+            );
+            Ok(())
+        }
+        ToolchainAction::List => {
+            let versions = konvoy_konanc::toolchain::list_installed().map_err(|e| e.to_string())?;
+            if versions.is_empty() {
+                eprintln!("No toolchains installed");
+                eprintln!();
+                eprintln!("  Install one with: konvoy toolchain install <version>");
+            } else {
+                eprintln!("Installed toolchains:");
+                for v in &versions {
+                    eprintln!("  {v}");
+                }
+            }
+            Ok(())
+        }
     }
 }

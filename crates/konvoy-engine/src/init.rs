@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use konvoy_config::manifest::{Manifest, Package};
+use konvoy_config::manifest::{Manifest, Package, Toolchain};
 
 use crate::error::EngineError;
 
@@ -34,6 +34,9 @@ pub fn init_project(name: &str, dir: &Path) -> Result<(), EngineError> {
         package: Package {
             name: name.to_owned(),
             entrypoint: "src/main.kt".to_owned(),
+        },
+        toolchain: Toolchain {
+            kotlin: "2.1.0".to_owned(),
         },
     };
     let toml_content = manifest.to_toml()?;
@@ -91,6 +94,7 @@ mod tests {
         let manifest = Manifest::from_path(&project_dir.join("konvoy.toml")).unwrap();
         assert_eq!(manifest.package.name, "test-proj");
         assert_eq!(manifest.package.entrypoint, "src/main.kt");
+        assert_eq!(manifest.toolchain.kotlin, "2.1.0");
     }
 
     #[test]

@@ -145,6 +145,12 @@ test_init_double_fails() {
 # ---------------------------------------------------------------------------
 
 test_doctor_all_ok() {
+    # Run doctor inside a konvoy project so it can check the managed toolchain.
+    konvoy init --name doctor-proj >/dev/null 2>&1
+    cd doctor-proj
+    # Pre-install toolchain so doctor can find it.
+    konvoy build >/dev/null 2>&1
+
     local output
     output=$(konvoy doctor 2>&1)
     assert_contains "$output" "[ok] Host target:"
@@ -204,7 +210,7 @@ test_build_release() {
 
 test_clean_no_konvoy_dir_ok() {
     mkdir -p src
-    printf '[package]\nname = "noop"\n' > konvoy.toml
+    printf '[package]\nname = "noop"\n\n[toolchain]\nkotlin = "2.1.0"\n' > konvoy.toml
     konvoy clean >/dev/null 2>&1
 }
 
@@ -263,13 +269,45 @@ test_run_outside_project_fails() {
 
 test_build_no_sources_fails() {
     mkdir -p src
-    printf '[package]\nname = "empty"\n' > konvoy.toml
+    printf '[package]\nname = "empty"\n\n[toolchain]\nkotlin = "2.1.0"\n' > konvoy.toml
     local output
     if output=$(konvoy build 2>&1); then
         echo "    expected build to fail with no sources" >&2
         return 1
     fi
     assert_contains "$output" "source"
+}
+
+# ---------------------------------------------------------------------------
+# Tests: toolchain management
+# ---------------------------------------------------------------------------
+
+test_toolchain_list_empty() {
+    local output
+    output=$(konvoy toolchain list 2>&1)
+    # Should not error, may show "No toolchains" or list existing ones.
+    # Since the build lifecycle test may have installed one, just check it runs.
+    [ $? -eq 0 ] || return 1
+}
+
+test_toolchain_install_from_manifest() {
+    konvoy init --name tc-proj >/dev/null 2>&1
+    cd tc-proj
+    konvoy toolchain install 2>&1
+    # Verify konanc is available via doctor.
+    local output
+    output=$(konvoy doctor 2>&1)
+    assert_contains "$output" "[ok] konanc:"
+}
+
+test_toolchain_help() {
+    konvoy toolchain --help >/dev/null 2>&1
+}
+
+test_init_includes_toolchain() {
+    konvoy init --name tc-init >/dev/null 2>&1
+    assert_file_contains tc-init/konvoy.toml "[toolchain]"
+    assert_file_contains tc-init/konvoy.toml "kotlin"
 }
 
 # ---------------------------------------------------------------------------
@@ -284,19 +322,25 @@ run_test test_version
 run_test test_init_help
 run_test test_build_help
 run_test test_doctor_help
+run_test test_toolchain_help
 
 # init
 run_test test_init_creates_project
 run_test test_init_manifest_is_valid
 run_test test_init_double_fails
-
-# doctor
-run_test test_doctor_all_ok
+run_test test_init_includes_toolchain
 
 # build lifecycle (build, cache, run, lockfile, clean, rebuild)
 run_test test_build_lifecycle
 run_test test_build_release
 run_test test_clean_no_konvoy_dir_ok
+
+# doctor (runs after build so toolchain is installed)
+run_test test_doctor_all_ok
+
+# toolchain
+run_test test_toolchain_list_empty
+run_test test_toolchain_install_from_manifest
 
 # worktree
 run_test test_worktree_cache_shared

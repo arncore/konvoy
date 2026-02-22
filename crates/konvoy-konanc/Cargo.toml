@@ -8,5 +8,9 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+flate2.workspace = true
 konvoy-util.workspace = true
+sha2.workspace = true
+tar.workspace = true
 thiserror.workspace = true
+ureq.workspace = true
