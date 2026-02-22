@@ -16,10 +16,17 @@ Konvoy avoids Gradle/Maven-style complexity by providing:
 
 Early-stage prototype / design-driven build. Expect rapid iteration and breaking changes.
 
+## Supported platforms
+
+- **Linux** — x86_64 and ARM64
+- **macOS** — x86_64 (Intel) and ARM64 (Apple Silicon)
+
 ## Requirements
 
-- Kotlin/Native compiler (`konanc`) available on your machine (`PATH` or configured via env var)
-- Platform toolchain installed for your host OS (e.g., Apple toolchains on macOS)
+- Kotlin/Native compiler (`konanc`) available on your machine (`PATH` or configured via `KONANC_HOME` env var)
+- Platform toolchain installed for your host OS:
+  - **macOS:** Xcode Command Line Tools (`xcode-select --install`)
+  - **Linux:** GCC/build-essential (`sudo apt install build-essential` on Debian/Ubuntu)
 
 ## Quick start
 
