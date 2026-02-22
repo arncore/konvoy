@@ -493,4 +493,62 @@ name = "no-deps"
             "serialized was: {serialized}"
         );
     }
+
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            #[allow(clippy::unwrap_used)]
+            fn valid_name_parses(name in "[a-zA-Z][a-zA-Z0-9_-]{0,30}") {
+                let toml_str = format!(
+                    "[package]\nname = \"{name}\"\n{TOOLCHAIN}"
+                );
+                let result = Manifest::from_str(&toml_str, "test.toml");
+                prop_assert!(result.is_ok(), "expected valid name to parse: {}", name);
+            }
+
+            #[test]
+            #[allow(clippy::unwrap_used)]
+            fn invalid_name_chars_rejected(
+                prefix in "[a-zA-Z][a-zA-Z0-9_-]{0,10}",
+                bad_char in "[^a-zA-Z0-9_\\-\"\\\\\\n\\r\\t]",
+                suffix in "[a-zA-Z0-9_-]{0,10}"
+            ) {
+                let name = format!("{prefix}{bad_char}{suffix}");
+                let toml_str = format!(
+                    "[package]\nname = \"{name}\"\n{TOOLCHAIN}"
+                );
+                let result = Manifest::from_str(&toml_str, "test.toml");
+                prop_assert!(result.is_err(), "expected invalid name to be rejected: {}", name);
+            }
+
+            #[test]
+            #[allow(clippy::unwrap_used)]
+            fn entrypoint_validation_never_panics(entry in "[a-zA-Z0-9_./ ]{1,50}") {
+                let toml_str = format!(
+                    "[package]\nname = \"test-proj\"\nentrypoint = \"{entry}\"\n{TOOLCHAIN}"
+                );
+                let _ = Manifest::from_str(&toml_str, "test.toml");
+            }
+
+            #[test]
+            #[allow(clippy::unwrap_used)]
+            fn manifest_round_trip(
+                name in "[a-zA-Z][a-zA-Z0-9_-]{0,20}",
+                version in "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}",
+                kotlin_ver in "[0-9]{1,2}\\.[0-9]{1,2}\\.[0-9]{1,2}",
+                entrypoint in "src/[a-zA-Z][a-zA-Z0-9_]{0,15}\\.kt",
+            ) {
+                let toml_str = format!(
+                    "[package]\nname = \"{name}\"\nversion = \"{version}\"\nentrypoint = \"{entrypoint}\"\n\n[toolchain]\nkotlin = \"{kotlin_ver}\"\n"
+                );
+                let original = Manifest::from_str(&toml_str, "test.toml").unwrap();
+                let serialized = original.to_toml().unwrap();
+                let reparsed = Manifest::from_str(&serialized, "test.toml").unwrap();
+                prop_assert_eq!(original, reparsed);
+            }
+        }
+    }
 }

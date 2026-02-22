@@ -318,4 +318,105 @@ mod tests {
 
         assert_ne!(key1, key2);
     }
+
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_cache_inputs(dir: &Path) -> impl Strategy<Value = CacheInputs> + use<'_> {
+            (
+                "[a-zA-Z0-9 =\n.]{1,100}",                            // manifest_content
+                "[a-zA-Z0-9 =\n.]{0,100}",                            // lockfile_content
+                "[0-9]{1,2}\\.[0-9]{1,2}\\.[0-9]{1,2}",               // konanc_version
+                "[a-f0-9]{8,16}",                                     // konanc_fingerprint
+                prop_oneof!["linux_x64", "macos_arm64", "macos_x64"], // target
+                prop_oneof!["debug", "release"],                      // profile
+                prop_oneof!["linux", "macos", "windows"],             // os
+                prop_oneof!["x86_64", "aarch64"],                     // arch
+            )
+                .prop_map(
+                    move |(
+                        manifest_content,
+                        lockfile_content,
+                        konanc_version,
+                        konanc_fingerprint,
+                        target,
+                        profile,
+                        os,
+                        arch,
+                    )| {
+                        CacheInputs {
+                            manifest_content,
+                            lockfile_content,
+                            konanc_version,
+                            konanc_fingerprint,
+                            target,
+                            profile,
+                            source_dir: dir.to_path_buf(),
+                            source_glob: "**/*.kt".to_owned(),
+                            os,
+                            arch,
+                            dependency_hashes: Vec::new(),
+                        }
+                    },
+                )
+        }
+
+        proptest! {
+            /// Same inputs must always produce the same cache key.
+            #[test]
+            #[allow(clippy::unwrap_used)]
+            fn cache_key_deterministic(seed in arb_cache_inputs(Path::new("/dev/null"))) {
+                // Use a real temp dir with source files for each run.
+                let tmp = tempfile::tempdir().unwrap();
+                let src = tmp.path().join("src");
+                fs::create_dir_all(&src).unwrap();
+                fs::write(src.join("main.kt"), "fun main() {}").unwrap();
+
+                let inputs1 = CacheInputs {
+                    source_dir: tmp.path().to_path_buf(),
+                    ..seed
+                };
+                let inputs2 = CacheInputs {
+                    manifest_content: inputs1.manifest_content.clone(),
+                    lockfile_content: inputs1.lockfile_content.clone(),
+                    konanc_version: inputs1.konanc_version.clone(),
+                    konanc_fingerprint: inputs1.konanc_fingerprint.clone(),
+                    target: inputs1.target.clone(),
+                    profile: inputs1.profile.clone(),
+                    source_dir: tmp.path().to_path_buf(),
+                    source_glob: "**/*.kt".to_owned(),
+                    os: inputs1.os.clone(),
+                    arch: inputs1.arch.clone(),
+                    dependency_hashes: Vec::new(),
+                };
+
+                let key1 = CacheKey::compute(&inputs1).unwrap();
+                let key2 = CacheKey::compute(&inputs2).unwrap();
+                prop_assert_eq!(key1, key2);
+            }
+
+            /// Cache key must always be a 64-character hex string.
+            #[test]
+            #[allow(clippy::unwrap_used)]
+            fn cache_key_always_valid_hex(seed in arb_cache_inputs(Path::new("/dev/null"))) {
+                let tmp = tempfile::tempdir().unwrap();
+                let src = tmp.path().join("src");
+                fs::create_dir_all(&src).unwrap();
+                fs::write(src.join("main.kt"), "fun main() {}").unwrap();
+
+                let inputs = CacheInputs {
+                    source_dir: tmp.path().to_path_buf(),
+                    ..seed
+                };
+                let key = CacheKey::compute(&inputs).unwrap();
+                let hex = key.as_hex();
+                prop_assert_eq!(hex.len(), 64);
+                prop_assert!(
+                    hex.chars().all(|c| c.is_ascii_hexdigit()),
+                    "cache key contains non-hex characters: {hex}"
+                );
+            }
+        }
+    }
 }

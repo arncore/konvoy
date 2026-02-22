@@ -238,4 +238,38 @@ mod tests {
         };
         assert_ne!(a, b);
     }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            #[allow(clippy::unwrap_used)]
+            fn arbitrary_target_never_panics(s in "\\PC*") {
+                let result = Target::from_str(&s);
+                prop_assert!(result.is_ok() || result.is_err());
+            }
+
+            #[test]
+            #[allow(clippy::unwrap_used)]
+            fn known_targets_always_parse(idx in 0usize..4) {
+                let known = ["linux_x64", "linux_arm64", "macos_x64", "macos_arm64"];
+                let name = known[idx];
+                let target = Target::from_str(name);
+                prop_assert!(target.is_ok(), "from_str rejected known target `{}`", name);
+                let target = target.unwrap();
+                prop_assert_eq!(target.to_string(), name);
+            }
+
+            #[test]
+            #[allow(clippy::unwrap_used)]
+            fn unknown_targets_always_error(s in "\\PC*") {
+                let known = ["linux_x64", "linux_arm64", "macos_x64", "macos_arm64"];
+                prop_assume!(!known.contains(&s.as_str()));
+                let result = Target::from_str(&s);
+                prop_assert!(result.is_err(), "from_str accepted unknown target `{}`", s);
+            }
+        }
+    }
 }

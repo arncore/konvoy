@@ -315,4 +315,51 @@ konanc_version = "2.1.0"
         fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
         dir
     }
+
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            #[allow(clippy::unwrap_used)]
+            fn lockfile_round_trip(
+                version in "[0-9]{1,2}\\.[0-9]{1,2}\\.[0-9]{1,2}",
+                konanc_sha in "[a-f0-9]{64}",
+                jre_sha in "[a-f0-9]{64}",
+            ) {
+                let dir = tempdir();
+                let path = dir.join("konvoy.lock");
+                let original = Lockfile::with_managed_toolchain(
+                    &version,
+                    Some(&konanc_sha),
+                    Some(&jre_sha),
+                );
+                original.write_to(&path).unwrap();
+                let reparsed = Lockfile::from_path(&path).unwrap();
+                prop_assert_eq!(original, reparsed);
+            }
+
+            #[test]
+            #[allow(clippy::unwrap_used)]
+            fn lockfile_with_deps_round_trip(
+                version in "[0-9]{1,2}\\.[0-9]{1,2}\\.[0-9]{1,2}",
+                dep_name in "[a-zA-Z][a-zA-Z0-9_-]{0,20}",
+                dep_path in "\\.\\./[a-zA-Z][a-zA-Z0-9_-]{0,15}",
+                source_hash in "[a-f0-9]{16,64}",
+            ) {
+                let dir = tempdir();
+                let path = dir.join("konvoy.lock");
+                let mut lockfile = Lockfile::with_toolchain(&version);
+                lockfile.dependencies.push(DependencyLock {
+                    name: dep_name,
+                    source: DepSource::Path { path: dep_path },
+                    source_hash,
+                });
+                lockfile.write_to(&path).unwrap();
+                let reparsed = Lockfile::from_path(&path).unwrap();
+                prop_assert_eq!(lockfile, reparsed);
+            }
+        }
+    }
 }
