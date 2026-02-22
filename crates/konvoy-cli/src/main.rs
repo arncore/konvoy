@@ -38,6 +38,9 @@ enum Command {
         /// Allow overriding hash mismatch checks
         #[arg(long)]
         force: bool,
+        /// Require the lockfile to be up-to-date; error on any mismatch
+        #[arg(long)]
+        locked: bool,
     },
     /// Build and run the project
     Run {
@@ -50,6 +53,9 @@ enum Command {
         /// Allow overriding hash mismatch checks
         #[arg(long)]
         force: bool,
+        /// Require the lockfile to be up-to-date; error on any mismatch
+        #[arg(long)]
+        locked: bool,
         /// Arguments to pass to the program
         #[arg(last = true)]
         args: Vec<String>,
@@ -68,6 +74,9 @@ enum Command {
         /// Allow overriding hash mismatch checks
         #[arg(long)]
         force: bool,
+        /// Require the lockfile to be up-to-date; error on any mismatch
+        #[arg(long)]
+        locked: bool,
     },
     /// Remove build artifacts
     Clean,
@@ -101,19 +110,22 @@ fn main() {
             release,
             verbose,
             force,
-        } => cmd_build(target, release, verbose, force),
+            locked,
+        } => cmd_build(target, release, verbose, force, locked),
         Command::Run {
             target,
             release,
             force,
+            locked,
             args,
-        } => cmd_run(target, release, force, &args),
+        } => cmd_run(target, release, force, locked, &args),
         Command::Test {
             target,
             release,
             verbose,
             force,
-        } => cmd_test(target, release, verbose, force),
+            locked,
+        } => cmd_test(target, release, verbose, force, locked),
         Command::Clean => cmd_clean(),
         Command::Doctor => cmd_doctor(),
         Command::Toolchain { action } => cmd_toolchain(action),
@@ -178,6 +190,7 @@ fn cmd_build(
     release: bool,
     verbose: bool,
     force: bool,
+    locked: bool,
 ) -> Result<(), String> {
     let root = project_root()?;
     let options = konvoy_engine::BuildOptions {
@@ -185,6 +198,7 @@ fn cmd_build(
         release,
         verbose,
         force,
+        locked,
     };
 
     let result = konvoy_engine::build(&root, &options).map_err(|e| e.to_string())?;
@@ -212,6 +226,7 @@ fn cmd_run(
     target: Option<String>,
     release: bool,
     force: bool,
+    locked: bool,
     args: &[String],
 ) -> Result<(), String> {
     let root = project_root()?;
@@ -231,6 +246,7 @@ fn cmd_run(
         release,
         verbose: false,
         force,
+        locked,
     };
 
     let result = konvoy_engine::build(&root, &options).map_err(|e| e.to_string())?;
@@ -260,6 +276,7 @@ fn cmd_test(
     release: bool,
     verbose: bool,
     force: bool,
+    locked: bool,
 ) -> Result<(), String> {
     // For MVP, konvoy test is essentially build + run with a test convention.
     // Kotlin/Native doesn't have a built-in test framework like cargo test,
@@ -272,6 +289,7 @@ fn cmd_test(
         release,
         verbose,
         force,
+        locked,
     };
 
     let result = konvoy_engine::build(&root, &options).map_err(|e| e.to_string())?;
@@ -454,11 +472,13 @@ mod tests {
                 release,
                 verbose,
                 force,
+                locked,
             } => {
                 assert!(target.is_none());
                 assert!(!release);
                 assert!(!verbose);
                 assert!(!force);
+                assert!(!locked);
             }
             other => panic!("expected Build, got {other:?}"),
         }
@@ -503,6 +523,7 @@ mod tests {
             "--release",
             "--verbose",
             "--force",
+            "--locked",
         ])
         .unwrap();
         match cli.command {
@@ -511,11 +532,13 @@ mod tests {
                 release,
                 verbose,
                 force,
+                locked,
             } => {
                 assert_eq!(target.as_deref(), Some("linux_x64"));
                 assert!(release);
                 assert!(verbose);
                 assert!(force);
+                assert!(locked);
             }
             other => panic!("expected Build, got {other:?}"),
         }
@@ -529,11 +552,13 @@ mod tests {
                 target,
                 release,
                 force,
+                locked,
                 args,
             } => {
                 assert!(target.is_none());
                 assert!(!release);
                 assert!(!force);
+                assert!(!locked);
                 assert!(args.is_empty());
             }
             other => panic!("expected Run, got {other:?}"),
@@ -590,11 +615,13 @@ mod tests {
                 release,
                 verbose,
                 force,
+                locked,
             } => {
                 assert!(target.is_none());
                 assert!(!release);
                 assert!(!verbose);
                 assert!(!force);
+                assert!(!locked);
             }
             other => panic!("expected Test, got {other:?}"),
         }
@@ -610,6 +637,7 @@ mod tests {
             "--target",
             "linux_x64",
             "--force",
+            "--locked",
         ])
         .unwrap();
         match cli.command {
@@ -618,11 +646,13 @@ mod tests {
                 release,
                 verbose,
                 force,
+                locked,
             } => {
                 assert_eq!(target.as_deref(), Some("linux_x64"));
                 assert!(release);
                 assert!(verbose);
                 assert!(force);
+                assert!(locked);
             }
             other => panic!("expected Test, got {other:?}"),
         }

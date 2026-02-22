@@ -25,6 +25,8 @@ pub struct BuildOptions {
     pub verbose: bool,
     /// Allow overriding hash mismatch checks.
     pub force: bool,
+    /// Require the lockfile to be up-to-date; error on any mismatch.
+    pub locked: bool,
 }
 
 /// Whether the build used a cached artifact or compiled fresh.
@@ -126,6 +128,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         project_root,
         &lockfile_path,
         options.force,
+        options.locked,
     )?;
 
     Ok(BuildResult {
@@ -344,15 +347,24 @@ fn update_lockfile_if_needed(
     project_root: &Path,
     lockfile_path: &Path,
     force: bool,
+    locked: bool,
 ) -> Result<(), EngineError> {
-    // Check for dependency source hash mismatches and warn.
+    // Check for dependency source hash mismatches.
+    // In --locked mode this is a hard error; otherwise warn and continue.
     for dep in &dep_graph.order {
-        if let Some(locked) = lockfile.dependencies.iter().find(|d| d.name == dep.name) {
-            if locked.source_hash != dep.source_hash && !dep.source_hash.is_empty() {
+        if let Some(locked_dep) = lockfile.dependencies.iter().find(|d| d.name == dep.name) {
+            if locked_dep.source_hash != dep.source_hash && !dep.source_hash.is_empty() {
+                if locked {
+                    return Err(EngineError::DependencyHashMismatch {
+                        name: dep.name.clone(),
+                        expected: locked_dep.source_hash.clone(),
+                        actual: dep.source_hash.clone(),
+                    });
+                }
                 eprintln!(
                     "warning: dependency `{}` source has changed (locked: {}, current: {})",
                     dep.name,
-                    truncate_hash(&locked.source_hash),
+                    truncate_hash(&locked_dep.source_hash),
                     truncate_hash(&dep.source_hash),
                 );
             }
@@ -430,6 +442,12 @@ fn update_lockfile_if_needed(
                 }
             }
         }
+    }
+
+    // In --locked mode, the lockfile must not be modified. If we reach here,
+    // something has changed (toolchain, deps, or hashes) that would require a write.
+    if locked {
+        return Err(EngineError::LockfileUpdateRequired);
     }
 
     // Build the updated lockfile. When the version hasn't changed, preserve
@@ -523,6 +541,7 @@ mod tests {
             release: false,
             verbose: false,
             force: false,
+            locked: false,
         };
         let result = build(tmp.path(), &options);
         assert!(result.is_err());
@@ -545,6 +564,7 @@ mod tests {
             release: false,
             verbose: false,
             force: false,
+            locked: false,
         };
         let result = build(&project, &options);
         assert!(result.is_err());
@@ -590,6 +610,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
+            false,
         )
         .unwrap();
         assert!(lockfile_path.exists());
@@ -621,6 +642,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
+            false,
         )
         .unwrap();
     }
@@ -647,6 +669,7 @@ mod tests {
             &empty_graph,
             tmp.path(),
             &lockfile_path,
+            false,
             false,
         )
         .unwrap();
@@ -675,6 +698,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
+            false,
         )
         .unwrap();
 
@@ -695,11 +719,13 @@ mod tests {
             release: false,
             verbose: false,
             force: false,
+            locked: false,
         };
         assert!(opts.target.is_none());
         assert!(!opts.release);
         assert!(!opts.verbose);
         assert!(!opts.force);
+        assert!(!opts.locked);
     }
 
     #[test]
@@ -734,6 +760,7 @@ mod tests {
             &graph,
             tmp.path(),
             &lockfile_path,
+            false,
             false,
         )
         .unwrap();
@@ -786,6 +813,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
+            false,
         )
         .unwrap();
 
@@ -823,6 +851,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
+            false,
         )
         .unwrap();
 
@@ -859,6 +888,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
+            false,
         )
         .unwrap();
 
@@ -890,6 +920,7 @@ mod tests {
             &empty_graph,
             tmp.path(),
             &lockfile_path,
+            false,
             false,
         );
 
@@ -930,6 +961,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             true,
+            false,
         )
         .unwrap();
 
@@ -965,6 +997,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
+            false,
         )
         .unwrap();
 
@@ -999,6 +1032,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
+            false,
         )
         .unwrap();
 
@@ -1007,5 +1041,202 @@ mod tests {
         assert_eq!(tc.konanc_version, "2.1.0");
         assert_eq!(tc.konanc_tarball_sha256, None);
         assert_eq!(tc.jre_tarball_sha256, None);
+    }
+
+    #[test]
+    fn update_lockfile_locked_mode_mismatch_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+
+        // Write a lockfile with an existing dep hash.
+        let mut lf = lockfile.clone();
+        lf.dependencies.push(DependencyLock {
+            name: "my-lib".to_owned(),
+            source: DepSource::Path {
+                path: "my-lib".to_owned(),
+            },
+            source_hash: "oldhash123".to_owned(),
+        });
+        lf.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        let dep = crate::resolve::ResolvedDep {
+            name: "my-lib".to_owned(),
+            project_root: tmp.path().join("my-lib"),
+            manifest: konvoy_config::manifest::Manifest::from_str(
+                "[package]\nname = \"my-lib\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+                "konvoy.toml",
+            )
+            .unwrap(),
+            dep_names: Vec::new(),
+            source_hash: "newhash456".to_owned(),
+        };
+        let graph = crate::resolve::ResolvedGraph { order: vec![dep] };
+
+        let result = update_lockfile_if_needed(
+            &lf,
+            &konanc,
+            None,
+            None,
+            &graph,
+            tmp.path(),
+            &lockfile_path,
+            false,
+            true, // locked = true
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("source hash mismatch"),
+            "expected dep hash mismatch error, got: {err}"
+        );
+        assert!(
+            err.contains("my-lib"),
+            "error should mention dep name, got: {err}"
+        );
+    }
+
+    #[test]
+    fn update_lockfile_unlocked_mode_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+
+        let mut lf = lockfile.clone();
+        lf.dependencies.push(DependencyLock {
+            name: "my-lib".to_owned(),
+            source: DepSource::Path {
+                path: "my-lib".to_owned(),
+            },
+            source_hash: "oldhash123".to_owned(),
+        });
+        lf.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        let dep = crate::resolve::ResolvedDep {
+            name: "my-lib".to_owned(),
+            project_root: tmp.path().join("my-lib"),
+            manifest: konvoy_config::manifest::Manifest::from_str(
+                "[package]\nname = \"my-lib\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+                "konvoy.toml",
+            )
+            .unwrap(),
+            dep_names: Vec::new(),
+            source_hash: "newhash456".to_owned(),
+        };
+        let graph = crate::resolve::ResolvedGraph { order: vec![dep] };
+
+        // Without --locked, mismatch should warn but succeed.
+        let result = update_lockfile_if_needed(
+            &lf,
+            &konanc,
+            None,
+            None,
+            &graph,
+            tmp.path(),
+            &lockfile_path,
+            false,
+            false, // locked = false
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn update_lockfile_locked_mode_matching_hash_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+
+        let mut lf = lockfile.clone();
+        lf.dependencies.push(DependencyLock {
+            name: "my-lib".to_owned(),
+            source: DepSource::Path {
+                path: "my-lib".to_owned(),
+            },
+            source_hash: "samehash789".to_owned(),
+        });
+        lf.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        let dep = crate::resolve::ResolvedDep {
+            name: "my-lib".to_owned(),
+            project_root: tmp.path().join("my-lib"),
+            manifest: konvoy_config::manifest::Manifest::from_str(
+                "[package]\nname = \"my-lib\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+                "konvoy.toml",
+            )
+            .unwrap(),
+            dep_names: Vec::new(),
+            source_hash: "samehash789".to_owned(),
+        };
+        let graph = crate::resolve::ResolvedGraph { order: vec![dep] };
+
+        // Matching hash with --locked should pass fine.
+        let result = update_lockfile_if_needed(
+            &lf,
+            &konanc,
+            None,
+            None,
+            &graph,
+            tmp.path(),
+            &lockfile_path,
+            false,
+            true, // locked = true
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn update_lockfile_locked_mode_prevents_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile = Lockfile::default();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        // Toolchain changed (default lockfile has no toolchain), so lockfile
+        // would need updating. With --locked, this should error.
+        let result = update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            tmp.path(),
+            &lockfile_path,
+            false,
+            true, // locked = true
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("lockfile is out of date"),
+            "expected lockfile update error, got: {err}"
+        );
     }
 }
