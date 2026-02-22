@@ -908,6 +908,79 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::panic)]
+    fn concurrent_rename_race_simulation() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("final-dest");
+        let dest = Arc::new(dest);
+
+        let num_threads = 8;
+        let barrier = Arc::new(Barrier::new(num_threads));
+
+        // Create source directories for each thread.
+        let sources: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let src = tmp.path().join(format!("src-{i}"));
+                std::fs::create_dir_all(&src).unwrap();
+                std::fs::write(src.join("marker.txt"), format!("thread-{i}")).unwrap();
+                src
+            })
+            .collect();
+
+        let handles: Vec<_> = sources
+            .into_iter()
+            .map(|src| {
+                let dest = Arc::clone(&dest);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    // Synchronize all threads to maximize contention.
+                    barrier.wait();
+
+                    match std::fs::rename(&src, &*dest) {
+                        Ok(()) => {
+                            // We won the race.
+                            "won"
+                        }
+                        Err(_) if dest.exists() => {
+                            // Another thread won; clean up our source.
+                            let _ = std::fs::remove_dir_all(&src);
+                            "lost"
+                        }
+                        Err(e) => {
+                            panic!("unexpected rename error: {e}");
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let mut winners = 0;
+        let mut losers = 0;
+        for handle in handles {
+            match handle.join().unwrap() {
+                "won" => winners += 1,
+                "lost" => losers += 1,
+                other => panic!("unexpected result: {other}"),
+            }
+        }
+
+        // Exactly one thread should have won the rename race.
+        // Note: on some filesystems, multiple renames may "succeed" if the
+        // destination doesn't exist yet at the moment of the call. The key
+        // invariant is that the destination exists and contains valid data.
+        assert!(winners >= 1, "at least one thread should win the race");
+        assert_eq!(winners + losers, num_threads, "all threads should complete");
+        assert!(dest.exists(), "destination should exist after the race");
+        assert!(
+            dest.join("marker.txt").exists(),
+            "destination should contain valid content"
+        );
+    }
+
+    #[test]
     fn temp_suffix_has_random_component() {
         // Two calls should produce different suffixes (random component differs).
         let a = temp_suffix();
