@@ -97,7 +97,13 @@ cargo build                      # build all crates
 cargo test                       # run all tests
 cargo run -- build               # run konvoy with a subcommand
 cargo test -p konvoy-config      # run tests for a single crate
+cargo clippy --workspace         # lint all crates
+cargo fmt --all                  # format all crates
 ```
+
+CI runs check, test (Linux + macOS), clippy, and rustfmt on every push and PR to `main`.
+
+See [docs/code-style.md](docs/code-style.md) for coding conventions.
 
 ## Roadmap (high level)
 
