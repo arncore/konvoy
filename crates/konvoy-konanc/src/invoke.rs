@@ -94,6 +94,7 @@ pub struct KonancCommand {
     release: bool,
     produce: ProduceKind,
     libraries: Vec<PathBuf>,
+    java_home: Option<PathBuf>,
 }
 
 impl KonancCommand {
@@ -135,6 +136,12 @@ impl KonancCommand {
     /// Add dependency library paths (`.klib` files).
     pub fn libraries(mut self, paths: &[PathBuf]) -> Self {
         self.libraries = paths.to_vec();
+        self
+    }
+
+    /// Set JAVA_HOME for the bundled JRE.
+    pub fn java_home(mut self, path: &Path) -> Self {
+        self.java_home = Some(path.to_path_buf());
         self
     }
 
@@ -202,8 +209,12 @@ impl KonancCommand {
             return Err(KonancError::NoOutput);
         };
 
-        let cmd_output = Command::new(&konanc.path)
-            .args(&args)
+        let mut cmd = Command::new(&konanc.path);
+        cmd.args(&args);
+        if let Some(jh) = &self.java_home {
+            cmd.env("JAVA_HOME", jh);
+        }
+        let cmd_output = cmd
             .output()
             .map_err(|source| KonancError::Exec { source })?;
 
@@ -600,6 +611,18 @@ mod tests {
 
         let args = cmd.build_args().unwrap();
         assert!(!args.contains(&"-produce".to_owned()));
+    }
+
+    #[test]
+    fn java_home_not_set_by_default() {
+        let cmd = KonancCommand::new();
+        assert!(cmd.java_home.is_none());
+    }
+
+    #[test]
+    fn java_home_builder_sets_value() {
+        let cmd = KonancCommand::new().java_home(Path::new("/opt/jre"));
+        assert_eq!(cmd.java_home, Some(PathBuf::from("/opt/jre")));
     }
 
     #[test]

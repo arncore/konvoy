@@ -71,6 +71,10 @@ pub enum KonancError {
     #[error("corrupt toolchain at {path} — run `konvoy toolchain install {version}` to reinstall")]
     CorruptToolchain { path: PathBuf, version: String },
 
+    /// Failed to install or locate the bundled JRE.
+    #[error("JRE installation failed: {message}")]
+    JreInstall { message: String },
+
     /// A filesystem operation failed during toolchain management.
     #[error("cannot access {path}: {source}")]
     Io {

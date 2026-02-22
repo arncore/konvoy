@@ -82,6 +82,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     // 4. Resolve managed konanc toolchain.
     let resolved = resolve_konanc(&manifest.toolchain.kotlin).map_err(EngineError::Konanc)?;
     let konanc = resolved.info;
+    let jre_home = resolved.jre_home.clone();
 
     // 5. Resolve dependencies and build them in topological order.
     let dep_graph = resolve_dependencies(project_root, &manifest)?;
@@ -92,6 +93,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
             &dep.project_root,
             &dep.manifest,
             &konanc,
+            jre_home.as_deref(),
             &target,
             profile,
             options,
@@ -105,6 +107,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         project_root,
         &manifest,
         &konanc,
+        jre_home.as_deref(),
         &target,
         profile,
         options,
@@ -115,7 +118,8 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     update_lockfile_if_needed(
         &lockfile,
         &konanc,
-        resolved.tarball_sha256.as_deref(),
+        resolved.konanc_tarball_sha256.as_deref(),
+        resolved.jre_tarball_sha256.as_deref(),
         &lockfile_path,
     )?;
 
@@ -129,10 +133,12 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
 /// Build a single project (either root or a dependency).
 ///
 /// Returns the path to the output artifact.
+#[allow(clippy::too_many_arguments)]
 fn build_single(
     project_root: &Path,
     manifest: &Manifest,
     konanc: &KonancInfo,
+    jre_home: Option<&Path>,
     target: &Target,
     profile: &str,
     options: &BuildOptions,
@@ -202,6 +208,7 @@ fn build_single(
 
     let compile_output = compile(
         konanc,
+        jre_home,
         &sources,
         target,
         &output_path,
@@ -240,8 +247,10 @@ fn resolve_target(target_opt: &Option<String>) -> Result<Target, EngineError> {
 }
 
 /// Invoke konanc and return the path to the compiled artifact.
+#[allow(clippy::too_many_arguments)]
 fn compile(
     konanc: &KonancInfo,
+    jre_home: Option<&Path>,
     sources: &[PathBuf],
     target: &Target,
     output_path: &Path,
@@ -254,13 +263,17 @@ fn compile(
         konvoy_util::fs::ensure_dir(parent)?;
     }
 
-    let cmd = KonancCommand::new()
+    let mut cmd = KonancCommand::new()
         .sources(sources)
         .output(output_path)
         .target(target.to_konanc_arg())
         .release(options.release)
         .produce(produce)
         .libraries(library_paths);
+
+    if let Some(jh) = jre_home {
+        cmd = cmd.java_home(jh);
+    }
 
     let result = cmd.execute(konanc).map_err(EngineError::Konanc)?;
 
@@ -317,7 +330,8 @@ fn lockfile_toml_content(lockfile: &Lockfile) -> String {
 fn update_lockfile_if_needed(
     lockfile: &Lockfile,
     konanc: &KonancInfo,
-    tarball_sha256: Option<&str>,
+    konanc_tarball_sha256: Option<&str>,
+    jre_tarball_sha256: Option<&str>,
     lockfile_path: &Path,
 ) -> Result<(), EngineError> {
     let needs_update = match &lockfile.toolchain {
@@ -326,9 +340,15 @@ fn update_lockfile_if_needed(
     };
 
     if needs_update {
-        let updated = match tarball_sha256 {
-            Some(sha) => Lockfile::with_managed_toolchain(&konanc.version, sha),
-            None => Lockfile::with_toolchain(&konanc.version),
+        let has_sha = konanc_tarball_sha256.is_some() || jre_tarball_sha256.is_some();
+        let updated = if has_sha {
+            Lockfile::with_managed_toolchain(
+                &konanc.version,
+                konanc_tarball_sha256,
+                jre_tarball_sha256,
+            )
+        } else {
+            Lockfile::with_toolchain(&konanc.version)
         };
         updated
             .write_to(lockfile_path)
@@ -439,7 +459,7 @@ mod tests {
             fingerprint: "abc".to_owned(),
         };
 
-        update_lockfile_if_needed(&lockfile, &konanc, None, &lockfile_path).unwrap();
+        update_lockfile_if_needed(&lockfile, &konanc, None, None, &lockfile_path).unwrap();
         assert!(lockfile_path.exists());
         let content = fs::read_to_string(&lockfile_path).unwrap();
         assert!(content.contains("2.1.0"));
@@ -459,7 +479,7 @@ mod tests {
         };
 
         // Should not error and should not change the file.
-        update_lockfile_if_needed(&lockfile, &konanc, None, &lockfile_path).unwrap();
+        update_lockfile_if_needed(&lockfile, &konanc, None, None, &lockfile_path).unwrap();
     }
 
     #[test]
@@ -475,7 +495,14 @@ mod tests {
             fingerprint: "abc".to_owned(),
         };
 
-        update_lockfile_if_needed(&lockfile, &konanc, Some("deadbeef"), &lockfile_path).unwrap();
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            Some("deadbeef"),
+            Some("cafebabe"),
+            &lockfile_path,
+        )
+        .unwrap();
         let content = fs::read_to_string(&lockfile_path).unwrap();
         assert!(content.contains("2.1.0"));
     }

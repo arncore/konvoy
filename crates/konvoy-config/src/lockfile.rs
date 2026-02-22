@@ -14,7 +14,9 @@ pub struct Lockfile {
 pub struct ToolchainLock {
     pub konanc_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tarball_sha256: Option<String>,
+    pub konanc_tarball_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jre_tarball_sha256: Option<String>,
 }
 
 /// A locked dependency entry.
@@ -60,18 +62,24 @@ impl Lockfile {
         Self {
             toolchain: Some(ToolchainLock {
                 konanc_version: version.to_owned(),
-                tarball_sha256: None,
+                konanc_tarball_sha256: None,
+                jre_tarball_sha256: None,
             }),
             dependencies: Vec::new(),
         }
     }
 
-    /// Create a lockfile with a pinned toolchain version and tarball SHA-256.
-    pub fn with_managed_toolchain(version: &str, sha256: &str) -> Self {
+    /// Create a lockfile with a pinned toolchain version and tarball SHA-256s.
+    pub fn with_managed_toolchain(
+        version: &str,
+        konanc_sha256: Option<&str>,
+        jre_sha256: Option<&str>,
+    ) -> Self {
         Self {
             toolchain: Some(ToolchainLock {
                 konanc_version: version.to_owned(),
-                tarball_sha256: Some(sha256.to_owned()),
+                konanc_tarball_sha256: konanc_sha256.map(str::to_owned),
+                jre_tarball_sha256: jre_sha256.map(str::to_owned),
             }),
             dependencies: Vec::new(),
         }
@@ -177,25 +185,28 @@ konanc_version = "1.9.22"
             .as_ref()
             .unwrap_or_else(|| panic!("missing toolchain"));
         assert_eq!(toolchain.konanc_version, "1.9.22");
-        assert!(toolchain.tarball_sha256.is_none());
+        assert!(toolchain.konanc_tarball_sha256.is_none());
+        assert!(toolchain.jre_tarball_sha256.is_none());
     }
 
     #[test]
     fn with_managed_toolchain_includes_sha256() {
-        let lockfile = Lockfile::with_managed_toolchain("2.1.0", "abc123");
+        let lockfile = Lockfile::with_managed_toolchain("2.1.0", Some("abc123"), Some("def456"));
         let toolchain = lockfile
             .toolchain
             .as_ref()
             .unwrap_or_else(|| panic!("missing toolchain"));
         assert_eq!(toolchain.konanc_version, "2.1.0");
-        assert_eq!(toolchain.tarball_sha256.as_deref(), Some("abc123"));
+        assert_eq!(toolchain.konanc_tarball_sha256.as_deref(), Some("abc123"));
+        assert_eq!(toolchain.jre_tarball_sha256.as_deref(), Some("def456"));
     }
 
     #[test]
     fn sha256_round_trip() {
         let dir = tempdir();
         let path = dir.join("konvoy.lock");
-        let original = Lockfile::with_managed_toolchain("2.1.0", "deadbeef");
+        let original =
+            Lockfile::with_managed_toolchain("2.1.0", Some("deadbeef"), Some("cafebabe"));
         original.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
         let reparsed = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(original, reparsed);
@@ -219,7 +230,33 @@ konanc_version = "2.1.0"
             .toolchain
             .as_ref()
             .unwrap_or_else(|| panic!("missing toolchain"));
-        assert!(toolchain.tarball_sha256.is_none());
+        assert!(toolchain.konanc_tarball_sha256.is_none());
+        assert!(toolchain.jre_tarball_sha256.is_none());
+    }
+
+    #[test]
+    fn backward_compat_old_tarball_sha256_field() {
+        // Old lockfiles may have `tarball_sha256` — they should still parse
+        // (the field is simply ignored since it's been renamed).
+        let dir = tempdir();
+        let path = dir.join("konvoy.lock");
+        fs::write(
+            &path,
+            r#"
+[toolchain]
+konanc_version = "2.1.0"
+tarball_sha256 = "oldvalue"
+"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        // Should parse without error (unknown fields are ignored by default in TOML).
+        let lockfile = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        let toolchain = lockfile
+            .toolchain
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing toolchain"));
+        assert_eq!(toolchain.konanc_version, "2.1.0");
     }
 
     #[test]
