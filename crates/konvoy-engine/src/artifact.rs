@@ -359,13 +359,24 @@ mod tests {
         // Create a worktree.
         let wt_dir = tmp.path().join("wt");
         Command::new("git")
-            .args(["worktree", "add", "-q", wt_dir.display().to_string().as_str(), "-b", "wt"])
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                wt_dir.display().to_string().as_str(),
+                "-b",
+                "wt",
+            ])
             .current_dir(&main_dir)
             .output()
             .unwrap();
 
         let root = resolve_cache_root(&wt_dir);
-        let expected = main_dir.canonicalize().unwrap().join(".konvoy").join("cache");
+        let expected = main_dir
+            .canonicalize()
+            .unwrap()
+            .join(".konvoy")
+            .join("cache");
         assert_eq!(root, expected);
     }
 }
