@@ -346,12 +346,19 @@ fn install_jre(version: &str) -> Result<(PathBuf, Option<String>), KonancError> 
 
 /// Find the extracted JRE root directory inside the jre/ directory.
 fn find_jre_root(jre_dir: &Path) -> Result<PathBuf, KonancError> {
-    let entries: Vec<_> = std::fs::read_dir(jre_dir)
+    let all_entries: Vec<_> = std::fs::read_dir(jre_dir)
         .map_err(|source| KonancError::Io {
             path: jre_dir.display().to_string(),
             source,
         })?
-        .filter_map(Result::ok)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| KonancError::Io {
+            path: jre_dir.display().to_string(),
+            source,
+        })?;
+
+    let entries: Vec<_> = all_entries
+        .into_iter()
         .filter(|e| e.path().is_dir())
         .collect();
 
