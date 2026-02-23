@@ -61,6 +61,26 @@ pub fn remove_dir_all_if_exists(path: &Path) -> Result<(), UtilError> {
     }
 }
 
+/// Return the Konvoy home directory (`~/.konvoy`).
+///
+/// Resolves via `HOME` (Unix) or `USERPROFILE` (Windows).
+///
+/// # Errors
+/// Returns an error if neither environment variable is set.
+pub fn konvoy_home() -> Result<PathBuf, UtilError> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(PathBuf::from)
+        .map_err(|_| UtilError::Io {
+            path: "~/.konvoy".to_owned(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cannot determine home directory — set the HOME environment variable",
+            ),
+        })?;
+    Ok(home.join(".konvoy"))
+}
+
 /// Collect all files with the given `extension` under `dir`, recursively, sorted by path.
 ///
 /// # Errors

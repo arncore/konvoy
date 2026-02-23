@@ -20,6 +20,8 @@ pub struct LintOptions {
     pub verbose: bool,
     /// Optional path to a custom detekt configuration file.
     pub config: Option<PathBuf>,
+    /// Require the lockfile to be up-to-date; error on any mismatch or missing hash.
+    pub locked: bool,
 }
 
 /// Result of running detekt.
@@ -50,14 +52,7 @@ pub struct DetektDiagnostic {
 
 /// Return the root directory for managed tools: `~/.konvoy/tools/`.
 fn tools_dir() -> Result<PathBuf, EngineError> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(PathBuf::from)
-        .map_err(|_| EngineError::DetektExec {
-            message: "cannot determine home directory — set the HOME environment variable"
-                .to_owned(),
-        })?;
-    Ok(home.join(".konvoy").join("tools"))
+    Ok(konvoy_util::fs::konvoy_home()?.join("tools"))
 }
 
 /// Return the directory for a specific detekt version.
@@ -148,8 +143,18 @@ pub fn ensure_detekt(
     match std::fs::rename(&tmp_path, &jar) {
         Ok(()) => {}
         Err(_) if jar.exists() => {
-            // Another process downloaded it concurrently.
+            // Another process downloaded it concurrently — verify its hash.
             let _ = std::fs::remove_file(&tmp_path);
+            if let Some(expected) = expected_sha256 {
+                let placed_hash = hash_file(&jar)?;
+                if placed_hash != expected {
+                    return Err(EngineError::DetektHashMismatch {
+                        version: version.to_owned(),
+                        expected: expected.to_owned(),
+                        actual: placed_hash,
+                    });
+                }
+            }
         }
         Err(source) => {
             let _ = std::fs::remove_file(&tmp_path);
@@ -326,6 +331,20 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
     } else {
         None
     };
+
+    // In --locked mode, the lockfile must have a matching version + hash pinned,
+    // and the JAR must already be downloaded. No network access allowed.
+    if options.locked {
+        if expected_hash.is_none() {
+            return Err(EngineError::LockfileUpdateRequired);
+        }
+        if !is_installed(detekt_version)? {
+            return Err(EngineError::DetektDownload {
+                version: detekt_version.to_owned(),
+                message: "detekt JAR not downloaded and --locked prevents downloads".to_owned(),
+            });
+        }
+    }
 
     // Ensure detekt jar is available and hash-verified.
     let (jar_path, actual_hash) = ensure_detekt(detekt_version, expected_hash)?;

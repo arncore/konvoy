@@ -89,6 +89,9 @@ enum Command {
         /// Path to a custom detekt configuration file
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Require the lockfile to be up-to-date; error on any mismatch
+        #[arg(long)]
+        locked: bool,
     },
     /// Remove build artifacts
     Clean,
@@ -139,7 +142,11 @@ fn main() {
             locked,
             filter,
         } => cmd_test(target, release, verbose, force, locked, &filter),
-        Command::Lint { verbose, config } => cmd_lint(verbose, config),
+        Command::Lint {
+            verbose,
+            config,
+            locked,
+        } => cmd_lint(verbose, config, locked),
         Command::Clean => cmd_clean(),
         Command::Doctor => cmd_doctor(),
         Command::Toolchain { action } => cmd_toolchain(action),
@@ -328,9 +335,13 @@ fn cmd_test(
     Ok(())
 }
 
-fn cmd_lint(verbose: bool, config: Option<PathBuf>) -> Result<(), String> {
+fn cmd_lint(verbose: bool, config: Option<PathBuf>, locked: bool) -> Result<(), String> {
     let root = project_root()?;
-    let options = konvoy_engine::LintOptions { verbose, config };
+    let options = konvoy_engine::LintOptions {
+        verbose,
+        config,
+        locked,
+    };
 
     let result = konvoy_engine::lint(&root, &options).map_err(|e| e.to_string())?;
 
@@ -1024,9 +1035,14 @@ mod tests {
     fn parse_lint_defaults() {
         let cli = Cli::try_parse_from(["konvoy", "lint"]).unwrap();
         match cli.command {
-            Command::Lint { verbose, config } => {
+            Command::Lint {
+                verbose,
+                config,
+                locked,
+            } => {
                 assert!(!verbose);
                 assert!(config.is_none());
+                assert!(!locked);
             }
             other => panic!("expected Lint, got {other:?}"),
         }
@@ -1054,12 +1070,24 @@ mod tests {
 
     #[test]
     fn parse_lint_all_flags() {
-        let cli =
-            Cli::try_parse_from(["konvoy", "lint", "--verbose", "--config", "custom.yml"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "konvoy",
+            "lint",
+            "--verbose",
+            "--config",
+            "custom.yml",
+            "--locked",
+        ])
+        .unwrap();
         match cli.command {
-            Command::Lint { verbose, config } => {
+            Command::Lint {
+                verbose,
+                config,
+                locked,
+            } => {
                 assert!(verbose);
                 assert_eq!(config, Some(PathBuf::from("custom.yml")));
+                assert!(locked);
             }
             other => panic!("expected Lint, got {other:?}"),
         }
