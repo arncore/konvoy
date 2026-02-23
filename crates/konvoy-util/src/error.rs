@@ -17,4 +17,8 @@ pub enum UtilError {
     /// A command failed to execute.
     #[error("cannot execute command: {source}")]
     CommandExec { source: std::io::Error },
+
+    /// A download failed.
+    #[error("download failed: {message}")]
+    Download { message: String },
 }
