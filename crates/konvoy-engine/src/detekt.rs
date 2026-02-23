@@ -75,7 +75,7 @@ pub fn detekt_jar_path(version: &str) -> Result<PathBuf, EngineError> {
 }
 
 /// Construct the download URL for a detekt-cli release.
-pub fn detekt_download_url(version: &str) -> String {
+pub(crate) fn detekt_download_url(version: &str) -> String {
     format!("https://github.com/detekt/detekt/releases/download/v{version}/detekt-cli-{version}-all.jar")
 }
 
@@ -219,13 +219,16 @@ fn resolve_lockfile_hash<'a>(
 }
 
 /// Persist the detekt version and JAR hash into the lockfile.
+///
+/// # Errors
+/// Returns an error if the lockfile cannot be written.
 fn persist_detekt_hash(
     lockfile_path: &Path,
     lockfile: konvoy_config::lockfile::Lockfile,
     kotlin_version: &str,
     detekt_version: &str,
     hash: String,
-) {
+) -> Result<(), EngineError> {
     let mut updated = lockfile;
     if let Some(ref mut tc) = updated.toolchain {
         tc.detekt_version = Some(detekt_version.to_owned());
@@ -239,9 +242,9 @@ fn persist_detekt_hash(
             detekt_jar_sha256: Some(hash),
         });
     }
-    if let Err(e) = updated.write_to(lockfile_path) {
-        eprintln!("    warning: could not persist detekt hash to lockfile: {e}");
-    }
+    updated.write_to(lockfile_path).map_err(|e| {
+        EngineError::Lockfile(format!("cannot write {}: {e}", lockfile_path.display()))
+    })
 }
 
 /// Resolve the JRE `java` binary from the managed Kotlin toolchain.
@@ -253,8 +256,8 @@ fn resolve_java_bin(kotlin_version: &str) -> Result<(PathBuf, PathBuf), EngineEr
         konvoy_konanc::toolchain::install(kotlin_version).map_err(EngineError::Konanc)?;
     }
 
-    let jre_home = konvoy_konanc::toolchain::jre_home_path(kotlin_version)
-        .map_err(|_| EngineError::DetektNoJre)?;
+    let jre_home =
+        konvoy_konanc::toolchain::jre_home_path(kotlin_version).map_err(EngineError::Konanc)?;
 
     let java_bin = jre_home.join("bin").join("java");
     if !java_bin.exists() {
@@ -388,7 +391,7 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
             &manifest.toolchain.kotlin,
             detekt_version,
             actual_hash,
-        );
+        )?;
     }
 
     // Resolve JRE.
@@ -530,6 +533,7 @@ fn parse_detekt_line(line: &str) -> Option<DetektDiagnostic> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::{detekt_download_url, detekt_jar_path, parse_detekt_output, validate_version};
 

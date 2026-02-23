@@ -12,7 +12,12 @@ fn u64_from_usize(n: usize) -> u64 {
 }
 
 /// Compute download percentage as a `u8` (0..=100).
+///
+/// Returns 0 when `total` is 0 to avoid division by zero.
 fn pct_u8(downloaded: u64, total: u64) -> u8 {
+    if total == 0 {
+        return 0;
+    }
     u8::try_from((downloaded * 100) / total).unwrap_or(100)
 }
 
@@ -97,4 +102,48 @@ pub fn download_with_progress(
     }
 
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{pct_u8, u64_from_usize};
+
+    #[test]
+    fn pct_u8_zero_total_returns_zero() {
+        assert_eq!(pct_u8(0, 0), 0);
+        assert_eq!(pct_u8(100, 0), 0);
+    }
+
+    #[test]
+    fn pct_u8_basic_percentages() {
+        assert_eq!(pct_u8(0, 100), 0);
+        assert_eq!(pct_u8(50, 100), 50);
+        assert_eq!(pct_u8(100, 100), 100);
+    }
+
+    #[test]
+    fn pct_u8_over_100_saturates() {
+        // When downloaded > total, the ratio exceeds 100.
+        // Values above 255 clamp to 100 via unwrap_or.
+        assert_eq!(pct_u8(200, 100), 200); // 200% fits in u8
+        assert_eq!(pct_u8(1000, 100), 100); // 1000% overflows u8 → clamps
+    }
+
+    #[test]
+    fn u64_from_usize_roundtrips() {
+        assert_eq!(u64_from_usize(0), 0);
+        assert_eq!(u64_from_usize(1024), 1024);
+    }
+
+    #[test]
+    fn download_invalid_url_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("out.bin");
+        let result =
+            super::download_with_progress("http://127.0.0.1:1/nonexistent", &dest, "test", "0.0");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("download failed"), "error was: {err}");
+    }
 }

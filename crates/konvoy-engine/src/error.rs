@@ -71,7 +71,7 @@ pub enum EngineError {
     DependencyPathEscape { name: String, path: String },
 
     /// A tarball hash in the lockfile does not match the freshly downloaded hash.
-    #[error("{kind} tarball hash mismatch — expected {expected}, got {actual}; re-run with --force to override")]
+    #[error("{kind} tarball hash mismatch — expected {expected}, got {actual}; this may indicate a tampered or corrupted download — re-run with --force to re-download, or verify the hash against the upstream release")]
     TarballHashMismatch {
         kind: String,
         expected: String,
@@ -79,7 +79,7 @@ pub enum EngineError {
     },
 
     /// A dependency source hash does not match the lockfile (in --locked mode).
-    #[error("dependency `{name}` source hash mismatch — locked: {expected}, current: {actual}; remove --locked to allow lockfile updates")]
+    #[error("dependency `{name}` source hash mismatch — locked: {expected}, current: {actual}; this may indicate unexpected source changes — remove --locked to allow lockfile updates, or verify the dependency sources have not been tampered with")]
     DependencyHashMismatch {
         name: String,
         expected: String,
@@ -105,11 +105,11 @@ pub enum EngineError {
     DetektExec { message: String },
 
     /// No JRE available to run detekt.
-    #[error("JRE not available for running detekt — run `konvoy toolchain install` first")]
+    #[error("jre not available for running detekt — run `konvoy toolchain install` first")]
     DetektNoJre,
 
-    /// Detekt JAR hash mismatch.
-    #[error("detekt {version} JAR hash mismatch — expected {expected}, got {actual}")]
+    /// Detekt jar hash mismatch.
+    #[error("detekt {version} jar hash mismatch — expected {expected}, got {actual}; this may indicate a tampered or corrupted download — delete ~/.konvoy/tools/detekt/{version}/ and re-run `konvoy lint` to re-download, or verify the hash at the detekt release page")]
     DetektHashMismatch {
         version: String,
         expected: String,
