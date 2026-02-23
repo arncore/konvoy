@@ -1,6 +1,6 @@
 //! Managed toolchain download, installation, and discovery.
 //!
-//! Downloads Kotlin/Native prebuilt tarballs from JetBrains GitHub releases
+//! Downloads Kotlin/Native prebuilt tarballs from `download.jetbrains.com`
 //! and installs them under `~/.konvoy/toolchains/<version>/`.
 
 use std::path::{Path, PathBuf};
@@ -726,6 +726,7 @@ mod tests {
             assert!(url.contains("kotlin-native-prebuilt"));
             assert!(url.contains(".tar.gz"));
             assert!(url.starts_with("https://"));
+            assert!(url.contains("download.jetbrains.com"));
         }
     }
 
