@@ -100,6 +100,7 @@ pub fn ensure_detekt(
     version: &str,
     expected_sha256: Option<&str>,
 ) -> Result<(PathBuf, String), EngineError> {
+    validate_version(version)?;
     let jar = detekt_jar_path(version)?;
 
     if jar.exists() {
@@ -162,15 +163,46 @@ pub fn ensure_detekt(
     Ok((jar, download_hash))
 }
 
-/// Compute the SHA-256 hash of a file on disk.
+/// Compute the SHA-256 hash of a file on disk using streaming reads.
 fn hash_file(path: &Path) -> Result<String, EngineError> {
-    let data = std::fs::read(path).map_err(|source| EngineError::Io {
+    let file = std::fs::File::open(path).map_err(|source| EngineError::Io {
         path: path.display().to_string(),
         source,
     })?;
+    let mut reader = std::io::BufReader::new(file);
     let mut hasher = Sha256::new();
-    hasher.update(&data);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut reader, &mut buf).map_err(|source| EngineError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if n == 0 {
+            break;
+        }
+        // SAFETY: `n` is the return value of `read(&mut buf)`, so `n <= buf.len()`.
+        #[allow(clippy::indexing_slicing)]
+        hasher.update(&buf[..n]);
+    }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Validate that a version string is safe for use in filesystem paths.
+/// Only allows alphanumeric characters, dots, hyphens, and underscores.
+fn validate_version(version: &str) -> Result<(), EngineError> {
+    if version.is_empty()
+        || !version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        return Err(EngineError::DetektDownload {
+            version: version.to_owned(),
+            message: format!(
+                "invalid detekt version \"{version}\" — only alphanumeric characters, dots, hyphens, and underscores are allowed"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Download a URL to a file, showing progress on stderr and computing SHA-256.
@@ -276,28 +308,40 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
         .as_deref()
         .unwrap_or(DEFAULT_DETEKT_VERSION);
 
-    // Read lockfile for expected hash.
+    // Read lockfile for expected hash. If the detekt version changed,
+    // the stored hash is stale and must not be used.
     let lockfile_path = root.join("konvoy.lock");
     let lockfile = konvoy_config::lockfile::Lockfile::from_path(&lockfile_path)
         .map_err(|e| EngineError::Lockfile(e.to_string()))?;
-    let expected_hash = lockfile
+    let version_matches = lockfile
         .toolchain
         .as_ref()
-        .and_then(|t| t.detekt_jar_sha256.as_deref());
+        .and_then(|t| t.detekt_version.as_deref())
+        .is_some_and(|v| v == detekt_version);
+    let expected_hash = if version_matches {
+        lockfile
+            .toolchain
+            .as_ref()
+            .and_then(|t| t.detekt_jar_sha256.as_deref())
+    } else {
+        None
+    };
 
     // Ensure detekt jar is available and hash-verified.
     let (jar_path, actual_hash) = ensure_detekt(detekt_version, expected_hash)?;
 
-    // Persist hash to lockfile if not already stored.
+    // Persist version + hash to lockfile if not already stored or version changed.
     if expected_hash.is_none() {
         let mut updated = lockfile;
         if let Some(ref mut tc) = updated.toolchain {
+            tc.detekt_version = Some(detekt_version.to_owned());
             tc.detekt_jar_sha256 = Some(actual_hash);
         } else {
             updated.toolchain = Some(konvoy_config::lockfile::ToolchainLock {
                 konanc_version: manifest.toolchain.kotlin.clone(),
                 konanc_tarball_sha256: None,
                 jre_tarball_sha256: None,
+                detekt_version: Some(detekt_version.to_owned()),
                 detekt_jar_sha256: Some(actual_hash),
             });
         }
@@ -610,5 +654,30 @@ src/main.kt:3:5: MagicNumber - Magic number. [detekt.style]
     #[test]
     fn default_detekt_version_is_set() {
         assert!(!DEFAULT_DETEKT_VERSION.is_empty());
+    }
+
+    #[test]
+    fn validate_version_accepts_valid() {
+        assert!(validate_version("1.23.7").is_ok());
+        assert!(validate_version("2.0.0-RC1").is_ok());
+        assert!(validate_version("1.0.0_beta").is_ok());
+    }
+
+    #[test]
+    fn validate_version_rejects_path_traversal() {
+        assert!(validate_version("../../etc").is_err());
+        assert!(validate_version("../foo").is_err());
+        assert!(validate_version("1.0/../../etc").is_err());
+    }
+
+    #[test]
+    fn validate_version_rejects_empty() {
+        assert!(validate_version("").is_err());
+    }
+
+    #[test]
+    fn validate_version_rejects_special_chars() {
+        assert!(validate_version("1.0; rm -rf /").is_err());
+        assert!(validate_version("ver\0sion").is_err());
     }
 }
