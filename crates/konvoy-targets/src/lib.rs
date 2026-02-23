@@ -8,7 +8,7 @@ use std::fmt;
 use std::str::FromStr;
 
 /// All known Kotlin/Native targets supported by Konvoy.
-const KNOWN_TARGETS: &[&str] = &["linux_x64", "linux_arm64", "macos_x64", "macos_arm64"];
+const KNOWN_TARGETS: &[&str] = &["linux_x64", "macos_x64", "macos_arm64"];
 
 /// A Kotlin/Native compilation target.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -65,7 +65,6 @@ impl FromStr for Target {
 pub fn host_target() -> Result<Target, TargetError> {
     let triple = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => "linux_x64",
-        ("linux", "aarch64") => "linux_arm64",
         ("macos", "x86_64") => "macos_x64",
         ("macos", "aarch64") => "macos_arm64",
         (os, arch) => {
@@ -143,6 +142,15 @@ mod tests {
     fn from_str_rejects_empty_string() {
         let result = Target::from_str("");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn linux_arm64_is_not_supported() {
+        let result = Target::from_str("linux_arm64");
+        assert!(
+            result.is_err(),
+            "linux_arm64 should not be a supported target (no prebuilt toolchain available)"
+        );
     }
 
     #[test]
@@ -253,8 +261,8 @@ mod tests {
 
             #[test]
             #[allow(clippy::unwrap_used)]
-            fn known_targets_always_parse(idx in 0usize..4) {
-                let known = ["linux_x64", "linux_arm64", "macos_x64", "macos_arm64"];
+            fn known_targets_always_parse(idx in 0usize..3) {
+                let known = ["linux_x64", "macos_x64", "macos_arm64"];
                 let name = known[idx];
                 let target = Target::from_str(name);
                 prop_assert!(target.is_ok(), "from_str rejected known target `{}`", name);
@@ -265,7 +273,7 @@ mod tests {
             #[test]
             #[allow(clippy::unwrap_used)]
             fn unknown_targets_always_error(s in "\\PC*") {
-                let known = ["linux_x64", "linux_arm64", "macos_x64", "macos_arm64"];
+                let known = ["linux_x64", "macos_x64", "macos_arm64"];
                 prop_assume!(!known.contains(&s.as_str()));
                 let result = Target::from_str(&s);
                 prop_assert!(result.is_err(), "from_str accepted unknown target `{}`", s);
