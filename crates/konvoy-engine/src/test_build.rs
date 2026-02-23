@@ -130,7 +130,7 @@ pub fn build_tests(
         target: target.to_string(),
         // Use "debug-test" / "release-test" to differentiate from regular builds.
         profile: format!("{profile}-test"),
-        source_dir: project_root.to_path_buf(),
+        source_dir: project_root.join("src"),
         source_glob: "**/*.kt".to_owned(),
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
