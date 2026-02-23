@@ -87,12 +87,20 @@ impl Lockfile {
 
     /// Write the lockfile to disk as human-readable TOML.
     ///
+    /// Uses atomic write (write-to-temp-then-rename) to prevent partial writes
+    /// from corrupting the lockfile.
+    ///
     /// # Errors
     /// Returns an error if serialization fails or the file cannot be written.
     pub fn write_to(&self, path: &Path) -> Result<(), LockfileError> {
         let content =
             toml::to_string_pretty(self).map_err(|e| LockfileError::Serialize { source: e })?;
-        std::fs::write(path, content).map_err(|e| LockfileError::Write {
+        let tmp_path = path.with_extension("lock.tmp");
+        std::fs::write(&tmp_path, &content).map_err(|e| LockfileError::Write {
+            path: tmp_path.display().to_string(),
+            source: e,
+        })?;
+        std::fs::rename(&tmp_path, path).map_err(|e| LockfileError::Write {
             path: path.display().to_string(),
             source: e,
         })?;
@@ -164,6 +172,21 @@ konanc_version = "1.9.22"
 
         let content = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}"));
         assert!(content.contains("2.0.0"), "content was: {content}");
+    }
+
+    #[test]
+    fn write_to_disk_no_temp_file_remains() {
+        let dir = tempdir();
+        let path = dir.join("konvoy.lock");
+        let tmp_path = path.with_extension("lock.tmp");
+        let lockfile = Lockfile::with_toolchain("2.0.0");
+        lockfile.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
+
+        assert!(path.exists(), "lockfile should exist after write");
+        assert!(
+            !tmp_path.exists(),
+            "temp file should not exist after successful write"
+        );
     }
 
     #[test]
