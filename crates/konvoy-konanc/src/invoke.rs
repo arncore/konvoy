@@ -95,6 +95,7 @@ pub struct KonancCommand {
     produce: ProduceKind,
     libraries: Vec<PathBuf>,
     java_home: Option<PathBuf>,
+    generate_test_runner: bool,
 }
 
 impl KonancCommand {
@@ -145,6 +146,12 @@ impl KonancCommand {
         self
     }
 
+    /// Enable test runner generation (adds `-generate-test-runner` flag).
+    pub fn generate_test_runner(mut self, enabled: bool) -> Self {
+        self.generate_test_runner = enabled;
+        self
+    }
+
     /// Build the argument list without executing.
     ///
     /// # Errors
@@ -187,6 +194,11 @@ impl KonancCommand {
         for lib in &self.libraries {
             args.push("-library".to_owned());
             args.push(lib.display().to_string());
+        }
+
+        // Test runner generation
+        if self.generate_test_runner {
+            args.push("-generate-test-runner".to_owned());
         }
 
         // Release optimization
@@ -623,6 +635,38 @@ mod tests {
     fn java_home_builder_sets_value() {
         let cmd = KonancCommand::new().java_home(Path::new("/opt/jre"));
         assert_eq!(cmd.java_home, Some(PathBuf::from("/opt/jre")));
+    }
+
+    #[test]
+    fn build_args_generate_test_runner_enabled() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("test.kt")])
+            .output(Path::new("test_out"))
+            .generate_test_runner(true);
+
+        let args = cmd.build_args().unwrap();
+        assert!(args.contains(&"-generate-test-runner".to_owned()));
+    }
+
+    #[test]
+    fn build_args_generate_test_runner_disabled() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("test.kt")])
+            .output(Path::new("test_out"))
+            .generate_test_runner(false);
+
+        let args = cmd.build_args().unwrap();
+        assert!(!args.contains(&"-generate-test-runner".to_owned()));
+    }
+
+    #[test]
+    fn build_args_generate_test_runner_default_off() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("test.kt")])
+            .output(Path::new("test_out"));
+
+        let args = cmd.build_args().unwrap();
+        assert!(!args.contains(&"-generate-test-runner".to_owned()));
     }
 
     #[test]
