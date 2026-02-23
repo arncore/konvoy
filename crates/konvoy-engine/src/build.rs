@@ -181,7 +181,7 @@ pub(crate) fn build_single(
         konanc_fingerprint: konanc.fingerprint.clone(),
         target: target.to_string(),
         profile: profile.to_owned(),
-        source_dir: project_root.to_path_buf(),
+        source_dir: project_root.join("src"),
         source_glob: "**/*.kt".to_owned(),
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
@@ -867,7 +867,7 @@ mod tests {
             konanc_fingerprint: konanc.fingerprint.clone(),
             target: target.to_string(),
             profile: profile.to_owned(),
-            source_dir: project.clone(),
+            source_dir: project.join("src"),
             source_glob: "**/*.kt".to_owned(),
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
@@ -956,7 +956,7 @@ mod tests {
             konanc_fingerprint: konanc.fingerprint.clone(),
             target: target.to_string(),
             profile: profile.to_owned(),
-            source_dir: project.clone(),
+            source_dir: project.join("src"),
             source_glob: "**/*.kt".to_owned(),
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
@@ -980,6 +980,120 @@ mod tests {
 
         // build_single should hit cache because test sources are excluded,
         // producing the same cache key we computed above.
+        let (output_path, outcome) = build_single(
+            &project,
+            &manifest,
+            &konanc,
+            None,
+            &target,
+            profile,
+            &options,
+            &[],
+            &lockfile_content,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, BuildOutcome::Cached);
+        assert!(output_path.exists());
+    }
+
+    #[test]
+    fn kt_files_outside_src_do_not_affect_cache_key() {
+        // Create a project with src/main.kt and an extra .kt file at the project root.
+        // The cache key should only depend on src/**/*.kt, so adding a .kt file
+        // outside src/ must not change the key.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("myapp");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("src").join("main.kt"), "fun main() {}").unwrap();
+        fs::write(
+            project.join("konvoy.toml"),
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+        )
+        .unwrap();
+
+        let manifest =
+            konvoy_config::manifest::Manifest::from_path(&project.join("konvoy.toml")).unwrap();
+        let konanc = KonancInfo {
+            path: PathBuf::from("/fake/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc123".to_owned(),
+        };
+        let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
+        let profile = "debug";
+        let options = BuildOptions {
+            target: None,
+            release: false,
+            verbose: false,
+            force: false,
+            locked: false,
+        };
+
+        // Compute cache key before adding the outside file.
+        let manifest_content = manifest.to_toml().unwrap();
+        let effective_lockfile = Lockfile::with_toolchain(&konanc.version);
+        let lockfile_content = lockfile_toml_content(&effective_lockfile);
+        let cache_inputs_before = CacheInputs {
+            manifest_content: manifest_content.clone(),
+            lockfile_content: lockfile_content.clone(),
+            konanc_version: konanc.version.clone(),
+            konanc_fingerprint: konanc.fingerprint.clone(),
+            target: target.to_string(),
+            profile: profile.to_owned(),
+            source_dir: project.join("src"),
+            source_glob: "**/*.kt".to_owned(),
+            os: std::env::consts::OS.to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+            dependency_hashes: Vec::new(),
+        };
+        let key_before = CacheKey::compute(&cache_inputs_before).unwrap();
+
+        // Pre-seed the cache so build_single returns Cached.
+        let store = ArtifactStore::new(&project);
+        let staging = tmp.path().join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let fake_artifact = staging.join("myapp");
+        fs::write(&fake_artifact, "fake-binary-content").unwrap();
+        let metadata = BuildMetadata {
+            target: target.to_string(),
+            profile: profile.to_owned(),
+            konanc_version: konanc.version.clone(),
+            built_at: now_iso8601(),
+        };
+        store.store(&key_before, &fake_artifact, &metadata).unwrap();
+
+        // Add a .kt file outside src/ (at the project root).
+        fs::write(
+            project.join("stray.kt"),
+            "fun stray() { /* should be ignored */ }",
+        )
+        .unwrap();
+
+        // Also add one in a sibling directory.
+        fs::create_dir_all(project.join("scripts")).unwrap();
+        fs::write(project.join("scripts").join("build.kt"), "fun build() {}").unwrap();
+
+        // Recompute the cache key — it should be identical since source_dir is src/.
+        let cache_inputs_after = CacheInputs {
+            manifest_content,
+            lockfile_content: lockfile_content.clone(),
+            konanc_version: konanc.version.clone(),
+            konanc_fingerprint: konanc.fingerprint.clone(),
+            target: target.to_string(),
+            profile: profile.to_owned(),
+            source_dir: project.join("src"),
+            source_glob: "**/*.kt".to_owned(),
+            os: std::env::consts::OS.to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+            dependency_hashes: Vec::new(),
+        };
+        let key_after = CacheKey::compute(&cache_inputs_after).unwrap();
+        assert_eq!(
+            key_before, key_after,
+            "cache key must not change when .kt files are added outside src/"
+        );
+
+        // build_single should still hit cache because it uses src/ as source_dir.
         let (output_path, outcome) = build_single(
             &project,
             &manifest,
