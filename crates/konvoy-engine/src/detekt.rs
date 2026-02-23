@@ -301,7 +301,9 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
                 detekt_jar_sha256: Some(actual_hash),
             });
         }
-        let _ = updated.write_to(&lockfile_path);
+        if let Err(e) = updated.write_to(&lockfile_path) {
+            eprintln!("    warning: could not persist detekt hash to lockfile: {e}");
+        }
     }
 
     // Resolve JRE from managed Kotlin toolchain.
