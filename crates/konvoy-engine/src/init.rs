@@ -57,6 +57,7 @@ pub fn init_project_with_kind(
             kotlin: "2.1.0".to_owned(),
         },
         dependencies: std::collections::BTreeMap::new(),
+        lint: None,
     };
     let toml_content = manifest.to_toml()?;
     std::fs::write(&manifest_path, toml_content).map_err(|source| EngineError::Io {

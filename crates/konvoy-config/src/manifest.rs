@@ -11,6 +11,17 @@ pub struct Manifest {
     pub toolchain: Toolchain,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dependencies: BTreeMap<String, DependencySpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lint: Option<LintConfig>,
+}
+
+/// Configuration for the `[lint]` section in `konvoy.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LintConfig {
+    /// Detekt version, e.g. "1.23.7".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detekt: Option<String>,
 }
 
 /// Toolchain specification declaring the Kotlin/Native version.
@@ -490,6 +501,102 @@ name = "no-deps"
         let serialized = manifest.to_toml().unwrap_or_else(|e| panic!("{e}"));
         assert!(
             !serialized.contains("[dependencies]"),
+            "serialized was: {serialized}"
+        );
+    }
+
+    #[test]
+    fn parse_manifest_with_lint_config() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[lint]
+detekt = "1.23.7"
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let lint = manifest
+            .lint
+            .unwrap_or_else(|| panic!("expected lint config"));
+        assert_eq!(lint.detekt.as_deref(), Some("1.23.7"));
+    }
+
+    #[test]
+    fn parse_manifest_without_lint() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        assert!(manifest.lint.is_none());
+    }
+
+    #[test]
+    fn lint_section_rejects_unknown_fields() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[lint]
+unknown = true
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn lint_section_empty_is_valid() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[lint]
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let lint = manifest
+            .lint
+            .unwrap_or_else(|| panic!("expected lint config"));
+        assert!(lint.detekt.is_none());
+    }
+
+    #[test]
+    fn round_trip_with_lint() {
+        let toml = format!(
+            r#"
+[package]
+name = "with-lint"
+{TOOLCHAIN}
+[lint]
+detekt = "1.23.7"
+"#
+        );
+        let original = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let serialized = original.to_toml().unwrap_or_else(|e| panic!("{e}"));
+        let reparsed =
+            Manifest::from_str(&serialized, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(original, reparsed);
+    }
+
+    #[test]
+    fn no_lint_omitted_in_toml() {
+        let toml = format!(
+            r#"
+[package]
+name = "no-lint"
+{TOOLCHAIN}"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let serialized = manifest.to_toml().unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            !serialized.contains("[lint]"),
             "serialized was: {serialized}"
         );
     }

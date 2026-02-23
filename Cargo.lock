@@ -424,9 +424,11 @@ dependencies = [
  "konvoy-util",
  "proptest",
  "serde",
+ "sha2",
  "tempfile",
  "thiserror",
  "toml",
+ "ureq",
 ]
 
 [[package]]

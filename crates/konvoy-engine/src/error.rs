@@ -95,4 +95,20 @@ pub enum EngineError {
     /// No test source files found.
     #[error("no test source files found in {dir} — create test files in src/test/ using kotlin.test annotations")]
     NoTestSources { dir: String },
+
+    /// Failed to download detekt.
+    #[error("cannot download detekt {version}: {message}")]
+    DetektDownload { version: String, message: String },
+
+    /// Failed to run detekt.
+    #[error("cannot run detekt: {message}")]
+    DetektExec { message: String },
+
+    /// No JRE available to run detekt.
+    #[error("JRE not available for running detekt — run `konvoy toolchain install` first")]
+    DetektNoJre,
+
+    /// Lint found issues.
+    #[error("lint found {finding_count} issue(s)")]
+    LintFailed { finding_count: usize },
 }

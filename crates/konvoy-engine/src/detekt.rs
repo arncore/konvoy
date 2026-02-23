@@ -1,0 +1,532 @@
+//! Detekt tool management: download, invocation, and output parsing.
+//!
+//! Downloads `detekt-cli` fat JARs from GitHub releases and runs them
+//! against Kotlin source files using the JRE bundled with managed toolchains.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use sha2::{Digest, Sha256};
+
+use crate::error::EngineError;
+
+/// Default detekt version used when no version is specified in `konvoy.toml`.
+pub const DEFAULT_DETEKT_VERSION: &str = "1.23.7";
+
+/// Options for the `lint` command.
+#[derive(Debug, Clone)]
+pub struct LintOptions {
+    /// Whether to show raw detekt output.
+    pub verbose: bool,
+    /// Optional path to a custom detekt configuration file.
+    pub config: Option<PathBuf>,
+}
+
+/// Result of running detekt.
+#[derive(Debug, Clone)]
+pub struct LintResult {
+    /// Whether detekt exited successfully (no findings).
+    pub success: bool,
+    /// Parsed diagnostics from detekt output.
+    pub diagnostics: Vec<DetektDiagnostic>,
+    /// Raw stderr output from detekt.
+    pub raw_output: String,
+    /// Number of findings.
+    pub finding_count: usize,
+}
+
+/// A single diagnostic finding from detekt.
+#[derive(Debug, Clone)]
+pub struct DetektDiagnostic {
+    /// The rule name (e.g. "MagicNumber").
+    pub rule: String,
+    /// The diagnostic message.
+    pub message: String,
+    /// Source file path, if available.
+    pub file: Option<String>,
+    /// Line number, if available.
+    pub line: Option<u32>,
+}
+
+/// Return the root directory for managed tools: `~/.konvoy/tools/`.
+fn tools_dir() -> Result<PathBuf, EngineError> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(PathBuf::from)
+        .map_err(|_| EngineError::DetektExec {
+            message: "cannot determine home directory — set the HOME environment variable"
+                .to_owned(),
+        })?;
+    Ok(home.join(".konvoy").join("tools"))
+}
+
+/// Return the directory for a specific detekt version.
+fn detekt_dir(version: &str) -> Result<PathBuf, EngineError> {
+    Ok(tools_dir()?.join("detekt").join(version))
+}
+
+/// Return the path to the detekt-cli JAR for a specific version.
+///
+/// # Errors
+/// Returns an error if the home directory cannot be determined.
+pub fn detekt_jar_path(version: &str) -> Result<PathBuf, EngineError> {
+    Ok(detekt_dir(version)?.join(format!("detekt-cli-{version}-all.jar")))
+}
+
+/// Construct the download URL for a detekt-cli release.
+pub fn detekt_download_url(version: &str) -> String {
+    format!("https://github.com/detekt/detekt/releases/download/v{version}/detekt-cli-{version}-all.jar")
+}
+
+/// Check if detekt is already downloaded for a given version.
+///
+/// # Errors
+/// Returns an error if the home directory cannot be determined.
+pub fn is_installed(version: &str) -> Result<bool, EngineError> {
+    let jar = detekt_jar_path(version)?;
+    Ok(jar.exists())
+}
+
+/// Download detekt-cli if not already present, returning the path to the JAR.
+///
+/// # Errors
+/// Returns an error if the download fails or the home directory cannot be determined.
+pub fn ensure_detekt(version: &str) -> Result<PathBuf, EngineError> {
+    let jar = detekt_jar_path(version)?;
+    if jar.exists() {
+        return Ok(jar);
+    }
+
+    let dir = detekt_dir(version)?;
+    std::fs::create_dir_all(&dir).map_err(|source| EngineError::Io {
+        path: dir.display().to_string(),
+        source,
+    })?;
+
+    let url = detekt_download_url(version);
+
+    // Download to a temp file, then rename atomically.
+    let pid = std::process::id();
+    let tmp_path = dir.join(format!(".tmp-detekt-{pid}.jar"));
+
+    download_with_progress(&url, &tmp_path, "detekt", version)?;
+
+    // Atomic rename.
+    match std::fs::rename(&tmp_path, &jar) {
+        Ok(()) => {}
+        Err(_) if jar.exists() => {
+            // Another process downloaded it concurrently.
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        Err(source) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(EngineError::Io {
+                path: jar.display().to_string(),
+                source,
+            });
+        }
+    }
+
+    Ok(jar)
+}
+
+/// Download a URL to a file, showing progress on stderr and computing SHA-256.
+fn download_with_progress(
+    url: &str,
+    dest: &Path,
+    label: &str,
+    version: &str,
+) -> Result<String, EngineError> {
+    let agent = ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .timeout_connect(Some(std::time::Duration::from_secs(30)))
+            .timeout_global(Some(std::time::Duration::from_secs(600)))
+            .build(),
+    );
+
+    let response = agent
+        .get(url)
+        .call()
+        .map_err(|e| EngineError::DetektDownload {
+            version: version.to_owned(),
+            message: e.to_string(),
+        })?;
+
+    let content_length: Option<u64> = response
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok());
+
+    let mut body = response.into_body();
+    let mut file = std::fs::File::create(dest).map_err(|source| EngineError::Io {
+        path: dest.display().to_string(),
+        source,
+    })?;
+
+    let mut hasher = Sha256::new();
+    let mut downloaded: u64 = 0;
+    let mut last_pct: u8 = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+
+    loop {
+        let n = std::io::Read::read(&mut body.as_reader(), &mut buf).map_err(|e| {
+            EngineError::DetektDownload {
+                version: version.to_owned(),
+                message: e.to_string(),
+            }
+        })?;
+        if n == 0 {
+            break;
+        }
+
+        let chunk = buf.get(..n).unwrap_or(&buf);
+        std::io::Write::write_all(&mut file, chunk).map_err(|source| EngineError::Io {
+            path: dest.display().to_string(),
+            source,
+        })?;
+        hasher.update(chunk);
+
+        downloaded = downloaded.saturating_add(n as u64);
+
+        if let Some(total) = content_length {
+            if total > 0 {
+                #[allow(clippy::cast_possible_truncation)]
+                let pct = ((downloaded * 100) / total) as u8;
+                if pct != last_pct && pct.is_multiple_of(10) {
+                    eprint!("\r    Downloading {label} {version}... {pct}%");
+                    last_pct = pct;
+                }
+            }
+        }
+    }
+
+    if content_length.is_some() {
+        eprintln!("\r    Downloading {label} {version}... done   ");
+    } else {
+        let mb = downloaded / (1024 * 1024);
+        eprintln!("    Downloaded {label} {version} ({mb} MB)");
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Run detekt on a project's Kotlin source files.
+///
+/// # Errors
+/// Returns an error if detekt cannot be downloaded, the JRE is unavailable,
+/// or the detekt process fails to execute.
+pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineError> {
+    let manifest = konvoy_config::Manifest::from_path(&root.join("konvoy.toml"))?;
+
+    // Determine detekt version.
+    let detekt_version = manifest
+        .lint
+        .as_ref()
+        .and_then(|l| l.detekt.as_deref())
+        .unwrap_or(DEFAULT_DETEKT_VERSION);
+
+    // Ensure detekt jar is available.
+    let jar_path = ensure_detekt(detekt_version)?;
+
+    // Resolve JRE from managed Kotlin toolchain.
+    let kotlin_version = &manifest.toolchain.kotlin;
+
+    // Auto-install toolchain if needed (to get JRE).
+    if !konvoy_konanc::toolchain::is_installed(kotlin_version).map_err(EngineError::Konanc)? {
+        eprintln!("    Installing Kotlin/Native {kotlin_version} (for JRE)...");
+        konvoy_konanc::toolchain::install(kotlin_version).map_err(EngineError::Konanc)?;
+    }
+
+    let jre_home = konvoy_konanc::toolchain::jre_home_path(kotlin_version)
+        .map_err(|_| EngineError::DetektNoJre)?;
+
+    let java_bin = jre_home.join("bin").join("java");
+    if !java_bin.exists() {
+        return Err(EngineError::DetektNoJre);
+    }
+
+    // Build detekt command.
+    let src_dir = root.join("src");
+    if !src_dir.exists() {
+        return Err(EngineError::NoSources {
+            dir: src_dir.display().to_string(),
+        });
+    }
+
+    let mut args = vec![
+        "-jar".to_owned(),
+        jar_path.display().to_string(),
+        "--input".to_owned(),
+        src_dir.display().to_string(),
+    ];
+
+    // Determine config file.
+    let config_path = if let Some(ref cfg) = options.config {
+        Some(cfg.clone())
+    } else {
+        let default_config = root.join("detekt.yml");
+        if default_config.exists() {
+            Some(default_config)
+        } else {
+            None
+        }
+    };
+
+    if let Some(ref cfg) = config_path {
+        args.push("--config".to_owned());
+        args.push(cfg.display().to_string());
+        args.push("--build-upon-default-config".to_owned());
+    }
+
+    eprintln!("    Linting with detekt {detekt_version}...");
+
+    let output = Command::new(&java_bin)
+        .args(&args)
+        .env("JAVA_HOME", &jre_home)
+        .output()
+        .map_err(|e| EngineError::DetektExec {
+            message: e.to_string(),
+        })?;
+
+    let raw_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let raw_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    // Detekt outputs findings to stdout in its default text format.
+    // Stderr may contain progress/warning messages.
+    let raw_output = format!("{raw_stdout}{raw_stderr}");
+
+    if options.verbose {
+        if !raw_stdout.is_empty() {
+            eprintln!("{raw_stdout}");
+        }
+        if !raw_stderr.is_empty() {
+            eprintln!("{raw_stderr}");
+        }
+    }
+
+    let diagnostics = parse_detekt_output(&raw_stdout);
+    let finding_count = diagnostics.len();
+    let success = output.status.success();
+
+    Ok(LintResult {
+        success,
+        diagnostics,
+        raw_output,
+        finding_count,
+    })
+}
+
+/// Parse detekt text output into structured diagnostics.
+///
+/// Detekt's default text output format:
+/// `file.kt:line:col: RuleName - message [detekt.RuleSet]`
+pub fn parse_detekt_output(output: &str) -> Vec<DetektDiagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Try to match: file:line:col: RuleName - message
+        // or:           file:line: RuleName - message
+        if let Some(diag) = parse_detekt_line(trimmed) {
+            diagnostics.push(diag);
+        }
+    }
+
+    diagnostics
+}
+
+/// Parse a single line of detekt output into a diagnostic.
+///
+/// Expected format: `path/file.kt:line:col: RuleName - message [detekt.RuleSet]`
+fn parse_detekt_line(line: &str) -> Option<DetektDiagnostic> {
+    // Find the pattern: ":<digits>:" which indicates file:line:
+    // We need at least one colon after a file path.
+
+    // Strategy: find the first occurrence of ":<digits>:" pattern.
+    let chars = line.char_indices();
+    let mut file_end = None;
+    let mut line_num = None;
+    let mut rest_start = 0;
+
+    for (i, ch) in chars {
+        if ch == ':' {
+            // Check if followed by digits then colon
+            let remaining = line.get(i + 1..)?;
+            if let Some(end) = remaining.find(':') {
+                let potential_num = remaining.get(..end)?;
+                if let Ok(num) = potential_num.parse::<u32>() {
+                    if file_end.is_none() {
+                        file_end = Some(i);
+                        line_num = Some(num);
+                        // Skip past the line number and colon.
+                        // Check if there's another number (column) after.
+                        let after_line = remaining.get(end + 1..)?;
+                        if let Some(col_end) = after_line.find(':') {
+                            let potential_col = after_line.get(..col_end)?;
+                            if potential_col.parse::<u32>().is_ok() {
+                                // Skip column number too.
+                                rest_start = i + 1 + end + 1 + col_end + 1;
+                            } else {
+                                rest_start = i + 1 + end + 1;
+                            }
+                        } else {
+                            rest_start = i + 1 + end + 1;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let file = file_end.and_then(|end| {
+        let f = line.get(..end)?.trim();
+        if f.is_empty() {
+            None
+        } else {
+            Some(f.to_owned())
+        }
+    });
+
+    let rest = line.get(rest_start..)?.trim();
+    if rest.is_empty() {
+        return None;
+    }
+
+    // Parse: "RuleName - message [detekt.RuleSet]"
+    // or just: "RuleName - message"
+    let (rule, message) = if let Some(dash_pos) = rest.find(" - ") {
+        let rule = rest.get(..dash_pos)?.trim();
+        let msg = rest.get(dash_pos + 3..)?;
+        // Strip trailing [detekt.RuleSet] if present.
+        let msg = if let Some(bracket_pos) = msg.rfind('[') {
+            msg.get(..bracket_pos)?.trim()
+        } else {
+            msg.trim()
+        };
+        (rule.to_owned(), msg.to_owned())
+    } else {
+        // No " - " separator found; treat the whole rest as the message.
+        return None;
+    };
+
+    if rule.is_empty() {
+        return None;
+    }
+
+    Some(DetektDiagnostic {
+        rule,
+        message,
+        file,
+        line: line_num,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detekt_download_url_format() {
+        let url = detekt_download_url("1.23.7");
+        assert_eq!(
+            url,
+            "https://github.com/detekt/detekt/releases/download/v1.23.7/detekt-cli-1.23.7-all.jar"
+        );
+    }
+
+    #[test]
+    fn detekt_jar_path_format() {
+        let path = detekt_jar_path("1.23.7").unwrap_or_else(|e| panic!("{e}"));
+        let s = path.display().to_string();
+        assert!(s.contains(".konvoy/tools/detekt/1.23.7"), "path was: {s}");
+        assert!(s.contains("detekt-cli-1.23.7-all.jar"), "path was: {s}");
+    }
+
+    #[test]
+    fn parse_detekt_single_finding() {
+        let output =
+            "src/main.kt:3:5: MagicNumber - This expression contains a magic number. [detekt.style]";
+        let diags = parse_detekt_output(output);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags.first().map(|d| d.file.as_deref()),
+            Some(Some("src/main.kt"))
+        );
+        assert_eq!(diags.first().map(|d| d.line), Some(Some(3)));
+        assert_eq!(diags.first().map(|d| d.rule.as_str()), Some("MagicNumber"));
+        assert_eq!(
+            diags.first().map(|d| d.message.as_str()),
+            Some("This expression contains a magic number.")
+        );
+    }
+
+    #[test]
+    fn parse_detekt_without_column() {
+        let output = "src/main.kt:10: LongMethod - The method is too long. [detekt.complexity]";
+        let diags = parse_detekt_output(output);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags.first().map(|d| d.file.as_deref()),
+            Some(Some("src/main.kt"))
+        );
+        assert_eq!(diags.first().map(|d| d.line), Some(Some(10)));
+        assert_eq!(diags.first().map(|d| d.rule.as_str()), Some("LongMethod"));
+    }
+
+    #[test]
+    fn parse_detekt_multiple_findings() {
+        let output = "\
+src/main.kt:3:5: MagicNumber - Magic number. [detekt.style]
+src/util.kt:20:1: LongMethod - Method too long. [detekt.complexity]
+src/app.kt:5:10: EmptyFunctionBlock - Empty function. [detekt.empty-blocks]";
+        let diags = parse_detekt_output(output);
+        assert_eq!(diags.len(), 3);
+        assert_eq!(diags.get(0).map(|d| d.rule.as_str()), Some("MagicNumber"));
+        assert_eq!(diags.get(1).map(|d| d.rule.as_str()), Some("LongMethod"));
+        assert_eq!(
+            diags.get(2).map(|d| d.rule.as_str()),
+            Some("EmptyFunctionBlock")
+        );
+    }
+
+    #[test]
+    fn parse_detekt_empty_output() {
+        let diags = parse_detekt_output("");
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn parse_detekt_non_finding_lines_skipped() {
+        let output = "\
+detekt finished in 1234ms
+Overall debt: 10min
+src/main.kt:3:5: MagicNumber - Magic number. [detekt.style]
+";
+        let diags = parse_detekt_output(output);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags.first().map(|d| d.rule.as_str()), Some("MagicNumber"));
+    }
+
+    #[test]
+    fn parse_detekt_without_rule_set_bracket() {
+        let output = "src/main.kt:5:1: UnusedImport - Unused import detected.";
+        let diags = parse_detekt_output(output);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags.first().map(|d| d.rule.as_str()), Some("UnusedImport"));
+        assert_eq!(
+            diags.first().map(|d| d.message.as_str()),
+            Some("Unused import detected.")
+        );
+    }
+
+    #[test]
+    fn default_detekt_version_is_set() {
+        assert!(!DEFAULT_DETEKT_VERSION.is_empty());
+    }
+}
