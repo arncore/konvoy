@@ -73,9 +73,9 @@ hello/
 ## Commands
 
 - `konvoy init [--name <name>] [--lib]` — create a new binary or library project
-- `konvoy build [--target <triple|host>] [--release] [--verbose]` — compile the project
-- `konvoy run [--target <triple|host>] [--release] [-- <args…>]` — build and run
-- `konvoy test [--target <triple|host>] [--release] [--verbose]` — build and run as test
+- `konvoy build [--target <triple|host>] [--release] [--verbose] [--force] [--locked]` — compile the project
+- `konvoy run [--target <triple|host>] [--release] [--force] [--locked] [-- <args…>]` — build and run
+- `konvoy test [--target <triple|host>] [--release] [--verbose] [--force] [--locked] [--filter <pattern>]` — build and run tests
 - `konvoy clean` — remove build artifacts
 - `konvoy doctor` — check environment and toolchain setup
 - `konvoy toolchain install [<version>]` — install a Kotlin/Native version
@@ -132,6 +132,52 @@ my-utils = { path = "../my-utils" }
 
 Library projects are created with `konvoy init --lib` and produce `.klib` files.
 
+## Testing
+
+Konvoy has a built-in test framework using `kotlin.test`. Test sources live in `src/test/` and are compiled alongside your project sources using konanc's `-generate-test-runner` flag.
+
+### Writing tests
+
+Create test files under `src/test/`:
+
+```
+hello/
+  src/
+    main.kt
+    test/
+      math_test.kt
+```
+
+Tests use standard `kotlin.test` annotations:
+
+```kotlin
+import kotlin.test.Test
+import kotlin.test.assertEquals
+
+class MathTest {
+    @Test
+    fun addition() {
+        assertEquals(4, 2 + 2)
+    }
+}
+```
+
+### Running tests
+
+```
+konvoy test
+```
+
+Filter tests by name pattern:
+
+```
+konvoy test --filter "MathTest.*"
+```
+
+The `--filter` flag is forwarded to the test runner as `--ktest_filter`.
+
+Test builds are cached separately from regular builds (using a `debug-test` / `release-test` profile key), so running `konvoy test` won't invalidate your normal build cache.
+
 ## Managed toolchains
 
 Konvoy automatically downloads and manages Kotlin/Native toolchains. The first `konvoy build` (or `konvoy toolchain install`) downloads the compiler and a bundled JRE to `~/.konvoy/toolchains/<version>/`. No manual Kotlin or Java installation is required.
@@ -139,7 +185,7 @@ Konvoy automatically downloads and manages Kotlin/Native toolchains. The first `
 ## Roadmap (high level)
 
 1. ~~**MVP:** host-native executable build/run + cache~~ done
-2. **Tests:** minimal native test runner model
+2. ~~**Tests:** built-in test framework using `kotlin.test`~~ done
 3. ~~**Targets:** explicit target triples~~ done
 4. **Dependencies:** ~~path~~ done → git → url+sha → registry
 5. ~~**Toolchain install/pinning**~~ done
