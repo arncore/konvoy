@@ -339,6 +339,54 @@ konanc_version = "2.1.0"
         dir
     }
 
+    #[test]
+    fn write_to_overwrites_existing_file() {
+        let dir = tempdir();
+        let path = dir.join("konvoy.lock");
+
+        // Write first lockfile
+        let first = Lockfile::with_toolchain("1.0.0");
+        first.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
+        let content = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert!(content.contains("1.0.0"), "first write failed: {content}");
+
+        // Overwrite with a different lockfile
+        let second = Lockfile::with_toolchain("2.0.0");
+        second.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
+        let content = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            content.contains("2.0.0"),
+            "second write should overwrite first: {content}"
+        );
+        assert!(
+            !content.contains("1.0.0"),
+            "first content should be gone: {content}"
+        );
+
+        // Verify round-trip of the overwritten file
+        let reparsed = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(second, reparsed);
+    }
+
+    #[test]
+    fn write_to_nonexistent_parent_returns_error() {
+        let dir = tempdir();
+        let bad_path = dir.join("no").join("such").join("dir").join("konvoy.lock");
+        let lockfile = Lockfile::with_toolchain("1.0.0");
+        let result = lockfile.write_to(&bad_path);
+        assert!(
+            result.is_err(),
+            "write_to should fail when parent directory does not exist"
+        );
+        // Verify the error is a Write variant (not a panic or other error kind)
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot write"),
+            "error should mention 'cannot write', got: {msg}"
+        );
+    }
+
     mod property_tests {
         use super::*;
         use proptest::prelude::*;

@@ -247,6 +247,36 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    /// Verify that the KNOWN_TARGETS list exactly matches the set of platforms
+    /// that have a prebuilt Kotlin/Native toolchain available.
+    ///
+    /// This is a static assertion that guards against adding a target to
+    /// KNOWN_TARGETS without also ensuring the toolchain download code can
+    /// handle it (or vice-versa).
+    #[test]
+    fn known_targets_match_toolchain_supported_platforms() {
+        // These are the Kotlin/Native targets for which JetBrains publishes
+        // prebuilt toolchain tarballs. This list must stay in sync with:
+        //   - konvoy-konanc::toolchain::platform_slug()
+        //   - konvoy-konanc::toolchain::jre_platform_slug()
+        //   - konvoy-targets::host_target()
+        let toolchain_supported: &[&str] = &["linux_x64", "macos_x64", "macos_arm64"];
+
+        let mut known_sorted: Vec<&str> = KNOWN_TARGETS.to_vec();
+        known_sorted.sort_unstable();
+        let mut supported_sorted: Vec<&str> = toolchain_supported.to_vec();
+        supported_sorted.sort_unstable();
+
+        assert_eq!(
+            known_sorted, supported_sorted,
+            "KNOWN_TARGETS and toolchain-supported platforms are out of sync.\n\
+             KNOWN_TARGETS:   {known_sorted:?}\n\
+             Toolchain-supported: {supported_sorted:?}\n\
+             If you add/remove a target, update both KNOWN_TARGETS and the \
+             platform_slug() match arms in konvoy-konanc."
+        );
+    }
+
     mod proptests {
         use super::*;
         use proptest::prelude::*;
