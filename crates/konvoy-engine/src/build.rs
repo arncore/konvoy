@@ -91,6 +91,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     // 5. Resolve dependencies and build them in topological order.
     let dep_graph = resolve_dependencies(project_root, &manifest)?;
     let mut library_paths: Vec<PathBuf> = Vec::new();
+    let lockfile_content = lockfile_toml_content(&lockfile);
 
     for dep in &dep_graph.order {
         let (dep_output, _) = build_single(
@@ -102,6 +103,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
             profile,
             options,
             &library_paths,
+            &lockfile_content,
         )?;
         library_paths.push(dep_output);
     }
@@ -116,6 +118,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         profile,
         options,
         &library_paths,
+        &lockfile_content,
     )?;
 
     // 7. Update lockfile if toolchain or dependencies changed.
@@ -151,6 +154,7 @@ fn build_single(
     profile: &str,
     options: &BuildOptions,
     library_paths: &[PathBuf],
+    lockfile_content: &str,
 ) -> Result<(PathBuf, BuildOutcome), EngineError> {
     // Collect source files.
     let src_dir = project_root.join("src");
@@ -165,11 +169,9 @@ fn build_single(
 
     // Compute cache key.
     let manifest_content = manifest.to_toml()?;
-    let effective_lockfile = Lockfile::with_toolchain(&konanc.version);
-    let lockfile_content = lockfile_toml_content(&effective_lockfile);
     let cache_inputs = CacheInputs {
         manifest_content,
-        lockfile_content,
+        lockfile_content: lockfile_content.to_owned(),
         konanc_version: konanc.version.clone(),
         konanc_fingerprint: konanc.fingerprint.clone(),
         target: target.to_string(),
@@ -590,6 +592,44 @@ mod tests {
     }
 
     #[test]
+    fn lockfile_toml_content_includes_tarball_hashes() {
+        let without_hashes = Lockfile::with_toolchain("2.1.0");
+        let with_hashes = Lockfile::with_managed_toolchain("2.1.0", Some("abc123"), Some("def456"));
+
+        let content_without = lockfile_toml_content(&without_hashes);
+        let content_with = lockfile_toml_content(&with_hashes);
+
+        assert_ne!(
+            content_without, content_with,
+            "lockfile content should differ when tarball hashes are present"
+        );
+        assert!(content_with.contains("abc123"));
+        assert!(content_with.contains("def456"));
+    }
+
+    #[test]
+    fn lockfile_toml_content_includes_dependencies() {
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.dependencies.push(DependencyLock {
+            name: "my-lib".to_owned(),
+            source: DepSource::Path {
+                path: "libs/my-lib".to_owned(),
+            },
+            source_hash: "deadbeef".to_owned(),
+        });
+
+        let content = lockfile_toml_content(&lockfile);
+        assert!(
+            content.contains("my-lib"),
+            "lockfile content should include dependency names"
+        );
+        assert!(
+            content.contains("deadbeef"),
+            "lockfile content should include dependency hashes"
+        );
+    }
+
+    #[test]
     fn update_lockfile_writes_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
         let lockfile_path = tmp.path().join("konvoy.lock");
@@ -817,7 +857,7 @@ mod tests {
         let lockfile_content = lockfile_toml_content(&effective_lockfile);
         let cache_inputs = CacheInputs {
             manifest_content,
-            lockfile_content,
+            lockfile_content: lockfile_content.clone(),
             konanc_version: konanc.version.clone(),
             konanc_fingerprint: konanc.fingerprint.clone(),
             target: target.to_string(),
@@ -855,6 +895,7 @@ mod tests {
             profile,
             &options,
             &[],
+            &lockfile_content,
         )
         .unwrap();
 
