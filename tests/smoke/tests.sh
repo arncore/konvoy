@@ -375,21 +375,22 @@ test_lint_without_config_fails() {
     cd no-lint
     local output
     if output=$(konvoy lint 2>&1); then
-        echo "    expected lint to fail without [lint] section" >&2
+        echo "    expected lint to fail without detekt in [toolchain]" >&2
         return 1
     fi
-    assert_contains "$output" "[lint]"
+    assert_contains "$output" "detekt"
+    assert_contains "$output" "[toolchain]"
 }
 
-test_lint_no_sources_fails() {
-    printf '[package]\nname = "empty"\n\n[toolchain]\nkotlin = "2.1.0"\n\n[lint]\n' > konvoy.toml
+test_lint_no_sources_warns() {
+    printf '[package]\nname = "empty"\n\n[toolchain]\nkotlin = "2.1.0"\ndetekt = "1.23.7"\n' > konvoy.toml
     printf '[toolchain]\nkonanc_version = "2.1.0"\n' > konvoy.lock
     local output
-    if output=$(konvoy lint 2>&1); then
-        echo "    expected lint to fail with no sources" >&2
+    if ! output=$(konvoy lint 2>&1); then
+        echo "    expected lint to succeed with no sources" >&2
         return 1
     fi
-    assert_contains "$output" "source"
+    assert_contains "$output" "no Kotlin sources to lint"
 }
 
 # ---------------------------------------------------------------------------
@@ -436,7 +437,7 @@ run_test test_run_lib_fails
 # lint
 run_test test_lint_help
 run_test test_lint_without_config_fails
-run_test test_lint_no_sources_fails
+run_test test_lint_no_sources_warns
 
 # error cases
 run_test test_build_outside_project_fails

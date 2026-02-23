@@ -428,12 +428,8 @@ fn cmd_doctor() -> Result<(), String> {
                     }
                 }
 
-                // Check detekt availability if [lint] is configured.
-                if let Some(ref lint) = manifest.lint {
-                    let detekt_version = lint
-                        .detekt
-                        .as_deref()
-                        .unwrap_or(konvoy_engine::DEFAULT_DETEKT_VERSION);
+                // Check detekt availability if detekt is configured in [toolchain].
+                if let Some(ref detekt_version) = manifest.toolchain.detekt {
                     match konvoy_engine::detekt::is_installed(detekt_version) {
                         Ok(true) => match konvoy_engine::detekt::detekt_jar_path(detekt_version) {
                             Ok(path) => {

@@ -6,8 +6,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use sha2::{Digest, Sha256};
-
 use crate::error::EngineError;
 
 /// Map a `UtilError::Download` to `EngineError::DetektDownload`.
@@ -20,9 +18,6 @@ fn map_download_err(version: &str, e: konvoy_util::error::UtilError) -> EngineEr
         other => EngineError::Util(other),
     }
 }
-
-/// Default detekt version used when no version is specified in `konvoy.toml`.
-pub const DEFAULT_DETEKT_VERSION: &str = "1.23.7";
 
 /// Options for the `lint` command.
 #[derive(Debug, Clone)]
@@ -183,30 +178,13 @@ pub fn ensure_detekt(
 
 /// Compute the SHA-256 hash of a file on disk using streaming reads.
 fn hash_file(path: &Path) -> Result<String, EngineError> {
-    let file = std::fs::File::open(path).map_err(|source| EngineError::Io {
-        path: path.display().to_string(),
-        source,
-    })?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = std::io::Read::read(&mut reader, &mut buf).map_err(|source| EngineError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
-        if n == 0 {
-            break;
-        }
-        // SAFETY: `n` is the return value of `read(&mut buf)`, so `n <= buf.len()`.
-        #[allow(clippy::indexing_slicing)]
-        hasher.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+    konvoy_util::hash::sha256_file(path).map_err(EngineError::from)
 }
 
 /// Validate that a version string is safe for use in filesystem paths.
 /// Only allows alphanumeric characters, dots, hyphens, and underscores.
+/// Notably excludes `+` (semver build metadata) since detekt releases don't
+/// use it, and `+` can be problematic in URLs and filesystem paths.
 fn validate_version(version: &str) -> Result<(), EngineError> {
     if version.is_empty()
         || !version
@@ -231,17 +209,12 @@ fn validate_version(version: &str) -> Result<(), EngineError> {
 pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineError> {
     let manifest = konvoy_config::Manifest::from_path(&root.join("konvoy.toml"))?;
 
-    // Require [lint] section.
-    let lint_config = manifest
-        .lint
-        .as_ref()
-        .ok_or(EngineError::LintNotConfigured)?;
-
-    // Determine detekt version.
-    let detekt_version = lint_config
+    // Require detekt version in [toolchain].
+    let detekt_version = manifest
+        .toolchain
         .detekt
         .as_deref()
-        .unwrap_or(DEFAULT_DETEKT_VERSION);
+        .ok_or(EngineError::LintNotConfigured)?;
 
     // Read lockfile for expected hash. If the detekt version changed,
     // the stored hash is stale and must not be used.
@@ -319,8 +292,12 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
     // Build detekt command.
     let src_dir = root.join("src");
     if !src_dir.exists() {
-        return Err(EngineError::NoSources {
-            dir: src_dir.display().to_string(),
+        eprintln!("    warning: no Kotlin sources to lint (src/ not found)");
+        return Ok(LintResult {
+            success: true,
+            diagnostics: Vec::new(),
+            raw_output: String::new(),
+            finding_count: 0,
         });
     }
 
@@ -598,11 +575,6 @@ src/main.kt:3:5: MagicNumber - Magic number. [detekt.style]
             diags.first().map(|d| d.message.as_str()),
             Some("Unused import detected.")
         );
-    }
-
-    #[test]
-    fn default_detekt_version_is_set() {
-        assert!(!DEFAULT_DETEKT_VERSION.is_empty());
     }
 
     #[test]

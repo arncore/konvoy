@@ -424,11 +424,9 @@ dependencies = [
  "konvoy-util",
  "proptest",
  "serde",
- "sha2",
  "tempfile",
  "thiserror",
  "toml",
- "ureq",
 ]
 
 [[package]]
@@ -437,11 +435,9 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "konvoy-util",
- "sha2",
  "tar",
  "tempfile",
  "thiserror",
- "ureq",
 ]
 
 [[package]]
@@ -460,6 +456,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "ureq",
 ]
 
 [[package]]

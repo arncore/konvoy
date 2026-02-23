@@ -117,6 +117,6 @@ pub enum EngineError {
     },
 
     /// Lint not configured.
-    #[error("no [lint] section in konvoy.toml — add `[lint]` to enable linting")]
+    #[error("detekt not configured — add `detekt = \"1.23.7\"` to [toolchain] in konvoy.toml")]
     LintNotConfigured,
 }

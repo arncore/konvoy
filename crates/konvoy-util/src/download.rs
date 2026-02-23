@@ -6,6 +6,18 @@ use sha2::{Digest, Sha256};
 
 use crate::error::UtilError;
 
+/// Convert `usize` to `u64` without `as`. Infallible on 32-bit and 64-bit platforms.
+#[allow(clippy::cast_possible_truncation)]
+const fn u64_from_usize(n: usize) -> u64 {
+    n as u64
+}
+
+/// Compute download percentage as a `u8` (0..=100).
+#[allow(clippy::cast_possible_truncation)]
+fn pct_u8(downloaded: u64, total: u64) -> u8 {
+    ((downloaded * 100) / total) as u8
+}
+
 /// Download a URL to a file, showing progress on stderr and computing SHA-256.
 ///
 /// Returns the hex-encoded SHA-256 hash of the downloaded content.
@@ -66,12 +78,11 @@ pub fn download_with_progress(
         })?;
         hasher.update(chunk);
 
-        downloaded = downloaded.saturating_add(n as u64);
+        downloaded = downloaded.saturating_add(u64_from_usize(n));
 
         if let Some(total) = content_length {
             if total > 0 {
-                #[allow(clippy::cast_possible_truncation)]
-                let pct = ((downloaded * 100) / total) as u8;
+                let pct = pct_u8(downloaded, total);
                 if pct != last_pct && pct.is_multiple_of(10) {
                     eprint!("\r    Downloading {label} {version}... {pct}%");
                     last_pct = pct;

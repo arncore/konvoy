@@ -13,7 +13,7 @@ pub mod test_build;
 pub use artifact::{ArtifactStore, BuildMetadata};
 pub use build::{build, BuildOptions, BuildOutcome, BuildResult};
 pub use cache::{CacheInputs, CacheKey};
-pub use detekt::{lint, DetektDiagnostic, LintOptions, LintResult, DEFAULT_DETEKT_VERSION};
+pub use detekt::{lint, DetektDiagnostic, LintOptions, LintResult};
 pub use error::EngineError;
 pub use init::{init_project, init_project_with_kind};
 pub use resolve::{resolve_dependencies, ResolvedGraph};

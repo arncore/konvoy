@@ -139,7 +139,7 @@ Konvoy automatically downloads and manages Kotlin/Native toolchains. The first `
 
 ## Linting
 
-Konvoy integrates [detekt](https://detekt.dev) for Kotlin static analysis. Enable it by adding a `[lint]` section to `konvoy.toml`:
+Konvoy integrates [detekt](https://detekt.dev) for Kotlin static analysis. Enable it by adding `detekt` to `[toolchain]` in `konvoy.toml`:
 
 ```toml
 [package]
@@ -147,12 +147,10 @@ name = "my-app"
 
 [toolchain]
 kotlin = "2.1.0"
-
-[lint]
 detekt = "1.23.7"
 ```
 
-If `detekt` is omitted from `[lint]`, the default version (1.23.7) is used. The detekt-cli JAR is automatically downloaded to `~/.konvoy/tools/detekt/<version>/` on first use and its SHA-256 hash is pinned in `konvoy.lock`.
+The detekt-cli JAR is automatically downloaded to `~/.konvoy/tools/detekt/<version>/` on first use and its SHA-256 hash is pinned in `konvoy.lock`.
 
 Detekt runs using the JRE bundled with the managed Kotlin/Native toolchain, so no separate Java installation is needed.
 
