@@ -89,12 +89,32 @@ pub fn is_installed(version: &str) -> Result<bool, EngineError> {
 
 /// Download detekt-cli if not already present, returning the path to the JAR.
 ///
+/// If `expected_sha256` is `Some`, the downloaded (or existing) JAR is verified
+/// against it. On first download, returns the computed SHA-256 so the caller
+/// can persist it in the lockfile.
+///
 /// # Errors
-/// Returns an error if the download fails or the home directory cannot be determined.
-pub fn ensure_detekt(version: &str) -> Result<PathBuf, EngineError> {
+/// Returns an error if the download fails, the hash doesn't match, or the
+/// home directory cannot be determined.
+pub fn ensure_detekt(
+    version: &str,
+    expected_sha256: Option<&str>,
+) -> Result<(PathBuf, String), EngineError> {
     let jar = detekt_jar_path(version)?;
+
     if jar.exists() {
-        return Ok(jar);
+        // Verify hash of existing JAR.
+        let actual_hash = hash_file(&jar)?;
+        if let Some(expected) = expected_sha256 {
+            if actual_hash != expected {
+                return Err(EngineError::DetektHashMismatch {
+                    version: version.to_owned(),
+                    expected: expected.to_owned(),
+                    actual: actual_hash,
+                });
+            }
+        }
+        return Ok((jar, actual_hash));
     }
 
     let dir = detekt_dir(version)?;
@@ -109,7 +129,19 @@ pub fn ensure_detekt(version: &str) -> Result<PathBuf, EngineError> {
     let pid = std::process::id();
     let tmp_path = dir.join(format!(".tmp-detekt-{pid}.jar"));
 
-    download_with_progress(&url, &tmp_path, "detekt", version)?;
+    let download_hash = download_with_progress(&url, &tmp_path, "detekt", version)?;
+
+    // Verify hash before placing the file.
+    if let Some(expected) = expected_sha256 {
+        if download_hash != expected {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(EngineError::DetektHashMismatch {
+                version: version.to_owned(),
+                expected: expected.to_owned(),
+                actual: download_hash,
+            });
+        }
+    }
 
     // Atomic rename.
     match std::fs::rename(&tmp_path, &jar) {
@@ -127,7 +159,18 @@ pub fn ensure_detekt(version: &str) -> Result<PathBuf, EngineError> {
         }
     }
 
-    Ok(jar)
+    Ok((jar, download_hash))
+}
+
+/// Compute the SHA-256 hash of a file on disk.
+fn hash_file(path: &Path) -> Result<String, EngineError> {
+    let data = std::fs::read(path).map_err(|source| EngineError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Download a URL to a file, showing progress on stderr and computing SHA-256.
@@ -180,7 +223,9 @@ fn download_with_progress(
             break;
         }
 
-        let chunk = buf.get(..n).unwrap_or(&buf);
+        // SAFETY: `n` is the return value of `read(&mut buf)`, so `n <= buf.len()`.
+        #[allow(clippy::indexing_slicing)]
+        let chunk = &buf[..n];
         std::io::Write::write_all(&mut file, chunk).map_err(|source| EngineError::Io {
             path: dest.display().to_string(),
             source,
@@ -219,15 +264,45 @@ fn download_with_progress(
 pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineError> {
     let manifest = konvoy_config::Manifest::from_path(&root.join("konvoy.toml"))?;
 
-    // Determine detekt version.
-    let detekt_version = manifest
+    // Require [lint] section.
+    let lint_config = manifest
         .lint
         .as_ref()
-        .and_then(|l| l.detekt.as_deref())
+        .ok_or(EngineError::LintNotConfigured)?;
+
+    // Determine detekt version.
+    let detekt_version = lint_config
+        .detekt
+        .as_deref()
         .unwrap_or(DEFAULT_DETEKT_VERSION);
 
-    // Ensure detekt jar is available.
-    let jar_path = ensure_detekt(detekt_version)?;
+    // Read lockfile for expected hash.
+    let lockfile_path = root.join("konvoy.lock");
+    let lockfile = konvoy_config::lockfile::Lockfile::from_path(&lockfile_path)
+        .map_err(|e| EngineError::Lockfile(e.to_string()))?;
+    let expected_hash = lockfile
+        .toolchain
+        .as_ref()
+        .and_then(|t| t.detekt_jar_sha256.as_deref());
+
+    // Ensure detekt jar is available and hash-verified.
+    let (jar_path, actual_hash) = ensure_detekt(detekt_version, expected_hash)?;
+
+    // Persist hash to lockfile if not already stored.
+    if expected_hash.is_none() {
+        let mut updated = lockfile;
+        if let Some(ref mut tc) = updated.toolchain {
+            tc.detekt_jar_sha256 = Some(actual_hash);
+        } else {
+            updated.toolchain = Some(konvoy_config::lockfile::ToolchainLock {
+                konanc_version: manifest.toolchain.kotlin.clone(),
+                konanc_tarball_sha256: None,
+                jre_tarball_sha256: None,
+                detekt_jar_sha256: Some(actual_hash),
+            });
+        }
+        let _ = updated.write_to(&lockfile_path);
+    }
 
     // Resolve JRE from managed Kotlin toolchain.
     let kotlin_version = &manifest.toolchain.kotlin;
@@ -261,9 +336,14 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
         src_dir.display().to_string(),
     ];
 
-    // Determine config file.
+    // Determine config file. Resolve relative paths against project root.
     let config_path = if let Some(ref cfg) = options.config {
-        Some(cfg.clone())
+        let resolved = if cfg.is_relative() {
+            root.join(cfg)
+        } else {
+            cfg.clone()
+        };
+        Some(resolved)
     } else {
         let default_config = root.join("detekt.yml");
         if default_config.exists() {

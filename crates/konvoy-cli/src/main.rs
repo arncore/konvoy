@@ -336,25 +336,25 @@ fn cmd_lint(verbose: bool, config: Option<PathBuf>) -> Result<(), String> {
 
     if result.success {
         eprintln!("    No lint issues found");
-        Ok(())
-    } else {
-        if !verbose {
-            for diag in &result.diagnostics {
-                let location = match (&diag.file, diag.line) {
-                    (Some(f), Some(l)) => format!("{f}:{l}"),
-                    (Some(f), None) => f.clone(),
-                    _ => String::new(),
-                };
-                if location.is_empty() {
-                    eprintln!("  {}: {}", diag.rule, diag.message);
-                } else {
-                    eprintln!("  {location}: {}: {}", diag.rule, diag.message);
-                }
+        return Ok(());
+    }
+
+    if !verbose {
+        for diag in &result.diagnostics {
+            let location = match (&diag.file, diag.line) {
+                (Some(f), Some(l)) => format!("{f}:{l}"),
+                (Some(f), None) => f.clone(),
+                _ => String::new(),
+            };
+            if location.is_empty() {
+                eprintln!("  {}: {}", diag.rule, diag.message);
+            } else {
+                eprintln!("  {location}: {}: {}", diag.rule, diag.message);
             }
         }
-        eprintln!();
-        Err(format!("lint found {} issue(s)", result.finding_count))
     }
+    eprintln!();
+    Err(format!("lint found {} issue(s)", result.finding_count))
 }
 
 fn cmd_clean() -> Result<(), String> {

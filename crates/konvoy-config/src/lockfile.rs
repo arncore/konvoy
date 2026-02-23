@@ -17,6 +17,8 @@ pub struct ToolchainLock {
     pub konanc_tarball_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jre_tarball_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detekt_jar_sha256: Option<String>,
 }
 
 /// A locked dependency entry.
@@ -64,6 +66,7 @@ impl Lockfile {
                 konanc_version: version.to_owned(),
                 konanc_tarball_sha256: None,
                 jre_tarball_sha256: None,
+                detekt_jar_sha256: None,
             }),
             dependencies: Vec::new(),
         }
@@ -80,6 +83,7 @@ impl Lockfile {
                 konanc_version: version.to_owned(),
                 konanc_tarball_sha256: konanc_sha256.map(str::to_owned),
                 jre_tarball_sha256: jre_sha256.map(str::to_owned),
+                detekt_jar_sha256: None,
             }),
             dependencies: Vec::new(),
         }

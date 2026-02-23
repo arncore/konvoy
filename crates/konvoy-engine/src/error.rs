@@ -108,7 +108,15 @@ pub enum EngineError {
     #[error("JRE not available for running detekt — run `konvoy toolchain install` first")]
     DetektNoJre,
 
-    /// Lint found issues.
-    #[error("lint found {finding_count} issue(s)")]
-    LintFailed { finding_count: usize },
+    /// Detekt JAR hash mismatch.
+    #[error("detekt {version} JAR hash mismatch — expected {expected}, got {actual}")]
+    DetektHashMismatch {
+        version: String,
+        expected: String,
+        actual: String,
+    },
+
+    /// Lint not configured.
+    #[error("no [lint] section in konvoy.toml — add `[lint]` to enable linting")]
+    LintNotConfigured,
 }
