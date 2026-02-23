@@ -6,16 +6,14 @@ use sha2::{Digest, Sha256};
 
 use crate::error::UtilError;
 
-/// Convert `usize` to `u64` without `as`. Infallible on 32-bit and 64-bit platforms.
-#[allow(clippy::cast_possible_truncation)]
-const fn u64_from_usize(n: usize) -> u64 {
-    n as u64
+/// Convert `usize` to `u64`. Infallible on 32-bit and 64-bit platforms.
+fn u64_from_usize(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
 }
 
 /// Compute download percentage as a `u8` (0..=100).
-#[allow(clippy::cast_possible_truncation)]
 fn pct_u8(downloaded: u64, total: u64) -> u8 {
-    ((downloaded * 100) / total) as u8
+    u8::try_from((downloaded * 100) / total).unwrap_or(100)
 }
 
 /// Download a URL to a file, showing progress on stderr and computing SHA-256.
@@ -69,9 +67,9 @@ pub fn download_with_progress(
             break;
         }
 
-        // SAFETY: `n` is the return value of `read(&mut buf)`, so `n <= buf.len()`.
-        #[allow(clippy::indexing_slicing)]
-        let chunk = &buf[..n];
+        let Some(chunk) = buf.get(..n) else {
+            break; // unreachable: n is bounded by buf.len()
+        };
         std::io::Write::write_all(&mut file, chunk).map_err(|source| UtilError::Io {
             path: dest.display().to_string(),
             source,

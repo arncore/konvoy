@@ -201,81 +201,53 @@ fn validate_version(version: &str) -> Result<(), EngineError> {
     Ok(())
 }
 
-/// Run detekt on a project's Kotlin source files.
+/// Resolve the expected detekt hash from the lockfile.
 ///
-/// # Errors
-/// Returns an error if detekt cannot be downloaded, the JRE is unavailable,
-/// or the detekt process fails to execute.
-pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineError> {
-    let manifest = konvoy_config::Manifest::from_path(&root.join("konvoy.toml"))?;
-
-    // Require detekt version in [toolchain].
-    let detekt_version = manifest
-        .toolchain
-        .detekt
-        .as_deref()
-        .ok_or(EngineError::LintNotConfigured)?;
-
-    // Read lockfile for expected hash. If the detekt version changed,
-    // the stored hash is stale and must not be used.
-    let lockfile_path = root.join("konvoy.lock");
-    let lockfile = konvoy_config::lockfile::Lockfile::from_path(&lockfile_path)
-        .map_err(|e| EngineError::Lockfile(e.to_string()))?;
-    let version_matches = lockfile
-        .toolchain
-        .as_ref()
-        .and_then(|t| t.detekt_version.as_deref())
-        .is_some_and(|v| v == detekt_version);
-    let expected_hash = if version_matches {
-        lockfile
-            .toolchain
-            .as_ref()
-            .and_then(|t| t.detekt_jar_sha256.as_deref())
+/// Returns `None` if the lockfile has no hash or the pinned version doesn't
+/// match `detekt_version` (stale entry).
+fn resolve_lockfile_hash<'a>(
+    lockfile: &'a konvoy_config::lockfile::Lockfile,
+    detekt_version: &str,
+) -> Option<&'a str> {
+    let tc = lockfile.toolchain.as_ref()?;
+    let pinned_version = tc.detekt_version.as_deref()?;
+    if pinned_version == detekt_version {
+        tc.detekt_jar_sha256.as_deref()
     } else {
         None
-    };
-
-    // In --locked mode, the lockfile must have a matching version + hash pinned,
-    // and the JAR must already be downloaded. No network access allowed.
-    if options.locked {
-        if expected_hash.is_none() {
-            return Err(EngineError::LockfileUpdateRequired);
-        }
-        if !is_installed(detekt_version)? {
-            return Err(EngineError::DetektDownload {
-                version: detekt_version.to_owned(),
-                message: "detekt JAR not downloaded and --locked prevents downloads".to_owned(),
-            });
-        }
     }
+}
 
-    // Ensure detekt jar is available and hash-verified.
-    let (jar_path, actual_hash) = ensure_detekt(detekt_version, expected_hash)?;
-
-    // Persist version + hash to lockfile if not already stored or version changed.
-    if expected_hash.is_none() {
-        let mut updated = lockfile;
-        if let Some(ref mut tc) = updated.toolchain {
-            tc.detekt_version = Some(detekt_version.to_owned());
-            tc.detekt_jar_sha256 = Some(actual_hash);
-        } else {
-            updated.toolchain = Some(konvoy_config::lockfile::ToolchainLock {
-                konanc_version: manifest.toolchain.kotlin.clone(),
-                konanc_tarball_sha256: None,
-                jre_tarball_sha256: None,
-                detekt_version: Some(detekt_version.to_owned()),
-                detekt_jar_sha256: Some(actual_hash),
-            });
-        }
-        if let Err(e) = updated.write_to(&lockfile_path) {
-            eprintln!("    warning: could not persist detekt hash to lockfile: {e}");
-        }
+/// Persist the detekt version and JAR hash into the lockfile.
+fn persist_detekt_hash(
+    lockfile_path: &Path,
+    lockfile: konvoy_config::lockfile::Lockfile,
+    kotlin_version: &str,
+    detekt_version: &str,
+    hash: String,
+) {
+    let mut updated = lockfile;
+    if let Some(ref mut tc) = updated.toolchain {
+        tc.detekt_version = Some(detekt_version.to_owned());
+        tc.detekt_jar_sha256 = Some(hash);
+    } else {
+        updated.toolchain = Some(konvoy_config::lockfile::ToolchainLock {
+            konanc_version: kotlin_version.to_owned(),
+            konanc_tarball_sha256: None,
+            jre_tarball_sha256: None,
+            detekt_version: Some(detekt_version.to_owned()),
+            detekt_jar_sha256: Some(hash),
+        });
     }
+    if let Err(e) = updated.write_to(lockfile_path) {
+        eprintln!("    warning: could not persist detekt hash to lockfile: {e}");
+    }
+}
 
-    // Resolve JRE from managed Kotlin toolchain.
-    let kotlin_version = &manifest.toolchain.kotlin;
-
-    // Auto-install toolchain if needed (to get JRE).
+/// Resolve the JRE `java` binary from the managed Kotlin toolchain.
+///
+/// Auto-installs the toolchain if it is not yet present.
+fn resolve_java_bin(kotlin_version: &str) -> Result<(PathBuf, PathBuf), EngineError> {
     if !konvoy_konanc::toolchain::is_installed(kotlin_version).map_err(EngineError::Konanc)? {
         eprintln!("    Installing Kotlin/Native {kotlin_version} (for JRE)...");
         konvoy_konanc::toolchain::install(kotlin_version).map_err(EngineError::Konanc)?;
@@ -289,31 +261,19 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
         return Err(EngineError::DetektNoJre);
     }
 
-    // Build detekt command.
-    let src_dir = root.join("src");
-    if !src_dir.exists() {
-        eprintln!("    warning: no Kotlin sources to lint (src/ not found)");
-        return Ok(LintResult {
-            success: true,
-            diagnostics: Vec::new(),
-            raw_output: String::new(),
-            finding_count: 0,
-        });
-    }
+    Ok((java_bin, jre_home))
+}
 
-    let mut args = vec![
-        "-jar".to_owned(),
-        jar_path.display().to_string(),
-        "--input".to_owned(),
-        src_dir.display().to_string(),
-    ];
-
-    // Determine config file. Resolve relative paths against project root.
-    let config_path = if let Some(ref cfg) = options.config {
+/// Resolve the detekt config file path.
+///
+/// If `--config` was passed, resolve it relative to the project root.
+/// Otherwise, use `detekt.yml` in the project root if it exists.
+fn resolve_config(root: &Path, explicit: Option<&Path>) -> Option<PathBuf> {
+    if let Some(cfg) = explicit {
         let resolved = if cfg.is_relative() {
             root.join(cfg)
         } else {
-            cfg.clone()
+            cfg.to_path_buf()
         };
         Some(resolved)
     } else {
@@ -323,9 +283,27 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
         } else {
             None
         }
-    };
+    }
+}
 
-    if let Some(ref cfg) = config_path {
+/// Execute the detekt process and build a `LintResult` from its output.
+fn run_detekt_process(
+    java_bin: &Path,
+    jre_home: &Path,
+    jar_path: &Path,
+    src_dir: &Path,
+    config_path: Option<&Path>,
+    detekt_version: &str,
+    verbose: bool,
+) -> Result<LintResult, EngineError> {
+    let mut args = vec![
+        "-jar".to_owned(),
+        jar_path.display().to_string(),
+        "--input".to_owned(),
+        src_dir.display().to_string(),
+    ];
+
+    if let Some(cfg) = config_path {
         args.push("--config".to_owned());
         args.push(cfg.display().to_string());
         args.push("--build-upon-default-config".to_owned());
@@ -333,9 +311,9 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
 
     eprintln!("    Linting with detekt {detekt_version}...");
 
-    let output = Command::new(&java_bin)
+    let output = Command::new(java_bin)
         .args(&args)
-        .env("JAVA_HOME", &jre_home)
+        .env("JAVA_HOME", jre_home)
         .output()
         .map_err(|e| EngineError::DetektExec {
             message: e.to_string(),
@@ -343,12 +321,9 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
 
     let raw_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let raw_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-
-    // Detekt outputs findings to stdout in its default text format.
-    // Stderr may contain progress/warning messages.
     let raw_output = format!("{raw_stdout}{raw_stderr}");
 
-    if options.verbose {
+    if verbose {
         if !raw_stdout.is_empty() {
             eprintln!("{raw_stdout}");
         }
@@ -367,6 +342,81 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
         raw_output,
         finding_count,
     })
+}
+
+/// Run detekt on a project's Kotlin source files.
+///
+/// # Errors
+/// Returns an error if detekt cannot be downloaded, the JRE is unavailable,
+/// or the detekt process fails to execute.
+pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineError> {
+    let manifest = konvoy_config::Manifest::from_path(&root.join("konvoy.toml"))?;
+
+    let detekt_version = manifest
+        .toolchain
+        .detekt
+        .as_deref()
+        .ok_or(EngineError::LintNotConfigured)?;
+
+    // Read lockfile and resolve expected hash.
+    let lockfile_path = root.join("konvoy.lock");
+    let lockfile = konvoy_config::lockfile::Lockfile::from_path(&lockfile_path)
+        .map_err(|e| EngineError::Lockfile(e.to_string()))?;
+    let expected_hash = resolve_lockfile_hash(&lockfile, detekt_version);
+
+    // In --locked mode, require pinned hash and pre-downloaded JAR.
+    if options.locked {
+        if expected_hash.is_none() {
+            return Err(EngineError::LockfileUpdateRequired);
+        }
+        if !is_installed(detekt_version)? {
+            return Err(EngineError::DetektDownload {
+                version: detekt_version.to_owned(),
+                message: "detekt JAR not downloaded and --locked prevents downloads".to_owned(),
+            });
+        }
+    }
+
+    // Ensure detekt jar is available and hash-verified.
+    let (jar_path, actual_hash) = ensure_detekt(detekt_version, expected_hash)?;
+
+    // Persist hash to lockfile if not already stored.
+    if expected_hash.is_none() {
+        persist_detekt_hash(
+            &lockfile_path,
+            lockfile,
+            &manifest.toolchain.kotlin,
+            detekt_version,
+            actual_hash,
+        );
+    }
+
+    // Resolve JRE.
+    let (java_bin, jre_home) = resolve_java_bin(&manifest.toolchain.kotlin)?;
+
+    // Check for sources.
+    let src_dir = root.join("src");
+    if !src_dir.exists() {
+        eprintln!("    warning: no Kotlin sources to lint (src/ not found)");
+        return Ok(LintResult {
+            success: true,
+            diagnostics: Vec::new(),
+            raw_output: String::new(),
+            finding_count: 0,
+        });
+    }
+
+    // Resolve config and run detekt.
+    let config_path = resolve_config(root, options.config.as_deref());
+    run_detekt_process(
+        &java_bin,
+        &jre_home,
+        &jar_path,
+        &src_dir,
+        config_path.as_deref(),
+        detekt_version,
+        options.verbose,
+    )
 }
 
 /// Parse detekt text output into structured diagnostics.
@@ -481,7 +531,7 @@ fn parse_detekt_line(line: &str) -> Option<DetektDiagnostic> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{detekt_download_url, detekt_jar_path, parse_detekt_output, validate_version};
 
     #[test]
     fn detekt_download_url_format() {
@@ -600,5 +650,71 @@ src/main.kt:3:5: MagicNumber - Magic number. [detekt.style]
     fn validate_version_rejects_special_chars() {
         assert!(validate_version("1.0; rm -rf /").is_err());
         assert!(validate_version("ver\0sion").is_err());
+    }
+
+    #[test]
+    fn ensure_detekt_rejects_invalid_version() {
+        let result = super::ensure_detekt("../../etc", None);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid detekt version"), "error was: {err}");
+    }
+
+    #[test]
+    fn ensure_detekt_rejects_empty_version() {
+        let result = super::ensure_detekt("", None);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid detekt version"), "error was: {err}");
+    }
+
+    #[test]
+    fn ensure_detekt_hash_mismatch_on_existing_jar() {
+        // Create a fake JAR file at the expected path.
+        let version = "99.0.0-test";
+        let jar = super::detekt_jar_path(version).unwrap();
+        if let Some(parent) = jar.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&jar, b"fake jar content").unwrap();
+
+        // Provide a bogus expected hash — should trigger mismatch.
+        let result = super::ensure_detekt(
+            version,
+            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+        );
+        // Clean up before asserting.
+        let _ = std::fs::remove_file(&jar);
+        let _ = std::fs::remove_dir(jar.parent().unwrap());
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("hash mismatch") || err.contains("Hash"),
+            "error was: {err}"
+        );
+    }
+
+    #[test]
+    fn ensure_detekt_accepts_matching_hash_on_existing_jar() {
+        // Create a fake JAR and compute its real hash.
+        let version = "99.0.1-test";
+        let jar = super::detekt_jar_path(version).unwrap();
+        if let Some(parent) = jar.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let content = b"deterministic test content";
+        std::fs::write(&jar, content).unwrap();
+
+        let real_hash = konvoy_util::hash::sha256_bytes(content);
+        let result = super::ensure_detekt(version, Some(&real_hash));
+        // Clean up.
+        let _ = std::fs::remove_file(&jar);
+        let _ = std::fs::remove_dir(jar.parent().unwrap());
+
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        let (path, hash) = result.unwrap();
+        assert_eq!(hash, real_hash);
+        assert!(path.display().to_string().contains(version));
     }
 }

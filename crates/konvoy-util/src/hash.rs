@@ -36,9 +36,10 @@ pub fn sha256_file(path: &Path) -> Result<String, UtilError> {
         if n == 0 {
             break;
         }
-        // SAFETY: `n` is the return value of `read(&mut buf)`, so `n <= buf.len()`.
-        #[allow(clippy::indexing_slicing)]
-        hasher.update(&buf[..n]);
+        let Some(chunk) = buf.get(..n) else {
+            break; // unreachable: n is bounded by buf.len()
+        };
+        hasher.update(chunk);
     }
     Ok(format!("{:x}", hasher.finalize()))
 }

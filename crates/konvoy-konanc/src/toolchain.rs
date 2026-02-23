@@ -42,8 +42,8 @@ pub struct InstallResult {
 /// # Errors
 /// Returns an error if the home directory cannot be determined.
 pub fn toolchains_dir() -> Result<PathBuf, KonancError> {
-    let home = home_dir()?;
-    Ok(home.join(".konvoy").join("toolchains"))
+    let konvoy_home = konvoy_util::fs::konvoy_home().map_err(|_| KonancError::NoHomeDir)?;
+    Ok(konvoy_home.join("toolchains"))
 }
 
 /// Return the installation directory for a specific version.
@@ -596,14 +596,6 @@ fn rand_u32() -> u32 {
     #[allow(clippy::cast_possible_truncation)]
     let result = hasher.finish() as u32;
     result
-}
-
-/// Get the user's home directory.
-fn home_dir() -> Result<PathBuf, KonancError> {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(PathBuf::from)
-        .map_err(|_| KonancError::NoHomeDir)
 }
 
 #[cfg(test)]

@@ -102,6 +102,17 @@ fn validate(manifest: &Manifest, path: &str) -> Result<(), ManifestError> {
             message: "kotlin version must not be empty".to_owned(),
         });
     }
+    if manifest
+        .toolchain
+        .detekt
+        .as_ref()
+        .is_some_and(String::is_empty)
+    {
+        return Err(ManifestError::InvalidToolchain {
+            path: path.to_owned(),
+            message: "detekt version must not be empty".to_owned(),
+        });
+    }
     // Validate dependencies.
     for (name, spec) in &manifest.dependencies {
         if !is_valid_name(name) {
@@ -600,6 +611,25 @@ name = "my-app"
         assert!(
             !serialized.contains("detekt"),
             "serialized was: {serialized}"
+        );
+    }
+
+    #[test]
+    fn reject_empty_detekt_version() {
+        let toml = r#"
+[package]
+name = "my-app"
+
+[toolchain]
+kotlin = "2.1.0"
+detekt = ""
+"#;
+        let result = Manifest::from_str(toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("detekt version must not be empty"),
+            "error was: {err}"
         );
     }
 

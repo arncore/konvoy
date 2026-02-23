@@ -26,6 +26,7 @@ Konvoy is a native-first Kotlin build tool implemented in Rust. The goal is to m
   - `.konvoy/build/<target>/debug/<name>.klib` (library)
   - `.konvoy/build/<target>/release/<name>.klib` (library)
 - **Managed toolchains:** `~/.konvoy/toolchains/<version>/` (konanc + bundled JRE)
+- **Managed tools:** `~/.konvoy/tools/detekt/<version>/` (detekt-cli JAR)
 
 ## Current scope
 
@@ -33,7 +34,7 @@ Konvoy is a native-first Kotlin build tool implemented in Rust. The goal is to m
 - Output kinds: native executable (`bin`) and Kotlin/Native library (`lib` / `.klib`)
 - Compiler: invoke `konanc` as an external process via managed toolchains
 - Managed toolchains: automatic download of Kotlin/Native + bundled JRE to `~/.konvoy/toolchains/`
-- Commands: `init`, `build`, `run`, `test`, `clean`, `doctor`, `toolchain install/list`
+- Commands: `init`, `build`, `run`, `test`, `lint`, `clean`, `doctor`, `toolchain install/list`
 - Dependencies: path-based (`{ path = "..." }`); no external registry
 - No plugin system
 - No C interop beyond detection placeholders
