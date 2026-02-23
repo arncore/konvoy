@@ -402,6 +402,7 @@ fn jre_platform_slug() -> Result<(&'static str, &'static str), KonancError> {
 
     match (os, arch) {
         ("linux", "x86_64") => Ok(("linux", "x64")),
+        ("linux", "aarch64") => Ok(("linux", "aarch64")),
         ("macos", "x86_64") => Ok(("mac", "x64")),
         ("macos", "aarch64") => Ok(("mac", "aarch64")),
         _ => Err(KonancError::UnsupportedPlatform {
@@ -412,10 +413,14 @@ fn jre_platform_slug() -> Result<(&'static str, &'static str), KonancError> {
 }
 
 /// Construct the download URL for a Kotlin/Native prebuilt tarball.
+///
+/// Uses `download.jetbrains.com` which hosts prebuilt tarballs for all
+/// supported platforms (including linux-aarch64 which is not published
+/// to GitHub releases).
 fn download_url(version: &str) -> Result<String, KonancError> {
     let (os, arch) = platform_slug()?;
     Ok(format!(
-        "https://github.com/JetBrains/kotlin/releases/download/v{version}/kotlin-native-prebuilt-{os}-{arch}-{version}.tar.gz"
+        "https://download.jetbrains.com/kotlin/native/builds/releases/{version}/{os}-{arch}/kotlin-native-prebuilt-{os}-{arch}-{version}.tar.gz"
     ))
 }
 
@@ -426,6 +431,7 @@ fn platform_slug() -> Result<(&'static str, &'static str), KonancError> {
 
     match (os, arch) {
         ("linux", "x86_64") => Ok(("linux", "x86_64")),
+        ("linux", "aarch64") => Ok(("linux", "aarch64")),
         ("macos", "x86_64") => Ok(("macos", "x86_64")),
         ("macos", "aarch64") => Ok(("macos", "aarch64")),
         _ => Err(KonancError::UnsupportedPlatform {
@@ -751,7 +757,7 @@ mod tests {
             // Adoptium uses "mac" not "macos", "x64" not "x86_64"
             assert!(matches!(
                 (os, arch),
-                ("linux", "x64") | ("mac", "x64") | ("mac", "aarch64")
+                ("linux", "x64") | ("linux", "aarch64") | ("mac", "x64") | ("mac", "aarch64")
             ));
         }
     }
