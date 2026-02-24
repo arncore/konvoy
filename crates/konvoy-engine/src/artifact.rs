@@ -17,7 +17,7 @@ pub struct BuildMetadata {
     pub profile: String,
     /// konanc version used for the build.
     pub konanc_version: String,
-    /// ISO 8601 timestamp of when the build was produced.
+    /// Epoch seconds timestamp of when the build was produced (e.g. "1708646400s-since-epoch").
     pub built_at: String,
 }
 
