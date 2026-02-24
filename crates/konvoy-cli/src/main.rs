@@ -1,9 +1,12 @@
 #![forbid(unsafe_code)]
 
+use std::error::Error;
 use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, Subcommand};
+
+type CliResult = Result<(), Box<dyn Error>>;
 
 #[derive(Debug, Parser)]
 #[command(name = "konvoy", about = "A native-first Kotlin build tool")]
@@ -163,22 +166,20 @@ fn main() {
 }
 
 /// Find the project root by looking for `konvoy.toml` in the current directory.
-fn project_root() -> Result<PathBuf, String> {
-    let cwd =
-        std::env::current_dir().map_err(|e| format!("cannot determine working directory: {e}"))?;
+fn project_root() -> Result<PathBuf, Box<dyn Error>> {
+    let cwd = std::env::current_dir()?;
     let manifest = cwd.join("konvoy.toml");
     if !manifest.exists() {
         return Err(
             "no konvoy.toml found in current directory — run `konvoy init` to create a project"
-                .to_owned(),
+                .into(),
         );
     }
     Ok(cwd)
 }
 
-fn cmd_init(name: Option<String>, lib: bool) -> Result<(), String> {
-    let cwd =
-        std::env::current_dir().map_err(|e| format!("cannot determine working directory: {e}"))?;
+fn cmd_init(name: Option<String>, lib: bool) -> CliResult {
+    let cwd = std::env::current_dir()?;
 
     let project_name = name.unwrap_or_else(|| {
         cwd.file_name()
@@ -195,8 +196,7 @@ fn cmd_init(name: Option<String>, lib: bool) -> Result<(), String> {
         konvoy_config::manifest::PackageKind::Bin
     };
 
-    konvoy_engine::init_project_with_kind(&project_name, &project_dir, kind)
-        .map_err(|e| e.to_string())?;
+    konvoy_engine::init_project_with_kind(&project_name, &project_dir, kind)?;
 
     let kind_label = if lib { "library" } else { "project" };
     eprintln!(
@@ -216,7 +216,7 @@ fn cmd_build(
     verbose: bool,
     force: bool,
     locked: bool,
-) -> Result<(), String> {
+) -> CliResult {
     let root = project_root()?;
     let options = konvoy_engine::BuildOptions {
         target,
@@ -226,7 +226,7 @@ fn cmd_build(
         locked,
     };
 
-    let result = konvoy_engine::build(&root, &options).map_err(|e| e.to_string())?;
+    let result = konvoy_engine::build(&root, &options)?;
 
     let profile = if release { "release" } else { "debug" };
     match result.outcome {
@@ -254,16 +254,15 @@ fn cmd_run(
     force: bool,
     locked: bool,
     args: &[String],
-) -> Result<(), String> {
+) -> CliResult {
     let root = project_root()?;
 
     // Cannot run a library project.
-    let manifest =
-        konvoy_config::Manifest::from_path(&root.join("konvoy.toml")).map_err(|e| e.to_string())?;
+    let manifest = konvoy_config::Manifest::from_path(&root.join("konvoy.toml"))?;
     if manifest.package.kind == konvoy_config::manifest::PackageKind::Lib {
         return Err(
             "cannot run a library project — only binary projects (kind = \"bin\") can be run"
-                .to_owned(),
+                .into(),
         );
     }
 
@@ -275,7 +274,7 @@ fn cmd_run(
         locked,
     };
 
-    let result = konvoy_engine::build(&root, &options).map_err(|e| e.to_string())?;
+    let result = konvoy_engine::build(&root, &options)?;
 
     let profile = if release { "release" } else { "debug" };
     eprintln!(
@@ -304,7 +303,7 @@ fn cmd_test(
     force: bool,
     locked: bool,
     filter: &Option<String>,
-) -> Result<(), String> {
+) -> CliResult {
     let root = project_root()?;
     let options = konvoy_engine::TestOptions {
         target,
@@ -314,7 +313,7 @@ fn cmd_test(
         locked,
     };
 
-    let result = konvoy_engine::build_tests(&root, &options).map_err(|e| e.to_string())?;
+    let result = konvoy_engine::build_tests(&root, &options)?;
 
     let profile = if release { "release" } else { "debug" };
     eprintln!(
@@ -340,7 +339,7 @@ fn cmd_test(
     Ok(())
 }
 
-fn cmd_lint(verbose: bool, config: Option<PathBuf>, locked: bool) -> Result<(), String> {
+fn cmd_lint(verbose: bool, config: Option<PathBuf>, locked: bool) -> CliResult {
     let root = project_root()?;
     let options = konvoy_engine::LintOptions {
         verbose,
@@ -348,7 +347,7 @@ fn cmd_lint(verbose: bool, config: Option<PathBuf>, locked: bool) -> Result<(), 
         locked,
     };
 
-    let result = konvoy_engine::lint(&root, &options).map_err(|e| e.to_string())?;
+    let result = konvoy_engine::lint(&root, &options)?;
 
     if result.success {
         eprintln!("    No lint issues found");
@@ -370,20 +369,20 @@ fn cmd_lint(verbose: bool, config: Option<PathBuf>, locked: bool) -> Result<(), 
         }
     }
     eprintln!();
-    Err(format!("lint found {} issue(s)", result.finding_count))
+    Err(format!("lint found {} issue(s)", result.finding_count).into())
 }
 
-fn cmd_clean() -> Result<(), String> {
+fn cmd_clean() -> CliResult {
     let root = project_root()?;
     let konvoy_dir = root.join(".konvoy");
 
-    konvoy_util::fs::remove_dir_all_if_exists(&konvoy_dir).map_err(|e| e.to_string())?;
+    konvoy_util::fs::remove_dir_all_if_exists(&konvoy_dir)?;
 
     eprintln!("    Cleaned build artifacts");
     Ok(())
 }
 
-fn cmd_doctor() -> Result<(), String> {
+fn cmd_doctor() -> CliResult {
     eprintln!("Checking environment...");
     eprintln!();
 
@@ -399,8 +398,7 @@ fn cmd_doctor() -> Result<(), String> {
     }
 
     // Check for konvoy.toml in current directory and report managed toolchain status.
-    let cwd =
-        std::env::current_dir().map_err(|e| format!("cannot determine working directory: {e}"))?;
+    let cwd = std::env::current_dir()?;
     if cwd.join("konvoy.toml").exists() {
         match konvoy_config::Manifest::from_path(&cwd.join("konvoy.toml")) {
             Ok(manifest) => {
@@ -480,7 +478,7 @@ fn cmd_doctor() -> Result<(), String> {
     eprintln!();
     if issues > 0 {
         eprintln!("{issues} issue(s) found — fix them before building");
-        Err(format!("{issues} issue(s) found"))
+        Err(format!("{issues} issue(s) found").into())
     } else {
         eprintln!("All checks passed");
         Ok(())
@@ -1156,18 +1154,16 @@ mod tests {
     }
 }
 
-fn cmd_toolchain(action: ToolchainAction) -> Result<(), String> {
+fn cmd_toolchain(action: ToolchainAction) -> CliResult {
     match action {
         ToolchainAction::Install { version } => {
             let version = if let Some(v) = version {
                 v
             } else {
                 // Read version from konvoy.toml in current directory.
-                let cwd = std::env::current_dir()
-                    .map_err(|e| format!("cannot determine working directory: {e}"))?;
+                let cwd = std::env::current_dir()?;
                 let manifest_path = cwd.join("konvoy.toml");
-                let manifest = konvoy_config::Manifest::from_path(&manifest_path)
-                    .map_err(|e| e.to_string())?;
+                let manifest = konvoy_config::Manifest::from_path(&manifest_path)?;
                 manifest.toolchain.kotlin
             };
 
@@ -1177,11 +1173,11 @@ fn cmd_toolchain(action: ToolchainAction) -> Result<(), String> {
                     return Ok(());
                 }
                 Ok(false) => {}
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(e.into()),
             }
 
             eprintln!("    Installing Kotlin/Native {version}...");
-            let result = konvoy_konanc::toolchain::install(&version).map_err(|e| e.to_string())?;
+            let result = konvoy_konanc::toolchain::install(&version)?;
             eprintln!(
                 "    Installed Kotlin/Native {version} at {}",
                 result.konanc_path.display()
@@ -1189,7 +1185,7 @@ fn cmd_toolchain(action: ToolchainAction) -> Result<(), String> {
             Ok(())
         }
         ToolchainAction::List => {
-            let versions = konvoy_konanc::toolchain::list_installed().map_err(|e| e.to_string())?;
+            let versions = konvoy_konanc::toolchain::list_installed()?;
             if versions.is_empty() {
                 eprintln!("No toolchains installed");
                 eprintln!();
