@@ -5,6 +5,9 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+use crate::cache::CacheKey;
+use crate::error::EngineError;
+
 /// Guard that removes a temporary directory when dropped, unless disarmed.
 struct TempDirGuard {
     path: Option<PathBuf>,
@@ -28,9 +31,6 @@ impl Drop for TempDirGuard {
         }
     }
 }
-
-use crate::cache::CacheKey;
-use crate::error::EngineError;
 
 /// Metadata stored alongside a cached artifact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
