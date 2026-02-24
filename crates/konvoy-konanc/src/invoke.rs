@@ -317,13 +317,13 @@ fn parse_file_and_line(s: &str) -> Option<FileLocation> {
     match parts.len() {
         3 => {
             // file:line:col
-            let file = parts.first()?.to_owned().to_owned();
+            let file = (*parts.first()?).to_owned();
             let line: u32 = parts.get(1)?.parse().ok()?;
             Some(FileLocation { file, line })
         }
         2 => {
             // file:line
-            let file = parts.first()?.to_owned().to_owned();
+            let file = (*parts.first()?).to_owned();
             let line: u32 = parts.get(1)?.parse().ok()?;
             Some(FileLocation { file, line })
         }
