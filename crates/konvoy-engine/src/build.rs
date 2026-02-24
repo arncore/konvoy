@@ -241,7 +241,7 @@ pub(crate) fn build_single(
         target: target.to_string(),
         profile: profile.to_owned(),
         konanc_version: konanc.version.clone(),
-        built_at: now_iso8601(),
+        built_at: now_epoch_secs(),
     };
     store.store(&cache_key, &compile_output, &metadata)?;
 
@@ -504,8 +504,8 @@ fn truncate_hash(hash: &str) -> &str {
     hash.get(..8).unwrap_or(hash)
 }
 
-/// Return the current UTC time as an ISO 8601 string.
-pub(crate) fn now_iso8601() -> String {
+/// Return the current UTC time as epoch seconds (e.g. "1708646400s-since-epoch").
+pub(crate) fn now_epoch_secs() -> String {
     // Use a simple approach without pulling in chrono.
     let duration = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -887,7 +887,7 @@ mod tests {
             target: target.to_string(),
             profile: profile.to_owned(),
             konanc_version: konanc.version.clone(),
-            built_at: now_iso8601(),
+            built_at: now_epoch_secs(),
         };
         store.store(&cache_key, &fake_artifact, &metadata).unwrap();
         assert!(store.has(&cache_key));
@@ -976,7 +976,7 @@ mod tests {
             target: target.to_string(),
             profile: profile.to_owned(),
             konanc_version: konanc.version.clone(),
-            built_at: now_iso8601(),
+            built_at: now_epoch_secs(),
         };
         store.store(&cache_key, &fake_artifact, &metadata).unwrap();
 
@@ -1060,7 +1060,7 @@ mod tests {
             target: target.to_string(),
             profile: profile.to_owned(),
             konanc_version: konanc.version.clone(),
-            built_at: now_iso8601(),
+            built_at: now_epoch_secs(),
         };
         store.store(&key_before, &fake_artifact, &metadata).unwrap();
 
@@ -1114,8 +1114,8 @@ mod tests {
     }
 
     #[test]
-    fn now_iso8601_not_empty() {
-        let ts = now_iso8601();
+    fn now_epoch_secs_not_empty() {
+        let ts = now_epoch_secs();
         assert!(!ts.is_empty());
         assert!(ts.contains("since-epoch"));
     }

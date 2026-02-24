@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::artifact::{ArtifactStore, BuildMetadata};
-use crate::build::{lockfile_toml_content, now_iso8601, resolve_target, BuildOutcome};
+use crate::build::{lockfile_toml_content, now_epoch_secs, resolve_target, BuildOutcome};
 use crate::cache::{CacheInputs, CacheKey};
 use crate::error::EngineError;
 use crate::resolve::resolve_dependencies;
@@ -230,7 +230,7 @@ pub fn build_tests(
         target: target.to_string(),
         profile: profile.to_owned(),
         konanc_version: konanc.version,
-        built_at: now_iso8601(),
+        built_at: now_epoch_secs(),
     };
     store.store(&cache_key, &output_path, &metadata)?;
 
