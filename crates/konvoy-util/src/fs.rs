@@ -101,9 +101,22 @@ fn collect_files_recursive(
             path: dir.display().to_string(),
             source,
         })?;
+
+        // Use entry.file_type() which does NOT follow symlinks, unlike
+        // path.is_dir()/path.metadata(). This prevents infinite recursion
+        // when symlink cycles exist (e.g. a -> b, b -> a).
+        let file_type = entry.file_type().map_err(|source| UtilError::Io {
+            path: entry.path().display().to_string(),
+            source,
+        })?;
+
+        if file_type.is_symlink() {
+            continue;
+        }
+
         let path = entry.path();
 
-        if path.is_dir() {
+        if file_type.is_dir() {
             collect_files_recursive(&path, extension, out)?;
         } else if path
             .extension()
@@ -213,6 +226,45 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let files = collect_files(tmp.path(), "kt").unwrap();
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn collect_files_skips_regular_files_without_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("src");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("main.kt"), b"fun main() {}").unwrap();
+        fs::write(sub.join("helper.kt"), b"fun helper() {}").unwrap();
+        fs::write(sub.join("notes.txt"), b"not kotlin").unwrap();
+        fs::write(sub.join("data.json"), b"{}").unwrap();
+
+        let files = collect_files(tmp.path(), "kt").unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files
+            .iter()
+            .all(|f| f.extension().and_then(|e| e.to_str()) == Some("kt")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_files_skips_symlink_cycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_a = tmp.path().join("a");
+        let dir_b = tmp.path().join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        // Create a symlink cycle: a/link_to_b -> ../b, b/link_to_a -> ../a
+        std::os::unix::fs::symlink(&dir_b, dir_a.join("link_to_b")).unwrap();
+        std::os::unix::fs::symlink(&dir_a, dir_b.join("link_to_a")).unwrap();
+
+        // Place a real file so we verify collection still works
+        fs::write(dir_a.join("real.kt"), b"fun real() {}").unwrap();
+
+        // This must complete without hanging or stack-overflowing
+        let files = collect_files(tmp.path(), "kt").unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files.first().unwrap().ends_with("real.kt"));
     }
 
     #[test]
