@@ -187,8 +187,8 @@ pub(crate) fn build_single(
         arch: std::env::consts::ARCH.to_owned(),
         dependency_hashes: library_paths
             .iter()
-            .filter_map(|p| konvoy_util::hash::sha256_file(p).ok())
-            .collect(),
+            .map(|p| konvoy_util::hash::sha256_file(p).map_err(EngineError::from))
+            .collect::<Result<Vec<_>, _>>()?,
     };
     let cache_key = CacheKey::compute(&cache_inputs)?;
 

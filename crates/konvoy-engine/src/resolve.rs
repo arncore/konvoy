@@ -162,7 +162,7 @@ fn dfs(
 
     // Compute source hash for integrity verification.
     let src_dir = canonical_path.join("src");
-    let source_hash = konvoy_util::hash::sha256_dir(&src_dir, "**/*.kt").unwrap_or_default();
+    let source_hash = konvoy_util::hash::sha256_dir(&src_dir, "**/*.kt")?;
 
     visited.insert(
         canonical_path.to_path_buf(),
