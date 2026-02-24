@@ -18,4 +18,4 @@ toml.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-tempfile = "3"
+tempfile.workspace = true

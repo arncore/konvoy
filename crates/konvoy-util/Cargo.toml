@@ -14,4 +14,4 @@ thiserror.workspace = true
 ureq.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
