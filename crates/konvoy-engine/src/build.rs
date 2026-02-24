@@ -156,9 +156,14 @@ pub(crate) fn build_single(
     library_paths: &[PathBuf],
     lockfile_content: &str,
 ) -> Result<(PathBuf, BuildOutcome), EngineError> {
-    // Collect source files.
+    // Collect source files, excluding test sources (src/test/).
     let src_dir = project_root.join("src");
-    let sources = konvoy_util::fs::collect_files(&src_dir, "kt")?;
+    let test_dir = src_dir.join("test");
+    let all_sources = konvoy_util::fs::collect_files(&src_dir, "kt")?;
+    let sources: Vec<PathBuf> = all_sources
+        .into_iter()
+        .filter(|p| !p.starts_with(&test_dir))
+        .collect();
     if sources.is_empty() {
         return Err(EngineError::NoSources {
             dir: src_dir.display().to_string(),
@@ -886,6 +891,95 @@ mod tests {
         assert!(store.has(&cache_key));
 
         // Call build_single — it should hit cache and return Cached.
+        let (output_path, outcome) = build_single(
+            &project,
+            &manifest,
+            &konanc,
+            None,
+            &target,
+            profile,
+            &options,
+            &[],
+            &lockfile_content,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, BuildOutcome::Cached);
+        assert!(output_path.exists());
+    }
+
+    #[test]
+    fn build_single_excludes_test_sources() {
+        // Create a project with both src/main.kt and src/test/FooTest.kt.
+        // Pre-populate cache with a key computed from only non-test sources.
+        // If build_single correctly excludes test sources, it should hit cache.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("myapp");
+        fs::create_dir_all(project.join("src").join("test")).unwrap();
+        fs::write(project.join("src").join("main.kt"), "fun main() {}").unwrap();
+        fs::write(
+            project.join("src").join("test").join("FooTest.kt"),
+            "import kotlin.test.Test\nclass FooTest { @Test fun foo() {} }",
+        )
+        .unwrap();
+        fs::write(
+            project.join("konvoy.toml"),
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+        )
+        .unwrap();
+
+        let manifest =
+            konvoy_config::manifest::Manifest::from_path(&project.join("konvoy.toml")).unwrap();
+        let konanc = KonancInfo {
+            path: PathBuf::from("/fake/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc123".to_owned(),
+        };
+        let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
+        let profile = "debug";
+        let options = BuildOptions {
+            target: None,
+            release: false,
+            verbose: false,
+            force: false,
+            locked: false,
+        };
+
+        // Compute cache key the same way build_single does (without test sources).
+        let manifest_content = manifest.to_toml().unwrap();
+        let effective_lockfile = Lockfile::with_toolchain(&konanc.version);
+        let lockfile_content = lockfile_toml_content(&effective_lockfile);
+        let cache_inputs = CacheInputs {
+            manifest_content,
+            lockfile_content: lockfile_content.clone(),
+            konanc_version: konanc.version.clone(),
+            konanc_fingerprint: konanc.fingerprint.clone(),
+            target: target.to_string(),
+            profile: profile.to_owned(),
+            source_dir: project.clone(),
+            source_glob: "**/*.kt".to_owned(),
+            os: std::env::consts::OS.to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+            dependency_hashes: Vec::new(),
+        };
+        let cache_key = CacheKey::compute(&cache_inputs).unwrap();
+
+        // Pre-populate the artifact store.
+        let store = ArtifactStore::new(&project);
+        let staging = tmp.path().join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let fake_artifact = staging.join("myapp");
+        fs::write(&fake_artifact, "fake-binary-content").unwrap();
+        let metadata = BuildMetadata {
+            target: target.to_string(),
+            profile: profile.to_owned(),
+            konanc_version: konanc.version.clone(),
+            built_at: now_iso8601(),
+        };
+        store.store(&cache_key, &fake_artifact, &metadata).unwrap();
+
+        // build_single should hit cache because test sources are excluded,
+        // producing the same cache key we computed above.
         let (output_path, outcome) = build_single(
             &project,
             &manifest,
