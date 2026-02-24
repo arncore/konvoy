@@ -33,7 +33,7 @@ pub struct ResolvedKonanc {
 /// Resolve a managed `konanc` installation for the given version.
 ///
 /// If the requested version is not installed, downloads and installs it
-/// from JetBrains GitHub releases. After installation, verifies the version
+/// from `download.jetbrains.com`. After installation, verifies the version
 /// matches and computes a fingerprint for cache keying.
 ///
 /// # Errors
