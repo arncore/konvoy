@@ -191,11 +191,18 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
             source,
         })?;
 
-        // Use randomized temp names to avoid collisions between concurrent installs.
-        let suffix = temp_suffix();
+        // Create secure temp file and directory for download and extraction.
+        let tmp_tarball_handle = tempfile::Builder::new()
+            .prefix(&format!(".tmp-{version}-"))
+            .suffix(".tar.gz")
+            .tempfile_in(&toolchains_root)
+            .map_err(|source| KonancError::Io {
+                path: toolchains_root.display().to_string(),
+                source,
+            })?;
+        let tmp_tarball = tmp_tarball_handle.path().to_path_buf();
 
-        // Download to a temp file, computing SHA-256 as we go.
-        let tmp_tarball = toolchains_root.join(format!(".tmp-{version}-{suffix}.tar.gz"));
+        // Download to the temp file, computing SHA-256 as we go.
         let sha256 = konvoy_util::download::download_with_progress(
             &url,
             &tmp_tarball,
@@ -205,13 +212,15 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
         .map_err(|e| map_download_err(version, e))?;
 
         // Extract to a temp directory, then rename atomically.
-        let tmp_extract = toolchains_root.join(format!(".tmp-{version}-{suffix}-extract"));
-        if tmp_extract.exists() {
-            std::fs::remove_dir_all(&tmp_extract).map_err(|source| KonancError::Io {
-                path: tmp_extract.display().to_string(),
+        let tmp_extract_handle = tempfile::Builder::new()
+            .prefix(&format!(".tmp-{version}-"))
+            .suffix("-extract")
+            .tempdir_in(&toolchains_root)
+            .map_err(|source| KonancError::Io {
+                path: toolchains_root.display().to_string(),
                 source,
             })?;
-        }
+        let tmp_extract = tmp_extract_handle.path().to_path_buf();
 
         extract_tarball(&tmp_tarball, &tmp_extract, "Kotlin/Native", version)?;
 
@@ -296,22 +305,31 @@ fn install_jre(version: &str) -> Result<(PathBuf, Option<String>), KonancError> 
     let url = jre_download_url()?;
     let toolchains_root = toolchains_dir()?;
 
-    // Use randomized temp names to avoid collisions between concurrent installs.
-    let suffix = temp_suffix();
+    // Create secure temp file and directory for download and extraction.
+    let tmp_tarball_handle = tempfile::Builder::new()
+        .prefix(&format!(".tmp-{version}-jre-"))
+        .suffix(".tar.gz")
+        .tempfile_in(&toolchains_root)
+        .map_err(|source| KonancError::Io {
+            path: toolchains_root.display().to_string(),
+            source,
+        })?;
+    let tmp_tarball = tmp_tarball_handle.path().to_path_buf();
 
     // Download JRE tarball.
-    let tmp_tarball = toolchains_root.join(format!(".tmp-{version}-jre-{suffix}.tar.gz"));
     let sha256 = konvoy_util::download::download_with_progress(&url, &tmp_tarball, "JRE", version)
         .map_err(|e| map_download_err(version, e))?;
 
     // Extract to temp directory.
-    let tmp_extract = toolchains_root.join(format!(".tmp-{version}-jre-{suffix}-extract"));
-    if tmp_extract.exists() {
-        std::fs::remove_dir_all(&tmp_extract).map_err(|source| KonancError::Io {
-            path: tmp_extract.display().to_string(),
+    let tmp_extract_handle = tempfile::Builder::new()
+        .prefix(&format!(".tmp-{version}-jre-"))
+        .suffix("-extract")
+        .tempdir_in(&toolchains_root)
+        .map_err(|source| KonancError::Io {
+            path: toolchains_root.display().to_string(),
             source,
         })?;
-    }
+    let tmp_extract = tmp_extract_handle.path().to_path_buf();
 
     extract_tarball(&tmp_tarball, &tmp_extract, "JRE", version)?;
 
@@ -580,30 +598,6 @@ fn find_extracted_root(extract_dir: &Path, version: &str) -> Result<PathBuf, Kon
     })
 }
 
-/// Generate a unique suffix for temp file/directory names.
-///
-/// Combines the process ID with a random component to prevent collisions
-/// between concurrent installs (even from the same PID via fork).
-fn temp_suffix() -> String {
-    let pid = std::process::id();
-    let random: u32 = rand_u32();
-    format!("{pid}-{random:08x}")
-}
-
-/// Simple random u32 using system time as a seed source.
-/// Not cryptographically secure, but sufficient for temp name uniqueness.
-fn rand_u32() -> u32 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    std::time::SystemTime::now().hash(&mut hasher);
-    std::thread::current().id().hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    #[allow(clippy::cast_possible_truncation)]
-    let result = hasher.finish() as u32;
-    result
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -827,12 +821,22 @@ mod tests {
     }
 
     #[test]
-    fn temp_suffix_contains_pid() {
-        let suffix = temp_suffix();
-        let pid = std::process::id().to_string();
-        assert!(
-            suffix.starts_with(&pid),
-            "suffix {suffix} should start with PID {pid}"
+    fn tempfile_builder_creates_unique_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = tempfile::Builder::new()
+            .prefix(".tmp-test-")
+            .suffix(".tar.gz")
+            .tempfile_in(dir.path())
+            .unwrap();
+        let b = tempfile::Builder::new()
+            .prefix(".tmp-test-")
+            .suffix(".tar.gz")
+            .tempfile_in(dir.path())
+            .unwrap();
+        assert_ne!(
+            a.path(),
+            b.path(),
+            "two tempfiles in the same directory should have different paths"
         );
     }
 
@@ -926,13 +930,23 @@ mod tests {
     }
 
     #[test]
-    fn temp_suffix_has_random_component() {
-        // Two calls should produce different suffixes (random component differs).
-        let a = temp_suffix();
-        // Small sleep to ensure different time hash.
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        let b = temp_suffix();
-        assert_ne!(a, b, "consecutive temp suffixes should differ");
+    fn tempdir_builder_creates_unique_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = tempfile::Builder::new()
+            .prefix(".tmp-test-")
+            .suffix("-extract")
+            .tempdir_in(dir.path())
+            .unwrap();
+        let b = tempfile::Builder::new()
+            .prefix(".tmp-test-")
+            .suffix("-extract")
+            .tempdir_in(dir.path())
+            .unwrap();
+        assert_ne!(
+            a.path(),
+            b.path(),
+            "two tempdirs in the same directory should have different paths"
+        );
     }
 
     #[test]
