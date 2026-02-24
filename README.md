@@ -76,6 +76,7 @@ hello/
 - `konvoy build [--target <triple|host>] [--release] [--verbose] [--force] [--locked]` — compile the project
 - `konvoy run [--target <triple|host>] [--release] [--force] [--locked] [-- <args…>]` — build and run
 - `konvoy test [--target <triple|host>] [--release] [--verbose] [--force] [--locked] [--filter <pattern>]` — build and run tests
+- `konvoy lint [--verbose] [--config <path>] [--locked]` — run detekt static analysis on Kotlin sources
 - `konvoy clean` — remove build artifacts
 - `konvoy doctor` — check environment and toolchain setup
 - `konvoy toolchain install [<version>]` — install a Kotlin/Native version
@@ -182,6 +183,31 @@ Test builds are cached separately from regular builds (using a `debug-test` / `r
 
 Konvoy automatically downloads and manages Kotlin/Native toolchains. The first `konvoy build` (or `konvoy toolchain install`) downloads the compiler and a bundled JRE to `~/.konvoy/toolchains/<version>/`. No manual Kotlin or Java installation is required.
 
+## Linting
+
+Konvoy integrates [detekt](https://detekt.dev) for Kotlin static analysis. Enable it by adding `detekt` to `[toolchain]` in `konvoy.toml`:
+
+```toml
+[package]
+name = "my-app"
+
+[toolchain]
+kotlin = "2.1.0"
+detekt = "1.23.7"
+```
+
+The detekt-cli JAR is automatically downloaded to `~/.konvoy/tools/detekt/<version>/` on first use and its SHA-256 hash is pinned in `konvoy.lock`.
+
+Detekt runs using the JRE bundled with the managed Kotlin/Native toolchain, so no separate Java installation is needed.
+
+To customize detekt rules, place a `detekt.yml` file in the project root or pass `--config <path>`:
+
+```
+konvoy lint                        # run with defaults or detekt.yml
+konvoy lint --config my-rules.yml  # use custom config
+konvoy lint --verbose              # show raw detekt output
+```
+
 ## Roadmap (high level)
 
 1. ~~**MVP:** host-native executable build/run + cache~~ done
@@ -189,4 +215,5 @@ Konvoy automatically downloads and manages Kotlin/Native toolchains. The first `
 3. ~~**Targets:** explicit target triples~~ done
 4. **Dependencies:** ~~path~~ done → git → url+sha → registry
 5. ~~**Toolchain install/pinning**~~ done
-6. **Remote cache** (later)
+6. ~~**Linting:** detekt integration~~ done
+7. **Remote cache** (later)

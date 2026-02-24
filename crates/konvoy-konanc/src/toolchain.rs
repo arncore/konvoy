@@ -5,9 +5,22 @@
 
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
-
 use crate::error::KonancError;
+
+/// Map a `UtilError` to `KonancError::Download`.
+fn map_download_err(version: &str, e: konvoy_util::error::UtilError) -> KonancError {
+    match e {
+        konvoy_util::error::UtilError::Download { message } => KonancError::Download {
+            version: version.to_owned(),
+            message,
+        },
+        konvoy_util::error::UtilError::Io { path, source } => KonancError::Io { path, source },
+        other => KonancError::Download {
+            version: version.to_owned(),
+            message: other.to_string(),
+        },
+    }
+}
 
 /// Result of installing a managed toolchain.
 #[derive(Debug, Clone)]
@@ -29,8 +42,8 @@ pub struct InstallResult {
 /// # Errors
 /// Returns an error if the home directory cannot be determined.
 pub fn toolchains_dir() -> Result<PathBuf, KonancError> {
-    let home = home_dir()?;
-    Ok(home.join(".konvoy").join("toolchains"))
+    let konvoy_home = konvoy_util::fs::konvoy_home().map_err(|_| KonancError::NoHomeDir)?;
+    Ok(konvoy_home.join("toolchains"))
 }
 
 /// Return the installation directory for a specific version.
@@ -183,7 +196,13 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
 
         // Download to a temp file, computing SHA-256 as we go.
         let tmp_tarball = toolchains_root.join(format!(".tmp-{version}-{suffix}.tar.gz"));
-        let sha256 = download_with_progress(&url, &tmp_tarball, "Kotlin/Native", version)?;
+        let sha256 = konvoy_util::download::download_with_progress(
+            &url,
+            &tmp_tarball,
+            "Kotlin/Native",
+            version,
+        )
+        .map_err(|e| map_download_err(version, e))?;
 
         // Extract to a temp directory, then rename atomically.
         let tmp_extract = toolchains_root.join(format!(".tmp-{version}-{suffix}-extract"));
@@ -282,7 +301,8 @@ fn install_jre(version: &str) -> Result<(PathBuf, Option<String>), KonancError> 
 
     // Download JRE tarball.
     let tmp_tarball = toolchains_root.join(format!(".tmp-{version}-jre-{suffix}.tar.gz"));
-    let sha256 = download_with_progress(&url, &tmp_tarball, "JRE", version)?;
+    let sha256 = konvoy_util::download::download_with_progress(&url, &tmp_tarball, "JRE", version)
+        .map_err(|e| map_download_err(version, e))?;
 
     // Extract to temp directory.
     let tmp_extract = toolchains_root.join(format!(".tmp-{version}-jre-{suffix}-extract"));
@@ -435,85 +455,6 @@ fn platform_slug() -> Result<(&'static str, &'static str), KonancError> {
     }
 }
 
-/// Download a URL to a file, showing progress on stderr and computing SHA-256.
-fn download_with_progress(
-    url: &str,
-    dest: &Path,
-    label: &str,
-    version: &str,
-) -> Result<String, KonancError> {
-    let agent = ureq::Agent::new_with_config(
-        ureq::config::Config::builder()
-            .timeout_connect(Some(std::time::Duration::from_secs(30)))
-            .timeout_global(Some(std::time::Duration::from_secs(600)))
-            .build(),
-    );
-
-    let response = agent.get(url).call().map_err(|e| KonancError::Download {
-        version: version.to_owned(),
-        message: e.to_string(),
-    })?;
-
-    let content_length: Option<u64> = response
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok());
-
-    let mut body = response.into_body();
-    let mut file = std::fs::File::create(dest).map_err(|source| KonancError::Io {
-        path: dest.display().to_string(),
-        source,
-    })?;
-
-    let mut hasher = Sha256::new();
-    let mut downloaded: u64 = 0;
-    let mut last_pct: u8 = 0;
-    let mut buf = vec![0u8; 64 * 1024];
-
-    loop {
-        let n = std::io::Read::read(&mut body.as_reader(), &mut buf).map_err(|e| {
-            KonancError::Download {
-                version: version.to_owned(),
-                message: e.to_string(),
-            }
-        })?;
-        if n == 0 {
-            break;
-        }
-
-        let chunk = buf.get(..n).unwrap_or(&buf);
-        std::io::Write::write_all(&mut file, chunk).map_err(|source| KonancError::Io {
-            path: dest.display().to_string(),
-            source,
-        })?;
-        hasher.update(chunk);
-
-        downloaded = downloaded.saturating_add(n as u64);
-
-        // Show progress.
-        if let Some(total) = content_length {
-            if total > 0 {
-                #[allow(clippy::cast_possible_truncation)]
-                let pct = ((downloaded * 100) / total) as u8;
-                if pct != last_pct && pct.is_multiple_of(10) {
-                    eprint!("\r    Downloading {label} {version}... {pct}%");
-                    last_pct = pct;
-                }
-            }
-        }
-    }
-
-    if content_length.is_some() {
-        eprintln!("\r    Downloading {label} {version}... done   ");
-    } else {
-        let mb = downloaded / (1024 * 1024);
-        eprintln!("    Downloaded {label} {version} ({mb} MB)");
-    }
-
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
 /// Extract a `.tar.gz` tarball to a directory.
 ///
 /// Each entry's path is validated to ensure it stays within `dest`,
@@ -655,14 +596,6 @@ fn rand_u32() -> u32 {
     #[allow(clippy::cast_possible_truncation)]
     let result = hasher.finish() as u32;
     result
-}
-
-/// Get the user's home directory.
-fn home_dir() -> Result<PathBuf, KonancError> {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(PathBuf::from)
-        .map_err(|_| KonancError::NoHomeDir)
 }
 
 #[cfg(test)]

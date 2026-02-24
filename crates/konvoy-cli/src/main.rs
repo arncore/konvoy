@@ -81,6 +81,18 @@ enum Command {
         #[arg(long)]
         filter: Option<String>,
     },
+    /// Run detekt linter on Kotlin source files
+    Lint {
+        /// Show raw detekt output
+        #[arg(long)]
+        verbose: bool,
+        /// Path to a custom detekt configuration file
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Require the lockfile to be up-to-date; error on any mismatch
+        #[arg(long)]
+        locked: bool,
+    },
     /// Remove build artifacts
     Clean,
     /// Check environment and toolchain setup
@@ -130,6 +142,11 @@ fn main() {
             locked,
             filter,
         } => cmd_test(target, release, verbose, force, locked, &filter),
+        Command::Lint {
+            verbose,
+            config,
+            locked,
+        } => cmd_lint(verbose, config, locked),
         Command::Clean => cmd_clean(),
         Command::Doctor => cmd_doctor(),
         Command::Toolchain { action } => cmd_toolchain(action),
@@ -318,6 +335,39 @@ fn cmd_test(
     Ok(())
 }
 
+fn cmd_lint(verbose: bool, config: Option<PathBuf>, locked: bool) -> Result<(), String> {
+    let root = project_root()?;
+    let options = konvoy_engine::LintOptions {
+        verbose,
+        config,
+        locked,
+    };
+
+    let result = konvoy_engine::lint(&root, &options).map_err(|e| e.to_string())?;
+
+    if result.success {
+        eprintln!("    No lint issues found");
+        return Ok(());
+    }
+
+    if !verbose {
+        for diag in &result.diagnostics {
+            let location = match (&diag.file, diag.line) {
+                (Some(f), Some(l)) => format!("{f}:{l}"),
+                (Some(f), None) => f.clone(),
+                _ => String::new(),
+            };
+            if location.is_empty() {
+                eprintln!("  {}: {}", diag.rule, diag.message);
+            } else {
+                eprintln!("  {location}: {}: {}", diag.rule, diag.message);
+            }
+        }
+    }
+    eprintln!();
+    Err(format!("lint found {} issue(s)", result.finding_count))
+}
+
 fn cmd_clean() -> Result<(), String> {
     let root = project_root()?;
     let konvoy_dir = root.join(".konvoy");
@@ -375,6 +425,28 @@ fn cmd_doctor() -> Result<(), String> {
                     Err(e) => {
                         eprintln!("  [!!] konanc: {e}");
                         issues = issues.saturating_add(1);
+                    }
+                }
+
+                // Check detekt availability if detekt is configured in [toolchain].
+                if let Some(ref detekt_version) = manifest.toolchain.detekt {
+                    match konvoy_engine::detekt::is_installed(detekt_version) {
+                        Ok(true) => match konvoy_engine::detekt::detekt_jar_path(detekt_version) {
+                            Ok(path) => {
+                                eprintln!("  [ok] detekt: {detekt_version} ({})", path.display());
+                            }
+                            Err(e) => {
+                                eprintln!("  [!!] detekt: {e}");
+                                issues = issues.saturating_add(1);
+                            }
+                        },
+                        Ok(false) => {
+                            eprintln!("  [--] detekt: {detekt_version} not downloaded — will download on first `konvoy lint`");
+                        }
+                        Err(e) => {
+                            eprintln!("  [!!] detekt: {e}");
+                            issues = issues.saturating_add(1);
+                        }
                     }
                 }
             }
@@ -921,6 +993,7 @@ mod tests {
             "build",
             "run",
             "test",
+            "lint",
             "clean",
             "doctor",
             "toolchain",
@@ -950,6 +1023,76 @@ mod tests {
             }
             other => panic!("expected Run, got {other:?}"),
         }
+    }
+
+    // ── Lint parsing ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_lint_defaults() {
+        let cli = Cli::try_parse_from(["konvoy", "lint"]).unwrap();
+        match cli.command {
+            Command::Lint {
+                verbose,
+                config,
+                locked,
+            } => {
+                assert!(!verbose);
+                assert!(config.is_none());
+                assert!(!locked);
+            }
+            other => panic!("expected Lint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lint_verbose() {
+        let cli = Cli::try_parse_from(["konvoy", "lint", "--verbose"]).unwrap();
+        match cli.command {
+            Command::Lint { verbose, .. } => assert!(verbose),
+            other => panic!("expected Lint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lint_with_config() {
+        let cli = Cli::try_parse_from(["konvoy", "lint", "--config", "my-detekt.yml"]).unwrap();
+        match cli.command {
+            Command::Lint { config, .. } => {
+                assert_eq!(config, Some(PathBuf::from("my-detekt.yml")));
+            }
+            other => panic!("expected Lint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lint_all_flags() {
+        let cli = Cli::try_parse_from([
+            "konvoy",
+            "lint",
+            "--verbose",
+            "--config",
+            "custom.yml",
+            "--locked",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Lint {
+                verbose,
+                config,
+                locked,
+            } => {
+                assert!(verbose);
+                assert_eq!(config, Some(PathBuf::from("custom.yml")));
+                assert!(locked);
+            }
+            other => panic!("expected Lint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn help_flag_on_lint() {
+        let err = Cli::try_parse_from(["konvoy", "lint", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
     }
 }
 

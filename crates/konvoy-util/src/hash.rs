@@ -13,16 +13,35 @@ pub fn sha256_bytes(data: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Compute the SHA-256 hex digest of a file's contents.
+/// Compute the SHA-256 hex digest of a file using streaming reads.
+///
+/// Uses a 64 KiB buffer to avoid loading the entire file into memory,
+/// which matters for large files like detekt JARs (~50 MB).
 ///
 /// # Errors
-/// Returns an error if the file cannot be read.
+/// Returns an error if the file cannot be opened or read.
 pub fn sha256_file(path: &Path) -> Result<String, UtilError> {
-    let data = std::fs::read(path).map_err(|source| UtilError::Io {
+    let file = std::fs::File::open(path).map_err(|source| UtilError::Io {
         path: path.display().to_string(),
         source,
     })?;
-    Ok(sha256_bytes(&data))
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut reader, &mut buf).map_err(|source| UtilError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if n == 0 {
+            break;
+        }
+        let Some(chunk) = buf.get(..n) else {
+            break; // unreachable: n is bounded by buf.len()
+        };
+        hasher.update(chunk);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Hash all files matching `pattern` inside `dir`, sorted by relative path for determinism.

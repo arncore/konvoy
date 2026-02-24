@@ -17,4 +17,12 @@ pub enum UtilError {
     /// A command failed to execute.
     #[error("cannot execute command: {source}")]
     CommandExec { source: std::io::Error },
+
+    /// A download failed.
+    #[error("download failed: {message}")]
+    Download { message: String },
+
+    /// Cannot determine the user's home directory.
+    #[error("cannot determine home directory — set the HOME environment variable")]
+    NoHomeDir,
 }

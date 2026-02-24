@@ -55,6 +55,7 @@ pub fn init_project_with_kind(
         },
         toolchain: Toolchain {
             kotlin: "2.1.0".to_owned(),
+            detekt: None,
         },
         dependencies: std::collections::BTreeMap::new(),
     };

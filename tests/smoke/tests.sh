@@ -363,6 +363,37 @@ test_run_lib_fails() {
 }
 
 # ---------------------------------------------------------------------------
+# Tests: lint
+# ---------------------------------------------------------------------------
+
+test_lint_help() {
+    konvoy lint --help >/dev/null 2>&1
+}
+
+test_lint_without_config_fails() {
+    konvoy init --name no-lint >/dev/null 2>&1
+    cd no-lint
+    local output
+    if output=$(konvoy lint 2>&1); then
+        echo "    expected lint to fail without detekt in [toolchain]" >&2
+        return 1
+    fi
+    assert_contains "$output" "detekt"
+    assert_contains "$output" "[toolchain]"
+}
+
+test_lint_no_sources_warns() {
+    printf '[package]\nname = "empty"\n\n[toolchain]\nkotlin = "2.1.0"\ndetekt = "1.23.7"\n' > konvoy.toml
+    printf '[toolchain]\nkonanc_version = "2.1.0"\n' > konvoy.lock
+    local output
+    if ! output=$(konvoy lint 2>&1); then
+        echo "    expected lint to succeed with no sources" >&2
+        return 1
+    fi
+    assert_contains "$output" "no Kotlin sources to lint"
+}
+
+# ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
 echo "Running Konvoy smoke tests..."
@@ -402,6 +433,11 @@ run_test test_init_lib
 run_test test_build_lib
 run_test test_dep_build
 run_test test_run_lib_fails
+
+# lint
+run_test test_lint_help
+run_test test_lint_without_config_fails
+run_test test_lint_no_sources_warns
 
 # error cases
 run_test test_build_outside_project_fails

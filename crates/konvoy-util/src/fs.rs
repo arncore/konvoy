@@ -61,6 +61,20 @@ pub fn remove_dir_all_if_exists(path: &Path) -> Result<(), UtilError> {
     }
 }
 
+/// Return the Konvoy home directory (`~/.konvoy`).
+///
+/// Resolves via `HOME` (Unix) or `USERPROFILE` (Windows).
+///
+/// # Errors
+/// Returns an error if neither environment variable is set.
+pub fn konvoy_home() -> Result<PathBuf, UtilError> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(PathBuf::from)
+        .map_err(|_| UtilError::NoHomeDir)?;
+    Ok(home.join(".konvoy"))
+}
+
 /// Collect all files with the given `extension` under `dir`, recursively, sorted by path.
 ///
 /// # Errors
@@ -199,5 +213,39 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let files = collect_files(tmp.path(), "kt").unwrap();
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn konvoy_home_returns_dotkonvoy_subdir() {
+        // HOME is set in normal test environments.
+        let home = konvoy_home().unwrap();
+        assert!(
+            home.ends_with(".konvoy"),
+            "expected path ending in .konvoy, got: {}",
+            home.display()
+        );
+    }
+
+    #[test]
+    fn konvoy_home_fails_without_home_vars() {
+        // Temporarily unset both HOME and USERPROFILE.
+        let saved_home = std::env::var("HOME").ok();
+        let saved_profile = std::env::var("USERPROFILE").ok();
+        std::env::remove_var("HOME");
+        std::env::remove_var("USERPROFILE");
+
+        let result = konvoy_home();
+
+        // Restore before asserting.
+        if let Some(v) = saved_home {
+            std::env::set_var("HOME", v);
+        }
+        if let Some(v) = saved_profile {
+            std::env::set_var("USERPROFILE", v);
+        }
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("home directory"), "error was: {err}");
     }
 }
