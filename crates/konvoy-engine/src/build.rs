@@ -324,13 +324,7 @@ fn compile(
     // konanc appends `.kexe` on Linux for programs. Rename to the expected path.
     // Libraries produce .klib directly, so skip this for library builds.
     if produce == ProduceKind::Program {
-        let kexe_path = output_path.with_extension("kexe");
-        if !output_path.exists() && kexe_path.exists() {
-            std::fs::rename(&kexe_path, output_path).map_err(|source| EngineError::Io {
-                path: output_path.display().to_string(),
-                source,
-            })?;
-        }
+        normalize_konanc_output(output_path)?;
     }
 
     Ok(output_path.to_path_buf())
@@ -496,6 +490,25 @@ fn update_lockfile_if_needed(
         .write_to(lockfile_path)
         .map_err(|e| EngineError::Lockfile(e.to_string()))?;
 
+    Ok(())
+}
+
+/// Rename the `.kexe` output that `konanc` sometimes produces (e.g. on Linux)
+/// back to the expected `output_path`.
+///
+/// This is a no-op when `output_path` already exists or the `.kexe` variant is
+/// absent.
+///
+/// # Errors
+/// Returns an error if the rename fails.
+pub(crate) fn normalize_konanc_output(output_path: &Path) -> Result<(), EngineError> {
+    let kexe_path = output_path.with_extension("kexe");
+    if !output_path.exists() && kexe_path.exists() {
+        std::fs::rename(&kexe_path, output_path).map_err(|source| EngineError::Io {
+            path: kexe_path.display().to_string(),
+            source,
+        })?;
+    }
     Ok(())
 }
 
