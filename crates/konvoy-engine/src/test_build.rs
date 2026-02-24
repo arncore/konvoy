@@ -217,13 +217,7 @@ pub fn build_tests(
     }
 
     // Handle .kexe suffix on Linux.
-    let kexe_path = output_path.with_extension("kexe");
-    if !output_path.exists() && kexe_path.exists() {
-        std::fs::rename(&kexe_path, &output_path).map_err(|source| EngineError::Io {
-            path: output_path.display().to_string(),
-            source,
-        })?;
-    }
+    crate::build::normalize_konanc_output(&output_path)?;
 
     // Store in cache.
     let metadata = BuildMetadata {
