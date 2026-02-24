@@ -131,7 +131,14 @@ kotlin = "2.1.0"
 my-utils = { path = "../my-utils" }
 ```
 
-Library projects are created with `konvoy init --lib` and produce `.klib` files.
+Library projects are created with `konvoy init --lib` and produce `.klib` files. The generated project uses `src/lib.kt` as its entrypoint (instead of `src/main.kt` for binaries):
+
+```
+my-utils/
+  konvoy.toml
+  src/
+    lib.kt
+```
 
 ## Testing
 
