@@ -50,6 +50,9 @@ enum Command {
         /// Run in release mode
         #[arg(long)]
         release: bool,
+        /// Show compiler output
+        #[arg(long, short = 'v')]
+        verbose: bool,
         /// Allow overriding hash mismatch checks
         #[arg(long)]
         force: bool,
@@ -130,10 +133,11 @@ fn main() {
         Command::Run {
             target,
             release,
+            verbose,
             force,
             locked,
             args,
-        } => cmd_run(target, release, force, locked, &args),
+        } => cmd_run(target, release, verbose, force, locked, &args),
         Command::Test {
             target,
             release,
@@ -246,6 +250,7 @@ fn cmd_build(
 fn cmd_run(
     target: Option<String>,
     release: bool,
+    verbose: bool,
     force: bool,
     locked: bool,
     args: &[String],
@@ -265,7 +270,7 @@ fn cmd_run(
     let options = konvoy_engine::BuildOptions {
         target,
         release,
-        verbose: false,
+        verbose,
         force,
         locked,
     };
@@ -625,15 +630,70 @@ mod tests {
             Command::Run {
                 target,
                 release,
+                verbose,
                 force,
                 locked,
                 args,
             } => {
                 assert!(target.is_none());
                 assert!(!release);
+                assert!(!verbose);
                 assert!(!force);
                 assert!(!locked);
                 assert!(args.is_empty());
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_run_verbose() {
+        let cli = Cli::try_parse_from(["konvoy", "run", "--verbose"]).unwrap();
+        match cli.command {
+            Command::Run { verbose, .. } => assert!(verbose),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_run_verbose_short() {
+        let cli = Cli::try_parse_from(["konvoy", "run", "-v"]).unwrap();
+        match cli.command {
+            Command::Run { verbose, .. } => assert!(verbose),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_run_all_flags() {
+        let cli = Cli::try_parse_from([
+            "konvoy",
+            "run",
+            "--target",
+            "linux_x64",
+            "--release",
+            "--verbose",
+            "--force",
+            "--locked",
+            "--",
+            "arg1",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Run {
+                target,
+                release,
+                verbose,
+                force,
+                locked,
+                args,
+            } => {
+                assert_eq!(target.as_deref(), Some("linux_x64"));
+                assert!(release);
+                assert!(verbose);
+                assert!(force);
+                assert!(locked);
+                assert_eq!(args, vec!["arg1"]);
             }
             other => panic!("expected Run, got {other:?}"),
         }
