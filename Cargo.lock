@@ -402,6 +402,7 @@ dependencies = [
  "konvoy-konanc",
  "konvoy-targets",
  "konvoy-util",
+ "tempfile",
 ]
 
 [[package]]
