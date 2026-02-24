@@ -5,6 +5,30 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+/// Guard that removes a temporary directory when dropped, unless disarmed.
+struct TempDirGuard {
+    path: Option<PathBuf>,
+}
+
+impl TempDirGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    /// Disarm the guard so the directory is NOT removed on drop.
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
 use crate::cache::CacheKey;
 use crate::error::EngineError;
 
@@ -49,10 +73,15 @@ impl ArtifactStore {
         self.cache_path(key).is_dir()
     }
 
-    /// Store an artifact and its metadata in the cache.
+    /// Store an artifact and its metadata in the cache atomically.
     ///
-    /// The cache is immutable: if an entry already exists for this key,
-    /// the store is a no-op and returns `Ok(())`.
+    /// Writes to a temporary directory first, then atomically renames it to the
+    /// final path. This avoids a TOCTOU race where another process could create
+    /// the directory between an existence check and the actual write.
+    ///
+    /// The cache is immutable: if an entry already exists for this key (either
+    /// detected early or via a rename conflict), the store is a no-op and
+    /// returns `Ok(())`.
     ///
     /// # Errors
     /// Returns an error if the cache directory cannot be created or the
@@ -65,14 +94,20 @@ impl ArtifactStore {
     ) -> Result<(), EngineError> {
         let entry_dir = self.cache_path(key);
 
-        // Immutable cache: never overwrite.
+        // Fast path: if the entry already exists, skip the work.
         if entry_dir.is_dir() {
             return Ok(());
         }
 
-        konvoy_util::fs::ensure_dir(&entry_dir)?;
+        // Ensure the cache root exists so we can create a temp dir inside it.
+        konvoy_util::fs::ensure_dir(&self.cache_root)?;
 
-        // Copy the artifact into the cache directory.
+        // Create a temp directory under the cache root (same filesystem so
+        // rename is atomic).
+        let tmp_dir = make_temp_dir(&self.cache_root)?;
+        let mut guard = TempDirGuard::new(tmp_dir.clone());
+
+        // Copy the artifact into the temp directory.
         let Some(file_name) = artifact.file_name() else {
             return Err(EngineError::Io {
                 path: artifact.display().to_string(),
@@ -82,14 +117,14 @@ impl ArtifactStore {
                 ),
             });
         };
-        let cached_artifact = entry_dir.join(file_name);
-        std::fs::copy(artifact, &cached_artifact).map_err(|source| EngineError::Io {
-            path: cached_artifact.display().to_string(),
+        let staged_artifact = tmp_dir.join(file_name);
+        std::fs::copy(artifact, &staged_artifact).map_err(|source| EngineError::Io {
+            path: staged_artifact.display().to_string(),
             source,
         })?;
 
         // Write metadata alongside the artifact.
-        let metadata_path = entry_dir.join("metadata.toml");
+        let metadata_path = tmp_dir.join("metadata.toml");
         let metadata_toml =
             toml::to_string_pretty(metadata).map_err(|e| EngineError::Metadata {
                 message: e.to_string(),
@@ -99,7 +134,32 @@ impl ArtifactStore {
             source,
         })?;
 
-        Ok(())
+        // Atomically move the temp directory to the final cache entry path.
+        // If another process already created the entry, rename fails with
+        // AlreadyExists — that is fine, the cache is immutable.
+        match std::fs::rename(&tmp_dir, &entry_dir) {
+            Ok(()) => {
+                // Success — disarm the cleanup guard so we keep the directory.
+                guard.disarm();
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Another process beat us; guard will clean up the temp dir.
+                Ok(())
+            }
+            Err(e) => {
+                // On Linux, rename(2) on directories returns ENOTEMPTY (not
+                // EEXIST) when the target directory already exists and is
+                // non-empty. Map this to the same "lost the race" semantics.
+                if is_directory_not_empty_error(&e) {
+                    return Ok(());
+                }
+                Err(EngineError::Io {
+                    path: entry_dir.display().to_string(),
+                    source: e,
+                })
+            }
+        }
     }
 
     /// Materialize a cached artifact to the given destination path.
@@ -219,6 +279,42 @@ fn resolve_cache_root(project_root: &Path) -> PathBuf {
     shared_cache
 }
 
+/// Create a temporary directory under `parent` with a random suffix.
+///
+/// The name format is `.tmp-<hex>` where `<hex>` is 8 random hex characters.
+/// The caller is responsible for cleaning up the directory.
+///
+/// # Errors
+/// Returns an error if the directory cannot be created.
+fn make_temp_dir(parent: &Path) -> Result<PathBuf, EngineError> {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
+    // Generate a random suffix using the standard library's RandomState,
+    // which seeds from OS entropy. No external crate needed.
+    let random_bits = RandomState::new().build_hasher().finish();
+    let name = format!(".tmp-{random_bits:016x}");
+    let tmp_path = parent.join(name);
+
+    std::fs::create_dir(&tmp_path).map_err(|source| EngineError::Io {
+        path: tmp_path.display().to_string(),
+        source,
+    })?;
+
+    Ok(tmp_path)
+}
+
+/// Check whether an I/O error indicates that a directory rename target already
+/// exists and is non-empty.
+///
+/// On Linux, `rename(2)` on directories returns `ENOTEMPTY` (mapped to
+/// `DirectoryNotEmpty`) rather than `EEXIST` when the target is a non-empty
+/// directory. On macOS, it returns `ENOTEMPTY` as well.
+fn is_directory_not_empty_error(err: &std::io::Error) -> bool {
+    // Stable variant available since Rust 1.64.
+    err.kind() == std::io::ErrorKind::DirectoryNotEmpty
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -308,6 +404,35 @@ mod tests {
         let cached = store.cache_path(&key).join("my-app");
         let content = fs::read(&cached).unwrap();
         assert_eq!(content, b"original");
+    }
+
+    #[test]
+    fn store_cleans_up_temp_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::new(tmp.path());
+        let key = test_key();
+
+        let artifact = tmp.path().join("my-app");
+        fs::write(&artifact, b"binary content").unwrap();
+
+        store.store(&key, &artifact, &test_metadata()).unwrap();
+
+        // The cache root is the parent of any cache_path entry. After a
+        // successful store, no .tmp-* directories should remain there.
+        let cache_root = store.cache_path(&key).parent().unwrap().to_path_buf();
+        let tmp_dirs: Vec<_> = fs::read_dir(&cache_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(".tmp-"))
+            })
+            .collect();
+        assert!(
+            tmp_dirs.is_empty(),
+            "expected no temp dirs in cache root, found: {tmp_dirs:?}"
+        );
     }
 
     #[test]
