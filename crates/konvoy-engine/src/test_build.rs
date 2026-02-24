@@ -12,7 +12,7 @@ use crate::resolve::resolve_dependencies;
 use konvoy_config::lockfile::Lockfile;
 use konvoy_config::manifest::Manifest;
 use konvoy_konanc::detect::resolve_konanc;
-use konvoy_konanc::invoke::{DiagnosticLevel, KonancCommand, ProduceKind};
+use konvoy_konanc::invoke::{KonancCommand, ProduceKind};
 
 /// Options controlling a test build invocation.
 #[derive(Debug, Clone)]
@@ -188,27 +188,7 @@ pub fn build_tests(
 
     let result = cmd.execute(&konanc).map_err(EngineError::Konanc)?;
 
-    // Print diagnostics.
-    for diag in &result.diagnostics {
-        let prefix = match diag.level {
-            DiagnosticLevel::Error => "error",
-            DiagnosticLevel::Warning => "warning",
-            DiagnosticLevel::Info => "info",
-        };
-        match (&diag.file, diag.line) {
-            (Some(file), Some(line)) => eprintln!("{prefix}: {file}:{line}: {}", diag.message),
-            _ => eprintln!("{prefix}: {}", diag.message),
-        }
-    }
-
-    if options.verbose {
-        if !result.raw_stdout.is_empty() {
-            eprintln!("{}", result.raw_stdout);
-        }
-        if !result.raw_stderr.is_empty() {
-            eprintln!("{}", result.raw_stderr);
-        }
-    }
+    crate::diagnostics::print_diagnostics(&result, options.verbose);
 
     if !result.success {
         return Err(EngineError::CompilationFailed {

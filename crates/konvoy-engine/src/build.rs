@@ -6,7 +6,7 @@ use std::time::Instant;
 use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile};
 use konvoy_config::manifest::{Manifest, PackageKind};
 use konvoy_konanc::detect::{resolve_konanc, KonancInfo};
-use konvoy_konanc::invoke::{DiagnosticLevel, KonancCommand, ProduceKind};
+use konvoy_konanc::invoke::{KonancCommand, ProduceKind};
 use konvoy_targets::{host_target, Target};
 
 use crate::artifact::{ArtifactStore, BuildMetadata};
@@ -292,28 +292,7 @@ fn compile(
 
     let result = cmd.execute(konanc).map_err(EngineError::Konanc)?;
 
-    // Print diagnostics to stderr.
-    for diag in &result.diagnostics {
-        let prefix = match diag.level {
-            DiagnosticLevel::Error => "error",
-            DiagnosticLevel::Warning => "warning",
-            DiagnosticLevel::Info => "info",
-        };
-        match (&diag.file, diag.line) {
-            (Some(file), Some(line)) => eprintln!("{prefix}: {file}:{line}: {}", diag.message),
-            _ => eprintln!("{prefix}: {}", diag.message),
-        }
-    }
-
-    // In verbose mode, print raw output.
-    if options.verbose {
-        if !result.raw_stdout.is_empty() {
-            eprintln!("{}", result.raw_stdout);
-        }
-        if !result.raw_stderr.is_empty() {
-            eprintln!("{}", result.raw_stderr);
-        }
-    }
+    crate::diagnostics::print_diagnostics(&result, options.verbose);
 
     if !result.success {
         return Err(EngineError::CompilationFailed {
