@@ -91,7 +91,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     // 5. Resolve dependencies and build them in topological order.
     let dep_graph = resolve_dependencies(project_root, &manifest)?;
     let mut library_paths: Vec<PathBuf> = Vec::new();
-    let lockfile_content = lockfile_toml_content(&lockfile);
+    let lockfile_content = lockfile_toml_content(&lockfile)?;
 
     for dep in &dep_graph.order {
         let (dep_output, _) = build_single(
@@ -337,8 +337,10 @@ fn compile(
 }
 
 /// Serialize lockfile content for cache key computation.
-pub(crate) fn lockfile_toml_content(lockfile: &Lockfile) -> String {
-    toml::to_string_pretty(lockfile).unwrap_or_default()
+pub(crate) fn lockfile_toml_content(lockfile: &Lockfile) -> Result<String, EngineError> {
+    toml::to_string_pretty(lockfile).map_err(|e| EngineError::Metadata {
+        message: e.to_string(),
+    })
 }
 
 /// Update konvoy.lock if the detected konanc version or dependency hashes differ,
@@ -585,14 +587,14 @@ mod tests {
     #[test]
     fn lockfile_toml_content_empty() {
         let lockfile = Lockfile::default();
-        let content = lockfile_toml_content(&lockfile);
+        let content = lockfile_toml_content(&lockfile).unwrap();
         assert!(content.contains("toolchain") || content.is_empty() || content.trim().is_empty());
     }
 
     #[test]
     fn lockfile_toml_content_with_version() {
         let lockfile = Lockfile::with_toolchain("2.1.0");
-        let content = lockfile_toml_content(&lockfile);
+        let content = lockfile_toml_content(&lockfile).unwrap();
         assert!(content.contains("2.1.0"));
     }
 
@@ -601,8 +603,8 @@ mod tests {
         let without_hashes = Lockfile::with_toolchain("2.1.0");
         let with_hashes = Lockfile::with_managed_toolchain("2.1.0", Some("abc123"), Some("def456"));
 
-        let content_without = lockfile_toml_content(&without_hashes);
-        let content_with = lockfile_toml_content(&with_hashes);
+        let content_without = lockfile_toml_content(&without_hashes).unwrap();
+        let content_with = lockfile_toml_content(&with_hashes).unwrap();
 
         assert_ne!(
             content_without, content_with,
@@ -623,7 +625,7 @@ mod tests {
             source_hash: "deadbeef".to_owned(),
         });
 
-        let content = lockfile_toml_content(&lockfile);
+        let content = lockfile_toml_content(&lockfile).unwrap();
         assert!(
             content.contains("my-lib"),
             "lockfile content should include dependency names"
@@ -859,7 +861,7 @@ mod tests {
         // Compute the cache key that build_single would compute.
         let manifest_content = manifest.to_toml().unwrap();
         let effective_lockfile = Lockfile::with_toolchain(&konanc.version);
-        let lockfile_content = lockfile_toml_content(&effective_lockfile);
+        let lockfile_content = lockfile_toml_content(&effective_lockfile).unwrap();
         let cache_inputs = CacheInputs {
             manifest_content,
             lockfile_content: lockfile_content.clone(),
@@ -948,7 +950,7 @@ mod tests {
         // Compute cache key the same way build_single does (without test sources).
         let manifest_content = manifest.to_toml().unwrap();
         let effective_lockfile = Lockfile::with_toolchain(&konanc.version);
-        let lockfile_content = lockfile_toml_content(&effective_lockfile);
+        let lockfile_content = lockfile_toml_content(&effective_lockfile).unwrap();
         let cache_inputs = CacheInputs {
             manifest_content,
             lockfile_content: lockfile_content.clone(),
@@ -1032,7 +1034,7 @@ mod tests {
         // Compute cache key before adding the outside file.
         let manifest_content = manifest.to_toml().unwrap();
         let effective_lockfile = Lockfile::with_toolchain(&konanc.version);
-        let lockfile_content = lockfile_toml_content(&effective_lockfile);
+        let lockfile_content = lockfile_toml_content(&effective_lockfile).unwrap();
         let cache_inputs_before = CacheInputs {
             manifest_content: manifest_content.clone(),
             lockfile_content: lockfile_content.clone(),

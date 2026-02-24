@@ -72,7 +72,7 @@ pub fn build_tests(
     // Build dependencies first (same as regular build).
     let dep_graph = resolve_dependencies(project_root, &manifest)?;
     let mut library_paths: Vec<PathBuf> = Vec::new();
-    let lockfile_content = lockfile_toml_content(&lockfile);
+    let lockfile_content = lockfile_toml_content(&lockfile)?;
 
     for dep in &dep_graph.order {
         let (dep_output, _) = crate::build::build_single(
