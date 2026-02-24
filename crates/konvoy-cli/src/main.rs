@@ -97,7 +97,11 @@ enum Command {
         locked: bool,
     },
     /// Remove build artifacts
-    Clean,
+    Clean {
+        /// Remove the entire .konvoy/ directory, not just build artifacts
+        #[arg(long)]
+        all: bool,
+    },
     /// Check environment and toolchain setup
     Doctor,
     /// Manage Kotlin/Native toolchains
@@ -151,7 +155,7 @@ fn main() {
             config,
             locked,
         } => cmd_lint(verbose, config, locked),
-        Command::Clean => cmd_clean(),
+        Command::Clean { all } => cmd_clean(all),
         Command::Doctor => cmd_doctor(),
         Command::Toolchain { action } => cmd_toolchain(action),
     };
@@ -373,13 +377,23 @@ fn cmd_lint(verbose: bool, config: Option<PathBuf>, locked: bool) -> Result<(), 
     Err(format!("lint found {} issue(s)", result.finding_count))
 }
 
-fn cmd_clean() -> Result<(), String> {
+fn cmd_clean(all: bool) -> Result<(), String> {
     let root = project_root()?;
+    clean_project(&root, all)
+}
+
+fn clean_project(root: &std::path::Path, all: bool) -> Result<(), String> {
     let konvoy_dir = root.join(".konvoy");
 
-    konvoy_util::fs::remove_dir_all_if_exists(&konvoy_dir).map_err(|e| e.to_string())?;
+    if all {
+        konvoy_util::fs::remove_dir_all_if_exists(&konvoy_dir).map_err(|e| e.to_string())?;
+        eprintln!("    Removed .konvoy/");
+    } else {
+        let build_dir = konvoy_dir.join("build");
+        konvoy_util::fs::remove_dir_all_if_exists(&build_dir).map_err(|e| e.to_string())?;
+        eprintln!("    Removed build artifacts");
+    }
 
-    eprintln!("    Cleaned build artifacts");
     Ok(())
 }
 
@@ -799,9 +813,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_clean() {
+    fn parse_clean_defaults() {
         let cli = Cli::try_parse_from(["konvoy", "clean"]).unwrap();
-        assert!(matches!(cli.command, Command::Clean));
+        match cli.command {
+            Command::Clean { all } => assert!(!all),
+            other => panic!("expected Clean, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_clean_all() {
+        let cli = Cli::try_parse_from(["konvoy", "clean", "--all"]).unwrap();
+        match cli.command {
+            Command::Clean { all } => assert!(all),
+            other => panic!("expected Clean, got {other:?}"),
+        }
     }
 
     #[test]
@@ -955,8 +981,8 @@ mod tests {
     }
 
     #[test]
-    fn error_clean_takes_no_args() {
-        let err = Cli::try_parse_from(["konvoy", "clean", "--all"]).unwrap_err();
+    fn error_clean_unknown_flag() {
+        let err = Cli::try_parse_from(["konvoy", "clean", "--force"]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::UnknownArgument);
     }
 
@@ -1153,6 +1179,84 @@ mod tests {
     fn help_flag_on_lint() {
         let err = Cli::try_parse_from(["konvoy", "lint", "--help"]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+    }
+
+    // ── clean_project behavior ────────────────────────────────────────
+
+    /// Helper: create a temp project dir with .konvoy/build/ and .konvoy/cache/.
+    fn make_clean_fixture() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let build_dir = root.join(".konvoy").join("build");
+        let cache_dir = root.join(".konvoy").join("cache");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(build_dir.join("artifact.exe"), b"binary").unwrap();
+        std::fs::write(cache_dir.join("key.json"), b"{}").unwrap();
+
+        tmp
+    }
+
+    #[test]
+    fn clean_default_removes_only_build_dir() {
+        let tmp = make_clean_fixture();
+        let root = tmp.path();
+
+        clean_project(root, false).unwrap();
+
+        assert!(
+            !root.join(".konvoy").join("build").exists(),
+            "build dir should be removed"
+        );
+        assert!(
+            root.join(".konvoy").join("cache").exists(),
+            "cache dir should be preserved"
+        );
+        assert!(
+            root.join(".konvoy").exists(),
+            ".konvoy dir should be preserved"
+        );
+    }
+
+    #[test]
+    fn clean_all_removes_entire_konvoy_dir() {
+        let tmp = make_clean_fixture();
+        let root = tmp.path();
+
+        clean_project(root, true).unwrap();
+
+        assert!(
+            !root.join(".konvoy").exists(),
+            ".konvoy dir should be removed"
+        );
+    }
+
+    #[test]
+    fn clean_default_no_build_dir_is_ok() {
+        let tmp = make_clean_fixture();
+        let root = tmp.path();
+
+        // Remove build dir before calling clean.
+        std::fs::remove_dir_all(root.join(".konvoy").join("build")).unwrap();
+
+        clean_project(root, false).unwrap();
+
+        assert!(
+            root.join(".konvoy").join("cache").exists(),
+            "cache dir should be preserved"
+        );
+    }
+
+    #[test]
+    fn clean_all_no_konvoy_dir_is_ok() {
+        let tmp = make_clean_fixture();
+        let root = tmp.path();
+
+        // Remove .konvoy/ before calling clean --all.
+        std::fs::remove_dir_all(root.join(".konvoy")).unwrap();
+
+        clean_project(root, true).unwrap();
     }
 }
 
