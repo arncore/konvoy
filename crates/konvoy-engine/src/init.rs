@@ -51,7 +51,11 @@ pub fn init_project_with_kind(
             } else {
                 None
             },
-            entrypoint: "src/main.kt".to_owned(),
+            entrypoint: if kind == PackageKind::Lib {
+                "src/lib.kt".to_owned()
+            } else {
+                "src/main.kt".to_owned()
+            },
         },
         toolchain: Toolchain {
             kotlin: "2.1.0".to_owned(),
@@ -176,6 +180,7 @@ mod tests {
         let manifest = Manifest::from_path(&project_dir.join("konvoy.toml")).unwrap();
         assert_eq!(manifest.package.kind, PackageKind::Lib);
         assert_eq!(manifest.package.version.as_deref(), Some("0.1.0"));
+        assert_eq!(manifest.package.entrypoint, "src/lib.kt");
     }
 
     #[test]
