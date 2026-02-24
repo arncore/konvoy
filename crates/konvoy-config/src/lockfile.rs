@@ -3,6 +3,7 @@ use std::path::Path;
 
 /// The `konvoy.lock` lockfile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Lockfile {
     #[serde(default)]
     pub toolchain: Option<ToolchainLock>,
@@ -11,6 +12,7 @@ pub struct Lockfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolchainLock {
     pub konanc_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -251,9 +253,9 @@ konanc_version = "2.1.0"
     }
 
     #[test]
-    fn backward_compat_old_tarball_sha256_field() {
-        // Old lockfiles may have `tarball_sha256` — they should still parse
-        // (the field is simply ignored since it's been renamed).
+    fn unknown_toolchain_field_rejected() {
+        // Unknown fields in [toolchain] must be rejected so that typos
+        // (e.g. the old `tarball_sha256` name) are caught immediately.
         let dir = tempdir();
         let path = dir.join("konvoy.lock");
         fs::write(
@@ -266,13 +268,12 @@ tarball_sha256 = "oldvalue"
         )
         .unwrap_or_else(|e| panic!("{e}"));
 
-        // Should parse without error (unknown fields are ignored by default in TOML).
-        let lockfile = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
-        let toolchain = lockfile
-            .toolchain
-            .as_ref()
-            .unwrap_or_else(|| panic!("missing toolchain"));
-        assert_eq!(toolchain.konanc_version, "2.1.0");
+        let err = Lockfile::from_path(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field"),
+            "expected 'unknown field' in error, got: {msg}"
+        );
     }
 
     #[test]
@@ -314,6 +315,29 @@ konanc_version = "2.1.0"
 
         let lockfile = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
         assert!(lockfile.dependencies.is_empty());
+    }
+
+    #[test]
+    fn unknown_top_level_field_rejected() {
+        let dir = tempdir();
+        let path = dir.join("konvoy.lock");
+        fs::write(
+            &path,
+            r#"
+bogus_field = "oops"
+
+[toolchain]
+konanc_version = "2.1.0"
+"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        let err = Lockfile::from_path(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field"),
+            "expected 'unknown field' in error, got: {msg}"
+        );
     }
 
     #[test]
