@@ -232,7 +232,7 @@ fn cmd_build(
     match result.outcome {
         konvoy_engine::BuildOutcome::Cached => {
             eprintln!(
-                "    Finished `{profile}` target in {:.2}s",
+                "    Finished `{profile}` target in {:.2}s (cached)",
                 result.duration.as_secs_f64()
             );
         }
