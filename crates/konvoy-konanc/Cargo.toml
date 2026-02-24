@@ -11,7 +11,7 @@ workspace = true
 flate2.workspace = true
 konvoy-util.workspace = true
 tar.workspace = true
-tempfile = "3"
+tempfile.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
