@@ -552,8 +552,7 @@ mod tests {
         // Pre-populate diagnostics with the same message that detect_toolchain_errors would add
         let mut diags = vec![Diagnostic {
             level: DiagnosticLevel::Error,
-            message: "Xcode Command Line Tools not found — run `xcode-select --install`"
-                .to_owned(),
+            message: "Xcode Command Line Tools not found — run `xcode-select --install`".to_owned(),
             file: None,
             line: None,
         }];
