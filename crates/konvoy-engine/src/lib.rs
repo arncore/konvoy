@@ -5,6 +5,7 @@ pub mod artifact;
 pub mod build;
 pub mod cache;
 pub mod detekt;
+mod diagnostics;
 pub mod error;
 pub mod init;
 pub mod resolve;
