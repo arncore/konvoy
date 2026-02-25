@@ -431,7 +431,10 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
 
 /// Parse detekt text output into structured diagnostics.
 ///
-/// Detekt's default text output format:
+/// Detekt 1.23.x default text output format:
+/// `file.kt:line:col: message text [RuleName]`
+///
+/// Also handles the legacy format for robustness:
 /// `file.kt:line:col: RuleName - message [detekt.RuleSet]`
 pub fn parse_detekt_output(output: &str) -> Vec<DetektDiagnostic> {
     let mut diagnostics = Vec::new();
@@ -454,7 +457,9 @@ pub fn parse_detekt_output(output: &str) -> Vec<DetektDiagnostic> {
 
 /// Parse a single line of detekt output into a diagnostic.
 ///
-/// Expected format: `path/file.kt:line:col: RuleName - message [detekt.RuleSet]`
+/// Handles two formats:
+/// - Real detekt 1.23.x: `path/file.kt:line:col: message text [RuleName]`
+/// - Legacy format:      `path/file.kt:line:col: RuleName - message [detekt.RuleSet]`
 fn parse_detekt_line(line: &str) -> Option<DetektDiagnostic> {
     // Find the pattern: ":<digits>:" which indicates file:line:
     // We need at least one colon after a file path.
@@ -510,30 +515,51 @@ fn parse_detekt_line(line: &str) -> Option<DetektDiagnostic> {
         return None;
     }
 
-    // Parse: "RuleName - message [detekt.RuleSet]"
-    // or just: "RuleName - message"
-    let (rule, message) = if let Some(dash_pos) = rest.find(" - ") {
-        let rule = rest.get(..dash_pos)?.trim();
-        let msg = rest.get(dash_pos + 3..)?;
-        // Strip trailing [detekt.RuleSet] if present.
-        let msg = if let Some(bracket_pos) = msg.rfind('[') {
-            msg.get(..bracket_pos)?.trim()
-        } else {
-            msg.trim()
-        };
-        (rule.to_owned(), msg.to_owned())
-    } else {
-        // No " - " separator found; treat the whole rest as the message.
-        return None;
-    };
+    // Try legacy format first: "RuleName - message [detekt.RuleSet]"
+    // The legacy format has " - " separating a single-word rule from the message,
+    // and the bracket contains a dotted category like "detekt.style".
+    if let Some(dash_pos) = rest.find(" - ") {
+        let candidate_rule = rest.get(..dash_pos)?.trim();
+        // Legacy rule names are single PascalCase identifiers (no spaces, no dots).
+        let is_legacy_rule = !candidate_rule.is_empty()
+            && !candidate_rule.contains(' ')
+            && !candidate_rule.contains('.');
+        if is_legacy_rule {
+            let msg = rest.get(dash_pos + 3..)?;
+            // Strip trailing [detekt.RuleSet] if present.
+            let msg = if let Some(bracket_pos) = msg.rfind('[') {
+                msg.get(..bracket_pos)?.trim()
+            } else {
+                msg.trim()
+            };
+            return Some(DetektDiagnostic {
+                rule: candidate_rule.to_owned(),
+                message: msg.to_owned(),
+                file,
+                line: line_num,
+            });
+        }
+    }
 
+    // Real detekt format: "message text [RuleName]"
+    // The rule name is inside square brackets at the end of the line.
+    let bracket_open = rest.rfind('[')?;
+    let bracket_close = rest.rfind(']')?;
+    if bracket_close <= bracket_open {
+        return None;
+    }
+    let rule = rest.get(bracket_open + 1..bracket_close)?.trim();
     if rule.is_empty() {
+        return None;
+    }
+    let message = rest.get(..bracket_open)?.trim();
+    if message.is_empty() {
         return None;
     }
 
     Some(DetektDiagnostic {
-        rule,
-        message,
+        rule: rule.to_owned(),
+        message: message.to_owned(),
         file,
         line: line_num,
     })
@@ -565,8 +591,7 @@ mod tests {
 
     #[test]
     fn parse_detekt_single_finding() {
-        let output =
-            "src/main.kt:3:5: MagicNumber - This expression contains a magic number. [detekt.style]";
+        let output = "src/main.kt:3:5: This expression contains a magic number. [MagicNumber]";
         let diags = parse_detekt_output(output);
         assert_eq!(diags.len(), 1);
         assert_eq!(
@@ -583,7 +608,7 @@ mod tests {
 
     #[test]
     fn parse_detekt_without_column() {
-        let output = "src/main.kt:10: LongMethod - The method is too long. [detekt.complexity]";
+        let output = "src/main.kt:10: The method is too long. [LongMethod]";
         let diags = parse_detekt_output(output);
         assert_eq!(diags.len(), 1);
         assert_eq!(
@@ -597,9 +622,9 @@ mod tests {
     #[test]
     fn parse_detekt_multiple_findings() {
         let output = "\
-src/main.kt:3:5: MagicNumber - Magic number. [detekt.style]
-src/util.kt:20:1: LongMethod - Method too long. [detekt.complexity]
-src/app.kt:5:10: EmptyFunctionBlock - Empty function. [detekt.empty-blocks]";
+src/main.kt:3:5: Magic number. [MagicNumber]
+src/util.kt:20:1: Method too long. [LongMethod]
+src/app.kt:5:10: Empty function. [EmptyFunctionBlock]";
         let diags = parse_detekt_output(output);
         assert_eq!(diags.len(), 3);
         assert_eq!(diags.get(0).map(|d| d.rule.as_str()), Some("MagicNumber"));
@@ -621,7 +646,7 @@ src/app.kt:5:10: EmptyFunctionBlock - Empty function. [detekt.empty-blocks]";
         let output = "\
 detekt finished in 1234ms
 Overall debt: 10min
-src/main.kt:3:5: MagicNumber - Magic number. [detekt.style]
+src/main.kt:3:5: Magic number. [MagicNumber]
 ";
         let diags = parse_detekt_output(output);
         assert_eq!(diags.len(), 1);
@@ -629,7 +654,21 @@ src/main.kt:3:5: MagicNumber - Magic number. [detekt.style]
     }
 
     #[test]
-    fn parse_detekt_without_rule_set_bracket() {
+    fn parse_detekt_legacy_format() {
+        // Legacy format: "RuleName - message [detekt.RuleSet]"
+        let output = "src/main.kt:5:1: UnusedImport - Unused import detected. [detekt.style]";
+        let diags = parse_detekt_output(output);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags.first().map(|d| d.rule.as_str()), Some("UnusedImport"));
+        assert_eq!(
+            diags.first().map(|d| d.message.as_str()),
+            Some("Unused import detected.")
+        );
+    }
+
+    #[test]
+    fn parse_detekt_legacy_format_without_bracket() {
+        // Legacy format without the trailing bracket.
         let output = "src/main.kt:5:1: UnusedImport - Unused import detected.";
         let diags = parse_detekt_output(output);
         assert_eq!(diags.len(), 1);
@@ -737,11 +776,11 @@ src/main.kt:3:5: MagicNumber - Magic number. [detekt.style]
         // Summary/timing lines (stdout) mixed with diagnostic findings (stderr).
         let combined = "\
 detekt finished in 1234ms
-src/main.kt:3:5: MagicNumber - This expression contains a magic number. [detekt.style]
-src/util.kt:20:1: LongMethod - Method too long. [detekt.complexity]
+src/main.kt:3:5: This expression contains a magic number. [MagicNumber]
+src/util.kt:20:1: Method too long. [LongMethod]
 Overall debt: 10min
-src/app.kt:5:10: EmptyFunctionBlock - Empty function body. [detekt.empty-blocks]
-src/config.kt:15:1: MaxLineLength - Line is too long. [detekt.style]";
+src/app.kt:5:10: Empty function body. [EmptyFunctionBlock]
+src/config.kt:15:1: Line is too long. [MaxLineLength]";
         let diags = parse_detekt_output(combined);
         assert_eq!(diags.len(), 4, "expected 4 findings, got {}", diags.len());
         assert_eq!(diags.get(0).map(|d| d.rule.as_str()), Some("MagicNumber"));
@@ -751,6 +790,34 @@ src/config.kt:15:1: MaxLineLength - Line is too long. [detekt.style]";
             Some("EmptyFunctionBlock")
         );
         assert_eq!(diags.get(3).map(|d| d.rule.as_str()), Some("MaxLineLength"));
+    }
+
+    #[test]
+    fn parse_detekt_real_output() {
+        // Real detekt 1.23.7 output copied verbatim.
+        let output = "\
+/tmp/project/src/main.kt:10:28: Empty catch block detected. If the exception can be safely ignored, name the exception according to one of the exemptions as per the configuration of this rule. [EmptyCatchBlock]
+/tmp/project/src/main.kt:2:13: This expression contains a magic number. Consider defining it to a well named constant. [MagicNumber]";
+        let diags = parse_detekt_output(output);
+        assert_eq!(diags.len(), 2, "expected 2 findings, got {}", diags.len());
+
+        let first = &diags[0];
+        assert_eq!(first.file.as_deref(), Some("/tmp/project/src/main.kt"));
+        assert_eq!(first.line, Some(10));
+        assert_eq!(first.rule, "EmptyCatchBlock");
+        assert_eq!(
+            first.message,
+            "Empty catch block detected. If the exception can be safely ignored, name the exception according to one of the exemptions as per the configuration of this rule."
+        );
+
+        let second = &diags[1];
+        assert_eq!(second.file.as_deref(), Some("/tmp/project/src/main.kt"));
+        assert_eq!(second.line, Some(2));
+        assert_eq!(second.rule, "MagicNumber");
+        assert_eq!(
+            second.message,
+            "This expression contains a magic number. Consider defining it to a well named constant."
+        );
     }
 
     #[test]
