@@ -335,7 +335,7 @@ fn run_detekt_process(
         }
     }
 
-    let diagnostics = parse_detekt_output(&raw_stdout);
+    let diagnostics = parse_detekt_output(&raw_output);
     let finding_count = diagnostics.len();
     let success = output.status.success();
 
@@ -720,5 +720,27 @@ src/main.kt:3:5: MagicNumber - Magic number. [detekt.style]
         let (path, hash) = result.unwrap();
         assert_eq!(hash, real_hash);
         assert!(path.display().to_string().contains(version));
+    }
+
+    #[test]
+    fn parse_detekt_combined_stdout_stderr() {
+        // Simulate realistic combined stdout+stderr output from detekt.
+        // Summary/timing lines (stdout) mixed with diagnostic findings (stderr).
+        let combined = "\
+detekt finished in 1234ms
+src/main.kt:3:5: MagicNumber - This expression contains a magic number. [detekt.style]
+src/util.kt:20:1: LongMethod - Method too long. [detekt.complexity]
+Overall debt: 10min
+src/app.kt:5:10: EmptyFunctionBlock - Empty function body. [detekt.empty-blocks]
+src/config.kt:15:1: MaxLineLength - Line is too long. [detekt.style]";
+        let diags = parse_detekt_output(combined);
+        assert_eq!(diags.len(), 4, "expected 4 findings, got {}", diags.len());
+        assert_eq!(diags.get(0).map(|d| d.rule.as_str()), Some("MagicNumber"));
+        assert_eq!(diags.get(1).map(|d| d.rule.as_str()), Some("LongMethod"));
+        assert_eq!(
+            diags.get(2).map(|d| d.rule.as_str()),
+            Some("EmptyFunctionBlock")
+        );
+        assert_eq!(diags.get(3).map(|d| d.rule.as_str()), Some("MaxLineLength"));
     }
 }
