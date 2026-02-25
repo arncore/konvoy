@@ -32,15 +32,6 @@ pub struct CacheInputs {
     pub dependency_hashes: Vec<String>,
 }
 
-impl CacheInputs {
-    /// Create inputs with OS and arch auto-detected from the current platform.
-    pub fn with_platform_defaults(mut self) -> Self {
-        self.os = std::env::consts::OS.to_owned();
-        self.arch = std::env::consts::ARCH.to_owned();
-        self
-    }
-}
-
 /// A content-addressed cache key wrapping a SHA-256 hex string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey(String);
