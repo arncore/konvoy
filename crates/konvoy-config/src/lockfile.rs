@@ -146,8 +146,8 @@ mod tests {
 
     #[test]
     fn parse_valid_lockfile() {
-        let dir = tempdir();
-        let path = dir.join("konvoy.lock");
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
         fs::write(
             &path,
             r#"
@@ -167,16 +167,16 @@ konanc_version = "1.9.22"
 
     #[test]
     fn default_when_absent() {
-        let dir = tempdir();
-        let path = dir.join("nonexistent.lock");
+        let dir = make_test_dir();
+        let path = dir.path().join("nonexistent.lock");
         let lockfile = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
         assert!(lockfile.toolchain.is_none());
     }
 
     #[test]
     fn write_to_disk() {
-        let dir = tempdir();
-        let path = dir.join("konvoy.lock");
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
         let lockfile = Lockfile::with_toolchain("2.0.0");
         lockfile.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
 
@@ -186,8 +186,8 @@ konanc_version = "1.9.22"
 
     #[test]
     fn round_trip() {
-        let dir = tempdir();
-        let path = dir.join("konvoy.lock");
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
 
         let original = Lockfile::with_toolchain("1.9.22");
         original.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
@@ -221,8 +221,8 @@ konanc_version = "1.9.22"
 
     #[test]
     fn sha256_round_trip() {
-        let dir = tempdir();
-        let path = dir.join("konvoy.lock");
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
         let original =
             Lockfile::with_managed_toolchain("2.1.0", Some("deadbeef"), Some("cafebabe"));
         original.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
@@ -232,8 +232,8 @@ konanc_version = "1.9.22"
 
     #[test]
     fn sha256_skipped_when_absent() {
-        let dir = tempdir();
-        let path = dir.join("konvoy.lock");
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
         fs::write(
             &path,
             r#"
@@ -256,8 +256,8 @@ konanc_version = "2.1.0"
     fn unknown_toolchain_field_rejected() {
         // Unknown fields in [toolchain] must be rejected so that typos
         // (e.g. the old `tarball_sha256` name) are caught immediately.
-        let dir = tempdir();
-        let path = dir.join("konvoy.lock");
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
         fs::write(
             &path,
             r#"
@@ -278,8 +278,8 @@ tarball_sha256 = "oldvalue"
 
     #[test]
     fn round_trip_with_dependencies() {
-        let dir = tempdir();
-        let path = dir.join("konvoy.lock");
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
         let mut lockfile = Lockfile::with_toolchain("2.1.0");
         lockfile.dependencies.push(DependencyLock {
             name: "my-utils".to_owned(),
@@ -302,8 +302,8 @@ tarball_sha256 = "oldvalue"
 
     #[test]
     fn backward_compat_no_deps() {
-        let dir = tempdir();
-        let path = dir.join("konvoy.lock");
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
         fs::write(
             &path,
             r#"
@@ -319,8 +319,8 @@ konanc_version = "2.1.0"
 
     #[test]
     fn unknown_top_level_field_rejected() {
-        let dir = tempdir();
-        let path = dir.join("konvoy.lock");
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
         fs::write(
             &path,
             r#"
@@ -342,8 +342,8 @@ konanc_version = "2.1.0"
 
     #[test]
     fn atomic_write_no_temp_file_after_success() {
-        let dir = tempdir();
-        let path = dir.join("konvoy.lock");
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
         let tmp_path = path.with_extension("lock.tmp");
         let lockfile = Lockfile::with_toolchain("2.0.0");
         lockfile.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
@@ -362,13 +362,9 @@ konanc_version = "2.1.0"
         assert!(!content.contains("dependencies"), "content was: {content}");
     }
 
-    /// Create a unique temporary directory for each test invocation.
-    fn tempdir() -> std::path::PathBuf {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("konvoy-test-{}-{id}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
-        dir
+    /// Create a unique temporary directory that is auto-cleaned on drop.
+    fn make_test_dir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"))
     }
 
     mod property_tests {
@@ -383,8 +379,8 @@ konanc_version = "2.1.0"
                 konanc_sha in "[a-f0-9]{64}",
                 jre_sha in "[a-f0-9]{64}",
             ) {
-                let dir = tempdir();
-                let path = dir.join("konvoy.lock");
+                let dir = make_test_dir();
+                let path = dir.path().join("konvoy.lock");
                 let original = Lockfile::with_managed_toolchain(
                     &version,
                     Some(&konanc_sha),
@@ -403,8 +399,8 @@ konanc_version = "2.1.0"
                 dep_path in "\\.\\./[a-zA-Z][a-zA-Z0-9_-]{0,15}",
                 source_hash in "[a-f0-9]{16,64}",
             ) {
-                let dir = tempdir();
-                let path = dir.join("konvoy.lock");
+                let dir = make_test_dir();
+                let path = dir.path().join("konvoy.lock");
                 let mut lockfile = Lockfile::with_toolchain(&version);
                 lockfile.dependencies.push(DependencyLock {
                     name: dep_name,
