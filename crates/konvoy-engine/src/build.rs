@@ -207,8 +207,8 @@ pub(crate) fn build_single(
 
     let store = ArtifactStore::new(project_root);
 
-    // Check cache.
-    if store.has(&cache_key) {
+    // Check cache (skip when --force is used to force a rebuild).
+    if !options.force && store.has(&cache_key) {
         eprintln!("    Fresh {} (cached)", manifest.package.name);
         store.materialize(&cache_key, &output_name, &output_path)?;
         return Ok((output_path, BuildOutcome::Cached));
@@ -1609,6 +1609,113 @@ mod tests {
         assert!(
             err.contains("lockfile is out of date"),
             "expected lockfile update error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_single_force_bypasses_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("myapp");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("src").join("main.kt"), "fun main() {}").unwrap();
+        fs::write(
+            project.join("konvoy.toml"),
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+        )
+        .unwrap();
+
+        let manifest =
+            konvoy_config::manifest::Manifest::from_path(&project.join("konvoy.toml")).unwrap();
+        let konanc = KonancInfo {
+            path: PathBuf::from("/fake/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc123".to_owned(),
+        };
+        let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
+        let profile = "debug";
+
+        // Compute the cache key that build_single would compute.
+        let manifest_content = manifest.to_toml().unwrap();
+        let effective_lockfile = Lockfile::with_toolchain(&konanc.version);
+        let lockfile_content = lockfile_toml_content(&effective_lockfile).unwrap();
+        let cache_inputs = CacheInputs {
+            manifest_content,
+            lockfile_content: lockfile_content.clone(),
+            konanc_version: konanc.version.clone(),
+            konanc_fingerprint: konanc.fingerprint.clone(),
+            target: target.to_string(),
+            profile: profile.to_owned(),
+            source_dir: project.join("src"),
+            source_glob: "**/*.kt".to_owned(),
+            os: std::env::consts::OS.to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+            dependency_hashes: Vec::new(),
+        };
+        let cache_key = CacheKey::compute(&cache_inputs).unwrap();
+
+        // Pre-populate the artifact store with a fake artifact.
+        let store = ArtifactStore::new(&project);
+        let staging = tmp.path().join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let fake_artifact = staging.join("myapp");
+        fs::write(&fake_artifact, "fake-binary-content").unwrap();
+        let metadata = BuildMetadata {
+            target: target.to_string(),
+            profile: profile.to_owned(),
+            konanc_version: konanc.version.clone(),
+            built_at: now_epoch_secs(),
+        };
+        store.store(&cache_key, &fake_artifact, &metadata).unwrap();
+        assert!(store.has(&cache_key));
+
+        // Verify that without force, we get a cache hit.
+        let options_no_force = BuildOptions {
+            target: None,
+            release: false,
+            verbose: false,
+            force: false,
+            locked: false,
+        };
+        let (_, outcome) = build_single(
+            &project,
+            &manifest,
+            &konanc,
+            None,
+            &target,
+            profile,
+            &options_no_force,
+            &[],
+            &lockfile_content,
+        )
+        .unwrap();
+        assert_eq!(outcome, BuildOutcome::Cached);
+
+        // Now call with force=true — should skip cache and attempt compilation.
+        // Since /fake/konanc doesn't exist, it will fail with a compiler error,
+        // which proves it bypassed the cache.
+        let options_force = BuildOptions {
+            target: None,
+            release: false,
+            verbose: false,
+            force: true,
+            locked: false,
+        };
+        let result = build_single(
+            &project,
+            &manifest,
+            &konanc,
+            None,
+            &target,
+            profile,
+            &options_force,
+            &[],
+            &lockfile_content,
+        );
+
+        // The build should fail (konanc doesn't exist), NOT return Cached.
+        assert!(
+            result.is_err(),
+            "force build should not return cached result"
         );
     }
 }
