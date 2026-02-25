@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: konvoy
+
+jobs:
+  build:
+    name: Build - ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            use_cross: false
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            use_cross: true
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            archive: zip
+            use_cross: false
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive: zip
+            use_cross: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --locked
+
+      - name: Build release binary
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Strip binary
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            docker run --rm \
+              -v "$(pwd)/target/${{ matrix.target }}/release:/target" \
+              "ghcr.io/cross-rs/${{ matrix.target }}:main" \
+              aarch64-linux-gnu-strip "/target/${{ env.BINARY_NAME }}"
+          else
+            strip "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}"
+          fi
+
+      - name: Determine archive name
+        id: archive
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ARCHIVE_NAME="${{ env.BINARY_NAME }}-${VERSION}-${{ matrix.target }}"
+          echo "name=${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Create archive
+        run: |
+          mkdir -p staging
+          cp "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}" staging/
+
+          cd staging
+          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
+            tar czf "../${{ steps.archive.outputs.name }}.tar.gz" "${{ env.BINARY_NAME }}"
+          else
+            zip "../${{ steps.archive.outputs.name }}.zip" "${{ env.BINARY_NAME }}"
+          fi
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.archive.outputs.name }}
+          path: ${{ steps.archive.outputs.name }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          generate_release_notes: true
+          files: artifacts/*
