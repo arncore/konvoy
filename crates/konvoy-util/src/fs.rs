@@ -111,6 +111,24 @@ fn collect_files_recursive(
         })?;
 
         if file_type.is_symlink() {
+            // Follow the symlink to determine what it points to.
+            // std::fs::metadata follows symlinks, so it gives us the target type.
+            // If the symlink is broken, metadata() returns an error — skip silently.
+            let path = entry.path();
+            let Ok(target_meta) = std::fs::metadata(&path) else {
+                continue; // broken symlink
+            };
+
+            // Only include symlinked regular files; skip directory symlinks
+            // to prevent infinite recursion from symlink cycles.
+            if target_meta.is_file()
+                && path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e == extension)
+            {
+                out.push(path);
+            }
             continue;
         }
 
@@ -265,6 +283,32 @@ mod tests {
         let files = collect_files(tmp.path(), "kt").unwrap();
         assert_eq!(files.len(), 1);
         assert!(files.first().unwrap().ends_with("real.kt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_files_follows_symlinked_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        let real_dir = tmp.path().join("real");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&real_dir).unwrap();
+
+        // Place real .kt files outside of src/
+        fs::write(real_dir.join("alpha.kt"), b"fun alpha() {}").unwrap();
+        fs::write(real_dir.join("beta.kt"), b"fun beta() {}").unwrap();
+        fs::write(real_dir.join("gamma.txt"), b"not kotlin").unwrap();
+
+        // Symlink .kt files into src/
+        std::os::unix::fs::symlink(real_dir.join("alpha.kt"), src_dir.join("alpha.kt")).unwrap();
+        std::os::unix::fs::symlink(real_dir.join("beta.kt"), src_dir.join("beta.kt")).unwrap();
+        // Symlink a non-.kt file to ensure extension filtering still applies
+        std::os::unix::fs::symlink(real_dir.join("gamma.txt"), src_dir.join("gamma.txt")).unwrap();
+
+        let files = collect_files(&src_dir, "kt").unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|f| f.ends_with("alpha.kt")));
+        assert!(files.iter().any(|f| f.ends_with("beta.kt")));
     }
 
     #[test]
