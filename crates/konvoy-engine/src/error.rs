@@ -119,4 +119,12 @@ pub enum EngineError {
     /// Lint not configured.
     #[error("detekt not configured — add `detekt = \"1.23.7\"` to [toolchain] in konvoy.toml")]
     LintNotConfigured,
+
+    /// The project name supplied to `konvoy init` is invalid.
+    #[error("invalid project name \"{name}\": {reason}")]
+    InvalidProjectName { name: String, reason: String },
+
+    /// An explicit config file was not found on disk.
+    #[error("config file not found: {path} — check the --config path or create the file")]
+    ConfigNotFound { path: String },
 }
