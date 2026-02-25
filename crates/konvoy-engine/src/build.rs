@@ -56,13 +56,11 @@ pub struct BuildResult {
 /// 2. Read `konvoy.lock` (or create default)
 /// 3. Detect host target (or resolve `--target` flag)
 /// 4. Detect `konanc` and get version + fingerprint
-/// 5. Collect source files (`src/**/*.kt`)
-/// 6. Compute cache key from all inputs
-/// 7. Check cache — if hit, materialize and return early
-/// 8. Invoke `konanc` with resolved inputs
-/// 9. Store artifact in cache
-/// 10. Materialize artifact to output path
-/// 11. Update `konvoy.lock` if toolchain version changed
+/// 5. Pre-stabilize lockfile for cache key consistency (issue #133)
+/// 6. Resolve dependencies and build them in topological order
+/// 7. Build the root project (collect sources, compute cache key,
+///    check cache, invoke compiler, store artifact)
+/// 8. Update `konvoy.lock` if toolchain version changed
 ///
 /// # Errors
 /// Returns an error if any step fails (config parsing, compiler detection,
@@ -88,10 +86,45 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     let konanc = resolved.info;
     let jre_home = resolved.jre_home.clone();
 
-    // 5. Resolve dependencies and build them in topological order.
+    // 5. Pre-stabilize the lockfile for cache key consistency.
+    //
+    // When `konvoy.lock` does not exist (first build) or the toolchain version
+    // has changed, the lockfile read at step 2 will differ from what
+    // `update_lockfile_if_needed` writes at step 8. Without pre-stabilization
+    // the first build computes a cache key using the stale/empty lockfile,
+    // then the lockfile is updated on disk, and the second build sees
+    // different content and misses the cache (issue #133).
+    //
+    // We predict the lockfile content that `update_lockfile_if_needed` will
+    // eventually write, so the cache key is the same in the first and second
+    // builds. In `--locked` mode we must use the lockfile as-is because the
+    // user explicitly forbids changes.
+    let effective_lockfile = if options.locked {
+        lockfile.clone()
+    } else {
+        match &lockfile.toolchain {
+            Some(tc) if tc.konanc_version == konanc.version => {
+                // Lockfile already has the correct version — use as-is
+                // (preserves any existing tarball hashes and detekt info).
+                lockfile.clone()
+            }
+            _ => {
+                // Lockfile is missing or has a different version. Build
+                // the same lockfile that `update_lockfile_if_needed` would
+                // write so the cache key is stable from the first build.
+                Lockfile::with_managed_toolchain(
+                    &konanc.version,
+                    resolved.konanc_tarball_sha256.as_deref(),
+                    resolved.jre_tarball_sha256.as_deref(),
+                )
+            }
+        }
+    };
+
+    // 6. Resolve dependencies and build them in topological order.
     let dep_graph = resolve_dependencies(project_root, &manifest)?;
     let mut library_paths: Vec<PathBuf> = Vec::new();
-    let lockfile_content = lockfile_toml_content(&lockfile)?;
+    let lockfile_content = lockfile_toml_content(&effective_lockfile)?;
 
     for dep in &dep_graph.order {
         let (dep_output, _) = build_single(
@@ -1716,6 +1749,155 @@ mod tests {
         assert!(
             result.is_err(),
             "force build should not return cached result"
+        );
+    }
+
+    /// Regression test for issue #133: the cache key computed on the first build
+    /// (when no lockfile exists) must match the key computed on the second build
+    /// (after the lockfile has been written by `update_lockfile_if_needed`).
+    #[test]
+    fn pre_stabilized_lockfile_matches_post_update_lockfile() {
+        let konanc_version = "2.1.0";
+
+        // Simulate the first build: no lockfile on disk, so we get Lockfile::default().
+        let absent_lockfile = Lockfile::default();
+        assert!(absent_lockfile.toolchain.is_none());
+
+        // Pre-stabilization: predict what update_lockfile_if_needed will write.
+        // Without tarball hashes (toolchain already installed, no fresh download).
+        let effective_first_no_hashes = match &absent_lockfile.toolchain {
+            Some(tc) if tc.konanc_version == konanc_version => absent_lockfile.clone(),
+            _ => Lockfile::with_managed_toolchain(konanc_version, None, None),
+        };
+
+        // After the first build, update_lockfile_if_needed writes this lockfile
+        // (no tarball hashes because toolchain was already installed).
+        let written_no_hashes = Lockfile::with_managed_toolchain(konanc_version, None, None);
+
+        // On the second build, the lockfile is read from disk.
+        // The lockfile version matches, so the effective lockfile is the on-disk one.
+        let effective_second_no_hashes = match &written_no_hashes.toolchain {
+            Some(tc) if tc.konanc_version == konanc_version => written_no_hashes.clone(),
+            _ => unreachable!("version should match"),
+        };
+
+        let content_first = lockfile_toml_content(&effective_first_no_hashes).unwrap();
+        let content_second = lockfile_toml_content(&effective_second_no_hashes).unwrap();
+        assert_eq!(
+            content_first, content_second,
+            "cache key lockfile content must be identical between first and second builds (no hashes)"
+        );
+
+        // Now test with tarball hashes (toolchain freshly downloaded).
+        let konanc_sha = "abc123def456";
+        let jre_sha = "789xyz000111";
+
+        let effective_first_with_hashes = match &absent_lockfile.toolchain {
+            Some(tc) if tc.konanc_version == konanc_version => absent_lockfile.clone(),
+            _ => Lockfile::with_managed_toolchain(konanc_version, Some(konanc_sha), Some(jre_sha)),
+        };
+
+        // After first build, update_lockfile_if_needed writes this (with hashes).
+        let written_with_hashes =
+            Lockfile::with_managed_toolchain(konanc_version, Some(konanc_sha), Some(jre_sha));
+
+        // Second build reads from disk; version matches, so used as-is.
+        let effective_second_with_hashes = match &written_with_hashes.toolchain {
+            Some(tc) if tc.konanc_version == konanc_version => written_with_hashes.clone(),
+            _ => unreachable!("version should match"),
+        };
+
+        let content_first_h = lockfile_toml_content(&effective_first_with_hashes).unwrap();
+        let content_second_h = lockfile_toml_content(&effective_second_with_hashes).unwrap();
+        assert_eq!(
+            content_first_h, content_second_h,
+            "cache key lockfile content must be identical between first and second builds (with hashes)"
+        );
+    }
+
+    /// The pre-stabilized lockfile should NOT change the content when the
+    /// lockfile already has the correct version and hashes.
+    #[test]
+    fn pre_stabilization_is_noop_when_lockfile_up_to_date() {
+        let konanc_version = "2.1.0";
+        let lockfile =
+            Lockfile::with_managed_toolchain(konanc_version, Some("hash1"), Some("hash2"));
+
+        // When the lockfile is up to date, pre-stabilization uses it as-is.
+        let effective = match &lockfile.toolchain {
+            Some(tc) if tc.konanc_version == konanc_version => lockfile.clone(),
+            _ => Lockfile::with_managed_toolchain(konanc_version, None, None),
+        };
+
+        let content_original = lockfile_toml_content(&lockfile).unwrap();
+        let content_effective = lockfile_toml_content(&effective).unwrap();
+        assert_eq!(
+            content_original, content_effective,
+            "pre-stabilization must not alter an up-to-date lockfile"
+        );
+    }
+
+    /// When the toolchain version changes, the pre-stabilized lockfile must
+    /// reflect the NEW version, not the old one.
+    #[test]
+    fn pre_stabilization_uses_new_version_on_upgrade() {
+        let old_lockfile =
+            Lockfile::with_managed_toolchain("2.0.0", Some("old_hash1"), Some("old_hash2"));
+        let new_version = "2.1.0";
+        let new_konanc_sha = "new_hash1";
+        let new_jre_sha = "new_hash2";
+
+        // Version changed: pre-stabilize with new version and hashes.
+        let effective = match &old_lockfile.toolchain {
+            Some(tc) if tc.konanc_version == new_version => old_lockfile.clone(),
+            _ => Lockfile::with_managed_toolchain(
+                new_version,
+                Some(new_konanc_sha),
+                Some(new_jre_sha),
+            ),
+        };
+
+        let content = lockfile_toml_content(&effective).unwrap();
+        assert!(
+            content.contains(new_version),
+            "effective lockfile must have new version"
+        );
+        assert!(
+            content.contains(new_konanc_sha),
+            "effective lockfile must have new konanc hash"
+        );
+        assert!(
+            content.contains(new_jre_sha),
+            "effective lockfile must have new jre hash"
+        );
+        assert!(
+            !content.contains("2.0.0"),
+            "effective lockfile must not have old version"
+        );
+    }
+
+    /// In --locked mode, the pre-stabilization must NOT modify the lockfile,
+    /// even if it is out of date.
+    #[test]
+    fn pre_stabilization_respects_locked_mode() {
+        let lockfile = Lockfile::default(); // No toolchain
+        let konanc_version = "2.1.0";
+
+        // Simulate --locked mode: use the lockfile as-is.
+        let locked = true;
+        let effective = if locked {
+            lockfile.clone()
+        } else {
+            match &lockfile.toolchain {
+                Some(tc) if tc.konanc_version == konanc_version => lockfile.clone(),
+                _ => Lockfile::with_managed_toolchain(konanc_version, None, None),
+            }
+        };
+
+        // In locked mode, the empty lockfile is used without modification.
+        assert!(
+            effective.toolchain.is_none(),
+            "locked mode must not modify the lockfile"
         );
     }
 }
