@@ -54,13 +54,14 @@ pub struct BuildResult {
 /// Steps:
 /// 1. Read `konvoy.toml` from project root
 /// 2. Read `konvoy.lock` (or create default)
-/// 3. Detect host target (or resolve `--target` flag)
-/// 4. Detect `konanc` and get version + fingerprint
-/// 5. Pre-stabilize lockfile for cache key consistency (issue #133)
-/// 6. Resolve dependencies and build them in topological order
-/// 7. Build the root project (collect sources, compute cache key,
+/// 3. Check lockfile staleness (in --locked mode)
+/// 4. Detect host target (or resolve `--target` flag)
+/// 5. Detect `konanc` and get version + fingerprint
+/// 6. Pre-stabilize lockfile for cache key consistency (issue #133)
+/// 7. Resolve dependencies and build them in topological order
+/// 8. Build the root project (collect sources, compute cache key,
 ///    check cache, invoke compiler, store artifact)
-/// 8. Update `konvoy.lock` if toolchain version changed
+/// 9. Update `konvoy.lock` if toolchain version changed
 ///
 /// # Errors
 /// Returns an error if any step fails (config parsing, compiler detection,
@@ -77,20 +78,26 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     let lockfile =
         Lockfile::from_path(&lockfile_path).map_err(|e| EngineError::Lockfile(e.to_string()))?;
 
-    // 3. Resolve target.
+    // 3. In --locked mode, verify the lockfile is complete and consistent
+    //    with what konvoy.toml specifies before doing any work.
+    if options.locked {
+        check_lockfile_staleness(&manifest, &lockfile)?;
+    }
+
+    // 4. Resolve target.
     let target = resolve_target(&options.target)?;
     let profile = if options.release { "release" } else { "debug" };
 
-    // 4. Resolve managed konanc toolchain.
+    // 5. Resolve managed konanc toolchain.
     let resolved = resolve_konanc(&manifest.toolchain.kotlin).map_err(EngineError::Konanc)?;
     let konanc = resolved.info;
     let jre_home = resolved.jre_home.clone();
 
-    // 5. Pre-stabilize the lockfile for cache key consistency.
+    // 6. Pre-stabilize the lockfile for cache key consistency.
     //
     // When `konvoy.lock` does not exist (first build) or the toolchain version
     // has changed, the lockfile read at step 2 will differ from what
-    // `update_lockfile_if_needed` writes at step 8. Without pre-stabilization
+    // `update_lockfile_if_needed` writes at step 9. Without pre-stabilization
     // the first build computes a cache key using the stale/empty lockfile,
     // then the lockfile is updated on disk, and the second build sees
     // different content and misses the cache (issue #133).
@@ -121,7 +128,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         }
     };
 
-    // 6. Resolve dependencies and build them in topological order.
+    // 7. Resolve dependencies and build them in topological order.
     let dep_graph = resolve_dependencies(project_root, &manifest)?;
     let mut library_paths: Vec<PathBuf> = Vec::new();
     let lockfile_content = lockfile_toml_content(&effective_lockfile)?;
@@ -141,7 +148,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         library_paths.push(dep_output);
     }
 
-    // 7. Build the root project.
+    // 8. Build the root project.
     let (output_path, outcome) = build_single(
         project_root,
         &manifest,
@@ -154,7 +161,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         &lockfile_content,
     )?;
 
-    // 8. Update lockfile if toolchain or dependencies changed.
+    // 9. Update lockfile if toolchain or dependencies changed.
     update_lockfile_if_needed(
         &lockfile,
         &konanc,
@@ -347,6 +354,45 @@ pub(crate) fn lockfile_toml_content(lockfile: &Lockfile) -> Result<String, Engin
     toml::to_string_pretty(lockfile).map_err(|e| EngineError::Metadata {
         message: e.to_string(),
     })
+}
+
+/// Check that the lockfile is complete and consistent with the manifest.
+///
+/// This is the early staleness check for `--locked` mode. It catches cases where
+/// the lockfile is missing entries that `konvoy.toml` would generate, such as:
+/// - Missing or mismatched toolchain version
+/// - Missing detekt entries when detekt is configured in the manifest
+///
+/// This runs before any build work so users get fast, clear feedback.
+fn check_lockfile_staleness(manifest: &Manifest, lockfile: &Lockfile) -> Result<(), EngineError> {
+    match &lockfile.toolchain {
+        Some(tc) => {
+            // Toolchain version must match.
+            if tc.konanc_version != manifest.toolchain.kotlin {
+                return Err(EngineError::LockfileUpdateRequired);
+            }
+
+            // If detekt is configured in manifest, lockfile must have matching detekt entries.
+            if let Some(manifest_detekt) = &manifest.toolchain.detekt {
+                match &tc.detekt_version {
+                    Some(locked_detekt) => {
+                        if locked_detekt != manifest_detekt {
+                            return Err(EngineError::LockfileUpdateRequired);
+                        }
+                    }
+                    None => {
+                        return Err(EngineError::LockfileUpdateRequired);
+                    }
+                }
+            }
+        }
+        None => {
+            // Lockfile has no toolchain section at all — it's stale.
+            return Err(EngineError::LockfileUpdateRequired);
+        }
+    }
+
+    Ok(())
 }
 
 /// Update konvoy.lock if the detected konanc version or dependency hashes differ,
@@ -1898,6 +1944,133 @@ mod tests {
         assert!(
             effective.toolchain.is_none(),
             "locked mode must not modify the lockfile"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_matching_lockfile_succeeds() {
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(result.is_ok(), "matching lockfile should pass: {result:?}");
+    }
+
+    #[test]
+    fn check_lockfile_staleness_no_toolchain_errors() {
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let lockfile = Lockfile::default(); // no toolchain section
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("lockfile is out of date"),
+            "expected staleness error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_wrong_toolchain_version_errors() {
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let lockfile = Lockfile::with_toolchain("2.0.0"); // wrong version
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("lockfile is out of date"),
+            "expected staleness error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_missing_detekt_errors() {
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\ndetekt = \"1.23.7\"\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        // Lockfile has toolchain but no detekt entries.
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("lockfile is out of date"),
+            "expected staleness error for missing detekt, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_wrong_detekt_version_errors() {
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\ndetekt = \"1.23.7\"\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        // Lockfile has detekt but with wrong version.
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        if let Some(tc) = &mut lockfile.toolchain {
+            tc.detekt_version = Some("1.23.6".to_owned());
+        }
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("lockfile is out of date"),
+            "expected staleness error for wrong detekt version, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_matching_detekt_succeeds() {
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\ndetekt = \"1.23.7\"\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        // Lockfile has matching detekt version.
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        if let Some(tc) = &mut lockfile.toolchain {
+            tc.detekt_version = Some("1.23.7".to_owned());
+        }
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(result.is_ok(), "matching detekt should pass: {result:?}");
+    }
+
+    #[test]
+    fn check_lockfile_staleness_no_detekt_in_manifest_ignores_lockfile_detekt() {
+        // If manifest doesn't configure detekt, lockfile having detekt entries is fine.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        if let Some(tc) = &mut lockfile.toolchain {
+            tc.detekt_version = Some("1.23.7".to_owned());
+        }
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(
+            result.is_ok(),
+            "extra detekt in lockfile should not cause error: {result:?}"
         );
     }
 }
