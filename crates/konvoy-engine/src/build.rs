@@ -141,7 +141,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         library_paths.push(dep_output);
     }
 
-    // 6. Build the root project.
+    // 7. Build the root project.
     let (output_path, outcome) = build_single(
         project_root,
         &manifest,
@@ -154,7 +154,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         &lockfile_content,
     )?;
 
-    // 7. Update lockfile if toolchain or dependencies changed.
+    // 8. Update lockfile if toolchain or dependencies changed.
     update_lockfile_if_needed(
         &lockfile,
         &konanc,
