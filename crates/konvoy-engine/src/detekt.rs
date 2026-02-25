@@ -269,22 +269,28 @@ fn resolve_java_bin(kotlin_version: &str) -> Result<(PathBuf, PathBuf), EngineEr
 
 /// Resolve the detekt config file path.
 ///
-/// If `--config` was passed, resolve it relative to the project root.
+/// If `--config` was passed, resolve it relative to the project root and
+/// verify the file exists (returning an error if it does not).
 /// Otherwise, use `detekt.yml` in the project root if it exists.
-fn resolve_config(root: &Path, explicit: Option<&Path>) -> Option<PathBuf> {
+fn resolve_config(root: &Path, explicit: Option<&Path>) -> Result<Option<PathBuf>, EngineError> {
     if let Some(cfg) = explicit {
         let resolved = if cfg.is_relative() {
             root.join(cfg)
         } else {
             cfg.to_path_buf()
         };
-        Some(resolved)
+        if !resolved.exists() {
+            return Err(EngineError::ConfigNotFound {
+                path: resolved.display().to_string(),
+            });
+        }
+        Ok(Some(resolved))
     } else {
         let default_config = root.join("detekt.yml");
         if default_config.exists() {
-            Some(default_config)
+            Ok(Some(default_config))
         } else {
-            None
+            Ok(None)
         }
     }
 }
@@ -350,8 +356,9 @@ fn run_detekt_process(
 /// Run detekt on a project's Kotlin source files.
 ///
 /// # Errors
-/// Returns an error if detekt cannot be downloaded, the JRE is unavailable,
-/// or the detekt process fails to execute.
+/// Returns an error if the explicitly provided config file does not exist,
+/// detekt cannot be downloaded, the JRE is unavailable, or the detekt
+/// process fails to execute.
 pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineError> {
     let manifest = konvoy_config::Manifest::from_path(&root.join("konvoy.toml"))?;
 
@@ -410,7 +417,7 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
     }
 
     // Resolve config and run detekt.
-    let config_path = resolve_config(root, options.config.as_deref());
+    let config_path = resolve_config(root, options.config.as_deref())?;
     run_detekt_process(
         &java_bin,
         &jre_home,
@@ -535,7 +542,9 @@ fn parse_detekt_line(line: &str) -> Option<DetektDiagnostic> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{detekt_download_url, detekt_jar_path, parse_detekt_output, validate_version};
+    use super::{
+        detekt_download_url, detekt_jar_path, parse_detekt_output, resolve_config, validate_version,
+    };
 
     #[test]
     fn detekt_download_url_format() {
@@ -742,5 +751,62 @@ src/config.kt:15:1: MaxLineLength - Line is too long. [detekt.style]";
             Some("EmptyFunctionBlock")
         );
         assert_eq!(diags.get(3).map(|d| d.rule.as_str()), Some("MaxLineLength"));
+    }
+
+    #[test]
+    fn resolve_config_errors_on_missing_explicit_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let missing = std::path::Path::new("nonexistent.yml");
+        let result = resolve_config(root, Some(missing));
+        assert!(result.is_err(), "expected Err for missing explicit config");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("config file not found"), "error was: {err}");
+        assert!(
+            err.contains("nonexistent.yml"),
+            "error should mention the path: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_config_returns_existing_explicit_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let cfg_path = root.join("my-detekt.yml");
+        std::fs::write(&cfg_path, "# config").unwrap();
+        let result = resolve_config(root, Some(std::path::Path::new("my-detekt.yml")));
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(result.unwrap(), Some(cfg_path));
+    }
+
+    #[test]
+    fn resolve_config_returns_absolute_explicit_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let cfg_path = tmp.path().join("absolute-detekt.yml");
+        std::fs::write(&cfg_path, "# config").unwrap();
+        let result = resolve_config(root, Some(&cfg_path));
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(result.unwrap(), Some(cfg_path));
+    }
+
+    #[test]
+    fn resolve_config_uses_default_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let default_cfg = root.join("detekt.yml");
+        std::fs::write(&default_cfg, "# default config").unwrap();
+        let result = resolve_config(root, None);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(result.unwrap(), Some(default_cfg));
+    }
+
+    #[test]
+    fn resolve_config_returns_none_when_no_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let result = resolve_config(root, None);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(result.unwrap(), None);
     }
 }

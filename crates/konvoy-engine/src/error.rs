@@ -123,4 +123,8 @@ pub enum EngineError {
     /// The project name supplied to `konvoy init` is invalid.
     #[error("invalid project name \"{name}\": {reason}")]
     InvalidProjectName { name: String, reason: String },
+
+    /// An explicit config file was not found on disk.
+    #[error("config file not found: {path} — check the --config path or create the file")]
+    ConfigNotFound { path: String },
 }
