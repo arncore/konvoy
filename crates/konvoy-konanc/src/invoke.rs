@@ -1,5 +1,6 @@
 //! Compiler invocation and diagnostics normalization.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -356,14 +357,25 @@ fn parse_level_message(s: &str) -> Option<(DiagnosticLevel, String)> {
 }
 
 /// Detect platform toolchain errors and add actionable diagnostics.
+///
+/// Deduplicates by message content so repeated compiler output does not
+/// produce duplicate diagnostics.
 fn detect_toolchain_errors(stderr: &str, diagnostics: &mut Vec<Diagnostic>) {
+    let mut seen: HashSet<String> = diagnostics.iter().map(|d| d.message.clone()).collect();
+
+    let mut push_unique = |diag: Diagnostic| {
+        if seen.insert(diag.message.clone()) {
+            diagnostics.push(diag);
+        }
+    };
+
     // macOS: missing Xcode Command Line Tools
     if stderr.contains("xcode-select")
         || stderr.contains("xcrun")
         || stderr.contains("no developer tools were found")
         || stderr.contains("CommandLineTools")
     {
-        diagnostics.push(Diagnostic {
+        push_unique(Diagnostic {
             level: DiagnosticLevel::Error,
             message: "Xcode Command Line Tools not found — run `xcode-select --install`".to_owned(),
             file: None,
@@ -373,7 +385,7 @@ fn detect_toolchain_errors(stderr: &str, diagnostics: &mut Vec<Diagnostic>) {
 
     // Linux: missing required system libraries
     if stderr.contains("cannot find -lstdc++") || stderr.contains("cannot find -lm") {
-        diagnostics.push(Diagnostic {
+        push_unique(Diagnostic {
             level: DiagnosticLevel::Error,
             message:
                 "missing system libraries — install build-essential: `sudo apt install build-essential`"
@@ -533,6 +545,31 @@ mod tests {
         let mut diags = Vec::new();
         detect_toolchain_errors("normal compiler output", &mut diags);
         assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn detect_toolchain_deduplicates_existing_diagnostics() {
+        // Pre-populate diagnostics with the same message that detect_toolchain_errors would add
+        let mut diags = vec![Diagnostic {
+            level: DiagnosticLevel::Error,
+            message: "Xcode Command Line Tools not found — run `xcode-select --install`".to_owned(),
+            file: None,
+            line: None,
+        }];
+        detect_toolchain_errors("xcode-select: error: something", &mut diags);
+        // Should still be 1, not 2
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn detect_toolchain_does_not_duplicate_on_repeated_call() {
+        let mut diags = Vec::new();
+        let stderr = "ld: cannot find -lstdc++\nld: cannot find -lstdc++";
+        detect_toolchain_errors(stderr, &mut diags);
+        detect_toolchain_errors(stderr, &mut diags);
+        // Should be 1 even after two calls
+        assert_eq!(diags.len(), 1);
+        assert!(diags.get(0).unwrap().message.contains("build-essential"));
     }
 
     #[test]
