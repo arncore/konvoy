@@ -36,7 +36,7 @@ enum Command {
         #[arg(long)]
         release: bool,
         /// Show compiler output
-        #[arg(long)]
+        #[arg(long, short = 'v')]
         verbose: bool,
         /// Allow overriding hash mismatch checks
         #[arg(long)]
@@ -75,7 +75,7 @@ enum Command {
         #[arg(long)]
         release: bool,
         /// Show compiler output
-        #[arg(long)]
+        #[arg(long, short = 'v')]
         verbose: bool,
         /// Allow overriding hash mismatch checks
         #[arg(long)]
@@ -90,7 +90,7 @@ enum Command {
     /// Run detekt linter on Kotlin source files
     Lint {
         /// Show raw detekt output
-        #[arg(long)]
+        #[arg(long, short = 'v')]
         verbose: bool,
         /// Path to a custom detekt configuration file
         #[arg(long)]
@@ -580,6 +580,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_build_verbose_short() {
+        let cli = Cli::try_parse_from(["konvoy", "build", "-v"]).unwrap();
+        match cli.command {
+            Command::Build { verbose, .. } => assert!(verbose),
+            other => panic!("expected Build, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_build_target() {
         let cli = Cli::try_parse_from(["konvoy", "build", "--target", "macos_arm64"]).unwrap();
         match cli.command {
@@ -757,6 +766,15 @@ mod tests {
                 assert!(!locked);
                 assert!(filter.is_none());
             }
+            other => panic!("expected Test, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_test_verbose_short() {
+        let cli = Cli::try_parse_from(["konvoy", "test", "-v"]).unwrap();
+        match cli.command {
+            Command::Test { verbose, .. } => assert!(verbose),
             other => panic!("expected Test, got {other:?}"),
         }
     }
@@ -1105,6 +1123,15 @@ mod tests {
     #[test]
     fn parse_lint_verbose() {
         let cli = Cli::try_parse_from(["konvoy", "lint", "--verbose"]).unwrap();
+        match cli.command {
+            Command::Lint { verbose, .. } => assert!(verbose),
+            other => panic!("expected Lint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lint_verbose_short() {
+        let cli = Cli::try_parse_from(["konvoy", "lint", "-v"]).unwrap();
         match cli.command {
             Command::Lint { verbose, .. } => assert!(verbose),
             other => panic!("expected Lint, got {other:?}"),
