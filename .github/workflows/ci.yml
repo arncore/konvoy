@@ -31,7 +31,7 @@ jobs:
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'tests/**'
-              - '.github/workflows/**'
+              - '.github/workflows/ci.yml'
 
   check:
     name: Check
