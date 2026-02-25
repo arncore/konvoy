@@ -475,14 +475,15 @@ fn update_lockfile_if_needed(
 /// Rename the `.kexe` output that `konanc` sometimes produces (e.g. on Linux)
 /// back to the expected `output_path`.
 ///
-/// This is a no-op when `output_path` already exists or the `.kexe` variant is
-/// absent.
+/// This is a no-op when the `.kexe` variant is absent. When a `.kexe` file
+/// exists, it is always renamed to `output_path`, replacing any previous binary
+/// so that rebuilds never serve stale artifacts.
 ///
 /// # Errors
 /// Returns an error if the rename fails.
 pub(crate) fn normalize_konanc_output(output_path: &Path) -> Result<(), EngineError> {
     let kexe_path = output_path.with_extension("kexe");
-    if !output_path.exists() && kexe_path.exists() {
+    if kexe_path.exists() {
         std::fs::rename(&kexe_path, output_path).map_err(|source| EngineError::Io {
             path: kexe_path.display().to_string(),
             source,
@@ -1526,6 +1527,54 @@ mod tests {
         );
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn normalize_konanc_output_renames_kexe_when_output_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("myapp");
+        let kexe_path = tmp.path().join("myapp.kexe");
+        fs::write(&kexe_path, "new-binary").unwrap();
+
+        normalize_konanc_output(&output_path).unwrap();
+
+        assert!(output_path.exists());
+        assert!(!kexe_path.exists());
+        assert_eq!(fs::read_to_string(&output_path).unwrap(), "new-binary");
+    }
+
+    #[test]
+    fn normalize_konanc_output_replaces_existing_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("myapp");
+        let kexe_path = tmp.path().join("myapp.kexe");
+
+        // Simulate a stale binary already at output_path.
+        fs::write(&output_path, "old-binary").unwrap();
+        // Simulate konanc writing a fresh .kexe.
+        fs::write(&kexe_path, "new-binary").unwrap();
+
+        normalize_konanc_output(&output_path).unwrap();
+
+        assert!(output_path.exists());
+        assert!(!kexe_path.exists());
+        assert_eq!(
+            fs::read_to_string(&output_path).unwrap(),
+            "new-binary",
+            "the stale binary should be replaced by the new .kexe content"
+        );
+    }
+
+    #[test]
+    fn normalize_konanc_output_noop_when_neither_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("myapp");
+
+        // Neither output_path nor the .kexe variant exist.
+        normalize_konanc_output(&output_path).unwrap();
+
+        assert!(!output_path.exists());
+        assert!(!tmp.path().join("myapp.kexe").exists());
     }
 
     #[test]
