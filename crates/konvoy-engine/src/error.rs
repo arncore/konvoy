@@ -119,4 +119,8 @@ pub enum EngineError {
     /// Lint not configured.
     #[error("detekt not configured — add `detekt = \"1.23.7\"` to [toolchain] in konvoy.toml")]
     LintNotConfigured,
+
+    /// The project name supplied to `konvoy init` is invalid.
+    #[error("invalid project name \"{name}\": {reason}")]
+    InvalidProjectName { name: String, reason: String },
 }

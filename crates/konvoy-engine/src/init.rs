@@ -13,6 +13,7 @@ use crate::error::EngineError;
 ///
 /// # Errors
 /// Returns an error if:
+/// - The project name is invalid (empty, contains special characters, etc.)
 /// - A `konvoy.toml` already exists in `dir`
 /// - The directory or files cannot be created
 /// - The manifest cannot be serialized
@@ -20,15 +21,54 @@ pub fn init_project(name: &str, dir: &Path) -> Result<(), EngineError> {
     init_project_with_kind(name, dir, PackageKind::Bin)
 }
 
+/// Validate that a project name is well-formed.
+///
+/// A valid project name:
+/// - Is not empty
+/// - Contains only ASCII alphanumeric characters, hyphens (`-`), or underscores (`_`)
+/// - Starts with a letter or underscore (not a digit or hyphen)
+fn validate_project_name(name: &str) -> Result<(), EngineError> {
+    let Some(first) = name.chars().next() else {
+        return Err(EngineError::InvalidProjectName {
+            name: name.to_owned(),
+            reason: "name must not be empty".to_owned(),
+        });
+    };
+
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return Err(EngineError::InvalidProjectName {
+            name: name.to_owned(),
+            reason: format!("must start with a letter or underscore, found '{first}'"),
+        });
+    }
+
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_')
+    {
+        return Err(EngineError::InvalidProjectName {
+            name: name.to_owned(),
+            reason: format!(
+                "contains invalid character '{bad}' — only ASCII letters, digits, hyphens, and underscores are allowed"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 /// Scaffold a new Konvoy project with a specific package kind.
 ///
 /// # Errors
-/// Returns an error if the project directory cannot be created or a manifest already exists.
+/// Returns an error if the project name is invalid, the project directory cannot be created,
+/// or a manifest already exists.
 pub fn init_project_with_kind(
     name: &str,
     dir: &Path,
     kind: PackageKind,
 ) -> Result<(), EngineError> {
+    validate_project_name(name)?;
+
     let manifest_path = dir.join("konvoy.toml");
 
     if manifest_path.exists() {
@@ -193,5 +233,102 @@ mod tests {
         let manifest = Manifest::from_path(&project_dir.join("konvoy.toml")).unwrap();
         assert_eq!(manifest.package.kind, PackageKind::Bin);
         assert!(manifest.package.version.is_none());
+    }
+
+    // --- Project name validation tests ---
+
+    #[test]
+    fn valid_names_accepted() {
+        let valid = ["my-app", "hello_world", "a", "test123", "_private", "App"];
+        for name in valid {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join(name);
+            init_project(name, &dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_empty_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("empty");
+        let err = init_project("", &dir).unwrap_err().to_string();
+        assert!(err.contains("must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_name_with_spaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("spaces");
+        let err = init_project("hello world", &dir).unwrap_err().to_string();
+        assert!(err.contains("invalid character"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_name_with_special_chars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("special");
+        let err = init_project("test@#$", &dir).unwrap_err().to_string();
+        assert!(err.contains("invalid character"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_path_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("traversal");
+        let err = init_project("../../../etc/test", &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invalid character") || err.contains("must start with"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_path_separator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sep");
+        let err = init_project("a/b", &dir).unwrap_err().to_string();
+        assert!(err.contains("invalid character"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_name_starting_with_digit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("digit");
+        let err = init_project("1abc", &dir).unwrap_err().to_string();
+        assert!(err.contains("must start with"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_name_starting_with_hyphen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("hyphen");
+        let err = init_project("-start", &dir).unwrap_err().to_string();
+        assert!(err.contains("must start with"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_name_with_null_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("null");
+        let err = init_project("ab\0cd", &dir).unwrap_err().to_string();
+        assert!(err.contains("invalid character"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_name_with_backslash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("backslash");
+        let err = init_project("a\\b", &dir).unwrap_err().to_string();
+        assert!(err.contains("invalid character"), "got: {err}");
+    }
+
+    #[test]
+    fn validation_prevents_file_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("should-not-exist");
+        let _ = init_project("", &dir);
+        assert!(!dir.exists(), "directory should not have been created");
     }
 }
