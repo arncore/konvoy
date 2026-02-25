@@ -61,9 +61,14 @@ fn default_entrypoint() -> String {
     "src/main.kt".to_owned()
 }
 
-/// Check whether a package name is valid: non-empty, only alphanumeric, hyphen, or underscore.
+/// Check whether a package name is valid: non-empty, starts with a letter or underscore,
+/// and contains only ASCII alphanumeric characters, hyphens, or underscores.
 fn is_valid_name(name: &str) -> bool {
-    !name.is_empty()
+    let Some(first) = name.chars().next() else {
+        return false;
+    };
+
+    (first.is_ascii_alphabetic() || first == '_')
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -356,10 +361,13 @@ entrypoint = "src/app.kt"
         assert!(is_valid_name("hello-world"));
         assert!(is_valid_name("hello_world"));
         assert!(is_valid_name("Hello123"));
+        assert!(is_valid_name("_leading_underscore"));
         assert!(!is_valid_name(""));
         assert!(!is_valid_name("hello world"));
         assert!(!is_valid_name("hello!"));
         assert!(!is_valid_name("hello.world"));
+        assert!(!is_valid_name("1abc"));
+        assert!(!is_valid_name("-leading-hyphen"));
     }
 
     #[test]
