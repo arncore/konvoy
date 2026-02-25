@@ -23,7 +23,7 @@ pub struct TestOptions {
     pub release: bool,
     /// Whether to show raw compiler output.
     pub verbose: bool,
-    /// Allow overriding hash mismatch checks.
+    /// Force a rebuild, bypassing the cache.
     pub force: bool,
     /// Require the lockfile to be up-to-date; error on any mismatch.
     pub locked: bool,
