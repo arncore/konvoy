@@ -356,8 +356,9 @@ fn run_detekt_process(
 /// Run detekt on a project's Kotlin source files.
 ///
 /// # Errors
-/// Returns an error if detekt cannot be downloaded, the JRE is unavailable,
-/// or the detekt process fails to execute.
+/// Returns an error if the explicitly provided config file does not exist,
+/// detekt cannot be downloaded, the JRE is unavailable, or the detekt
+/// process fails to execute.
 pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineError> {
     let manifest = konvoy_config::Manifest::from_path(&root.join("konvoy.toml"))?;
 
