@@ -445,8 +445,8 @@ pub fn parse_detekt_output(output: &str) -> Vec<DetektDiagnostic> {
             continue;
         }
 
-        // Try to match: file:line:col: RuleName - message
-        // or:           file:line: RuleName - message
+        // Try to match real detekt format: file:line:col: message [RuleName]
+        // or legacy format:                file:line:col: RuleName - message [detekt.RuleSet]
         if let Some(diag) = parse_detekt_line(trimmed) {
             diagnostics.push(diag);
         }
@@ -801,7 +801,7 @@ src/config.kt:15:1: Line is too long. [MaxLineLength]";
         let diags = parse_detekt_output(output);
         assert_eq!(diags.len(), 2, "expected 2 findings, got {}", diags.len());
 
-        let first = &diags[0];
+        let first = diags.get(0).expect("expected at least 1 finding");
         assert_eq!(first.file.as_deref(), Some("/tmp/project/src/main.kt"));
         assert_eq!(first.line, Some(10));
         assert_eq!(first.rule, "EmptyCatchBlock");
@@ -810,7 +810,7 @@ src/config.kt:15:1: Line is too long. [MaxLineLength]";
             "Empty catch block detected. If the exception can be safely ignored, name the exception according to one of the exemptions as per the configuration of this rule."
         );
 
-        let second = &diags[1];
+        let second = diags.get(1).expect("expected at least 2 findings");
         assert_eq!(second.file.as_deref(), Some("/tmp/project/src/main.kt"));
         assert_eq!(second.line, Some(2));
         assert_eq!(second.rule, "MagicNumber");
