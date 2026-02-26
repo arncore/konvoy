@@ -38,7 +38,7 @@ enum Command {
         /// Show compiler output
         #[arg(long, short = 'v')]
         verbose: bool,
-        /// Allow overriding hash mismatch checks
+        /// Force a rebuild, bypassing the cache
         #[arg(long)]
         force: bool,
         /// Require the lockfile to be up-to-date; error on any mismatch
@@ -56,7 +56,7 @@ enum Command {
         /// Show compiler output
         #[arg(long, short = 'v')]
         verbose: bool,
-        /// Allow overriding hash mismatch checks
+        /// Force a rebuild, bypassing the cache
         #[arg(long)]
         force: bool,
         /// Require the lockfile to be up-to-date; error on any mismatch
@@ -77,7 +77,7 @@ enum Command {
         /// Show compiler output
         #[arg(long, short = 'v')]
         verbose: bool,
-        /// Allow overriding hash mismatch checks
+        /// Force a rebuild, bypassing the cache
         #[arg(long)]
         force: bool,
         /// Require the lockfile to be up-to-date; error on any mismatch
