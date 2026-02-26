@@ -9,6 +9,24 @@ pub struct Lockfile {
     pub toolchain: Option<ToolchainLock>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<DependencyLock>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<PluginLock>,
+}
+
+/// A locked plugin artifact entry in the lockfile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginLock {
+    /// Human-readable plugin name (e.g. `"serialization"`).
+    pub name: String,
+    /// Artifact label (e.g. `"compiler-plugin"` or module name like `"core"`).
+    pub artifact: String,
+    /// Artifact kind: `"compiler-plugin"` or `"runtime"`.
+    pub kind: String,
+    /// Hex-encoded SHA-256 hash of the artifact file.
+    pub sha256: String,
+    /// Download URL used to fetch this artifact.
+    pub url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +92,7 @@ impl Lockfile {
                 detekt_jar_sha256: None,
             }),
             dependencies: Vec::new(),
+            plugins: Vec::new(),
         }
     }
 
@@ -92,6 +111,7 @@ impl Lockfile {
                 detekt_jar_sha256: None,
             }),
             dependencies: Vec::new(),
+            plugins: Vec::new(),
         }
     }
 
@@ -353,6 +373,55 @@ konanc_version = "2.1.0"
             !tmp_path.exists(),
             "temp file should not exist after successful write"
         );
+    }
+
+    #[test]
+    fn round_trip_with_plugins() {
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(PluginLock {
+            name: "serialization".to_owned(),
+            artifact: "compiler-plugin".to_owned(),
+            kind: "compiler-plugin".to_owned(),
+            sha256: "abc123def456".to_owned(),
+            url: "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-serialization-compiler-plugin/2.1.0/kotlin-serialization-compiler-plugin-2.1.0.jar".to_owned(),
+        });
+        lockfile.plugins.push(PluginLock {
+            name: "serialization".to_owned(),
+            artifact: "core".to_owned(),
+            kind: "runtime".to_owned(),
+            sha256: "deadbeef".to_owned(),
+            url: "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/kotlinx-serialization-core-linuxx64/1.8.0/kotlinx-serialization-core-linuxx64-1.8.0.klib".to_owned(),
+        });
+        lockfile.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
+        let reparsed = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(lockfile, reparsed);
+        assert_eq!(reparsed.plugins.len(), 2);
+    }
+
+    #[test]
+    fn backward_compat_no_plugins() {
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        fs::write(
+            &path,
+            r#"
+[toolchain]
+konanc_version = "2.1.0"
+"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        let lockfile = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert!(lockfile.plugins.is_empty());
+    }
+
+    #[test]
+    fn empty_plugins_omitted_in_toml() {
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+        let content = toml::to_string_pretty(&lockfile).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!content.contains("plugins"), "content was: {content}");
     }
 
     #[test]

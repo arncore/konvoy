@@ -127,4 +127,33 @@ pub enum EngineError {
     /// An explicit config file was not found on disk.
     #[error("config file not found: {path} — check the --config path or create the file")]
     ConfigNotFound { path: String },
+
+    /// An unknown plugin was referenced in the manifest.
+    #[error("unknown plugin `{name}` — available plugins: {available}")]
+    UnknownPlugin { name: String, available: String },
+
+    /// A plugin module name is invalid.
+    #[error("unknown module `{module}` for plugin `{plugin}` — available modules: {available}")]
+    UnknownPluginModule {
+        plugin: String,
+        module: String,
+        available: String,
+    },
+
+    /// Plugin configuration is invalid.
+    #[error("invalid plugin `{name}` configuration: {reason}")]
+    InvalidPluginConfig { name: String, reason: String },
+
+    /// Plugin artifact download failed.
+    #[error("cannot download plugin `{name}` artifact: {message}")]
+    PluginDownload { name: String, message: String },
+
+    /// Plugin artifact hash mismatch.
+    #[error("plugin `{name}` artifact hash mismatch for {artifact} — expected {expected}, got {actual}; delete the cached artifact and re-run to re-download")]
+    PluginHashMismatch {
+        name: String,
+        artifact: String,
+        expected: String,
+        actual: String,
+    },
 }

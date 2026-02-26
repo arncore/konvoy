@@ -95,6 +95,7 @@ pub struct KonancCommand {
     release: bool,
     produce: ProduceKind,
     libraries: Vec<PathBuf>,
+    plugins: Vec<PathBuf>,
     java_home: Option<PathBuf>,
     generate_test_runner: bool,
 }
@@ -138,6 +139,12 @@ impl KonancCommand {
     /// Add dependency library paths (`.klib` files).
     pub fn libraries(mut self, paths: &[PathBuf]) -> Self {
         self.libraries = paths.to_vec();
+        self
+    }
+
+    /// Add compiler plugin JAR paths (emits `-Xplugin=<path>` for each).
+    pub fn plugins(mut self, paths: &[PathBuf]) -> Self {
+        self.plugins = paths.to_vec();
         self
     }
 
@@ -195,6 +202,11 @@ impl KonancCommand {
         for lib in &self.libraries {
             args.push("-library".to_owned());
             args.push(lib.display().to_string());
+        }
+
+        // Compiler plugins
+        for plugin in &self.plugins {
+            args.push(format!("-Xplugin={}", plugin.display()));
         }
 
         // Test runner generation
@@ -704,6 +716,42 @@ mod tests {
 
         let args = cmd.build_args().unwrap();
         assert!(!args.contains(&"-generate-test-runner".to_owned()));
+    }
+
+    #[test]
+    fn build_args_with_plugins() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("main.kt")])
+            .output(Path::new("out"))
+            .plugins(&[
+                PathBuf::from("/cache/plugin-a.jar"),
+                PathBuf::from("/cache/plugin-b.jar"),
+            ]);
+
+        let args = cmd.build_args().unwrap();
+        let plugin_args: Vec<_> = args.iter().filter(|a| a.starts_with("-Xplugin=")).collect();
+        assert_eq!(plugin_args.len(), 2);
+        assert_eq!(
+            plugin_args.first().map(|s| s.as_str()),
+            Some("-Xplugin=/cache/plugin-a.jar")
+        );
+        assert_eq!(
+            plugin_args.get(1).map(|s| s.as_str()),
+            Some("-Xplugin=/cache/plugin-b.jar")
+        );
+    }
+
+    #[test]
+    fn build_args_no_plugins_by_default() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("main.kt")])
+            .output(Path::new("out"));
+
+        let args = cmd.build_args().unwrap();
+        assert!(
+            !args.iter().any(|a| a.starts_with("-Xplugin=")),
+            "should not have -Xplugin args by default"
+        );
     }
 
     #[test]

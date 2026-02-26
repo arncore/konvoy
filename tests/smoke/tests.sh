@@ -246,6 +246,150 @@ test_worktree_cache_shared() {
 }
 
 # ---------------------------------------------------------------------------
+# Tests: plugins
+# ---------------------------------------------------------------------------
+
+test_init_no_plugins_section() {
+    konvoy init --name no-plug >/dev/null 2>&1
+    # Default init should NOT include a [plugins] section.
+    if grep -q '\[plugins' no-plug/konvoy.toml; then
+        echo "    konvoy init should not add [plugins] section by default" >&2
+        return 1
+    fi
+}
+
+test_plugin_manifest_parses() {
+    # A manifest with [plugins.serialization] must be accepted by konvoy.
+    konvoy init --name plug-parse >/dev/null 2>&1
+    cat >> plug-parse/konvoy.toml << 'TOML'
+
+[plugins.serialization]
+version = "1.7.3"
+modules = ["json"]
+TOML
+    cd plug-parse
+    # Build will fail at plugin download (no cached artifacts), but must NOT
+    # fail at manifest parsing. Look for TOML/parse errors as a signal.
+    local output
+    output=$(konvoy build 2>&1) || true
+    if echo "$output" | grep -qi "unknown field\|parse error\|invalid.*toml"; then
+        echo "    manifest with plugins section should parse cleanly" >&2
+        echo "    got: $output" >&2
+        return 1
+    fi
+}
+
+test_plugin_unknown_name_error() {
+    konvoy init --name plug-unknown >/dev/null 2>&1
+    cat >> plug-unknown/konvoy.toml << 'TOML'
+
+[plugins.nonexistent]
+version = "1.0.0"
+TOML
+    cd plug-unknown
+    local output
+    if output=$(konvoy build 2>&1); then
+        echo "    expected build to fail with unknown plugin name" >&2
+        return 1
+    fi
+    assert_contains "$output" "unknown plugin"
+    assert_contains "$output" "nonexistent"
+    # Error should list available plugins so the user knows what to use.
+    assert_contains "$output" "serialization"
+}
+
+test_plugin_unknown_module_error() {
+    konvoy init --name plug-mod >/dev/null 2>&1
+    cat >> plug-mod/konvoy.toml << 'TOML'
+
+[plugins.serialization]
+version = "1.7.3"
+modules = ["nonexistent_module"]
+TOML
+    cd plug-mod
+    local output
+    if output=$(konvoy build 2>&1); then
+        echo "    expected build to fail with unknown module name" >&2
+        return 1
+    fi
+    assert_contains "$output" "unknown module"
+    assert_contains "$output" "nonexistent_module"
+}
+
+test_plugin_empty_version_error() {
+    konvoy init --name plug-ver >/dev/null 2>&1
+    cat >> plug-ver/konvoy.toml << 'TOML'
+
+[plugins.serialization]
+version = ""
+TOML
+    cd plug-ver
+    local output
+    if output=$(konvoy build 2>&1); then
+        echo "    expected build to fail with empty plugin version" >&2
+        return 1
+    fi
+    assert_contains "$output" "version"
+}
+
+test_plugin_locked_no_entries_error() {
+    # --locked must fail when plugins are declared but lockfile has no plugin entries.
+    konvoy init --name plug-locked >/dev/null 2>&1
+    cat >> plug-locked/konvoy.toml << 'TOML'
+
+[plugins.serialization]
+version = "1.7.3"
+TOML
+    cd plug-locked
+    # Write a valid lockfile that's missing plugin entries.
+    printf '[toolchain]\nkonanc_version = "2.1.0"\n' > konvoy.lock
+    local output
+    if output=$(konvoy build --locked 2>&1); then
+        echo "    expected --locked to fail without plugin entries in lockfile" >&2
+        return 1
+    fi
+    assert_contains "$output" "lockfile"
+}
+
+test_plugin_build_lifecycle() {
+    # End-to-end: build with serialization plugin, verify lockfile + --locked.
+    konvoy init --name plug-app >/dev/null 2>&1
+    cat >> plug-app/konvoy.toml << 'TOML'
+
+[plugins.serialization]
+version = "1.7.3"
+TOML
+    # Write Kotlin source that uses the @Serializable annotation.
+    cat > plug-app/src/main.kt << 'KOTLIN'
+import kotlinx.serialization.Serializable
+
+@Serializable
+data class User(val name: String, val age: Int)
+
+fun main() {
+    println("Hello with serialization!")
+}
+KOTLIN
+    cd plug-app
+
+    # First build downloads plugin artifacts and compiles.
+    local out1
+    out1=$(konvoy build 2>&1)
+    assert_contains "$out1" "Compiling"
+
+    # Lockfile should contain plugin entries after build.
+    assert_file_exists konvoy.lock
+    assert_file_contains konvoy.lock "[[plugins]]"
+    assert_file_contains konvoy.lock "serialization"
+    assert_file_contains konvoy.lock "sha256"
+
+    # --locked should succeed now that the lockfile has plugin entries.
+    # (May recompile due to lockfile content change — that's fine,
+    #  the key assertion is that --locked doesn't error out.)
+    konvoy build --locked 2>&1
+}
+
+# ---------------------------------------------------------------------------
 # Tests: error cases
 # ---------------------------------------------------------------------------
 
@@ -438,6 +582,15 @@ run_test test_run_lib_fails
 run_test test_lint_help
 run_test test_lint_without_config_fails
 run_test test_lint_no_sources_warns
+
+# plugins
+run_test test_init_no_plugins_section
+run_test test_plugin_manifest_parses
+run_test test_plugin_unknown_name_error
+run_test test_plugin_unknown_module_error
+run_test test_plugin_empty_version_error
+run_test test_plugin_locked_no_entries_error
+run_test test_plugin_build_lifecycle
 
 # error cases
 run_test test_build_outside_project_fails

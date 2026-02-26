@@ -128,6 +128,7 @@ pub fn init_project_with_kind(
             detekt: None,
         },
         dependencies: std::collections::BTreeMap::new(),
+        plugins: std::collections::BTreeMap::new(),
     };
     let toml_content = manifest.to_toml()?;
     std::fs::write(&manifest_path, toml_content).map_err(|source| EngineError::Io {

@@ -311,9 +311,13 @@ mod tests {
         assert!(files.iter().any(|f| f.ends_with("beta.kt")));
     }
 
+    /// Guards tests that read or mutate HOME / USERPROFILE env vars so they
+    /// don't race with each other (env vars are process-wide shared state).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn konvoy_home_returns_dotkonvoy_subdir() {
-        // HOME is set in normal test environments.
+        let _guard = ENV_LOCK.lock().unwrap();
         let home = konvoy_home().unwrap();
         assert!(
             home.ends_with(".konvoy"),
@@ -324,7 +328,8 @@ mod tests {
 
     #[test]
     fn konvoy_home_fails_without_home_vars() {
-        // Temporarily unset both HOME and USERPROFILE.
+        let _guard = ENV_LOCK.lock().unwrap();
+
         let saved_home = std::env::var("HOME").ok();
         let saved_profile = std::env::var("USERPROFILE").ok();
         std::env::remove_var("HOME");
