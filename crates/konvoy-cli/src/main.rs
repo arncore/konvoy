@@ -181,32 +181,40 @@ fn project_root() -> Result<PathBuf, Box<dyn Error>> {
 fn cmd_init(name: Option<String>, lib: bool) -> CliResult {
     let cwd = std::env::current_dir()?;
 
-    let project_name = name.unwrap_or_else(|| {
-        cwd.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("my-project")
-            .to_owned()
-    });
-
-    let project_dir = cwd.join(&project_name);
-
     let kind = if lib {
         konvoy_config::manifest::PackageKind::Lib
     } else {
         konvoy_config::manifest::PackageKind::Bin
     };
 
-    konvoy_engine::init_project_with_kind(&project_name, &project_dir, kind)?;
-
     let kind_label = if lib { "library" } else { "project" };
-    eprintln!(
-        "    Created {kind_label} `{project_name}` at {}",
-        project_dir.display()
-    );
-    eprintln!();
-    eprintln!("  To get started:");
-    eprintln!("    cd {project_name}");
-    eprintln!("    konvoy build");
+
+    if let Some(project_name) = name {
+        // `konvoy init --name <name>`: create a subdirectory.
+        let project_dir = cwd.join(&project_name);
+        konvoy_engine::init_project_with_kind(&project_name, &project_dir, kind)?;
+
+        eprintln!(
+            "    Created {kind_label} `{project_name}` at {}",
+            project_dir.display()
+        );
+        eprintln!();
+        eprintln!("  To get started:");
+        eprintln!("    cd {project_name}");
+        eprintln!("    konvoy build");
+    } else {
+        // `konvoy init` (no --name): initialize in the current directory.
+        let project_name = konvoy_engine::init_project_in_place(&cwd, kind)?;
+
+        eprintln!(
+            "    Created {kind_label} `{project_name}` at {}",
+            cwd.display()
+        );
+        eprintln!();
+        eprintln!("  To get started:");
+        eprintln!("    konvoy build");
+    }
+
     Ok(())
 }
 

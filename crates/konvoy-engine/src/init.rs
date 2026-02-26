@@ -6,7 +6,7 @@ use konvoy_config::manifest::{Manifest, Package, PackageKind, Toolchain};
 
 use crate::error::EngineError;
 
-/// Scaffold a new Konvoy project.
+/// Scaffold a new Konvoy project in a new subdirectory.
 ///
 /// Creates the project directory (if it doesn't exist), a `konvoy.toml` manifest,
 /// and a `src/main.kt` with a hello-world program.
@@ -19,6 +19,32 @@ use crate::error::EngineError;
 /// - The manifest cannot be serialized
 pub fn init_project(name: &str, dir: &Path) -> Result<(), EngineError> {
     init_project_with_kind(name, dir, PackageKind::Bin)
+}
+
+/// Initialize a Konvoy project in the current (existing) directory.
+///
+/// Derives the project name from the directory's final component. Writes
+/// `konvoy.toml`, `src/main.kt` (or `src/lib.kt`), and `.gitignore` into
+/// `dir` without creating a subdirectory.
+///
+/// # Errors
+/// Returns an error if:
+/// - The directory name cannot be determined (e.g., root `/`)
+/// - The derived project name is invalid
+/// - A `konvoy.toml` already exists in `dir`
+/// - Files cannot be created or the manifest cannot be serialized
+pub fn init_project_in_place(dir: &Path, kind: PackageKind) -> Result<String, EngineError> {
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| EngineError::InvalidProjectName {
+            name: dir.display().to_string(),
+            reason: "cannot derive project name from directory path".to_owned(),
+        })?
+        .to_owned();
+
+    init_project_with_kind(&name, dir, kind)?;
+    Ok(name)
 }
 
 /// Validate that a project name is well-formed.
@@ -330,5 +356,84 @@ mod tests {
         let dir = tmp.path().join("should-not-exist");
         let _ = init_project("", &dir);
         assert!(!dir.exists(), "directory should not have been created");
+    }
+
+    // --- In-place initialization tests ---
+
+    #[test]
+    fn in_place_creates_project_in_existing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("my-app");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let name = init_project_in_place(&project_dir, PackageKind::Bin).unwrap();
+
+        assert_eq!(name, "my-app");
+        assert!(project_dir.join("konvoy.toml").exists());
+        assert!(project_dir.join("src").join("main.kt").exists());
+        assert!(project_dir.join(".gitignore").exists());
+    }
+
+    #[test]
+    fn in_place_derives_name_from_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("cool-project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let name = init_project_in_place(&project_dir, PackageKind::Bin).unwrap();
+
+        assert_eq!(name, "cool-project");
+        let manifest = Manifest::from_path(&project_dir.join("konvoy.toml")).unwrap();
+        assert_eq!(manifest.package.name, "cool-project");
+    }
+
+    #[test]
+    fn in_place_lib_creates_lib_kt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("my-lib");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let name = init_project_in_place(&project_dir, PackageKind::Lib).unwrap();
+
+        assert_eq!(name, "my-lib");
+        assert!(project_dir.join("src").join("lib.kt").exists());
+        assert!(!project_dir.join("src").join("main.kt").exists());
+
+        let manifest = Manifest::from_path(&project_dir.join("konvoy.toml")).unwrap();
+        assert_eq!(manifest.package.kind, PackageKind::Lib);
+    }
+
+    #[test]
+    fn in_place_refuses_existing_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("existing");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(project_dir.join("konvoy.toml"), "").unwrap();
+
+        let result = init_project_in_place(&project_dir, PackageKind::Bin);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("already exists"));
+    }
+
+    #[test]
+    fn in_place_does_not_create_subdirectory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("no-sub");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        init_project_in_place(&project_dir, PackageKind::Bin).unwrap();
+
+        // The project files should be directly in project_dir, not in a nested subdirectory.
+        assert!(project_dir.join("konvoy.toml").exists());
+        assert!(!project_dir.join("no-sub").exists());
+    }
+
+    #[test]
+    fn in_place_rejects_root_path() {
+        let result = init_project_in_place(std::path::Path::new("/"), PackageKind::Bin);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cannot derive project name"), "got: {err}");
     }
 }
