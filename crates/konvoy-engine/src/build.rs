@@ -143,10 +143,42 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
             profile,
             options,
             &library_paths,
+            &[],
             &lockfile_content,
         )?;
         library_paths.push(dep_output);
     }
+
+    // 7a. Resolve and download plugin artifacts.
+    let (plugin_jars, plugin_klibs, plugin_locks) = if !manifest.plugins.is_empty() {
+        let resolved_artifacts = crate::plugin::resolve_plugin_artifacts(&manifest, &target)?;
+        let results = crate::plugin::ensure_plugin_artifacts(
+            &resolved_artifacts,
+            &effective_lockfile,
+            options.locked,
+        )?;
+        let locks = crate::plugin::build_plugin_locks(&results);
+
+        let mut jars = Vec::new();
+        let mut klibs = Vec::new();
+        for r in &results {
+            match r.kind {
+                crate::plugin::PluginArtifactKind::CompilerPlugin => {
+                    jars.push(r.path.clone());
+                }
+                crate::plugin::PluginArtifactKind::Runtime => {
+                    klibs.push(r.path.clone());
+                }
+            }
+        }
+        (jars, klibs, locks)
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+
+    // Append runtime klibs from plugins to library paths.
+    let mut all_library_paths = library_paths;
+    all_library_paths.extend(plugin_klibs);
 
     // 8. Build the root project.
     let (output_path, outcome) = build_single(
@@ -157,17 +189,19 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         &target,
         profile,
         options,
-        &library_paths,
+        &all_library_paths,
+        &plugin_jars,
         &lockfile_content,
     )?;
 
-    // 9. Update lockfile if toolchain or dependencies changed.
+    // 9. Update lockfile if toolchain, dependencies, or plugins changed.
     update_lockfile_if_needed(
         &lockfile,
         &konanc,
         resolved.konanc_tarball_sha256.as_deref(),
         resolved.jre_tarball_sha256.as_deref(),
         &dep_graph,
+        &plugin_locks,
         project_root,
         &lockfile_path,
         options.force,
@@ -194,6 +228,7 @@ pub(crate) fn build_single(
     profile: &str,
     options: &BuildOptions,
     library_paths: &[PathBuf],
+    plugin_jars: &[PathBuf],
     lockfile_content: &str,
 ) -> Result<(PathBuf, BuildOutcome), EngineError> {
     // Collect source files, excluding test sources (src/test/).
@@ -274,6 +309,7 @@ pub(crate) fn build_single(
             ProduceKind::Program
         },
         library_paths,
+        plugin_jars,
     )?;
 
     // Store artifact in cache.
@@ -320,6 +356,7 @@ fn compile(
     options: &BuildOptions,
     produce: ProduceKind,
     library_paths: &[PathBuf],
+    plugin_jars: &[PathBuf],
 ) -> Result<PathBuf, EngineError> {
     // Ensure the output directory exists.
     if let Some(parent) = output_path.parent() {
@@ -332,7 +369,8 @@ fn compile(
         .target(target.to_konanc_arg())
         .release(options.release)
         .produce(produce)
-        .libraries(library_paths);
+        .libraries(library_paths)
+        .plugins(plugin_jars);
 
     if let Some(jh) = jre_home {
         cmd = cmd.java_home(jh);
@@ -370,6 +408,7 @@ pub(crate) fn lockfile_toml_content(lockfile: &Lockfile) -> Result<String, Engin
 /// the lockfile is missing entries that `konvoy.toml` would generate, such as:
 /// - Missing or mismatched toolchain version
 /// - Missing detekt entries when detekt is configured in the manifest
+/// - Missing plugin entries when plugins are configured in the manifest
 ///
 /// This runs before any build work so users get fast, clear feedback.
 fn check_lockfile_staleness(manifest: &Manifest, lockfile: &Lockfile) -> Result<(), EngineError> {
@@ -400,12 +439,22 @@ fn check_lockfile_staleness(manifest: &Manifest, lockfile: &Lockfile) -> Result<
         }
     }
 
+    // If the manifest has plugins, the lockfile must have at least one plugin entry
+    // for each declared plugin name.
+    for plugin_name in manifest.plugins.keys() {
+        let has_plugin = lockfile.plugins.iter().any(|p| p.name == *plugin_name);
+        if !has_plugin {
+            return Err(EngineError::LockfileUpdateRequired);
+        }
+    }
+
     Ok(())
 }
 
 /// Update konvoy.lock if the detected konanc version or dependency hashes differ,
-/// or if a fresh download provides new tarball hashes. When the lockfile already
-/// contains hashes and a fresh download yields different ones, emit a warning.
+/// or if a fresh download provides new tarball hashes or plugin artifacts changed.
+/// When the lockfile already contains hashes and a fresh download yields different
+/// ones, emit a warning.
 #[allow(clippy::too_many_arguments)]
 fn update_lockfile_if_needed(
     lockfile: &Lockfile,
@@ -413,6 +462,7 @@ fn update_lockfile_if_needed(
     konanc_tarball_sha256: Option<&str>,
     jre_tarball_sha256: Option<&str>,
     dep_graph: &ResolvedGraph,
+    plugin_locks: &[konvoy_config::lockfile::PluginLock],
     project_root: &Path,
     lockfile_path: &Path,
     force: bool,
@@ -466,9 +516,10 @@ fn update_lockfile_if_needed(
 
     let has_new_hashes = konanc_tarball_sha256.is_some() || jre_tarball_sha256.is_some();
     let deps_changed = lockfile.dependencies != new_deps;
+    let plugins_changed = lockfile.plugins.as_slice() != plugin_locks;
 
     // If nothing changed, nothing to do.
-    if !toolchain_changed && !has_new_hashes && !deps_changed {
+    if !toolchain_changed && !has_new_hashes && !deps_changed && !plugins_changed {
         return Ok(());
     }
 
@@ -552,6 +603,7 @@ fn update_lockfile_if_needed(
         final_jre_sha.as_deref(),
     );
     updated.dependencies = new_deps;
+    updated.plugins = plugin_locks.to_vec();
     updated
         .write_to(lockfile_path)
         .map_err(|e| EngineError::Lockfile(e.to_string()))?;
@@ -775,6 +827,7 @@ mod tests {
             None,
             None,
             &empty_graph,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -807,6 +860,7 @@ mod tests {
             None,
             None,
             &empty_graph,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -835,6 +889,7 @@ mod tests {
             Some("deadbeef"),
             Some("cafebabe"),
             &empty_graph,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -863,6 +918,7 @@ mod tests {
             Some("first-konanc-hash"),
             Some("first-jre-hash"),
             &empty_graph,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -926,6 +982,7 @@ mod tests {
             None,
             None,
             &graph,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -1023,6 +1080,7 @@ mod tests {
             profile,
             &options,
             &[],
+            &[],
             &lockfile_content,
         )
         .unwrap();
@@ -1111,6 +1169,7 @@ mod tests {
             &target,
             profile,
             &options,
+            &[],
             &[],
             &lockfile_content,
         )
@@ -1226,6 +1285,7 @@ mod tests {
             profile,
             &options,
             &[],
+            &[],
             &lockfile_content,
         )
         .unwrap();
@@ -1262,6 +1322,7 @@ mod tests {
             None,
             None,
             &empty_graph,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -1300,6 +1361,7 @@ mod tests {
             Some("newhash1"),
             Some("newhash2"),
             &empty_graph,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -1337,6 +1399,7 @@ mod tests {
             Some("samehash1"),
             Some("samehash2"),
             &empty_graph,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -1370,6 +1433,7 @@ mod tests {
             Some("newhash1"),
             Some("newhash2"),
             &empty_graph,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -1410,6 +1474,7 @@ mod tests {
             Some("newhash1"),
             Some("newhash2"),
             &empty_graph,
+            &[],
             tmp.path(),
             &lockfile_path,
             true,
@@ -1446,6 +1511,7 @@ mod tests {
             None,
             None,
             &empty_graph,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -1481,6 +1547,7 @@ mod tests {
             None,
             None,
             &empty_graph,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -1537,6 +1604,7 @@ mod tests {
             None,
             None,
             &graph,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -1597,6 +1665,7 @@ mod tests {
             None,
             None,
             &graph,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -1648,6 +1717,7 @@ mod tests {
             None,
             None,
             &graph,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -1726,6 +1796,7 @@ mod tests {
             None,
             None,
             &empty_graph,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -1813,6 +1884,7 @@ mod tests {
             profile,
             &options_no_force,
             &[],
+            &[],
             &lockfile_content,
         )
         .unwrap();
@@ -1836,6 +1908,7 @@ mod tests {
             &target,
             profile,
             &options_force,
+            &[],
             &[],
             &lockfile_content,
         );
@@ -2120,6 +2193,178 @@ mod tests {
         assert!(
             result.is_ok(),
             "extra detekt in lockfile should not cause error: {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_missing_plugin_entries_errors() {
+        // Manifest declares a plugin, but lockfile has no plugin entries.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins.serialization]\nversion = \"1.8.0\"\nmodules = [\"json\"]\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("lockfile is out of date"),
+            "expected staleness error for missing plugin entries, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_matching_plugin_entries_succeeds() {
+        // Manifest declares a plugin, lockfile has matching plugin entries.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins.serialization]\nversion = \"1.8.0\"\nmodules = [\"json\"]\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "serialization".to_owned(),
+            artifact: "kotlin-serialization-compiler-plugin-2.1.0.jar".to_owned(),
+            kind: "compiler-plugin".to_owned(),
+            sha256: "abc123".to_owned(),
+            url: "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-serialization-compiler-plugin/2.1.0/kotlin-serialization-compiler-plugin-2.1.0.jar".to_owned(),
+        });
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(
+            result.is_ok(),
+            "matching plugin entries should pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_no_plugins_in_manifest_ignores_lockfile_plugins() {
+        // If manifest doesn't declare plugins, lockfile having plugin entries is fine.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "serialization".to_owned(),
+            artifact: "some.jar".to_owned(),
+            kind: "compiler-plugin".to_owned(),
+            sha256: "abc".to_owned(),
+            url: "https://example.com/some.jar".to_owned(),
+        });
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(
+            result.is_ok(),
+            "extra plugin in lockfile should not cause error: {result:?}"
+        );
+    }
+
+    #[test]
+    fn update_lockfile_writes_plugin_locks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile = Lockfile::default();
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        let plugin_locks = vec![
+            konvoy_config::lockfile::PluginLock {
+                name: "serialization".to_owned(),
+                artifact: "kotlin-serialization-compiler-plugin-2.1.0.jar".to_owned(),
+                kind: "compiler-plugin".to_owned(),
+                sha256: "pluginhash1".to_owned(),
+                url: "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-serialization-compiler-plugin/2.1.0/kotlin-serialization-compiler-plugin-2.1.0.jar".to_owned(),
+            },
+            konvoy_config::lockfile::PluginLock {
+                name: "serialization".to_owned(),
+                artifact: "kotlinx-serialization-core-linuxx64-1.8.0.klib".to_owned(),
+                kind: "runtime".to_owned(),
+                sha256: "pluginhash2".to_owned(),
+                url: "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/kotlinx-serialization-core-linuxx64/1.8.0/kotlinx-serialization-core-linuxx64-1.8.0.klib".to_owned(),
+            },
+        ];
+
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            &plugin_locks,
+            tmp.path(),
+            &lockfile_path,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let reparsed = Lockfile::from_path(&lockfile_path).unwrap();
+        assert_eq!(reparsed.plugins.len(), 2);
+        assert_eq!(reparsed.plugins.first().unwrap().name, "serialization");
+        assert_eq!(reparsed.plugins.first().unwrap().kind, "compiler-plugin");
+        assert_eq!(reparsed.plugins.first().unwrap().sha256, "pluginhash1");
+        assert_eq!(reparsed.plugins.get(1).unwrap().kind, "runtime");
+        assert_eq!(reparsed.plugins.get(1).unwrap().sha256, "pluginhash2");
+    }
+
+    #[test]
+    fn update_lockfile_detects_plugin_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "serialization".to_owned(),
+            artifact: "old-artifact.jar".to_owned(),
+            kind: "compiler-plugin".to_owned(),
+            sha256: "oldhash".to_owned(),
+            url: "https://example.com/old.jar".to_owned(),
+        });
+        lockfile.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        // New plugin locks differ from what's in the lockfile.
+        let new_plugin_locks = vec![konvoy_config::lockfile::PluginLock {
+            name: "serialization".to_owned(),
+            artifact: "new-artifact.jar".to_owned(),
+            kind: "compiler-plugin".to_owned(),
+            sha256: "newhash".to_owned(),
+            url: "https://example.com/new.jar".to_owned(),
+        }];
+
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            &new_plugin_locks,
+            tmp.path(),
+            &lockfile_path,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let reparsed = Lockfile::from_path(&lockfile_path).unwrap();
+        assert_eq!(reparsed.plugins.len(), 1);
+        assert_eq!(reparsed.plugins.first().unwrap().sha256, "newhash");
+        assert_eq!(
+            reparsed.plugins.first().unwrap().artifact,
+            "new-artifact.jar"
         );
     }
 }

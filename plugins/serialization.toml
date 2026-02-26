@@ -1,0 +1,9 @@
+name = "serialization"
+compiler_plugin = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin:{kotlin_version}"
+
+[modules]
+core = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-core-{target}:{version}", always = true }
+json = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-json-{target}:{version}", depends_on = ["core"] }
+cbor = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-cbor-{target}:{version}", depends_on = ["core"] }
+protobuf = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-protobuf-{target}:{version}", depends_on = ["core"] }
+properties = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-properties-{target}:{version}", depends_on = ["core"] }

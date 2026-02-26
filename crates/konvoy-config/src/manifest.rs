@@ -11,6 +11,19 @@ pub struct Manifest {
     pub toolchain: Toolchain,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dependencies: BTreeMap<String, DependencySpec>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugins: BTreeMap<String, PluginConfig>,
+}
+
+/// Configuration for a single plugin in `[plugins.<name>]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginConfig {
+    /// The version of the plugin (e.g. `"1.8.0"`).
+    pub version: String,
+    /// Optional list of specific modules to include (beyond `always = true` modules).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modules: Vec<String>,
 }
 
 /// Toolchain specification declaring the Kotlin/Native version and optional tools.
@@ -118,6 +131,16 @@ fn validate(manifest: &Manifest, path: &str) -> Result<(), ManifestError> {
             message: "detekt version must not be empty".to_owned(),
         });
     }
+    // Validate plugins.
+    for (name, config) in &manifest.plugins {
+        if config.version.is_empty() {
+            return Err(ManifestError::InvalidPluginConfig {
+                path: path.to_owned(),
+                name: name.clone(),
+                reason: "version must not be empty".to_owned(),
+            });
+        }
+    }
     // Validate dependencies.
     for (name, spec) in &manifest.dependencies {
         if !is_valid_name(name) {
@@ -208,6 +231,12 @@ pub enum ManifestError {
     DependencyInvalidName { path: String, name: String },
     #[error("dependency `{name}` references itself in {path}")]
     DependencySelfReference { path: String, name: String },
+    #[error("invalid plugin `{name}` in {path}: {reason}")]
+    InvalidPluginConfig {
+        path: String,
+        name: String,
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -653,6 +682,130 @@ unknown = true
 "#;
         let result = Manifest::from_str(toml, "konvoy.toml");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_manifest_with_plugins() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.serialization]
+version = "1.8.0"
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(manifest.plugins.len(), 1);
+        let plugin = manifest
+            .plugins
+            .get("serialization")
+            .unwrap_or_else(|| panic!("missing plugin"));
+        assert_eq!(plugin.version, "1.8.0");
+        assert!(plugin.modules.is_empty());
+    }
+
+    #[test]
+    fn parse_manifest_with_plugin_modules() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.serialization]
+version = "1.8.0"
+modules = ["json", "cbor"]
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let plugin = manifest
+            .plugins
+            .get("serialization")
+            .unwrap_or_else(|| panic!("missing plugin"));
+        assert_eq!(plugin.modules, vec!["json", "cbor"]);
+    }
+
+    #[test]
+    fn parse_manifest_without_plugins() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        assert!(manifest.plugins.is_empty());
+    }
+
+    #[test]
+    fn reject_empty_plugin_version() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.serialization]
+version = ""
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("version must not be empty"),
+            "error was: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_unknown_plugin_fields() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.serialization]
+version = "1.8.0"
+unknown_field = true
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn round_trip_with_plugins() {
+        let toml = format!(
+            r#"
+[package]
+name = "with-plugins"
+{TOOLCHAIN}
+[plugins.serialization]
+version = "1.8.0"
+modules = ["json"]
+"#
+        );
+        let original = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let serialized = original.to_toml().unwrap_or_else(|e| panic!("{e}"));
+        let reparsed =
+            Manifest::from_str(&serialized, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(original, reparsed);
+    }
+
+    #[test]
+    fn no_plugins_omitted_in_toml() {
+        let toml = format!(
+            r#"
+[package]
+name = "no-plugins"
+{TOOLCHAIN}"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let serialized = manifest.to_toml().unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            !serialized.contains("[plugins]"),
+            "serialized was: {serialized}"
+        );
     }
 
     mod property_tests {

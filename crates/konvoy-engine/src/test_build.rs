@@ -90,6 +90,7 @@ pub fn build_tests(
                 locked: options.locked,
             },
             &library_paths,
+            &[],
             &lockfile_content,
         )?;
         library_paths.push(dep_output);
