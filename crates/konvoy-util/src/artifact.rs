@@ -87,10 +87,7 @@ pub fn ensure_artifact(
 
     // Build temp file path: ".tmp-{label}-{pid}.{ext}" in the same directory.
     let pid = std::process::id();
-    let ext = dest
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("tmp");
+    let ext = dest.extension().and_then(|e| e.to_str()).unwrap_or("tmp");
     let tmp_name = format!(".tmp-{label}-{pid}.{ext}");
     let tmp_path = dest
         .parent()
@@ -98,8 +95,7 @@ pub fn ensure_artifact(
         .unwrap_or_else(|| PathBuf::from(&tmp_name));
 
     // Download to temp file.
-    let download_hash =
-        crate::download::download_with_progress(url, &tmp_path, label, version)?;
+    let download_hash = crate::download::download_with_progress(url, &tmp_path, label, version)?;
 
     // Verify hash of downloaded file before placing it.
     if let Some(expected) = expected_sha256 {
@@ -218,10 +214,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("artifact hash mismatch"),
-            "error was: {err}"
-        );
+        assert!(err.contains("artifact hash mismatch"), "error was: {err}");
     }
 
     #[test]
@@ -261,9 +254,6 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("download failed"),
-            "error was: {err}"
-        );
+        assert!(err.contains("download failed"), "error was: {err}");
     }
 }
