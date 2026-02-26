@@ -10,10 +10,13 @@ pub const MAVEN_CENTRAL: &str = "https://repo1.maven.org/maven2";
 /// A parsed Maven coordinate identifying a single artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MavenCoordinate {
+    /// Maven group identifier, e.g. `"org.jetbrains.kotlinx"`.
     pub group_id: String,
+    /// Maven artifact identifier, e.g. `"kotlinx-serialization-core"`.
     pub artifact_id: String,
+    /// Artifact version, e.g. `"1.8.0"`.
     pub version: String,
-    /// File extension / packaging type (defaults to "jar").
+    /// File extension / packaging type (defaults to `"jar"`).
     pub packaging: String,
 }
 
@@ -175,10 +178,7 @@ mod tests {
         let result = MavenCoordinate::parse("org.jetbrains:artifact");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("invalid Maven coordinate"),
-            "error was: {err}"
-        );
+        assert!(err.contains("invalid Maven coordinate"), "error was: {err}");
     }
 
     #[test]
@@ -186,10 +186,7 @@ mod tests {
         let result = MavenCoordinate::parse("a:b:c:d:e");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("invalid Maven coordinate"),
-            "error was: {err}"
-        );
+        assert!(err.contains("invalid Maven coordinate"), "error was: {err}");
     }
 
     #[test]
@@ -197,10 +194,7 @@ mod tests {
         let result = MavenCoordinate::parse("org.jetbrains::1.0");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("invalid Maven coordinate"),
-            "error was: {err}"
-        );
+        assert!(err.contains("invalid Maven coordinate"), "error was: {err}");
         assert!(err.contains("empty"), "error was: {err}");
     }
 
@@ -212,8 +206,7 @@ mod tests {
 
     #[test]
     fn filename_klib() {
-        let coord =
-            MavenCoordinate::new("org.example", "artifact", "1.0.0").with_packaging("klib");
+        let coord = MavenCoordinate::new("org.example", "artifact", "1.0.0").with_packaging("klib");
         assert_eq!(coord.filename(), "artifact-1.0.0.klib");
     }
 
@@ -277,8 +270,7 @@ mod tests {
 
     #[test]
     fn with_packaging_overrides() {
-        let coord =
-            MavenCoordinate::new("org.example", "mylib", "1.0.0").with_packaging("klib");
+        let coord = MavenCoordinate::new("org.example", "mylib", "1.0.0").with_packaging("klib");
         assert_eq!(coord.packaging, "klib");
         assert_eq!(coord.filename(), "mylib-1.0.0.klib");
     }
