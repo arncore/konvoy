@@ -30,6 +30,14 @@ impl Target {
         let host = host_target()?;
         Ok(self == &host)
     }
+
+    /// Returns the Maven artifact name suffix (underscores stripped).
+    ///
+    /// Kotlin/Native klibs published to Maven repositories use target names
+    /// without underscores: `linux_x64` → `linuxx64`, `macos_arm64` → `macosarm64`.
+    pub fn to_maven_suffix(&self) -> String {
+        self.triple.replace('_', "")
+    }
 }
 
 impl fmt::Display for Target {
@@ -239,6 +247,30 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    #[test]
+    fn to_maven_suffix_linux_x64() {
+        let target = Target::from_str("linux_x64").unwrap();
+        assert_eq!(target.to_maven_suffix(), "linuxx64");
+    }
+
+    #[test]
+    fn to_maven_suffix_macos_arm64() {
+        let target = Target::from_str("macos_arm64").unwrap();
+        assert_eq!(target.to_maven_suffix(), "macosarm64");
+    }
+
+    #[test]
+    fn to_maven_suffix_no_underscores() {
+        for &name in KNOWN_TARGETS {
+            let target = Target::from_str(name).unwrap();
+            let suffix = target.to_maven_suffix();
+            assert!(
+                !suffix.contains('_'),
+                "to_maven_suffix() for `{name}` should not contain underscores, got `{suffix}`"
+            );
+        }
+    }
+
     mod proptests {
         use super::*;
         use proptest::prelude::*;
@@ -260,6 +292,16 @@ mod tests {
                 prop_assert!(target.is_ok(), "from_str rejected known target `{}`", name);
                 let target = target.unwrap();
                 prop_assert_eq!(target.to_string(), name);
+            }
+
+            #[test]
+            #[allow(clippy::unwrap_used)]
+            fn maven_suffix_never_contains_underscore(idx in 0usize..4) {
+                let known = ["linux_x64", "linux_arm64", "macos_x64", "macos_arm64"];
+                let name = known[idx];
+                let target = Target::from_str(name).unwrap();
+                let suffix = target.to_maven_suffix();
+                prop_assert!(!suffix.contains('_'), "maven suffix `{}` contains underscore", suffix);
             }
 
             #[test]
