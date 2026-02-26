@@ -801,22 +801,29 @@ src/config.kt:15:1: Line is too long. [MaxLineLength]";
         let diags = parse_detekt_output(output);
         assert_eq!(diags.len(), 2, "expected 2 findings, got {}", diags.len());
 
-        let first = diags.get(0).expect("expected at least 1 finding");
-        assert_eq!(first.file.as_deref(), Some("/tmp/project/src/main.kt"));
-        assert_eq!(first.line, Some(10));
-        assert_eq!(first.rule, "EmptyCatchBlock");
         assert_eq!(
-            first.message,
-            "Empty catch block detected. If the exception can be safely ignored, name the exception according to one of the exemptions as per the configuration of this rule."
+            diags.first().map(|d| d.file.as_deref()),
+            Some(Some("/tmp/project/src/main.kt"))
+        );
+        assert_eq!(diags.first().map(|d| d.line), Some(Some(10)));
+        assert_eq!(
+            diags.first().map(|d| d.rule.as_str()),
+            Some("EmptyCatchBlock")
+        );
+        assert_eq!(
+            diags.first().map(|d| d.message.as_str()),
+            Some("Empty catch block detected. If the exception can be safely ignored, name the exception according to one of the exemptions as per the configuration of this rule.")
         );
 
-        let second = diags.get(1).expect("expected at least 2 findings");
-        assert_eq!(second.file.as_deref(), Some("/tmp/project/src/main.kt"));
-        assert_eq!(second.line, Some(2));
-        assert_eq!(second.rule, "MagicNumber");
         assert_eq!(
-            second.message,
-            "This expression contains a magic number. Consider defining it to a well named constant."
+            diags.get(1).map(|d| d.file.as_deref()),
+            Some(Some("/tmp/project/src/main.kt"))
+        );
+        assert_eq!(diags.get(1).map(|d| d.line), Some(Some(2)));
+        assert_eq!(diags.get(1).map(|d| d.rule.as_str()), Some("MagicNumber"));
+        assert_eq!(
+            diags.get(1).map(|d| d.message.as_str()),
+            Some("This expression contains a magic number. Consider defining it to a well named constant.")
         );
     }
 
