@@ -22,6 +22,22 @@ pub enum UtilError {
     #[error("download failed: {message}")]
     Download { message: String },
 
+    /// A Maven coordinate string is malformed.
+    #[error("invalid Maven coordinate \"{coordinate}\": {reason}")]
+    InvalidMavenCoordinate { coordinate: String, reason: String },
+
+    /// A version string contains unsafe characters.
+    #[error("invalid version \"{version}\": only alphanumeric characters, dots, hyphens, and underscores are allowed")]
+    InvalidVersion { version: String },
+
+    /// An artifact hash does not match the expected value.
+    #[error("artifact hash mismatch for {path} — expected {expected}, got {actual}")]
+    ArtifactHashMismatch {
+        path: String,
+        expected: String,
+        actual: String,
+    },
+
     /// Cannot determine the user's home directory.
     #[error("cannot determine home directory — set the HOME environment variable")]
     NoHomeDir,
