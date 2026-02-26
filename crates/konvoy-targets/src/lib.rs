@@ -86,7 +86,7 @@ pub enum TargetError {
     UnsupportedHost { os: String, arch: String },
 
     #[error(
-        "unknown target `{name}`, supported targets: {}",
+        "unknown target `{name}`, supported targets: host, {}",
         KNOWN_TARGETS.join(", ")
     )]
     InvalidTarget { name: String },
@@ -158,6 +158,19 @@ mod tests {
                 "error message should list `{name}`, got: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn invalid_target_error_mentions_host_alias() {
+        let err = Target::from_str("bsd_x64");
+        let msg = match err {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error"), // only in test code
+        };
+        assert!(
+            msg.contains("host"),
+            "error message should mention `host` alias, got: {msg}"
+        );
     }
 
     #[test]

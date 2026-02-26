@@ -294,8 +294,16 @@ pub(crate) fn build_single(
 }
 
 /// Resolve the target: use the explicit `--target` value or detect the host.
+///
+/// Accepts `"host"` as a special alias that resolves to the current platform's
+/// target triple, making `--target host` behave identically to omitting `--target`.
+///
+/// # Errors
+/// Returns an error if the target string is not a known target triple (or `"host"`),
+/// or if host detection fails on an unsupported platform.
 pub(crate) fn resolve_target(target_opt: &Option<String>) -> Result<Target, EngineError> {
     match target_opt {
+        Some(name) if name == "host" => host_target().map_err(EngineError::Target),
         Some(name) => name.parse::<Target>().map_err(EngineError::Target),
         None => host_target().map_err(EngineError::Target),
     }
@@ -598,6 +606,47 @@ mod tests {
         if let Ok(t) = target {
             assert!(!t.to_string().is_empty());
         }
+    }
+
+    #[test]
+    fn resolve_target_host_alias() {
+        // `--target host` should resolve to the same target as omitting `--target`.
+        let from_alias = resolve_target(&Some("host".to_owned()));
+        let from_none = resolve_target(&None);
+
+        match (from_alias, from_none) {
+            (Ok(alias_target), Ok(none_target)) => {
+                assert_eq!(
+                    alias_target, none_target,
+                    "`--target host` must resolve to the same target as auto-detection"
+                );
+            }
+            (Err(_), Err(_)) => {
+                // Both fail on unsupported platforms — that's fine.
+            }
+            (alias_result, none_result) => {
+                panic!(
+                    "host alias and auto-detect should both succeed or both fail, \
+                     got alias={alias_result:?}, none={none_result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_target_host_alias_is_not_case_sensitive_rejection() {
+        // Only the exact string "host" is accepted; "Host", "HOST", etc. are not aliases.
+        let result = resolve_target(&Some("HOST".to_owned()));
+        assert!(
+            result.is_err(),
+            "only lowercase `host` should be accepted as an alias"
+        );
+
+        let result = resolve_target(&Some("Host".to_owned()));
+        assert!(
+            result.is_err(),
+            "only lowercase `host` should be accepted as an alias"
+        );
     }
 
     #[test]
