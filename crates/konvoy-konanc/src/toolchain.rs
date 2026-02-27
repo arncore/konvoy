@@ -1089,10 +1089,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("bar")).unwrap();
 
         let result = find_extracted_root(dir.path(), "2.1.0");
-        assert!(
-            result.is_err(),
-            "multiple non-matching dirs should error"
-        );
+        assert!(result.is_err(), "multiple non-matching dirs should error");
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("found 2 entries"),
