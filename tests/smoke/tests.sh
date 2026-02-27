@@ -3,35 +3,89 @@
 #
 # Each test_* function runs in a fresh temp directory.
 # Tests call the `konvoy` binary directly and verify behavior.
+# Tests run in parallel (up to $MAX_PARALLEL at once) for speed.
 set -uo pipefail
 
 # ---------------------------------------------------------------------------
 # Framework
 # ---------------------------------------------------------------------------
-PASS=0
-FAIL=0
-TOTAL=0
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'
 
+# Max parallel test jobs. Default to number of CPUs, capped at 8.
+MAX_PARALLEL="${MAX_PARALLEL:-$(nproc 2>/dev/null || echo 4)}"
+if [ "$MAX_PARALLEL" -gt 8 ]; then MAX_PARALLEL=8; fi
+
+# Results directory for thread-safe result collection.
+RESULTS_DIR=$(mktemp -d)
+PIDS=()
+TEST_NAMES=()
+
+# Run a single test in the background.
 run_test() {
     local name="$1"
-    TOTAL=$((TOTAL + 1))
+    local result_file="$RESULTS_DIR/$name"
 
-    # Run each test in a subshell with a fresh temp directory.
-    local tmpdir
-    tmpdir=$(mktemp -d)
+    (
+        local tmpdir
+        tmpdir=$(mktemp -d)
+        if (cd "$tmpdir" && "$name") >/dev/null 2>&1; then
+            echo "pass" > "$result_file"
+        else
+            echo "fail" > "$result_file"
+        fi
+        rm -rf "$tmpdir"
+    ) &
 
-    if (cd "$tmpdir" && "$name") 2>&1; then
-        PASS=$((PASS + 1))
-        echo -e "  ${GREEN}PASS${NC}  $name"
-    else
-        FAIL=$((FAIL + 1))
-        echo -e "  ${RED}FAIL${NC}  $name"
+    PIDS+=($!)
+    TEST_NAMES+=("$name")
+
+    # Throttle: if we've hit the parallelism cap, wait for one to finish.
+    if [ "${#PIDS[@]}" -ge "$MAX_PARALLEL" ]; then
+        wait_and_drain
     fi
+}
 
-    rm -rf "$tmpdir"
+# Wait for all running jobs and drain the queue, printing results.
+wait_and_drain() {
+    for i in "${!PIDS[@]}"; do
+        wait "${PIDS[$i]}" 2>/dev/null || true
+        local name="${TEST_NAMES[$i]}"
+        local result_file="$RESULTS_DIR/$name"
+        if [ -f "$result_file" ] && [ "$(cat "$result_file")" = "pass" ]; then
+            echo -e "  ${GREEN}PASS${NC}  $name"
+        else
+            echo -e "  ${RED}FAIL${NC}  $name"
+        fi
+    done
+    PIDS=()
+    TEST_NAMES=()
+}
+
+# Wait for all remaining jobs and print final summary.
+finish_tests() {
+    wait_and_drain
+
+    local pass=0 fail=0 total=0
+    for f in "$RESULTS_DIR"/*; do
+        [ -f "$f" ] || continue
+        total=$((total + 1))
+        if [ "$(cat "$f")" = "pass" ]; then
+            pass=$((pass + 1))
+        else
+            fail=$((fail + 1))
+        fi
+    done
+    rm -rf "$RESULTS_DIR"
+
+    echo ""
+    echo "---"
+    echo -e "Results: ${GREEN}${pass} passed${NC}, ${RED}${fail} failed${NC}, ${total} total"
+
+    if [ "$fail" -gt 0 ]; then
+        exit 1
+    fi
 }
 
 assert_contains() {
@@ -1121,10 +1175,4 @@ run_test test_build_no_sources_fails
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
-echo ""
-echo "---"
-echo -e "Results: ${GREEN}${PASS} passed${NC}, ${RED}${FAIL} failed${NC}, ${TOTAL} total"
-
-if [ "$FAIL" -gt 0 ]; then
-    exit 1
-fi
+finish_tests
