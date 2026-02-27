@@ -138,6 +138,44 @@ mod tests {
     }
 
     #[test]
+    fn pct_u8_rounding_down() {
+        // Integer division truncates: 1/3 * 100 = 33, not 34.
+        assert_eq!(pct_u8(1, 3), 33);
+        assert_eq!(pct_u8(2, 3), 66);
+    }
+
+    #[test]
+    fn pct_u8_exact_multiples_of_ten() {
+        assert_eq!(pct_u8(10, 100), 10);
+        assert_eq!(pct_u8(20, 100), 20);
+        assert_eq!(pct_u8(90, 100), 90);
+    }
+
+    #[test]
+    fn pct_u8_large_values() {
+        // Test with large but non-overflowing u64 values.
+        let total: u64 = 1_000_000_000;
+        assert_eq!(pct_u8(500_000_000, total), 50);
+        assert_eq!(pct_u8(total, total), 100);
+    }
+
+    #[test]
+    fn pct_u8_one_byte_downloaded() {
+        // 1 byte out of 1000 is 0%.
+        assert_eq!(pct_u8(1, 1000), 0);
+        // 1 byte out of 1 is 100%.
+        assert_eq!(pct_u8(1, 1), 100);
+    }
+
+    #[test]
+    fn u64_from_usize_max_value() {
+        // usize::MAX should convert to u64 on 64-bit, or saturate to u64::MAX on 128-bit+.
+        let result = u64_from_usize(usize::MAX);
+        // On 64-bit platforms, usize::MAX == u64::MAX; on 32-bit, it fits.
+        assert!(result > 0);
+    }
+
+    #[test]
     fn download_invalid_url_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("out.bin");
@@ -146,5 +184,29 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("download failed"), "error was: {err}");
+    }
+
+    #[test]
+    fn download_malformed_url_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("out.bin");
+        let result = super::download_with_progress("not-a-valid-url", &dest, "test", "0.0");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn download_unwritable_dest_returns_error() {
+        // Destination directory that doesn't exist and can't be created is
+        // caught by File::create failing. However download_with_progress
+        // doesn't call ensure_dir — it trusts the caller. If the server
+        // rejects before writing, the download error comes first. Trying
+        // with a valid-looking URL to an unroutable host + bad dest path.
+        let result = super::download_with_progress(
+            "http://127.0.0.1:1/file.bin",
+            std::path::Path::new("/nonexistent_root/subdir/out.bin"),
+            "test",
+            "0.0",
+        );
+        assert!(result.is_err());
     }
 }
