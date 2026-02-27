@@ -30,7 +30,8 @@ run_test() {
     (
         local tmpdir
         tmpdir=$(mktemp -d)
-        if (cd "$tmpdir" && "$name") >/dev/null 2>&1; then
+        local log_file="$RESULTS_DIR/${name}.log"
+        if (cd "$tmpdir" && "$name") >"$log_file" 2>&1; then
             echo "pass" > "$result_file"
         else
             echo "fail" > "$result_file"
@@ -53,10 +54,15 @@ wait_and_drain() {
         wait "${PIDS[$i]}" 2>/dev/null || true
         local name="${TEST_NAMES[$i]}"
         local result_file="$RESULTS_DIR/$name"
+        local log_file="$RESULTS_DIR/${name}.log"
         if [ -f "$result_file" ] && [ "$(cat "$result_file")" = "pass" ]; then
             echo -e "  ${GREEN}PASS${NC}  $name"
         else
             echo -e "  ${RED}FAIL${NC}  $name"
+            # Show captured output for debugging.
+            if [ -f "$log_file" ] && [ -s "$log_file" ]; then
+                sed 's/^/         /' "$log_file"
+            fi
         fi
     done
     PIDS=()
