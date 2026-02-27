@@ -180,4 +180,12 @@ pub enum EngineError {
     /// A target hash is missing from the lockfile for a Maven dependency.
     #[error("no hash for target `{target}` in lockfile for dependency `{name}` — run `konvoy update` to resolve")]
     MissingTargetHash { name: String, target: String },
+
+    /// A library klib hash mismatch was detected after download.
+    #[error("library `{name}` klib hash mismatch — expected {expected}, got {actual}; run `konvoy update` to refresh")]
+    LibraryHashMismatch {
+        name: String,
+        expected: String,
+        actual: String,
+    },
 }
