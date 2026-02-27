@@ -253,6 +253,7 @@ pub enum ManifestError {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -269,7 +270,7 @@ entrypoint = "src/main.kt"
         );
         let manifest = Manifest::from_str(&toml, "konvoy.toml");
         assert!(manifest.is_ok());
-        let manifest = manifest.unwrap_or_else(|e| panic!("{e}"));
+        let manifest = manifest.unwrap();
         assert_eq!(manifest.package.name, "my-project");
         assert_eq!(manifest.package.entrypoint, "src/main.kt");
         assert_eq!(manifest.toolchain.kotlin, "2.1.0");
@@ -285,7 +286,7 @@ name = "minimal"
         );
         let manifest = Manifest::from_str(&toml, "konvoy.toml");
         assert!(manifest.is_ok());
-        let manifest = manifest.unwrap_or_else(|e| panic!("{e}"));
+        let manifest = manifest.unwrap();
         assert_eq!(manifest.package.name, "minimal");
         assert_eq!(manifest.package.entrypoint, "src/main.kt");
     }
@@ -390,10 +391,9 @@ name = "round-trip"
 entrypoint = "src/app.kt"
 {TOOLCHAIN}"#
         );
-        let original = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
-        let serialized = original.to_toml().unwrap_or_else(|e| panic!("{e}"));
-        let reparsed =
-            Manifest::from_str(&serialized, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let original = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        let serialized = original.to_toml().unwrap();
+        let reparsed = Manifest::from_str(&serialized, "konvoy.toml").unwrap();
         assert_eq!(original, reparsed);
     }
 
@@ -422,7 +422,7 @@ kind = "lib"
 version = "0.1.0"
 {TOOLCHAIN}"#
         );
-        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
         assert_eq!(manifest.package.kind, PackageKind::Lib);
         assert_eq!(manifest.package.version.as_deref(), Some("0.1.0"));
     }
@@ -435,7 +435,7 @@ version = "0.1.0"
 name = "implicit-bin"
 {TOOLCHAIN}"#
         );
-        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
         assert_eq!(manifest.package.kind, PackageKind::Bin);
     }
 
@@ -464,7 +464,7 @@ name = "my-app"
 my-utils = {{ path = "../my-utils" }}
 "#
         );
-        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
         assert_eq!(manifest.dependencies.len(), 1);
         let dep = manifest
             .dependencies
@@ -535,10 +535,9 @@ name = "with-deps"
 utils = {{ path = "../utils" }}
 "#
         );
-        let original = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
-        let serialized = original.to_toml().unwrap_or_else(|e| panic!("{e}"));
-        let reparsed =
-            Manifest::from_str(&serialized, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let original = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        let serialized = original.to_toml().unwrap();
+        let reparsed = Manifest::from_str(&serialized, "konvoy.toml").unwrap();
         assert_eq!(original, reparsed);
     }
 
@@ -550,8 +549,8 @@ utils = {{ path = "../utils" }}
 name = "no-deps"
 {TOOLCHAIN}"#
         );
-        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
-        let serialized = manifest.to_toml().unwrap_or_else(|e| panic!("{e}"));
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        let serialized = manifest.to_toml().unwrap();
         assert!(
             !serialized.contains("[dependencies]"),
             "serialized was: {serialized}"
@@ -568,7 +567,7 @@ name = "my-app"
 kotlin = "2.1.0"
 detekt = "1.23.7"
 "#;
-        let manifest = Manifest::from_str(toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let manifest = Manifest::from_str(toml, "konvoy.toml").unwrap();
         assert_eq!(manifest.toolchain.detekt.as_deref(), Some("1.23.7"));
     }
 
@@ -580,7 +579,7 @@ detekt = "1.23.7"
 name = "my-app"
 {TOOLCHAIN}"#
         );
-        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
         assert!(manifest.toolchain.detekt.is_none());
     }
 
@@ -592,7 +591,7 @@ name = "my-app"
 name = "my-app"
 {TOOLCHAIN}"#
         );
-        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
         assert!(manifest.toolchain.detekt.is_none());
         assert_eq!(manifest.toolchain.kotlin, "2.1.0");
     }
@@ -622,10 +621,9 @@ name = "with-detekt"
 kotlin = "2.1.0"
 detekt = "1.23.7"
 "#;
-        let original = Manifest::from_str(toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
-        let serialized = original.to_toml().unwrap_or_else(|e| panic!("{e}"));
-        let reparsed =
-            Manifest::from_str(&serialized, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let original = Manifest::from_str(toml, "konvoy.toml").unwrap();
+        let serialized = original.to_toml().unwrap();
+        let reparsed = Manifest::from_str(&serialized, "konvoy.toml").unwrap();
         assert_eq!(original, reparsed);
     }
 
@@ -637,14 +635,13 @@ detekt = "1.23.7"
 name = "my-app"
 {TOOLCHAIN}"#
         );
-        let original = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
-        let serialized = original.to_toml().unwrap_or_else(|e| panic!("{e}"));
+        let original = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        let serialized = original.to_toml().unwrap();
         assert!(
             !serialized.contains("detekt"),
             "serialized should not contain detekt: {serialized}"
         );
-        let reparsed =
-            Manifest::from_str(&serialized, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let reparsed = Manifest::from_str(&serialized, "konvoy.toml").unwrap();
         assert_eq!(original, reparsed);
     }
 
@@ -656,8 +653,8 @@ name = "my-app"
 name = "my-app"
 {TOOLCHAIN}"#
         );
-        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
-        let serialized = manifest.to_toml().unwrap_or_else(|e| panic!("{e}"));
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        let serialized = manifest.to_toml().unwrap();
         assert!(
             !serialized.contains("detekt"),
             "serialized was: {serialized}"
@@ -708,7 +705,7 @@ name = "my-app"
 version = "1.8.0"
 "#
         );
-        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
         assert_eq!(manifest.plugins.len(), 1);
         let plugin = manifest
             .plugins
@@ -730,7 +727,7 @@ version = "1.8.0"
 modules = ["json", "cbor"]
 "#
         );
-        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
         let plugin = manifest
             .plugins
             .get("serialization")
@@ -746,7 +743,7 @@ modules = ["json", "cbor"]
 name = "my-app"
 {TOOLCHAIN}"#
         );
-        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
         assert!(manifest.plugins.is_empty());
     }
 
@@ -798,10 +795,9 @@ version = "1.8.0"
 modules = ["json"]
 "#
         );
-        let original = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
-        let serialized = original.to_toml().unwrap_or_else(|e| panic!("{e}"));
-        let reparsed =
-            Manifest::from_str(&serialized, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let original = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        let serialized = original.to_toml().unwrap();
+        let reparsed = Manifest::from_str(&serialized, "konvoy.toml").unwrap();
         assert_eq!(original, reparsed);
     }
 
@@ -813,8 +809,8 @@ modules = ["json"]
 name = "no-plugins"
 {TOOLCHAIN}"#
         );
-        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
-        let serialized = manifest.to_toml().unwrap_or_else(|e| panic!("{e}"));
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        let serialized = manifest.to_toml().unwrap();
         assert!(
             !serialized.contains("[plugins]"),
             "serialized was: {serialized}"

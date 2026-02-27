@@ -166,6 +166,7 @@ pub enum LockfileError {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::fs;
@@ -181,9 +182,9 @@ mod tests {
 konanc_version = "1.9.22"
 "#,
         )
-        .unwrap_or_else(|e| panic!("{e}"));
+        .unwrap();
 
-        let lockfile = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        let lockfile = Lockfile::from_path(&path).unwrap();
         let toolchain = lockfile
             .toolchain
             .as_ref()
@@ -195,7 +196,7 @@ konanc_version = "1.9.22"
     fn default_when_absent() {
         let dir = make_test_dir();
         let path = dir.path().join("nonexistent.lock");
-        let lockfile = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        let lockfile = Lockfile::from_path(&path).unwrap();
         assert!(lockfile.toolchain.is_none());
     }
 
@@ -204,9 +205,9 @@ konanc_version = "1.9.22"
         let dir = make_test_dir();
         let path = dir.path().join("konvoy.lock");
         let lockfile = Lockfile::with_toolchain("2.0.0");
-        lockfile.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
+        lockfile.write_to(&path).unwrap();
 
-        let content = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}"));
+        let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("2.0.0"), "content was: {content}");
     }
 
@@ -216,8 +217,8 @@ konanc_version = "1.9.22"
         let path = dir.path().join("konvoy.lock");
 
         let original = Lockfile::with_toolchain("1.9.22");
-        original.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
-        let reparsed = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        original.write_to(&path).unwrap();
+        let reparsed = Lockfile::from_path(&path).unwrap();
         assert_eq!(original, reparsed);
     }
 
@@ -251,8 +252,8 @@ konanc_version = "1.9.22"
         let path = dir.path().join("konvoy.lock");
         let original =
             Lockfile::with_managed_toolchain("2.1.0", Some("deadbeef"), Some("cafebabe"));
-        original.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
-        let reparsed = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        original.write_to(&path).unwrap();
+        let reparsed = Lockfile::from_path(&path).unwrap();
         assert_eq!(original, reparsed);
     }
 
@@ -267,9 +268,9 @@ konanc_version = "1.9.22"
 konanc_version = "2.1.0"
 "#,
         )
-        .unwrap_or_else(|e| panic!("{e}"));
+        .unwrap();
 
-        let lockfile = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        let lockfile = Lockfile::from_path(&path).unwrap();
         let toolchain = lockfile
             .toolchain
             .as_ref()
@@ -292,7 +293,7 @@ konanc_version = "2.1.0"
 tarball_sha256 = "oldvalue"
 "#,
         )
-        .unwrap_or_else(|e| panic!("{e}"));
+        .unwrap();
 
         let err = Lockfile::from_path(&path).unwrap_err();
         let msg = err.to_string();
@@ -314,8 +315,8 @@ tarball_sha256 = "oldvalue"
             },
             source_hash: "abcdef1234".to_owned(),
         });
-        lockfile.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
-        let reparsed = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        lockfile.write_to(&path).unwrap();
+        let reparsed = Lockfile::from_path(&path).unwrap();
         assert_eq!(lockfile, reparsed);
         assert_eq!(reparsed.dependencies.len(), 1);
         let dep = reparsed
@@ -337,9 +338,9 @@ tarball_sha256 = "oldvalue"
 konanc_version = "2.1.0"
 "#,
         )
-        .unwrap_or_else(|e| panic!("{e}"));
+        .unwrap();
 
-        let lockfile = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        let lockfile = Lockfile::from_path(&path).unwrap();
         assert!(lockfile.dependencies.is_empty());
     }
 
@@ -356,7 +357,7 @@ bogus_field = "oops"
 konanc_version = "2.1.0"
 "#,
         )
-        .unwrap_or_else(|e| panic!("{e}"));
+        .unwrap();
 
         let err = Lockfile::from_path(&path).unwrap_err();
         let msg = err.to_string();
@@ -372,7 +373,7 @@ konanc_version = "2.1.0"
         let path = dir.path().join("konvoy.lock");
         let tmp_path = path.with_extension("lock.tmp");
         let lockfile = Lockfile::with_toolchain("2.0.0");
-        lockfile.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
+        lockfile.write_to(&path).unwrap();
 
         assert!(path.exists(), "lockfile should exist after write");
         assert!(
@@ -400,8 +401,8 @@ konanc_version = "2.1.0"
             sha256: "deadbeef".to_owned(),
             url: "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/kotlinx-serialization-core-linuxx64/1.8.0/kotlinx-serialization-core-linuxx64-1.8.0.klib".to_owned(),
         });
-        lockfile.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
-        let reparsed = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        lockfile.write_to(&path).unwrap();
+        let reparsed = Lockfile::from_path(&path).unwrap();
         assert_eq!(lockfile, reparsed);
         assert_eq!(reparsed.plugins.len(), 2);
     }
@@ -417,29 +418,29 @@ konanc_version = "2.1.0"
 konanc_version = "2.1.0"
 "#,
         )
-        .unwrap_or_else(|e| panic!("{e}"));
+        .unwrap();
 
-        let lockfile = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        let lockfile = Lockfile::from_path(&path).unwrap();
         assert!(lockfile.plugins.is_empty());
     }
 
     #[test]
     fn empty_plugins_omitted_in_toml() {
         let lockfile = Lockfile::with_toolchain("2.1.0");
-        let content = toml::to_string_pretty(&lockfile).unwrap_or_else(|e| panic!("{e}"));
+        let content = toml::to_string_pretty(&lockfile).unwrap();
         assert!(!content.contains("plugins"), "content was: {content}");
     }
 
     #[test]
     fn empty_deps_omitted_in_toml() {
         let lockfile = Lockfile::with_toolchain("2.1.0");
-        let content = toml::to_string_pretty(&lockfile).unwrap_or_else(|e| panic!("{e}"));
+        let content = toml::to_string_pretty(&lockfile).unwrap();
         assert!(!content.contains("dependencies"), "content was: {content}");
     }
 
     /// Create a unique temporary directory that is auto-cleaned on drop.
     fn make_test_dir() -> tempfile::TempDir {
-        tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"))
+        tempfile::tempdir().unwrap()
     }
 
     #[test]
