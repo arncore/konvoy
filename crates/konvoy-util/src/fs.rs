@@ -349,4 +349,119 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("home directory"), "error was: {err}");
     }
+
+    #[test]
+    fn ensure_dir_deeply_nested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp
+            .path()
+            .join("x")
+            .join("y")
+            .join("z")
+            .join("w")
+            .join("v");
+        ensure_dir(&deep).unwrap();
+        assert!(deep.is_dir());
+        // Calling again on the same path is a no-op.
+        ensure_dir(&deep).unwrap();
+        assert!(deep.is_dir());
+    }
+
+    #[test]
+    fn materialize_content_matches_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("original.bin");
+        let dest = tmp.path().join("copy.bin");
+        let content = b"hello konvoy world\nline two\n";
+        fs::write(&src, content).unwrap();
+
+        materialize(&src, &dest).unwrap();
+
+        // Verify byte-for-byte content match.
+        assert_eq!(fs::read(&dest).unwrap(), content);
+    }
+
+    #[test]
+    fn materialize_overwrites_larger_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src.txt");
+        let dest = tmp.path().join("dest.txt");
+        // Write a large old file, then a small new source.
+        fs::write(&dest, b"this is a much longer old content that should be replaced").unwrap();
+        fs::write(&src, b"short").unwrap();
+
+        materialize(&src, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"short");
+    }
+
+    #[test]
+    fn remove_dir_all_if_exists_deeply_nested_non_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("a").join("b").join("c");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("deep.txt"), b"deep content").unwrap();
+        fs::write(
+            tmp.path().join("a").join("b").join("mid.txt"),
+            b"mid content",
+        )
+        .unwrap();
+
+        // Remove from root of the subtree.
+        remove_dir_all_if_exists(&tmp.path().join("a")).unwrap();
+        assert!(!tmp.path().join("a").exists());
+    }
+
+    #[test]
+    fn konvoy_home_uses_custom_home_var() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let saved_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", "/tmp/fake_home");
+
+        let result = konvoy_home().unwrap();
+
+        // Restore before asserting.
+        if let Some(v) = saved_home {
+            std::env::set_var("HOME", v);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        assert_eq!(result, PathBuf::from("/tmp/fake_home/.konvoy"));
+    }
+
+    #[test]
+    fn collect_files_deeply_nested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("a").join("b").join("c");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("deep.kt"), b"fun deep() {}").unwrap();
+        fs::write(tmp.path().join("top.kt"), b"fun top() {}").unwrap();
+
+        let files = collect_files(tmp.path(), "kt").unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|f| f.ends_with("deep.kt")));
+        assert!(files.iter().any(|f| f.ends_with("top.kt")));
+    }
+
+    #[test]
+    fn collect_files_no_matching_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("file.rs"), b"fn main() {}").unwrap();
+        fs::write(tmp.path().join("file.txt"), b"hello").unwrap();
+
+        let files = collect_files(tmp.path(), "kt").unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn materialize_error_on_nonexistent_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("does_not_exist.txt");
+        let dest = tmp.path().join("dest.txt");
+
+        let result = materialize(&src, &dest);
+        // hard_link fails, then copy fails too => error
+        assert!(result.is_err());
+    }
 }
