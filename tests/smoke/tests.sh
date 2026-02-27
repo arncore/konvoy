@@ -570,18 +570,16 @@ test_update_preserves_path_deps() {
     # Path deps in the lockfile should survive a konvoy update.
     konvoy init --name path-lib --lib >/dev/null 2>&1
     konvoy init --name update-preserve >/dev/null 2>&1
-    cat >> update-preserve/konvoy.toml << 'TOML'
 
-[dependencies]
-path-lib = { path = "../path-lib" }
-kotlinx-datetime = { version = "0.6.0" }
-TOML
+    # First, build with only the path dep so it gets into the lockfile.
+    printf '\n[dependencies]\npath-lib = { path = "../path-lib" }\n' >> update-preserve/konvoy.toml
     cd update-preserve
-
-    # Build first to create lockfile with path dep hash.
     konvoy build >/dev/null 2>&1
+    assert_file_contains konvoy.lock "path-lib"
+    assert_file_contains konvoy.lock "../path-lib"
 
-    # Now update — path dep lock should be preserved.
+    # Now add a Maven dep and run update — path dep should be preserved.
+    printf 'kotlinx-datetime = { version = "0.6.0" }\n' >> konvoy.toml
     konvoy update >/dev/null 2>&1
     assert_file_contains konvoy.lock "path-lib"
     assert_file_contains konvoy.lock "kotlinx-datetime"
