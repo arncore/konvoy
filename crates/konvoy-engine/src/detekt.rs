@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn detekt_jar_path_format() {
-        let path = detekt_jar_path("1.23.7").unwrap_or_else(|e| panic!("{e}"));
+        let path = detekt_jar_path("1.23.7").unwrap();
         let s = path.display().to_string();
         assert!(s.contains(".konvoy/tools/detekt/1.23.7"), "path was: {s}");
         assert!(s.contains("detekt-cli-1.23.7-all.jar"), "path was: {s}");
