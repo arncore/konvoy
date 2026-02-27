@@ -131,10 +131,7 @@ pub fn init_project_with_kind(
         plugins: std::collections::BTreeMap::new(),
     };
     let toml_content = manifest.to_toml()?;
-    std::fs::write(&manifest_path, toml_content).map_err(|source| EngineError::Io {
-        path: manifest_path.display().to_string(),
-        source,
-    })?;
+    konvoy_util::fs::write_file(&manifest_path, toml_content)?;
 
     // Generate and write source file.
     let (source_name, source_content) = if kind == PackageKind::Lib {
@@ -149,17 +146,11 @@ pub fn init_project_with_kind(
         )
     };
     let source_path = src_dir.join(source_name);
-    std::fs::write(&source_path, source_content).map_err(|source| EngineError::Io {
-        path: source_path.display().to_string(),
-        source,
-    })?;
+    konvoy_util::fs::write_file(&source_path, source_content)?;
 
     // Generate .gitignore.
     let gitignore_path = dir.join(".gitignore");
-    std::fs::write(&gitignore_path, ".konvoy/\n").map_err(|source| EngineError::Io {
-        path: gitignore_path.display().to_string(),
-        source,
-    })?;
+    konvoy_util::fs::write_file(&gitignore_path, ".konvoy/\n")?;
 
     Ok(())
 }

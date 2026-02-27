@@ -109,19 +109,17 @@ impl ArtifactStore {
 
         // Copy the artifact into the temp directory.
         let Some(file_name) = artifact.file_name() else {
-            return Err(EngineError::Io {
+            return Err(konvoy_util::error::UtilError::Io {
                 path: artifact.display().to_string(),
                 source: std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "artifact path has no file name",
                 ),
-            });
+            }
+            .into());
         };
         let staged_artifact = tmp_dir.join(file_name);
-        std::fs::copy(artifact, &staged_artifact).map_err(|source| EngineError::Io {
-            path: staged_artifact.display().to_string(),
-            source,
-        })?;
+        konvoy_util::fs::copy_file(artifact, &staged_artifact)?;
 
         // Write metadata alongside the artifact.
         let metadata_path = tmp_dir.join("metadata.toml");
@@ -129,10 +127,7 @@ impl ArtifactStore {
             toml::to_string_pretty(metadata).map_err(|e| EngineError::Metadata {
                 message: e.to_string(),
             })?;
-        std::fs::write(&metadata_path, metadata_toml).map_err(|source| EngineError::Io {
-            path: metadata_path.display().to_string(),
-            source,
-        })?;
+        konvoy_util::fs::write_file(&metadata_path, metadata_toml)?;
 
         // Atomically move the temp directory to the final cache entry path.
         // If another process already created the entry, rename fails with
@@ -154,10 +149,11 @@ impl ArtifactStore {
                 if is_directory_not_empty_error(&e) {
                     return Ok(());
                 }
-                Err(EngineError::Io {
+                Err(konvoy_util::error::UtilError::Io {
                     path: entry_dir.display().to_string(),
                     source: e,
-                })
+                }
+                .into())
             }
         }
     }
@@ -180,13 +176,14 @@ impl ArtifactStore {
         let cached_artifact = entry_dir.join(artifact_name);
 
         if !cached_artifact.exists() {
-            return Err(EngineError::Io {
+            return Err(konvoy_util::error::UtilError::Io {
                 path: cached_artifact.display().to_string(),
                 source: std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "cached artifact not found",
                 ),
-            });
+            }
+            .into());
         }
 
         konvoy_util::fs::materialize(&cached_artifact, dest)?;
@@ -296,7 +293,7 @@ fn make_temp_dir(parent: &Path) -> Result<PathBuf, EngineError> {
     let name = format!(".tmp-{random_bits:016x}");
     let tmp_path = parent.join(name);
 
-    std::fs::create_dir(&tmp_path).map_err(|source| EngineError::Io {
+    std::fs::create_dir(&tmp_path).map_err(|source| konvoy_util::error::UtilError::Io {
         path: tmp_path.display().to_string(),
         source,
     })?;
@@ -569,10 +566,7 @@ mod tests {
                 thread::spawn(move || {
                     let dest = output_dir.join(format!("thread-{i}")).join("my-app");
                     store.materialize(&key, "my-app", &dest)?;
-                    let content = fs::read(&dest).map_err(|source| EngineError::Io {
-                        path: dest.display().to_string(),
-                        source,
-                    })?;
+                    let content = konvoy_util::fs::read_file(&dest)?;
                     assert_eq!(content, b"binary content");
                     Ok::<(), EngineError>(())
                 })

@@ -120,10 +120,7 @@ pub fn ensure_detekt(
     }
 
     let dir = detekt_dir(version)?;
-    std::fs::create_dir_all(&dir).map_err(|source| EngineError::Io {
-        path: dir.display().to_string(),
-        source,
-    })?;
+    konvoy_util::fs::ensure_dir(&dir)?;
 
     let url = detekt_download_url(version);
 
@@ -166,10 +163,11 @@ pub fn ensure_detekt(
         }
         Err(source) => {
             let _ = std::fs::remove_file(&tmp_path);
-            return Err(EngineError::Io {
+            return Err(konvoy_util::error::UtilError::Io {
                 path: jar.display().to_string(),
                 source,
-            });
+            }
+            .into());
         }
     }
 

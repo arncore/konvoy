@@ -46,6 +46,50 @@ pub fn materialize(src: &Path, dest: &Path) -> Result<(), UtilError> {
     Ok(())
 }
 
+/// Write `contents` to a file, creating it if it does not exist.
+///
+/// # Errors
+/// Returns an error if the file cannot be written.
+pub fn write_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), UtilError> {
+    std::fs::write(path, contents).map_err(|source| UtilError::Io {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+/// Read the entire contents of a file into a byte vector.
+///
+/// # Errors
+/// Returns an error if the file cannot be read.
+pub fn read_file(path: &Path) -> Result<Vec<u8>, UtilError> {
+    std::fs::read(path).map_err(|source| UtilError::Io {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+/// Copy a file from `src` to `dest`.
+///
+/// # Errors
+/// Returns an error if the copy fails.
+pub fn copy_file(src: &Path, dest: &Path) -> Result<u64, UtilError> {
+    std::fs::copy(src, dest).map_err(|source| UtilError::Io {
+        path: dest.display().to_string(),
+        source,
+    })
+}
+
+/// Rename (move) a file or directory from `from` to `to`.
+///
+/// # Errors
+/// Returns an error if the rename fails.
+pub fn rename(from: &Path, to: &Path) -> Result<(), UtilError> {
+    std::fs::rename(from, to).map_err(|source| UtilError::Io {
+        path: to.display().to_string(),
+        source,
+    })
+}
+
 /// Remove a directory and all its contents. No error if the directory is absent.
 ///
 /// # Errors

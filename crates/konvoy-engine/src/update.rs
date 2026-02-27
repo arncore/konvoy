@@ -91,10 +91,7 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
         // Create a temp directory for downloads using std::env::temp_dir.
         let pid = std::process::id();
         let tmp_base = std::env::temp_dir().join(format!("konvoy-update-{pid}"));
-        std::fs::create_dir_all(&tmp_base).map_err(|source| EngineError::Io {
-            path: tmp_base.display().to_string(),
-            source,
-        })?;
+        konvoy_util::fs::ensure_dir(&tmp_base)?;
 
         let target_results: Vec<Result<(String, String), EngineError>> = known_targets
             .par_iter()

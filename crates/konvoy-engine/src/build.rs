@@ -786,10 +786,7 @@ fn update_lockfile_if_needed(
 pub(crate) fn normalize_konanc_output(output_path: &Path) -> Result<(), EngineError> {
     let kexe_path = output_path.with_extension("kexe");
     if kexe_path.exists() {
-        std::fs::rename(&kexe_path, output_path).map_err(|source| EngineError::Io {
-            path: kexe_path.display().to_string(),
-            source,
-        })?;
+        konvoy_util::fs::rename(&kexe_path, output_path)?;
     }
     Ok(())
 }

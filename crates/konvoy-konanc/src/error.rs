@@ -80,6 +80,9 @@ pub enum KonancError {
     JreInstall { message: String },
 
     /// A filesystem operation failed during toolchain management.
+    ///
+    /// Kept for raw `std::fs` calls (read_dir iteration, metadata, set_permissions,
+    /// tempfile creation, etc.) that have no konvoy-util wrapper.
     #[error("cannot access {path}: {source}")]
     Io {
         path: String,

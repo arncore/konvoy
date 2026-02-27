@@ -7,18 +7,14 @@ use std::path::{Path, PathBuf};
 
 use crate::error::KonancError;
 
-/// Map a `UtilError` to `KonancError::Download`.
+/// Map a `UtilError` to `KonancError::Download` or propagate through `Util`.
 fn map_download_err(version: &str, e: konvoy_util::error::UtilError) -> KonancError {
     match e {
         konvoy_util::error::UtilError::Download { message } => KonancError::Download {
             version: version.to_owned(),
             message,
         },
-        konvoy_util::error::UtilError::Io { path, source } => KonancError::Io { path, source },
-        other => KonancError::Download {
-            version: version.to_owned(),
-            message: other.to_string(),
-        },
+        other => KonancError::Util(other),
     }
 }
 
@@ -186,10 +182,7 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
         let toolchains_root = toolchains_dir()?;
 
         // Ensure the toolchains directory exists.
-        std::fs::create_dir_all(&toolchains_root).map_err(|source| KonancError::Io {
-            path: toolchains_root.display().to_string(),
-            source,
-        })?;
+        konvoy_util::fs::ensure_dir(&toolchains_root)?;
 
         // Create secure temp file and directory for download and extraction.
         let tmp_tarball_handle = tempfile::Builder::new()
@@ -494,10 +487,7 @@ fn extract_tarball(
 ) -> Result<(), KonancError> {
     eprintln!("    Extracting {label} {version}...");
 
-    std::fs::create_dir_all(dest).map_err(|source| KonancError::Io {
-        path: dest.display().to_string(),
-        source,
-    })?;
+    konvoy_util::fs::ensure_dir(dest)?;
 
     let canonical_dest = std::fs::canonicalize(dest).map_err(|source| KonancError::Io {
         path: dest.display().to_string(),
@@ -548,10 +538,7 @@ fn extract_tarball(
 
         // Ensure parent directories exist before unpacking the entry.
         if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| KonancError::Io {
-                path: parent.display().to_string(),
-                source,
-            })?;
+            konvoy_util::fs::ensure_dir(parent)?;
         }
 
         entry.unpack(&target).map_err(|e| KonancError::Extract {
@@ -1247,8 +1234,8 @@ mod tests {
     }
 
     #[test]
-    fn map_download_err_other_variant_becomes_download() {
-        // Any non-Download, non-Io variant should be mapped to Download.
+    fn map_download_err_other_variant_becomes_util() {
+        // Any non-Download, non-Io variant should propagate through Util.
         let util_err = konvoy_util::error::UtilError::ArtifactHashMismatch {
             path: "/file".to_owned(),
             expected: "aaa".to_owned(),
@@ -1257,8 +1244,8 @@ mod tests {
         let err = map_download_err("2.1.0", util_err);
         let msg = format!("{err}");
         assert!(
-            msg.contains("2.1.0"),
-            "other variants should map to Download with version: {msg}"
+            msg.contains("/file"),
+            "other variants should propagate through Util preserving original message: {msg}"
         );
     }
 }
