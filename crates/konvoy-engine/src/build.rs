@@ -462,79 +462,88 @@ fn resolve_maven_deps(
 
     let cache_root = konvoy_util::fs::konvoy_home()?.join("cache").join("maven");
     let target_str = target.to_string();
-    let mut klib_paths = Vec::new();
 
-    for (name, spec) in maven_deps {
-        // Safe: `maven_deps` is filtered for `version.is_some()` above.
-        let Some(version) = &spec.version else {
-            continue;
-        };
+    let klib_paths: Vec<Result<PathBuf, EngineError>> = maven_deps
+        .par_iter()
+        .map(|(name, spec)| {
+            // Safe: `maven_deps` is filtered for `version.is_some()` above.
+            let Some(version) = &spec.version else {
+                // Unreachable due to filter, but return empty path to satisfy types.
+                return Ok(PathBuf::new());
+            };
 
-        // Look up the library descriptor to resolve the Maven coordinate.
-        let descriptor = crate::library::lookup(name)?.ok_or_else(|| {
-            let available = crate::library::available_library_names().unwrap_or_default();
-            EngineError::UnknownLibrary {
-                name: name.clone(),
-                available,
+            let dep_name = (*name).clone();
+
+            // Look up the library descriptor to resolve the Maven coordinate.
+            let descriptor = crate::library::lookup(name)?.ok_or_else(|| {
+                let available = crate::library::available_library_names().unwrap_or_default();
+                EngineError::UnknownLibrary {
+                    name: dep_name.clone(),
+                    available,
+                }
+            })?;
+
+            // Resolve the coordinate for this specific target.
+            let coord = crate::library::resolve_coordinate(&descriptor, version, target)?;
+
+            // Find the lockfile entry for this dependency.
+            let lock_entry = lockfile
+                .dependencies
+                .iter()
+                .find(|d| d.name == **name)
+                .ok_or_else(|| EngineError::MissingLockfileEntry {
+                    name: dep_name.clone(),
+                })?;
+
+            // Extract the expected SHA-256 for this target from the lockfile.
+            let expected_sha256 = match &lock_entry.source {
+                DepSource::Maven { targets, .. } => {
+                    targets
+                        .get(&target_str)
+                        .ok_or_else(|| EngineError::MissingTargetHash {
+                            name: dep_name.clone(),
+                            target: target_str.clone(),
+                        })?
+                }
+                DepSource::Path { .. } => {
+                    return Err(EngineError::MissingLockfileEntry {
+                        name: dep_name.clone(),
+                    });
+                }
+            };
+
+            // Compute the cache path and download URL.
+            let dest = coord.cache_path(&cache_root);
+            let url = coord.to_url(konvoy_util::maven::MAVEN_CENTRAL);
+
+            // Download (or use cached) and verify hash.
+            let result = konvoy_util::artifact::ensure_artifact(
+                &url,
+                &dest,
+                Some(expected_sha256),
+                name,
+                version,
+            )
+            .map_err(|e| EngineError::LibraryDownloadFailed {
+                name: dep_name.clone(),
+                url: url.clone(),
+                message: e.to_string(),
+            })?;
+
+            // Double-check the hash matches the lockfile expectation.
+            if result.sha256 != *expected_sha256 {
+                return Err(EngineError::LibraryHashMismatch {
+                    name: dep_name,
+                    expected: expected_sha256.clone(),
+                    actual: result.sha256,
+                });
             }
-        })?;
 
-        // Resolve the coordinate for this specific target.
-        let coord = crate::library::resolve_coordinate(&descriptor, version, target)?;
+            Ok(result.path)
+        })
+        .collect();
 
-        // Find the lockfile entry for this dependency.
-        let lock_entry = lockfile
-            .dependencies
-            .iter()
-            .find(|d| d.name == *name)
-            .ok_or_else(|| EngineError::MissingLockfileEntry { name: name.clone() })?;
-
-        // Extract the expected SHA-256 for this target from the lockfile.
-        let expected_sha256 = match &lock_entry.source {
-            DepSource::Maven { targets, .. } => {
-                targets
-                    .get(&target_str)
-                    .ok_or_else(|| EngineError::MissingTargetHash {
-                        name: name.clone(),
-                        target: target_str.clone(),
-                    })?
-            }
-            DepSource::Path { .. } => {
-                return Err(EngineError::MissingLockfileEntry { name: name.clone() });
-            }
-        };
-
-        // Compute the cache path and download URL.
-        let dest = coord.cache_path(&cache_root);
-        let url = coord.to_url(konvoy_util::maven::MAVEN_CENTRAL);
-
-        // Download (or use cached) and verify hash.
-        let result = konvoy_util::artifact::ensure_artifact(
-            &url,
-            &dest,
-            Some(expected_sha256),
-            name,
-            version,
-        )
-        .map_err(|e| EngineError::LibraryDownloadFailed {
-            name: name.clone(),
-            url: url.clone(),
-            message: e.to_string(),
-        })?;
-
-        // Double-check the hash matches the lockfile expectation.
-        if result.sha256 != *expected_sha256 {
-            return Err(EngineError::LibraryHashMismatch {
-                name: name.clone(),
-                expected: expected_sha256.clone(),
-                actual: result.sha256,
-            });
-        }
-
-        klib_paths.push(result.path);
-    }
-
-    Ok(klib_paths)
+    klib_paths.into_iter().collect()
 }
 
 /// Check that the lockfile is complete and consistent with the manifest.

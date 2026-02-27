@@ -14,6 +14,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use rayon::prelude::*;
+
 use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile};
 use konvoy_config::manifest::Manifest;
 use konvoy_util::maven::MAVEN_CENTRAL;
@@ -86,9 +88,8 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
             continue;
         }
 
-        // For each known target, download and hash.
+        // For each known target, download and hash (in parallel).
         let known_targets = konvoy_targets::known_targets();
-        let mut targets_map: BTreeMap<String, String> = BTreeMap::new();
 
         // Create a temp directory for downloads using std::env::temp_dir.
         let pid = std::process::id();
@@ -98,41 +99,50 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
             source,
         })?;
 
-        for target_name in known_targets {
-            let target = target_name
-                .parse::<konvoy_targets::Target>()
-                .map_err(EngineError::Target)?;
-            let coord = library::resolve_coordinate(&descriptor, version, &target)?;
-            let url = coord.to_url(MAVEN_CENTRAL);
+        let target_results: Vec<Result<(String, String), EngineError>> = known_targets
+            .par_iter()
+            .map(|target_name| {
+                let target = target_name
+                    .parse::<konvoy_targets::Target>()
+                    .map_err(EngineError::Target)?;
+                let coord = library::resolve_coordinate(&descriptor, version, &target)?;
+                let url = coord.to_url(MAVEN_CENTRAL);
 
-            // Download to a temp file, hash it, delete.
-            let tmp_file = tmp_base.join(coord.filename());
+                // Download to a temp file, hash it, delete.
+                let tmp_file = tmp_base.join(coord.filename());
 
-            let result = konvoy_util::artifact::ensure_artifact(
-                &url,
-                &tmp_file,
-                None, // no expected hash -- we are discovering it
-                &format!("{dep_name}:{target_name}"),
-                version,
-            )
-            .map_err(|e| match e {
-                konvoy_util::error::UtilError::Download { message } => {
-                    EngineError::LibraryDownloadFailed {
-                        name: (*dep_name).clone(),
-                        url: url.clone(),
-                        message,
+                let result = konvoy_util::artifact::ensure_artifact(
+                    &url,
+                    &tmp_file,
+                    None, // no expected hash -- we are discovering it
+                    &format!("{dep_name}:{target_name}"),
+                    version,
+                )
+                .map_err(|e| match e {
+                    konvoy_util::error::UtilError::Download { message } => {
+                        EngineError::LibraryDownloadFailed {
+                            name: (*dep_name).clone(),
+                            url: url.clone(),
+                            message,
+                        }
                     }
-                }
-                other => EngineError::Util(other),
-            })?;
+                    other => EngineError::Util(other),
+                })?;
 
-            // Truncate the hash to the first 16 chars for display.
-            let display_hash = result.sha256.get(..16).unwrap_or(&result.sha256);
+                // Clean up the downloaded file.
+                let _ = std::fs::remove_file(&tmp_file);
+
+                Ok(((*target_name).to_owned(), result.sha256))
+            })
+            .collect();
+
+        // Collect results and print hashes.
+        let mut targets_map: BTreeMap<String, String> = BTreeMap::new();
+        for result in target_results {
+            let (target_name, sha256) = result?;
+            let display_hash = sha256.get(..16).unwrap_or(&sha256);
             eprintln!("    {}: {}...", target_name, display_hash);
-            targets_map.insert((*target_name).to_owned(), result.sha256);
-
-            // Clean up the downloaded file.
-            let _ = std::fs::remove_file(&tmp_file);
+            targets_map.insert(target_name, sha256);
         }
 
         // Clean up the temp directory.
