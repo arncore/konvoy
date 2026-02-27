@@ -380,8 +380,7 @@ entrypoint = "src/app.kt"
         );
         let original = Manifest::from_str(&toml, "konvoy.toml").unwrap();
         let serialized = original.to_toml().unwrap();
-        let reparsed =
-            Manifest::from_str(&serialized, "konvoy.toml").unwrap();
+        let reparsed = Manifest::from_str(&serialized, "konvoy.toml").unwrap();
         assert_eq!(original, reparsed);
     }
 
@@ -525,8 +524,7 @@ utils = {{ path = "../utils" }}
         );
         let original = Manifest::from_str(&toml, "konvoy.toml").unwrap();
         let serialized = original.to_toml().unwrap();
-        let reparsed =
-            Manifest::from_str(&serialized, "konvoy.toml").unwrap();
+        let reparsed = Manifest::from_str(&serialized, "konvoy.toml").unwrap();
         assert_eq!(original, reparsed);
     }
 
@@ -612,8 +610,7 @@ detekt = "1.23.7"
 "#;
         let original = Manifest::from_str(toml, "konvoy.toml").unwrap();
         let serialized = original.to_toml().unwrap();
-        let reparsed =
-            Manifest::from_str(&serialized, "konvoy.toml").unwrap();
+        let reparsed = Manifest::from_str(&serialized, "konvoy.toml").unwrap();
         assert_eq!(original, reparsed);
     }
 
@@ -631,8 +628,7 @@ name = "my-app"
             !serialized.contains("detekt"),
             "serialized should not contain detekt: {serialized}"
         );
-        let reparsed =
-            Manifest::from_str(&serialized, "konvoy.toml").unwrap();
+        let reparsed = Manifest::from_str(&serialized, "konvoy.toml").unwrap();
         assert_eq!(original, reparsed);
     }
 
@@ -788,8 +784,7 @@ modules = ["json"]
         );
         let original = Manifest::from_str(&toml, "konvoy.toml").unwrap();
         let serialized = original.to_toml().unwrap();
-        let reparsed =
-            Manifest::from_str(&serialized, "konvoy.toml").unwrap();
+        let reparsed = Manifest::from_str(&serialized, "konvoy.toml").unwrap();
         assert_eq!(original, reparsed);
     }
 
