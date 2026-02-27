@@ -189,8 +189,7 @@ mod tests {
     fn download_malformed_url_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("out.bin");
-        let result =
-            super::download_with_progress("not-a-valid-url", &dest, "test", "0.0");
+        let result = super::download_with_progress("not-a-valid-url", &dest, "test", "0.0");
         assert!(result.is_err());
     }
 

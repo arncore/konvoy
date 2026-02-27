@@ -353,13 +353,7 @@ mod tests {
     #[test]
     fn ensure_dir_deeply_nested() {
         let tmp = tempfile::tempdir().unwrap();
-        let deep = tmp
-            .path()
-            .join("x")
-            .join("y")
-            .join("z")
-            .join("w")
-            .join("v");
+        let deep = tmp.path().join("x").join("y").join("z").join("w").join("v");
         ensure_dir(&deep).unwrap();
         assert!(deep.is_dir());
         // Calling again on the same path is a no-op.
@@ -387,7 +381,11 @@ mod tests {
         let src = tmp.path().join("src.txt");
         let dest = tmp.path().join("dest.txt");
         // Write a large old file, then a small new source.
-        fs::write(&dest, b"this is a much longer old content that should be replaced").unwrap();
+        fs::write(
+            &dest,
+            b"this is a much longer old content that should be replaced",
+        )
+        .unwrap();
         fs::write(&src, b"short").unwrap();
 
         materialize(&src, &dest).unwrap();
