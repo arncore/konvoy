@@ -144,6 +144,14 @@ pub enum EngineError {
     #[error("invalid plugin `{name}` configuration: {reason}")]
     InvalidPluginConfig { name: String, reason: String },
 
+    /// A library descriptor is invalid.
+    #[error("invalid library descriptor `{name}`: {reason}")]
+    InvalidLibraryDescriptor { name: String, reason: String },
+
+    /// An unknown library was referenced in the manifest.
+    #[error("unknown library `{name}` — available libraries: {available}")]
+    UnknownLibrary { name: String, available: String },
+
     /// Plugin artifact download failed.
     #[error("cannot download plugin `{name}` artifact: {message}")]
     PluginDownload { name: String, message: String },

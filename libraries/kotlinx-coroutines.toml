@@ -1,0 +1,2 @@
+name = "kotlinx-coroutines"
+maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core-{target}:{version}:klib"
