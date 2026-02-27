@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use rayon::prelude::*;
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile};
 use konvoy_config::manifest::{Manifest, PackageKind};

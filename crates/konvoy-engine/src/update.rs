@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use rayon::prelude::*;
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile};
 use konvoy_config::manifest::Manifest;

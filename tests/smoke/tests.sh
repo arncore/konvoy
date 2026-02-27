@@ -76,6 +76,8 @@ finish_tests() {
     local pass=0 fail=0 total=0
     for f in "$RESULTS_DIR"/*; do
         [ -f "$f" ] || continue
+        # Skip log files — only count result files.
+        case "$f" in *.log) continue ;; esac
         total=$((total + 1))
         if [ "$(cat "$f")" = "pass" ]; then
             pass=$((pass + 1))
