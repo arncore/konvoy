@@ -25,6 +25,7 @@ thiserror = "2"
 toml = "0.8"
 ureq = "3"
 proptest = "1"
+rayon = "1"
 tempfile = "3"
 
 konvoy-config = { path = "crates/konvoy-config" }

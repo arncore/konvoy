@@ -1,7 +1,10 @@
 //! Build orchestration: resolve config, detect target, invoke compiler, store artifacts.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+use rayon::prelude::*;
 
 use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile};
 use konvoy_config::manifest::{Manifest, PackageKind};
@@ -12,7 +15,7 @@ use konvoy_targets::{host_target, Target};
 use crate::artifact::{ArtifactStore, BuildMetadata};
 use crate::cache::{CacheInputs, CacheKey};
 use crate::error::EngineError;
-use crate::resolve::{resolve_dependencies, ResolvedGraph};
+use crate::resolve::{parallel_levels, resolve_dependencies, ResolvedGraph};
 
 /// Options controlling a build invocation.
 #[derive(Debug, Clone)]
@@ -130,24 +133,48 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
 
     // 7. Resolve dependencies and build them in topological order.
     let dep_graph = resolve_dependencies(project_root, &manifest)?;
-    let mut library_paths: Vec<PathBuf> = Vec::new();
     let lockfile_content = lockfile_toml_content(&effective_lockfile)?;
 
-    for dep in &dep_graph.order {
-        let (dep_output, _) = build_single(
-            &dep.project_root,
-            &dep.manifest,
-            &konanc,
-            jre_home.as_deref(),
-            &target,
-            profile,
-            options,
-            &library_paths,
-            &[],
-            &lockfile_content,
-        )?;
-        library_paths.push(dep_output);
+    let levels = parallel_levels(&dep_graph);
+    let mut completed: HashMap<String, PathBuf> = HashMap::new();
+
+    for level in &levels {
+        // Collect library paths from all previously completed deps.
+        let lib_paths: Vec<PathBuf> = completed.values().cloned().collect();
+
+        // Build all deps in this level in parallel.
+        let results: Vec<Result<(String, PathBuf, BuildOutcome), EngineError>> = level
+            .par_iter()
+            .map(|dep| {
+                let (output, outcome) = build_single(
+                    &dep.project_root,
+                    &dep.manifest,
+                    &konanc,
+                    jre_home.as_deref(),
+                    &target,
+                    profile,
+                    options,
+                    &lib_paths,
+                    &[],
+                    &lockfile_content,
+                )?;
+                Ok((dep.name.clone(), output, outcome))
+            })
+            .collect();
+
+        // Collect outputs, propagating the first error.
+        for result in results {
+            let (name, output, _) = result?;
+            completed.insert(name, output);
+        }
     }
+
+    // Collect all dep outputs for root project (preserve topological order).
+    let library_paths: Vec<PathBuf> = dep_graph
+        .order
+        .iter()
+        .filter_map(|dep| completed.get(&dep.name).cloned())
+        .collect();
 
     // 7a. Resolve and download plugin artifacts.
     let (plugin_jars, plugin_klibs, plugin_locks) = if !manifest.plugins.is_empty() {

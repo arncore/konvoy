@@ -495,6 +495,66 @@ KOTLIN
     assert_contains "$output" "Compiling app"
 }
 
+test_dep_build_diamond() {
+    # Diamond: shared <- [utils, models], app depends on both utils and models.
+    # shared and logging are independent leaves → built in parallel (level 0).
+    # utils and models both depend on shared → built in parallel (level 1).
+    konvoy init --name shared --lib >/dev/null 2>&1
+    konvoy init --name logging --lib >/dev/null 2>&1
+    konvoy init --name utils --lib >/dev/null 2>&1
+    printf '\n[dependencies]\nshared = { path = "../shared" }\n' >> utils/konvoy.toml
+    konvoy init --name models --lib >/dev/null 2>&1
+    printf '\n[dependencies]\nshared = { path = "../shared" }\n' >> models/konvoy.toml
+    konvoy init --name app >/dev/null 2>&1
+    printf '\n[dependencies]\nutils = { path = "../utils" }\nmodels = { path = "../models" }\nlogging = { path = "../logging" }\n' >> app/konvoy.toml
+
+    cd app
+    local output
+    output=$(konvoy build 2>&1)
+    # All four deps must be compiled.
+    assert_contains "$output" "Compiling shared"
+    assert_contains "$output" "Compiling logging"
+    assert_contains "$output" "Compiling utils"
+    assert_contains "$output" "Compiling models"
+    assert_contains "$output" "Compiling app"
+    assert_file_exists .konvoy/build/linux_x64/debug/app
+}
+
+test_dep_build_wide() {
+    # Three independent libs — all at the same level, built in parallel.
+    konvoy init --name lib-a --lib >/dev/null 2>&1
+    konvoy init --name lib-b --lib >/dev/null 2>&1
+    konvoy init --name lib-c --lib >/dev/null 2>&1
+    konvoy init --name wide-app >/dev/null 2>&1
+    printf '\n[dependencies]\nlib-a = { path = "../lib-a" }\nlib-b = { path = "../lib-b" }\nlib-c = { path = "../lib-c" }\n' >> wide-app/konvoy.toml
+
+    cd wide-app
+    local output
+    output=$(konvoy build 2>&1)
+    assert_contains "$output" "Compiling lib-a"
+    assert_contains "$output" "Compiling lib-b"
+    assert_contains "$output" "Compiling lib-c"
+    assert_contains "$output" "Compiling wide-app"
+    assert_file_exists .konvoy/build/linux_x64/debug/wide-app
+}
+
+test_dep_build_chain() {
+    # Linear chain: leaf -> mid -> app (strictly sequential levels).
+    konvoy init --name chain-leaf --lib >/dev/null 2>&1
+    konvoy init --name chain-mid --lib >/dev/null 2>&1
+    printf '\n[dependencies]\nchain-leaf = { path = "../chain-leaf" }\n' >> chain-mid/konvoy.toml
+    konvoy init --name chain-app >/dev/null 2>&1
+    printf '\n[dependencies]\nchain-mid = { path = "../chain-mid" }\n' >> chain-app/konvoy.toml
+
+    cd chain-app
+    local output
+    output=$(konvoy build 2>&1)
+    assert_contains "$output" "Compiling chain-leaf"
+    assert_contains "$output" "Compiling chain-mid"
+    assert_contains "$output" "Compiling chain-app"
+    assert_file_exists .konvoy/build/linux_x64/debug/chain-app
+}
+
 test_run_lib_fails() {
     konvoy init --name run-lib --lib >/dev/null 2>&1
     cd run-lib
@@ -576,6 +636,9 @@ run_test test_worktree_cache_shared
 run_test test_init_lib
 run_test test_build_lib
 run_test test_dep_build
+run_test test_dep_build_diamond
+run_test test_dep_build_wide
+run_test test_dep_build_chain
 run_test test_run_lib_fails
 
 # lint

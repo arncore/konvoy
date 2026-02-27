@@ -12,6 +12,7 @@ konvoy-config.workspace = true
 konvoy-konanc.workspace = true
 konvoy-targets.workspace = true
 konvoy-util.workspace = true
+rayon.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
