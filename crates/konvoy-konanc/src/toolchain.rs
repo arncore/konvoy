@@ -7,18 +7,14 @@ use std::path::{Path, PathBuf};
 
 use crate::error::KonancError;
 
-/// Map a `UtilError` to `KonancError::Download`.
+/// Map a `UtilError` to `KonancError::Download` or propagate through `Util`.
 fn map_download_err(version: &str, e: konvoy_util::error::UtilError) -> KonancError {
     match e {
         konvoy_util::error::UtilError::Download { message } => KonancError::Download {
             version: version.to_owned(),
             message,
         },
-        konvoy_util::error::UtilError::Io { path, source } => KonancError::Io { path, source },
-        other => KonancError::Download {
-            version: version.to_owned(),
-            message: other.to_string(),
-        },
+        other => KonancError::Util(other),
     }
 }
 
@@ -186,10 +182,7 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
         let toolchains_root = toolchains_dir()?;
 
         // Ensure the toolchains directory exists.
-        std::fs::create_dir_all(&toolchains_root).map_err(|source| KonancError::Io {
-            path: toolchains_root.display().to_string(),
-            source,
-        })?;
+        konvoy_util::fs::ensure_dir(&toolchains_root)?;
 
         // Create secure temp file and directory for download and extraction.
         let tmp_tarball_handle = tempfile::Builder::new()
@@ -494,10 +487,7 @@ fn extract_tarball(
 ) -> Result<(), KonancError> {
     eprintln!("    Extracting {label} {version}...");
 
-    std::fs::create_dir_all(dest).map_err(|source| KonancError::Io {
-        path: dest.display().to_string(),
-        source,
-    })?;
+    konvoy_util::fs::ensure_dir(dest)?;
 
     let canonical_dest = std::fs::canonicalize(dest).map_err(|source| KonancError::Io {
         path: dest.display().to_string(),
@@ -548,10 +538,7 @@ fn extract_tarball(
 
         // Ensure parent directories exist before unpacking the entry.
         if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| KonancError::Io {
-                path: parent.display().to_string(),
-                source,
-            })?;
+            konvoy_util::fs::ensure_dir(parent)?;
         }
 
         entry.unpack(&target).map_err(|e| KonancError::Extract {
