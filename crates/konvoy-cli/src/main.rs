@@ -575,6 +575,53 @@ fn cmd_doctor() -> CliResult {
     }
 }
 
+fn cmd_toolchain(action: ToolchainAction) -> CliResult {
+    match action {
+        ToolchainAction::Install { version } => {
+            let version = if let Some(v) = version {
+                v
+            } else {
+                // Read version from konvoy.toml in current directory.
+                let cwd = std::env::current_dir()?;
+                let manifest_path = cwd.join("konvoy.toml");
+                let manifest = konvoy_config::Manifest::from_path(&manifest_path)?;
+                manifest.toolchain.kotlin
+            };
+
+            match konvoy_konanc::toolchain::is_installed(&version) {
+                Ok(true) => {
+                    eprintln!("    Kotlin/Native {version} is already installed");
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(e) => return Err(e.into()),
+            }
+
+            eprintln!("    Installing Kotlin/Native {version}...");
+            let result = konvoy_konanc::toolchain::install(&version)?;
+            eprintln!(
+                "    Installed Kotlin/Native {version} at {}",
+                result.konanc_path.display()
+            );
+            Ok(())
+        }
+        ToolchainAction::List => {
+            let versions = konvoy_konanc::toolchain::list_installed()?;
+            if versions.is_empty() {
+                eprintln!("No toolchains installed");
+                eprintln!();
+                eprintln!("  Install one with: konvoy toolchain install <version>");
+            } else {
+                eprintln!("Installed toolchains:");
+                for v in &versions {
+                    eprintln!("  {v}");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1287,52 +1334,5 @@ mod tests {
     fn help_flag_on_lint() {
         let err = Cli::try_parse_from(["konvoy", "lint", "--help"]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayHelp);
-    }
-}
-
-fn cmd_toolchain(action: ToolchainAction) -> CliResult {
-    match action {
-        ToolchainAction::Install { version } => {
-            let version = if let Some(v) = version {
-                v
-            } else {
-                // Read version from konvoy.toml in current directory.
-                let cwd = std::env::current_dir()?;
-                let manifest_path = cwd.join("konvoy.toml");
-                let manifest = konvoy_config::Manifest::from_path(&manifest_path)?;
-                manifest.toolchain.kotlin
-            };
-
-            match konvoy_konanc::toolchain::is_installed(&version) {
-                Ok(true) => {
-                    eprintln!("    Kotlin/Native {version} is already installed");
-                    return Ok(());
-                }
-                Ok(false) => {}
-                Err(e) => return Err(e.into()),
-            }
-
-            eprintln!("    Installing Kotlin/Native {version}...");
-            let result = konvoy_konanc::toolchain::install(&version)?;
-            eprintln!(
-                "    Installed Kotlin/Native {version} at {}",
-                result.konanc_path.display()
-            );
-            Ok(())
-        }
-        ToolchainAction::List => {
-            let versions = konvoy_konanc::toolchain::list_installed()?;
-            if versions.is_empty() {
-                eprintln!("No toolchains installed");
-                eprintln!();
-                eprintln!("  Install one with: konvoy toolchain install <version>");
-            } else {
-                eprintln!("Installed toolchains:");
-                for v in &versions {
-                    eprintln!("  {v}");
-                }
-            }
-            Ok(())
-        }
     }
 }
