@@ -1,2 +1,1 @@
-name = "kotlinx-datetime"
 maven = "org.jetbrains.kotlinx:kotlinx-datetime-{target}:{version}:klib"

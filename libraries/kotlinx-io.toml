@@ -1,2 +1,1 @@
-name = "kotlinx-io"
 maven = "org.jetbrains.kotlinx:kotlinx-io-core-{target}:{version}:klib"

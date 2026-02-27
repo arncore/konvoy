@@ -1,2 +1,1 @@
-name = "kotlinx-atomicfu"
 maven = "org.jetbrains.kotlinx:atomicfu-{target}:{version}:klib"
