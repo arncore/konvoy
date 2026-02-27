@@ -454,7 +454,8 @@ konanc_version = "2.1.0"
             name: "kotlinx-coroutines".to_owned(),
             source: DepSource::Maven {
                 version: "1.8.0".to_owned(),
-                maven_coordinate: "org.jetbrains.kotlinx:kotlinx-coroutines-core-{target}:1.8.0:klib".to_owned(),
+                maven_coordinate:
+                    "org.jetbrains.kotlinx:kotlinx-coroutines-core-{target}:1.8.0:klib".to_owned(),
                 targets,
             },
             source_hash: "maven-hash-1234".to_owned(),
@@ -493,7 +494,8 @@ konanc_version = "2.1.0"
             name: "kotlinx-datetime".to_owned(),
             source: DepSource::Maven {
                 version: "0.6.0".to_owned(),
-                maven_coordinate: "org.jetbrains.kotlinx:kotlinx-datetime-{target}:0.6.0:klib".to_owned(),
+                maven_coordinate: "org.jetbrains.kotlinx:kotlinx-datetime-{target}:0.6.0:klib"
+                    .to_owned(),
                 targets,
             },
             source_hash: "hash-5678".to_owned(),
@@ -513,8 +515,7 @@ konanc_version = "2.1.0"
         );
         assert!(
             content.contains("[dependencies.targets]")
-                || content.contains("targets")
-                    && content.contains("linux_x64"),
+                || content.contains("targets") && content.contains("linux_x64"),
             "content was: {content}"
         );
     }
