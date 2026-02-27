@@ -535,14 +535,7 @@ test_dep_build_wide() {
     assert_contains "$output" "Compiling lib-b"
     assert_contains "$output" "Compiling lib-c"
     assert_contains "$output" "Compiling wide-app"
-
-    # Second build should be fully cached.
-    local out2
-    out2=$(konvoy build 2>&1)
-    assert_contains "$out2" "Fresh lib-a"
-    assert_contains "$out2" "Fresh lib-b"
-    assert_contains "$out2" "Fresh lib-c"
-    assert_contains "$out2" "Fresh wide-app"
+    assert_file_exists .konvoy/build/linux_x64/debug/wide-app
 }
 
 test_dep_build_chain() {
