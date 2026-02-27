@@ -166,7 +166,7 @@ pub enum EngineError {
     },
 
     /// A Maven library artifact download failed.
-    #[error("failed to download library `{name}` from {url}: {message}")]
+    #[error("cannot download library `{name}` from {url}: {message}")]
     LibraryDownloadFailed {
         name: String,
         url: String,

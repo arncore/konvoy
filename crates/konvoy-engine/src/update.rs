@@ -129,7 +129,7 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
             // Truncate the hash to the first 16 chars for display.
             let display_hash = result.sha256.get(..16).unwrap_or(&result.sha256);
             eprintln!("    {}: {}...", target_name, display_hash);
-            targets_map.insert(target_name.to_string(), result.sha256);
+            targets_map.insert((*target_name).to_owned(), result.sha256);
 
             // Clean up the downloaded file.
             let _ = std::fs::remove_file(&tmp_file);
