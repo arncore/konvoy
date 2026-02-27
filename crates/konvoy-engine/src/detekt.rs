@@ -106,7 +106,7 @@ pub fn ensure_detekt(
 
     if jar.exists() {
         // Verify hash of existing JAR.
-        let actual_hash = hash_file(&jar)?;
+        let actual_hash = konvoy_util::hash::sha256_file(&jar)?;
         if let Some(expected) = expected_sha256 {
             if actual_hash != expected {
                 return Err(EngineError::DetektHashMismatch {
@@ -154,7 +154,7 @@ pub fn ensure_detekt(
             // Another process downloaded it concurrently — verify its hash.
             let _ = std::fs::remove_file(&tmp_path);
             if let Some(expected) = expected_sha256 {
-                let placed_hash = hash_file(&jar)?;
+                let placed_hash = konvoy_util::hash::sha256_file(&jar)?;
                 if placed_hash != expected {
                     return Err(EngineError::DetektHashMismatch {
                         version: version.to_owned(),
@@ -174,11 +174,6 @@ pub fn ensure_detekt(
     }
 
     Ok((jar, download_hash))
-}
-
-/// Compute the SHA-256 hash of a file on disk using streaming reads.
-fn hash_file(path: &Path) -> Result<String, EngineError> {
-    konvoy_util::hash::sha256_file(path).map_err(EngineError::from)
 }
 
 /// Validate that a version string is safe for use in filesystem paths.
