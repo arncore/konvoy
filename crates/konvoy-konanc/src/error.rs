@@ -47,9 +47,9 @@ pub enum KonancError {
         fix_command: String,
     },
 
-    /// Could not determine user home directory.
-    #[error("cannot determine home directory — set the HOME environment variable")]
-    NoHomeDir,
+    /// An error propagated from konvoy-util.
+    #[error("{0}")]
+    Util(#[from] konvoy_util::error::UtilError),
 
     /// The host platform is not supported for managed toolchain downloads.
     #[error("unsupported platform {os}/{arch} — Kotlin/Native prebuilt binaries are not available for this platform")]
