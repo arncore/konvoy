@@ -587,9 +587,10 @@ fn check_lockfile_staleness(manifest: &Manifest, lockfile: &Lockfile) -> Result<
     // have matching Maven entries for each.
     for (dep_name, dep_spec) in &manifest.dependencies {
         if dep_spec.version.is_some() {
-            let has_maven_entry = lockfile.dependencies.iter().any(|d| {
-                d.name == *dep_name && matches!(&d.source, DepSource::Maven { .. })
-            });
+            let has_maven_entry = lockfile
+                .dependencies
+                .iter()
+                .any(|d| d.name == *dep_name && matches!(&d.source, DepSource::Maven { .. }));
             if !has_maven_entry {
                 return Err(EngineError::LockfileUpdateRequired);
             }
@@ -2558,7 +2559,8 @@ mod tests {
             name: "kotlinx-coroutines".to_owned(),
             source: DepSource::Maven {
                 version: "1.8.0".to_owned(),
-                maven_coordinate: "org.jetbrains.kotlinx:kotlinx-coroutines-core-{target}:1.8.0:klib".to_owned(),
+                maven_coordinate:
+                    "org.jetbrains.kotlinx:kotlinx-coroutines-core-{target}:1.8.0:klib".to_owned(),
                 targets,
             },
             source_hash: "maven-hash".to_owned(),
@@ -2622,7 +2624,8 @@ mod tests {
             name: "kotlinx-coroutines".to_owned(),
             source: DepSource::Maven {
                 version: "1.8.0".to_owned(),
-                maven_coordinate: "org.jetbrains.kotlinx:kotlinx-coroutines-core-{target}:1.8.0:klib".to_owned(),
+                maven_coordinate:
+                    "org.jetbrains.kotlinx:kotlinx-coroutines-core-{target}:1.8.0:klib".to_owned(),
                 targets,
             },
             source_hash: "maven-hash".to_owned(),
@@ -2652,10 +2655,7 @@ mod tests {
 
         let reparsed = Lockfile::from_path(&lockfile_path).unwrap();
         // Toolchain should have been updated.
-        assert_eq!(
-            reparsed.toolchain.as_ref().unwrap().konanc_version,
-            "2.1.0"
-        );
+        assert_eq!(reparsed.toolchain.as_ref().unwrap().konanc_version, "2.1.0");
         // Maven dep lock should be preserved.
         assert_eq!(reparsed.dependencies.len(), 1);
         let dep = reparsed.dependencies.first().unwrap();
