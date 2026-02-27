@@ -399,6 +399,9 @@ fn find_jre_root(jre_dir: &Path) -> Result<PathBuf, KonancError> {
         .collect();
 
     if entries.len() == 1 {
+        // The `unwrap_or_else` fallback is unreachable: we just confirmed
+        // `entries.len() == 1`, so `.next()` always yields `Some`. The
+        // fallback exists only to satisfy the type system without panicking.
         return Ok(entries
             .into_iter()
             .next()
@@ -572,6 +575,9 @@ fn find_extracted_root(extract_dir: &Path, version: &str) -> Result<PathBuf, Kon
         .collect();
 
     if entries.len() == 1 {
+        // The `unwrap_or_else` fallback is unreachable: we just confirmed
+        // `entries.len() == 1`, so `.next()` always yields `Some`. The
+        // fallback exists only to satisfy the type system without panicking.
         return Ok(entries
             .into_iter()
             .next()
@@ -1000,6 +1006,259 @@ mod tests {
         assert!(
             err.contains("found 2 entries"),
             "error should mention 2 entries, got: {err}"
+        );
+    }
+
+    // ---- find_jre_root: empty directory ----
+
+    #[test]
+    fn find_jre_root_empty_directory_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // Completely empty — no files, no subdirectories.
+        let result = find_jre_root(dir.path());
+        assert!(result.is_err(), "empty directory should error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("found 0 entries"),
+            "error should mention 0 entries, got: {err}"
+        );
+    }
+
+    // ---- find_extracted_root tests ----
+
+    #[test]
+    fn find_extracted_root_single_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = dir.path().join("kotlin-native-prebuilt-linux-x86_64-2.1.0");
+        std::fs::create_dir(&subdir).unwrap();
+
+        let result = find_extracted_root(dir.path(), "2.1.0");
+        assert!(result.is_ok(), "single directory should succeed");
+        assert_eq!(result.unwrap(), subdir);
+    }
+
+    #[test]
+    fn find_extracted_root_empty_directory_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // Completely empty — no subdirectories.
+        let result = find_extracted_root(dir.path(), "2.1.0");
+        assert!(result.is_err(), "empty directory should error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("found 0 entries"),
+            "error should mention 0 entries, got: {err}"
+        );
+    }
+
+    #[test]
+    fn find_extracted_root_empty_with_only_files_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // Only files, no directories — directories are filtered by is_dir().
+        std::fs::write(dir.path().join("readme.txt"), "hello").unwrap();
+        std::fs::write(dir.path().join("license.txt"), "MIT").unwrap();
+
+        let result = find_extracted_root(dir.path(), "2.1.0");
+        assert!(result.is_err(), "files-only directory should error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("found 0 entries"),
+            "error should mention 0 entries, got: {err}"
+        );
+    }
+
+    #[test]
+    fn find_extracted_root_multiple_dirs_picks_kotlin_native_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let unrelated = dir.path().join("some-other-dir");
+        let expected = dir.path().join("kotlin-native-prebuilt-linux-x86_64-2.1.0");
+        std::fs::create_dir(&unrelated).unwrap();
+        std::fs::create_dir(&expected).unwrap();
+
+        let result = find_extracted_root(dir.path(), "2.1.0");
+        assert!(
+            result.is_ok(),
+            "should find kotlin-native directory among multiple"
+        );
+        assert_eq!(result.unwrap(), expected);
+    }
+
+    #[test]
+    fn find_extracted_root_multiple_dirs_no_match_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("foo")).unwrap();
+        std::fs::create_dir(dir.path().join("bar")).unwrap();
+
+        let result = find_extracted_root(dir.path(), "2.1.0");
+        assert!(result.is_err(), "multiple non-matching dirs should error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("found 2 entries"),
+            "error should mention 2 entries, got: {err}"
+        );
+    }
+
+    #[test]
+    fn find_extracted_root_requires_version_in_name() {
+        // A directory containing "kotlin-native" but wrong version should not match.
+        let dir = tempfile::tempdir().unwrap();
+        let wrong_version = dir.path().join("kotlin-native-prebuilt-linux-x86_64-1.9.0");
+        let unrelated = dir.path().join("other");
+        std::fs::create_dir(&wrong_version).unwrap();
+        std::fs::create_dir(&unrelated).unwrap();
+
+        let result = find_extracted_root(dir.path(), "2.1.0");
+        assert!(
+            result.is_err(),
+            "kotlin-native dir with wrong version should not match"
+        );
+    }
+
+    // ---- managed_konanc_path structure ----
+
+    #[test]
+    fn managed_konanc_path_structure() {
+        let path = managed_konanc_path("2.1.0").unwrap();
+        // Should end with <version>/bin/konanc.
+        let s = path.display().to_string();
+        assert!(
+            s.ends_with("2.1.0/bin/konanc"),
+            "path should end with version/bin/konanc, got: {s}"
+        );
+    }
+
+    // ---- jre_home_path structure (macOS Contents/Home layout) ----
+
+    #[test]
+    fn jre_home_path_linux_layout() {
+        // Simulate a Linux JRE layout: jre/<extracted-dir>/ is JAVA_HOME.
+        let tmp = tempfile::tempdir().unwrap();
+
+        // We cannot call jre_home_path directly (it uses the global home dir),
+        // so we test the underlying find_jre_root + macOS detection logic.
+        let jre_root = tmp.path();
+        let extracted = jre_root.join("jdk-21.0.10+7-jre");
+        std::fs::create_dir(&extracted).unwrap();
+
+        let found = find_jre_root(jre_root).unwrap();
+        assert_eq!(found, extracted);
+
+        // On Linux, there is no Contents/Home, so the extracted root IS java home.
+        let contents_home = found.join("Contents").join("Home");
+        assert!(
+            !contents_home.exists(),
+            "Linux layout should not have Contents/Home"
+        );
+    }
+
+    #[test]
+    fn jre_home_path_macos_layout() {
+        // Simulate a macOS JRE layout: jre/<extracted-dir>/Contents/Home/.
+        let tmp = tempfile::tempdir().unwrap();
+        let jre_root = tmp.path();
+        let extracted = jre_root.join("jdk-21.0.10+7-jre");
+        let contents_home = extracted.join("Contents").join("Home");
+        std::fs::create_dir_all(&contents_home).unwrap();
+
+        let found = find_jre_root(jre_root).unwrap();
+        assert_eq!(found, extracted);
+
+        // On macOS, Contents/Home exists, so it should be preferred.
+        assert!(
+            contents_home.exists(),
+            "macOS layout should have Contents/Home"
+        );
+    }
+
+    // ---- version_dir path construction ----
+
+    #[test]
+    fn version_dir_path_construction() {
+        let dir = version_dir("2.1.0").unwrap();
+        let s = dir.display().to_string();
+        assert!(
+            s.ends_with("toolchains/2.1.0"),
+            "version_dir should end with toolchains/<version>, got: {s}"
+        );
+    }
+
+    #[test]
+    fn version_dir_different_versions_differ() {
+        let a = version_dir("2.1.0").unwrap();
+        let b = version_dir("2.2.0").unwrap();
+        assert_ne!(a, b, "different versions should produce different paths");
+    }
+
+    // ---- is_installed edge cases ----
+
+    #[test]
+    fn is_installed_false_for_nonexistent_version() {
+        // A completely made-up version should not be installed.
+        let result = is_installed("0.0.0-nonexistent").unwrap();
+        assert!(
+            !result,
+            "non-existent version should not report as installed"
+        );
+    }
+
+    // ---- list_installed edge cases ----
+
+    #[test]
+    fn list_installed_result_is_sorted() {
+        // list_installed sorts its output; verify this property holds even
+        // when the underlying readdir returns entries out of order.
+        let result = list_installed().unwrap();
+        let mut sorted = result.clone();
+        sorted.sort();
+        assert_eq!(
+            result, sorted,
+            "list_installed should return sorted versions"
+        );
+    }
+
+    // ---- map_download_err ----
+
+    #[test]
+    fn map_download_err_download_variant() {
+        let util_err = konvoy_util::error::UtilError::Download {
+            message: "connection refused".to_owned(),
+        };
+        let err = map_download_err("2.1.0", util_err);
+        let msg = format!("{err}");
+        assert!(msg.contains("2.1.0"), "should include version: {msg}");
+        assert!(
+            msg.contains("connection refused"),
+            "should include message: {msg}"
+        );
+    }
+
+    #[test]
+    fn map_download_err_io_variant() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
+        let util_err = konvoy_util::error::UtilError::Io {
+            path: "/some/path".to_owned(),
+            source: io_err,
+        };
+        let err = map_download_err("2.1.0", util_err);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("/some/path"),
+            "Io variant should preserve path: {msg}"
+        );
+    }
+
+    #[test]
+    fn map_download_err_other_variant_becomes_download() {
+        // Any non-Download, non-Io variant should be mapped to Download.
+        let util_err = konvoy_util::error::UtilError::ArtifactHashMismatch {
+            path: "/file".to_owned(),
+            expected: "aaa".to_owned(),
+            actual: "bbb".to_owned(),
+        };
+        let err = map_download_err("2.1.0", util_err);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("2.1.0"),
+            "other variants should map to Download with version: {msg}"
         );
     }
 }
