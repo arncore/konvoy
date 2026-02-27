@@ -1,6 +1,6 @@
 //! Dependency graph resolution with topological ordering and cycle detection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use konvoy_config::manifest::{Manifest, PackageKind};
@@ -80,6 +80,30 @@ pub fn resolve_dependencies(
         .collect();
 
     Ok(ResolvedGraph { order })
+}
+
+/// Group dependencies into parallel build levels.
+///
+/// Each level contains deps whose own dependencies are all in previous levels.
+/// Deps within the same level can be built concurrently.
+pub fn parallel_levels(graph: &ResolvedGraph) -> Vec<Vec<&ResolvedDep>> {
+    let mut levels: Vec<Vec<&ResolvedDep>> = Vec::new();
+    let mut assigned: HashSet<&str> = HashSet::new();
+    let mut remaining: Vec<&ResolvedDep> = graph.order.iter().collect();
+
+    while !remaining.is_empty() {
+        let (level, rest): (Vec<_>, Vec<_>) = remaining
+            .into_iter()
+            .partition(|dep| dep.dep_names.iter().all(|d| assigned.contains(d.as_str())));
+
+        for dep in &level {
+            assigned.insert(&dep.name);
+        }
+        levels.push(level);
+        remaining = rest;
+    }
+
+    levels
 }
 
 /// DFS traversal for topological sort with cycle detection.
@@ -581,6 +605,307 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("escapes the project tree"), "error was: {err}");
+    }
+
+    fn make_dep(name: &str, dep_names: &[&str]) -> ResolvedDep {
+        ResolvedDep {
+            name: name.to_owned(),
+            project_root: PathBuf::from(format!("/fake/{name}")),
+            manifest: Manifest::from_str(
+                &format!(
+                    "[package]\nname = \"{name}\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n"
+                ),
+                "<test>",
+            )
+            .unwrap(),
+            dep_names: dep_names.iter().map(|s| s.to_string()).collect(),
+            source_hash: "deadbeef".to_owned(),
+        }
+    }
+
+    #[test]
+    fn parallel_levels_empty_graph() {
+        let graph = ResolvedGraph { order: Vec::new() };
+        let levels = parallel_levels(&graph);
+        assert!(levels.is_empty());
+    }
+
+    #[test]
+    fn parallel_levels_linear_chain() {
+        // a -> b -> c (c is leaf, a depends on b, b depends on c)
+        let graph = ResolvedGraph {
+            order: vec![
+                make_dep("c", &[]),
+                make_dep("b", &["c"]),
+                make_dep("a", &["b"]),
+            ],
+        };
+        let levels = parallel_levels(&graph);
+        assert_eq!(levels.len(), 3);
+        assert_eq!(levels.first().unwrap().len(), 1);
+        assert_eq!(levels.first().unwrap().first().unwrap().name, "c");
+        assert_eq!(levels.get(1).unwrap().len(), 1);
+        assert_eq!(levels.get(1).unwrap().first().unwrap().name, "b");
+        assert_eq!(levels.get(2).unwrap().len(), 1);
+        assert_eq!(levels.get(2).unwrap().first().unwrap().name, "a");
+    }
+
+    #[test]
+    fn parallel_levels_diamond() {
+        // shared <- [a, b] (both a and b depend on shared)
+        let graph = ResolvedGraph {
+            order: vec![
+                make_dep("shared", &[]),
+                make_dep("a", &["shared"]),
+                make_dep("b", &["shared"]),
+            ],
+        };
+        let levels = parallel_levels(&graph);
+        assert_eq!(levels.len(), 2);
+        // Level 0: shared (no deps)
+        assert_eq!(levels.first().unwrap().len(), 1);
+        assert_eq!(levels.first().unwrap().first().unwrap().name, "shared");
+        // Level 1: a and b (both depend only on shared)
+        assert_eq!(levels.get(1).unwrap().len(), 2);
+        let level1_names: HashSet<&str> = levels
+            .get(1)
+            .unwrap()
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(level1_names.contains("a"));
+        assert!(level1_names.contains("b"));
+    }
+
+    #[test]
+    fn parallel_levels_wide() {
+        // a, b, c all independent (no deps)
+        let graph = ResolvedGraph {
+            order: vec![make_dep("a", &[]), make_dep("b", &[]), make_dep("c", &[])],
+        };
+        let levels = parallel_levels(&graph);
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels.first().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn parallel_levels_preserves_all_deps() {
+        // Every dep in the graph must appear exactly once across all levels.
+        let graph = ResolvedGraph {
+            order: vec![
+                make_dep("x", &[]),
+                make_dep("y", &["x"]),
+                make_dep("z", &["x"]),
+                make_dep("w", &["y", "z"]),
+            ],
+        };
+        let levels = parallel_levels(&graph);
+        let all_names: Vec<&str> = levels
+            .iter()
+            .flat_map(|level| level.iter().map(|d| d.name.as_str()))
+            .collect();
+        assert_eq!(all_names.len(), 4);
+        let unique: HashSet<&str> = all_names.into_iter().collect();
+        assert_eq!(unique.len(), 4);
+        assert!(unique.contains("x"));
+        assert!(unique.contains("y"));
+        assert!(unique.contains("z"));
+        assert!(unique.contains("w"));
+    }
+
+    // -- Smoke tests: parallel_levels through real resolve_dependencies --
+
+    #[test]
+    fn parallel_levels_single_dep_via_resolve() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib_dir = tmp.path().join("my-lib");
+        write_manifest(&lib_dir, "my-lib", "lib", "");
+
+        let root_dir = tmp.path().join("root");
+        write_manifest(
+            &root_dir,
+            "root",
+            "bin",
+            "my-lib = { path = \"../my-lib\" }\n",
+        );
+
+        let manifest = Manifest::from_path(&root_dir.join("konvoy.toml")).unwrap();
+        let graph = resolve_dependencies(&root_dir, &manifest).unwrap();
+        let levels = parallel_levels(&graph);
+
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels.first().unwrap().len(), 1);
+        assert_eq!(levels.first().unwrap().first().unwrap().name, "my-lib");
+    }
+
+    #[test]
+    fn parallel_levels_diamond_via_resolve() {
+        // shared has no deps; a and b both depend on shared; root depends on a and b.
+        let tmp = tempfile::tempdir().unwrap();
+
+        let shared_dir = tmp.path().join("shared");
+        write_manifest(&shared_dir, "shared", "lib", "");
+
+        let a_dir = tmp.path().join("a");
+        write_manifest(&a_dir, "a", "lib", "shared = { path = \"../shared\" }\n");
+
+        let b_dir = tmp.path().join("b");
+        write_manifest(&b_dir, "b", "lib", "shared = { path = \"../shared\" }\n");
+
+        let root_dir = tmp.path().join("root");
+        write_manifest(
+            &root_dir,
+            "root",
+            "bin",
+            "a = { path = \"../a\" }\nb = { path = \"../b\" }\n",
+        );
+
+        let manifest = Manifest::from_path(&root_dir.join("konvoy.toml")).unwrap();
+        let graph = resolve_dependencies(&root_dir, &manifest).unwrap();
+        let levels = parallel_levels(&graph);
+
+        // Level 0: shared (leaf); Level 1: a and b (siblings).
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels.first().unwrap().len(), 1);
+        assert_eq!(levels.first().unwrap().first().unwrap().name, "shared");
+        assert_eq!(levels.get(1).unwrap().len(), 2);
+        let level1_names: HashSet<&str> = levels
+            .get(1)
+            .unwrap()
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(level1_names.contains("a"));
+        assert!(level1_names.contains("b"));
+    }
+
+    #[test]
+    fn parallel_levels_wide_independent_via_resolve() {
+        // Three independent libs with no deps between them.
+        let tmp = tempfile::tempdir().unwrap();
+
+        let x_dir = tmp.path().join("x");
+        write_manifest(&x_dir, "x", "lib", "");
+
+        let y_dir = tmp.path().join("y");
+        write_manifest(&y_dir, "y", "lib", "");
+
+        let z_dir = tmp.path().join("z");
+        write_manifest(&z_dir, "z", "lib", "");
+
+        let root_dir = tmp.path().join("root");
+        write_manifest(
+            &root_dir,
+            "root",
+            "bin",
+            "x = { path = \"../x\" }\ny = { path = \"../y\" }\nz = { path = \"../z\" }\n",
+        );
+
+        let manifest = Manifest::from_path(&root_dir.join("konvoy.toml")).unwrap();
+        let graph = resolve_dependencies(&root_dir, &manifest).unwrap();
+        let levels = parallel_levels(&graph);
+
+        // All three are independent → single level.
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels.first().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn parallel_levels_chain_via_resolve() {
+        // leaf → mid → root: each dep depends on the previous.
+        let tmp = tempfile::tempdir().unwrap();
+
+        let leaf_dir = tmp.path().join("leaf");
+        write_manifest(&leaf_dir, "leaf", "lib", "");
+
+        let mid_dir = tmp.path().join("mid");
+        write_manifest(&mid_dir, "mid", "lib", "leaf = { path = \"../leaf\" }\n");
+
+        let root_dir = tmp.path().join("root");
+        write_manifest(&root_dir, "root", "bin", "mid = { path = \"../mid\" }\n");
+
+        let manifest = Manifest::from_path(&root_dir.join("konvoy.toml")).unwrap();
+        let graph = resolve_dependencies(&root_dir, &manifest).unwrap();
+        let levels = parallel_levels(&graph);
+
+        // leaf first, then mid — strictly sequential.
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels.first().unwrap().first().unwrap().name, "leaf");
+        assert_eq!(levels.get(1).unwrap().first().unwrap().name, "mid");
+    }
+
+    #[test]
+    fn parallel_levels_complex_graph_via_resolve() {
+        // Models the issue description graph:
+        //   app → [utils, models, logging]
+        //   models → [shared]
+        //   utils → [shared]
+        //   logging → (no deps)
+        //
+        // Expected levels:
+        //   Level 0: shared, logging  (independent leaves)
+        //   Level 1: utils, models    (both only depend on shared)
+        let tmp = tempfile::tempdir().unwrap();
+
+        let shared_dir = tmp.path().join("shared");
+        write_manifest(&shared_dir, "shared", "lib", "");
+
+        let logging_dir = tmp.path().join("logging");
+        write_manifest(&logging_dir, "logging", "lib", "");
+
+        let utils_dir = tmp.path().join("utils");
+        write_manifest(
+            &utils_dir,
+            "utils",
+            "lib",
+            "shared = { path = \"../shared\" }\n",
+        );
+
+        let models_dir = tmp.path().join("models");
+        write_manifest(
+            &models_dir,
+            "models",
+            "lib",
+            "shared = { path = \"../shared\" }\n",
+        );
+
+        let root_dir = tmp.path().join("app");
+        write_manifest(
+            &root_dir,
+            "app",
+            "bin",
+            "utils = { path = \"../utils\" }\nmodels = { path = \"../models\" }\nlogging = { path = \"../logging\" }\n",
+        );
+
+        let manifest = Manifest::from_path(&root_dir.join("konvoy.toml")).unwrap();
+        let graph = resolve_dependencies(&root_dir, &manifest).unwrap();
+        let levels = parallel_levels(&graph);
+
+        // Level 0: shared and logging (both are leaves).
+        // Level 1: utils and models (both depend only on shared).
+        assert_eq!(levels.len(), 2, "expected 2 levels, got {levels:?}");
+
+        let level0_names: HashSet<&str> = levels
+            .first()
+            .unwrap()
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(level0_names.contains("shared"), "level 0 missing shared");
+        assert!(level0_names.contains("logging"), "level 0 missing logging");
+
+        let level1_names: HashSet<&str> = levels
+            .get(1)
+            .unwrap()
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(level1_names.contains("utils"), "level 1 missing utils");
+        assert!(level1_names.contains("models"), "level 1 missing models");
+
+        // All 4 deps accounted for.
+        let total: usize = levels.iter().map(|l| l.len()).sum();
+        assert_eq!(total, 4);
     }
 
     mod property_tests {
