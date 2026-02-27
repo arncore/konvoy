@@ -1234,8 +1234,8 @@ mod tests {
     }
 
     #[test]
-    fn map_download_err_other_variant_becomes_download() {
-        // Any non-Download, non-Io variant should be mapped to Download.
+    fn map_download_err_other_variant_becomes_util() {
+        // Any non-Download, non-Io variant should propagate through Util.
         let util_err = konvoy_util::error::UtilError::ArtifactHashMismatch {
             path: "/file".to_owned(),
             expected: "aaa".to_owned(),
@@ -1244,8 +1244,8 @@ mod tests {
         let err = map_download_err("2.1.0", util_err);
         let msg = format!("{err}");
         assert!(
-            msg.contains("2.1.0"),
-            "other variants should map to Download with version: {msg}"
+            msg.contains("/file"),
+            "other variants should propagate through Util preserving original message: {msg}"
         );
     }
 }

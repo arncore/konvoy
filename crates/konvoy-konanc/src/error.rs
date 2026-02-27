@@ -79,10 +79,6 @@ pub enum KonancError {
     #[error("JRE installation failed: {message}")]
     JreInstall { message: String },
 
-    /// A utility operation failed.
-    #[error("{0}")]
-    Util(#[from] konvoy_util::error::UtilError),
-
     /// A filesystem operation failed during toolchain management.
     ///
     /// Kept for raw `std::fs` calls (read_dir iteration, metadata, set_permissions,
