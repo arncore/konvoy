@@ -78,8 +78,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
 
     // 2. Read konvoy.lock (or default).
     let lockfile_path = project_root.join("konvoy.lock");
-    let lockfile =
-        Lockfile::from_path(&lockfile_path).map_err(|e| EngineError::Lockfile(e.to_string()))?;
+    let lockfile = Lockfile::from_path(&lockfile_path)?;
 
     // 3. In --locked mode, verify the lockfile is complete and consistent
     //    with what konvoy.toml specifies before doing any work.
@@ -770,9 +769,7 @@ fn update_lockfile_if_needed(
     );
     updated.dependencies = new_deps;
     updated.plugins = plugin_locks.to_vec();
-    updated
-        .write_to(lockfile_path)
-        .map_err(|e| EngineError::Lockfile(e.to_string()))?;
+    updated.write_to(lockfile_path)?;
 
     Ok(())
 }

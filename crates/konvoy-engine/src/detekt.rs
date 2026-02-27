@@ -237,9 +237,8 @@ fn persist_detekt_hash(
             detekt_jar_sha256: Some(hash),
         });
     }
-    updated.write_to(lockfile_path).map_err(|e| {
-        EngineError::Lockfile(format!("cannot write {}: {e}", lockfile_path.display()))
-    })
+    updated.write_to(lockfile_path)?;
+    Ok(())
 }
 
 /// Resolve the JRE `java` binary from the managed Kotlin toolchain.
@@ -364,8 +363,7 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
 
     // Read lockfile and resolve expected hash.
     let lockfile_path = root.join("konvoy.lock");
-    let lockfile = konvoy_config::lockfile::Lockfile::from_path(&lockfile_path)
-        .map_err(|e| EngineError::Lockfile(e.to_string()))?;
+    let lockfile = konvoy_config::lockfile::Lockfile::from_path(&lockfile_path)?;
     let expected_hash = resolve_lockfile_hash(&lockfile, detekt_version);
 
     // In --locked mode, require pinned hash and pre-downloaded JAR.
