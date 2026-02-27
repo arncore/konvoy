@@ -28,11 +28,11 @@ pub enum EngineError {
 
     /// A compiler operation failed.
     #[error("{0}")]
-    Konanc(konvoy_konanc::error::KonancError),
+    Konanc(#[from] konvoy_konanc::error::KonancError),
 
     /// A target resolution failed.
     #[error("{0}")]
-    Target(konvoy_targets::TargetError),
+    Target(#[from] konvoy_targets::TargetError),
 
     /// Lockfile error.
     #[error("lockfile error: {0}")]

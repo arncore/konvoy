@@ -65,7 +65,7 @@ pub fn build_tests(
     let target = resolve_target(&options.target)?;
     let profile = if options.release { "release" } else { "debug" };
 
-    let resolved = resolve_konanc(&manifest.toolchain.kotlin).map_err(EngineError::Konanc)?;
+    let resolved = resolve_konanc(&manifest.toolchain.kotlin)?;
     let jre_home = resolved.jre_home;
     let konanc = resolved.info;
 
@@ -187,7 +187,7 @@ pub fn build_tests(
         cmd = cmd.java_home(jh);
     }
 
-    let result = cmd.execute(&konanc).map_err(EngineError::Konanc)?;
+    let result = cmd.execute(&konanc)?;
 
     crate::diagnostics::print_diagnostics(&result, options.verbose);
 

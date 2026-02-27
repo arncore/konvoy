@@ -246,13 +246,12 @@ fn persist_detekt_hash(
 ///
 /// Auto-installs the toolchain if it is not yet present.
 fn resolve_java_bin(kotlin_version: &str) -> Result<(PathBuf, PathBuf), EngineError> {
-    if !konvoy_konanc::toolchain::is_installed(kotlin_version).map_err(EngineError::Konanc)? {
+    if !konvoy_konanc::toolchain::is_installed(kotlin_version)? {
         eprintln!("    Installing Kotlin/Native {kotlin_version} (for JRE)...");
-        konvoy_konanc::toolchain::install(kotlin_version).map_err(EngineError::Konanc)?;
+        konvoy_konanc::toolchain::install(kotlin_version)?;
     }
 
-    let jre_home =
-        konvoy_konanc::toolchain::jre_home_path(kotlin_version).map_err(EngineError::Konanc)?;
+    let jre_home = konvoy_konanc::toolchain::jre_home_path(kotlin_version)?;
 
     let java_bin = jre_home.join("bin").join("java");
     if !java_bin.exists() {

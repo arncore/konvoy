@@ -92,7 +92,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     let profile = if options.release { "release" } else { "debug" };
 
     // 5. Resolve managed konanc toolchain.
-    let resolved = resolve_konanc(&manifest.toolchain.kotlin).map_err(EngineError::Konanc)?;
+    let resolved = resolve_konanc(&manifest.toolchain.kotlin)?;
     let konanc = resolved.info;
     let jre_home = resolved.jre_home.clone();
 
@@ -370,9 +370,9 @@ pub(crate) fn build_single(
 /// or if host detection fails on an unsupported platform.
 pub(crate) fn resolve_target(target_opt: &Option<String>) -> Result<Target, EngineError> {
     match target_opt {
-        Some(name) if name == "host" => host_target().map_err(EngineError::Target),
-        Some(name) => name.parse::<Target>().map_err(EngineError::Target),
-        None => host_target().map_err(EngineError::Target),
+        Some(name) if name == "host" => Ok(host_target()?),
+        Some(name) => Ok(name.parse::<Target>()?),
+        None => Ok(host_target()?),
     }
 }
 
@@ -407,7 +407,7 @@ fn compile(
         cmd = cmd.java_home(jh);
     }
 
-    let result = cmd.execute(konanc).map_err(EngineError::Konanc)?;
+    let result = cmd.execute(konanc)?;
 
     crate::diagnostics::print_diagnostics(&result, options.verbose);
 
