@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      smoke:
+        description: Run smoke tests
+        type: boolean
+        default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -83,11 +89,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace -- -D warnings
 
+  # Smoke tests: only run on manual trigger (workflow_dispatch with smoke=true).
+  # Takes ~10min due to Docker build + konanc download. Can also be run locally
+  # via `bash tests/smoke/run.sh`.
+  smoke:
+    name: Smoke Tests
+    if: github.event_name == 'workflow_dispatch' && inputs.smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build smoke test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tests/smoke/Dockerfile
+          load: true
+          tags: konvoy-smoke:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Run smoke tests
+        run: docker run --rm konvoy-smoke:latest bash /build/tests/smoke/tests.sh
+
   # Single gate job for branch protection. Passes when all jobs succeed or
   # are skipped (doc-only changes). Make this the only required check.
-  #
-  # Smoke tests (tests/smoke/) are run locally via `bash tests/smoke/run.sh`
-  # rather than in CI to avoid the ~10min Docker build + konanc download overhead.
+  # Smoke tests are excluded — they run on-demand via manual trigger.
   ci-pass:
     name: CI Pass
     if: always()
