@@ -42,7 +42,7 @@ pub struct InstallResult {
 /// # Errors
 /// Returns an error if the home directory cannot be determined.
 pub fn toolchains_dir() -> Result<PathBuf, KonancError> {
-    let konvoy_home = konvoy_util::fs::konvoy_home().map_err(|_| KonancError::NoHomeDir)?;
+    let konvoy_home = konvoy_util::fs::konvoy_home()?;
     Ok(konvoy_home.join("toolchains"))
 }
 
