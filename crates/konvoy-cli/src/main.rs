@@ -99,6 +99,8 @@ enum Command {
         #[arg(long)]
         locked: bool,
     },
+    /// Resolve Maven dependencies and update konvoy.lock
+    Update,
     /// Remove build artifacts
     Clean,
     /// Check environment and toolchain setup
@@ -154,6 +156,7 @@ fn main() {
             config,
             locked,
         } => cmd_lint(verbose, config, locked),
+        Command::Update => cmd_update(),
         Command::Clean => cmd_clean(),
         Command::Doctor => cmd_doctor(),
         Command::Toolchain { action } => cmd_toolchain(action),
@@ -378,6 +381,16 @@ fn cmd_lint(verbose: bool, config: Option<PathBuf>, locked: bool) -> CliResult {
     }
     eprintln!();
     Err(format!("lint found {} issue(s)", result.finding_count).into())
+}
+
+fn cmd_update() -> CliResult {
+    let root = project_root()?;
+    let result = konvoy_engine::update(&root)?;
+    eprintln!(
+        "    Updated {} dependencies in konvoy.lock",
+        result.updated_count
+    );
+    Ok(())
 }
 
 fn cmd_clean() -> CliResult {
@@ -835,6 +848,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_update() {
+        let cli = Cli::try_parse_from(["konvoy", "update"]).unwrap();
+        assert!(matches!(cli.command, Command::Update));
+    }
+
+    #[test]
     fn parse_toolchain_install_with_version() {
         let args = ["konvoy", "toolchain", "install", "2.1.0"];
         let cli = Cli::try_parse_from(args).unwrap();
@@ -1078,6 +1097,7 @@ mod tests {
             "run",
             "test",
             "lint",
+            "update",
             "clean",
             "doctor",
             "toolchain",
@@ -1180,6 +1200,18 @@ mod tests {
             }
             other => panic!("expected Lint, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn help_flag_on_update() {
+        let err = Cli::try_parse_from(["konvoy", "update", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn error_update_takes_no_args() {
+        let err = Cli::try_parse_from(["konvoy", "update", "--force"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
     }
 
     #[test]

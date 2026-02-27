@@ -164,4 +164,20 @@ pub enum EngineError {
         expected: String,
         actual: String,
     },
+
+    /// A Maven library artifact download failed.
+    #[error("failed to download library `{name}` from {url}: {message}")]
+    LibraryDownloadFailed {
+        name: String,
+        url: String,
+        message: String,
+    },
+
+    /// A dependency is not in the lockfile (user should run `konvoy update`).
+    #[error("dependency `{name}` not in lockfile — run `konvoy update` to resolve")]
+    MissingLockfileEntry { name: String },
+
+    /// A target hash is missing from the lockfile for a Maven dependency.
+    #[error("no hash for target `{target}` in lockfile for dependency `{name}` — run `konvoy update` to resolve")]
+    MissingTargetHash { name: String, target: String },
 }
