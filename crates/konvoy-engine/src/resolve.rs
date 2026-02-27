@@ -61,6 +61,9 @@ pub fn resolve_dependencies(
     let mut topo: Vec<PathBuf> = Vec::new();
 
     for (dep_name, dep_spec) in &manifest.dependencies {
+        if dep_spec.version.is_some() {
+            continue; // Maven deps are resolved separately
+        }
         let dep_path = resolve_dep_path(project_root, dep_name, dep_spec.path.as_deref())?;
 
         dfs(
@@ -165,9 +168,12 @@ fn dfs(
         });
     }
 
-    // Recurse into this dep's own dependencies.
+    // Recurse into this dep's own dependencies (skip Maven deps).
     let dep_names: Vec<String> = dep_manifest.dependencies.keys().cloned().collect();
     for (sub_name, sub_spec) in &dep_manifest.dependencies {
+        if sub_spec.version.is_some() {
+            continue; // Maven deps are resolved separately
+        }
         let sub_path = resolve_dep_path(canonical_path, sub_name, sub_spec.path.as_deref())?;
         dfs(
             sub_name,
@@ -906,6 +912,45 @@ mod tests {
         // All 4 deps accounted for.
         let total: usize = levels.iter().map(|l| l.len()).sum();
         assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn maven_deps_skipped_in_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // A path-based lib dependency
+        let lib_dir = tmp.path().join("my-lib");
+        write_manifest(&lib_dir, "my-lib", "lib", "");
+
+        // Root with both a path dep and a maven dep
+        let root_dir = tmp.path().join("root");
+        fs::create_dir_all(root_dir.join("src")).unwrap();
+        fs::write(root_dir.join("src/main.kt"), "fun main() {}").unwrap();
+        fs::write(
+            root_dir.join("konvoy.toml"),
+            r#"[package]
+name = "root"
+
+[toolchain]
+kotlin = "2.1.0"
+
+[dependencies]
+my-lib = { path = "../my-lib" }
+kotlinx-coroutines = { version = "1.8.0" }
+"#,
+        )
+        .unwrap();
+
+        let manifest = Manifest::from_path(&root_dir.join("konvoy.toml")).unwrap();
+        let graph = resolve_dependencies(&root_dir, &manifest).unwrap();
+
+        // Only the path dep should appear in the resolved graph
+        assert_eq!(graph.order.len(), 1);
+        assert_eq!(graph.order.first().unwrap().name, "my-lib");
+
+        // The maven dep should not appear
+        let has_maven = graph.order.iter().any(|d| d.name == "kotlinx-coroutines");
+        assert!(!has_maven, "Maven dep should not appear in resolved graph");
     }
 
     mod property_tests {

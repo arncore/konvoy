@@ -144,6 +144,14 @@ pub enum EngineError {
     #[error("invalid plugin `{name}` configuration: {reason}")]
     InvalidPluginConfig { name: String, reason: String },
 
+    /// A library descriptor is invalid.
+    #[error("invalid library descriptor `{name}`: {reason}")]
+    InvalidLibraryDescriptor { name: String, reason: String },
+
+    /// An unknown library was referenced in the manifest.
+    #[error("unknown library `{name}` — available libraries: {available}")]
+    UnknownLibrary { name: String, available: String },
+
     /// Plugin artifact download failed.
     #[error("cannot download plugin `{name}` artifact: {message}")]
     PluginDownload { name: String, message: String },
@@ -153,6 +161,30 @@ pub enum EngineError {
     PluginHashMismatch {
         name: String,
         artifact: String,
+        expected: String,
+        actual: String,
+    },
+
+    /// A Maven library artifact download failed.
+    #[error("cannot download library `{name}` from {url}: {message}")]
+    LibraryDownloadFailed {
+        name: String,
+        url: String,
+        message: String,
+    },
+
+    /// A dependency is not in the lockfile (user should run `konvoy update`).
+    #[error("dependency `{name}` not in lockfile — run `konvoy update` to resolve")]
+    MissingLockfileEntry { name: String },
+
+    /// A target hash is missing from the lockfile for a Maven dependency.
+    #[error("no hash for target `{target}` in lockfile for dependency `{name}` — run `konvoy update` to resolve")]
+    MissingTargetHash { name: String, target: String },
+
+    /// A library klib hash mismatch was detected after download.
+    #[error("library `{name}` klib hash mismatch — expected {expected}, got {actual}; run `konvoy update` to refresh")]
+    LibraryHashMismatch {
+        name: String,
         expected: String,
         actual: String,
     },

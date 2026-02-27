@@ -8,9 +8,11 @@ pub mod detekt;
 mod diagnostics;
 pub mod error;
 pub mod init;
+pub mod library;
 pub mod plugin;
 pub mod resolve;
 pub mod test_build;
+pub mod update;
 
 pub use artifact::{ArtifactStore, BuildMetadata};
 pub use build::{build, BuildOptions, BuildOutcome, BuildResult};
@@ -24,3 +26,4 @@ pub use plugin::{
 };
 pub use resolve::{resolve_dependencies, ResolvedGraph};
 pub use test_build::{build_tests, TestBuildResult, TestOptions};
+pub use update::{update, UpdateResult};

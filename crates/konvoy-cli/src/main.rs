@@ -99,6 +99,8 @@ enum Command {
         #[arg(long)]
         locked: bool,
     },
+    /// Resolve Maven dependencies and update konvoy.lock
+    Update,
     /// Remove build artifacts
     Clean,
     /// Check environment and toolchain setup
@@ -154,6 +156,7 @@ fn main() {
             config,
             locked,
         } => cmd_lint(verbose, config, locked),
+        Command::Update => cmd_update(),
         Command::Clean => cmd_clean(),
         Command::Doctor => cmd_doctor(),
         Command::Toolchain { action } => cmd_toolchain(action),
@@ -380,6 +383,16 @@ fn cmd_lint(verbose: bool, config: Option<PathBuf>, locked: bool) -> CliResult {
     Err(format!("lint found {} issue(s)", result.finding_count).into())
 }
 
+fn cmd_update() -> CliResult {
+    let root = project_root()?;
+    let result = konvoy_engine::update(&root)?;
+    eprintln!(
+        "    Updated {} dependencies in konvoy.lock",
+        result.updated_count
+    );
+    Ok(())
+}
+
 fn cmd_clean() -> CliResult {
     let root = project_root()?;
     let konvoy_dir = root.join(".konvoy");
@@ -459,6 +472,75 @@ fn cmd_doctor() -> CliResult {
                             issues = issues.saturating_add(1);
                         }
                     }
+                }
+
+                // Check Maven dependencies against curated library index.
+                let maven_deps: Vec<_> = manifest
+                    .dependencies
+                    .iter()
+                    .filter(|(_, spec)| spec.version.is_some())
+                    .collect();
+
+                if !maven_deps.is_empty() {
+                    for (dep_name, dep_spec) in &maven_deps {
+                        if let Some(ref dep_version) = dep_spec.version {
+                            match konvoy_engine::library::lookup(dep_name) {
+                                Ok(Some(_)) => {
+                                    eprintln!("  [ok] Library: {} {}", dep_name, dep_version);
+                                }
+                                Ok(None) => {
+                                    let available =
+                                        konvoy_engine::library::available_library_names()
+                                            .unwrap_or_else(|_| "none".to_owned());
+                                    eprintln!("  [!!] Library: unknown library '{}' — available libraries: {}", dep_name, available);
+                                    issues = issues.saturating_add(1);
+                                }
+                                Err(e) => {
+                                    eprintln!("  [!!] Library: {}: {}", dep_name, e);
+                                    issues = issues.saturating_add(1);
+                                }
+                            }
+                        }
+                    }
+
+                    // Check lockfile entries for Maven deps.
+                    let lockfile_path = cwd.join("konvoy.lock");
+                    if lockfile_path.exists() {
+                        match konvoy_config::lockfile::Lockfile::from_path(&lockfile_path) {
+                            Ok(lockfile) => {
+                                for (dep_name, _) in &maven_deps {
+                                    let has_entry = lockfile.dependencies.iter().any(|d| {
+                                        d.name == **dep_name
+                                            && matches!(
+                                                &d.source,
+                                                konvoy_config::lockfile::DepSource::Maven { .. }
+                                            )
+                                    });
+                                    if has_entry {
+                                        eprintln!("  [ok] Lockfile entry: {}", dep_name);
+                                    } else {
+                                        eprintln!("  [!!] Lockfile entry: '{}' not found — run 'konvoy update'", dep_name);
+                                        issues = issues.saturating_add(1);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("  [!!] Lockfile: {}", e);
+                                issues = issues.saturating_add(1);
+                            }
+                        }
+                    } else {
+                        eprintln!("  [!!] No konvoy.lock found — run 'konvoy update' to resolve Maven dependencies");
+                        issues = issues.saturating_add(1);
+                    }
+                }
+
+                // List available libraries.
+                match konvoy_engine::library::available_library_names() {
+                    Ok(names) if !names.is_empty() => {
+                        eprintln!("  Available libraries: {}", names);
+                    }
+                    _ => {}
                 }
             }
             Err(e) => {
@@ -835,6 +917,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_update() {
+        let cli = Cli::try_parse_from(["konvoy", "update"]).unwrap();
+        assert!(matches!(cli.command, Command::Update));
+    }
+
+    #[test]
     fn parse_toolchain_install_with_version() {
         let args = ["konvoy", "toolchain", "install", "2.1.0"];
         let cli = Cli::try_parse_from(args).unwrap();
@@ -1078,6 +1166,7 @@ mod tests {
             "run",
             "test",
             "lint",
+            "update",
             "clean",
             "doctor",
             "toolchain",
@@ -1180,6 +1269,18 @@ mod tests {
             }
             other => panic!("expected Lint, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn help_flag_on_update() {
+        let err = Cli::try_parse_from(["konvoy", "update", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn error_update_takes_no_args() {
+        let err = Cli::try_parse_from(["konvoy", "update", "--force"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
     }
 
     #[test]

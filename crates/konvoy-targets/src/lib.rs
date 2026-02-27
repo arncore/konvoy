@@ -10,6 +10,11 @@ use std::str::FromStr;
 /// All known Kotlin/Native targets supported by Konvoy.
 const KNOWN_TARGETS: &[&str] = &["linux_x64", "linux_arm64", "macos_x64", "macos_arm64"];
 
+/// Returns the list of all known Kotlin/Native target names.
+pub fn known_targets() -> &'static [&'static str] {
+    KNOWN_TARGETS
+}
+
 /// A Kotlin/Native compilation target.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Target {

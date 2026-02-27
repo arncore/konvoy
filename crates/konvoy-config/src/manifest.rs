@@ -67,7 +67,9 @@ pub struct DependencySpec {
     /// Path to the dependency project, relative to this manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    // Future: git, tag, branch, rev fields for git dependencies.
+    /// Maven dependency version requirement (e.g. "1.8.0").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 fn default_entrypoint() -> String {
@@ -155,11 +157,20 @@ fn validate(manifest: &Manifest, path: &str) -> Result<(), ManifestError> {
                 name: name.clone(),
             });
         }
-        if spec.path.is_none() {
-            return Err(ManifestError::DependencyNoSource {
-                path: path.to_owned(),
-                name: name.clone(),
-            });
+        match (&spec.path, &spec.version) {
+            (Some(_), Some(_)) => {
+                return Err(ManifestError::DependencyAmbiguousSource {
+                    path: path.to_owned(),
+                    name: name.clone(),
+                });
+            }
+            (None, None) => {
+                return Err(ManifestError::DependencyNoSource {
+                    path: path.to_owned(),
+                    name: name.clone(),
+                });
+            }
+            _ => {} // exactly one is set — valid
         }
     }
     Ok(())
@@ -225,8 +236,10 @@ pub enum ManifestError {
     InvalidEntrypoint { path: String, entrypoint: String },
     #[error("invalid [toolchain] in {path}: {message}")]
     InvalidToolchain { path: String, message: String },
-    #[error("dependency `{name}` has no source (set `path`) in {path}")]
+    #[error("dependency `{name}` has no source (set `path` or `version`) in {path}")]
     DependencyNoSource { path: String, name: String },
+    #[error("dependency `{name}` has both `path` and `version` set in {path} — use exactly one")]
+    DependencyAmbiguousSource { path: String, name: String },
     #[error("dependency name `{name}` contains invalid characters in {path}")]
     DependencyInvalidName { path: String, name: String },
     #[error("dependency `{name}` references itself in {path}")]
@@ -806,6 +819,97 @@ name = "no-plugins"
             !serialized.contains("[plugins]"),
             "serialized was: {serialized}"
         );
+    }
+
+    #[test]
+    fn parse_maven_dependency() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+kotlinx-coroutines = {{ version = "1.8.0" }}
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(manifest.dependencies.len(), 1);
+        let dep = manifest
+            .dependencies
+            .get("kotlinx-coroutines")
+            .unwrap_or_else(|| panic!("missing dep"));
+        assert_eq!(dep.version.as_deref(), Some("1.8.0"));
+        assert!(dep.path.is_none());
+    }
+
+    #[test]
+    fn reject_dependency_both_path_and_version() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+bad-dep = {{ path = "../x", version = "1.0" }}
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("both"), "error was: {err}");
+    }
+
+    #[test]
+    fn round_trip_with_maven_dep() {
+        let toml = format!(
+            r#"
+[package]
+name = "with-maven"
+{TOOLCHAIN}
+[dependencies]
+kotlinx-coroutines = {{ version = "1.8.0" }}
+"#
+        );
+        let original = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        let serialized = original.to_toml().unwrap_or_else(|e| panic!("{e}"));
+        let reparsed =
+            Manifest::from_str(&serialized, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(original, reparsed);
+    }
+
+    #[test]
+    fn mixed_path_and_maven_deps() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+my-local-lib = {{ path = "../my-lib" }}
+kotlinx-coroutines = {{ version = "1.8.0" }}
+kotlinx-datetime = {{ version = "0.6.0" }}
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(manifest.dependencies.len(), 3);
+        let local = manifest
+            .dependencies
+            .get("my-local-lib")
+            .unwrap_or_else(|| panic!("missing local dep"));
+        assert_eq!(local.path.as_deref(), Some("../my-lib"));
+        assert!(local.version.is_none());
+        let coroutines = manifest
+            .dependencies
+            .get("kotlinx-coroutines")
+            .unwrap_or_else(|| panic!("missing coroutines dep"));
+        assert_eq!(coroutines.version.as_deref(), Some("1.8.0"));
+        assert!(coroutines.path.is_none());
+        let datetime = manifest
+            .dependencies
+            .get("kotlinx-datetime")
+            .unwrap_or_else(|| panic!("missing datetime dep"));
+        assert_eq!(datetime.version.as_deref(), Some("0.6.0"));
+        assert!(datetime.path.is_none());
     }
 
     mod property_tests {

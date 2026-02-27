@@ -77,8 +77,9 @@ hello/
 - `konvoy run [--target <triple|host>] [--release] [--force] [--locked] [-- <args…>]` — build and run
 - `konvoy test [--target <triple|host>] [--release] [--verbose] [--force] [--locked] [--filter <pattern>]` — build and run tests
 - `konvoy lint [--verbose] [--config <path>] [--locked]` — run detekt static analysis on Kotlin sources
+- `konvoy update` — resolve Maven dependencies and update `konvoy.lock`
 - `konvoy clean` — remove build artifacts
-- `konvoy doctor` — check environment and toolchain setup
+- `konvoy doctor` — check environment, toolchain, and dependency setup
 - `konvoy toolchain install [<version>]` — install a Kotlin/Native version
 - `konvoy toolchain list` — list installed toolchain versions
 
@@ -118,15 +119,13 @@ See [docs/code-style.md](docs/code-style.md) for coding conventions.
 
 ## Dependencies
 
-Library projects can depend on other Konvoy projects via path dependencies:
+Konvoy supports two kinds of dependencies: **path dependencies** (local projects) and **Maven dependencies** (external libraries from Maven Central).
+
+### Path dependencies
+
+Depend on other Konvoy projects via relative paths:
 
 ```toml
-[package]
-name = "my-app"
-
-[toolchain]
-kotlin = "2.1.0"
-
 [dependencies]
 my-utils = { path = "../my-utils" }
 ```
@@ -138,6 +137,61 @@ my-utils/
   konvoy.toml
   src/
     lib.kt
+```
+
+### Maven dependencies
+
+Depend on external Kotlin/Native libraries from Maven Central using a curated library index:
+
+```toml
+[package]
+name = "my-app"
+
+[toolchain]
+kotlin = "2.1.0"
+
+[dependencies]
+kotlinx-coroutines = { version = "1.8.0" }
+kotlinx-datetime = { version = "0.6.0" }
+my-utils = { path = "../my-utils" }
+```
+
+After adding a Maven dependency, run `konvoy update` to resolve versions and populate `konvoy.lock` with per-target SHA-256 hashes. At build time, only the klib for your current target is downloaded — subsequent builds use the cached artifact.
+
+```
+konvoy update    # resolve deps, download klibs, write hashes to konvoy.lock
+konvoy build     # downloads only the klib needed for your host target
+```
+
+Each dependency must have exactly one of `path` or `version` — not both.
+
+### Available libraries
+
+Konvoy ships with a curated index of popular Kotlin/Native libraries:
+
+| Name | Maven artifact |
+|------|---------------|
+| `kotlinx-coroutines` | `org.jetbrains.kotlinx:kotlinx-coroutines-core` |
+| `kotlinx-datetime` | `org.jetbrains.kotlinx:kotlinx-datetime` |
+| `kotlinx-io` | `org.jetbrains.kotlinx:kotlinx-io-core` |
+| `kotlinx-atomicfu` | `org.jetbrains.kotlinx:atomicfu` |
+
+Run `konvoy doctor` to see the full list of available libraries.
+
+### Plugins
+
+Konvoy supports compiler plugins via the `[plugins]` section. Plugins are data-driven — no scripting or build DSL:
+
+```toml
+[plugins]
+serialization = { version = "2.1.0" }
+```
+
+Plugins are resolved alongside toolchain downloads. The `serialization` plugin automatically includes the `core` runtime module; additional modules (e.g., `json`, `cbor`) can be enabled:
+
+```toml
+[plugins]
+serialization = { version = "2.1.0", modules = ["json"] }
 ```
 
 ## Testing
@@ -220,7 +274,8 @@ konvoy lint --verbose              # show raw detekt output
 1. ~~**MVP:** host-native executable build/run + cache~~ done
 2. ~~**Tests:** built-in test framework using `kotlin.test`~~ done
 3. ~~**Targets:** explicit target triples~~ done
-4. **Dependencies:** ~~path~~ done → git → url+sha → registry
+4. **Dependencies:** ~~path~~ done → ~~Maven Central~~ done → git → url+sha → registry
 5. ~~**Toolchain install/pinning**~~ done
 6. ~~**Linting:** detekt integration~~ done
-7. **Remote cache** (later)
+7. ~~**Plugins:** data-driven compiler plugins (serialization)~~ done
+8. **Remote cache** (later)

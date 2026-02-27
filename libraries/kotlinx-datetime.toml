@@ -1,0 +1,1 @@
+maven = "org.jetbrains.kotlinx:kotlinx-datetime-{target}:{version}:klib"
