@@ -35,8 +35,8 @@ pub enum EngineError {
     Target(#[from] konvoy_targets::TargetError),
 
     /// Lockfile error.
-    #[error("lockfile error: {0}")]
-    Lockfile(String),
+    #[error("{0}")]
+    Lockfile(#[from] konvoy_config::lockfile::LockfileError),
 
     /// No source files found.
     #[error("no .kt source files found in {dir}")]

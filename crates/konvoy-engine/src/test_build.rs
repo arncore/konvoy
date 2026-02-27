@@ -59,8 +59,7 @@ pub fn build_tests(
     let manifest = Manifest::from_path(&manifest_path)?;
 
     let lockfile_path = project_root.join("konvoy.lock");
-    let lockfile =
-        Lockfile::from_path(&lockfile_path).map_err(|e| EngineError::Lockfile(e.to_string()))?;
+    let lockfile = Lockfile::from_path(&lockfile_path)?;
 
     let target = resolve_target(&options.target)?;
     let profile = if options.release { "release" } else { "debug" };
