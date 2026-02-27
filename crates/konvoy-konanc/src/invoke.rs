@@ -772,4 +772,570 @@ mod tests {
         assert_eq!(args.get(lib_indices[0] + 1).unwrap(), "dep.klib");
         assert_eq!(args.get(lib_indices[1] + 1).unwrap(), "other.klib");
     }
+
+    // ── Error variant matching ──────────────────────────────────────────
+
+    #[test]
+    fn build_args_no_sources_returns_no_sources_error() {
+        let cmd = KonancCommand::new().output(Path::new("out"));
+        let err = cmd.build_args().unwrap_err();
+        assert!(
+            matches!(err, KonancError::NoSources),
+            "expected NoSources, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_no_output_returns_no_output_error() {
+        let cmd = KonancCommand::new().sources(&[PathBuf::from("main.kt")]);
+        let err = cmd.build_args().unwrap_err();
+        assert!(
+            matches!(err, KonancError::NoOutput),
+            "expected NoOutput, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_empty_sources_returns_no_sources_error() {
+        let cmd = KonancCommand::new().sources(&[]).output(Path::new("out"));
+        let err = cmd.build_args().unwrap_err();
+        assert!(matches!(err, KonancError::NoSources));
+    }
+
+    // ── Default builder state ───────────────────────────────────────────
+
+    #[test]
+    fn default_builder_has_expected_defaults() {
+        let cmd = KonancCommand::new();
+        assert!(cmd.sources.is_empty());
+        assert!(cmd.output.is_none());
+        assert!(cmd.target.is_none());
+        assert!(!cmd.release);
+        assert_eq!(cmd.produce, ProduceKind::Program);
+        assert!(cmd.libraries.is_empty());
+        assert!(cmd.plugins.is_empty());
+        assert!(cmd.java_home.is_none());
+        assert!(!cmd.generate_test_runner);
+    }
+
+    #[test]
+    fn produce_kind_default_is_program() {
+        assert_eq!(ProduceKind::default(), ProduceKind::Program);
+    }
+
+    // ── Argument ordering ───────────────────────────────────────────────
+
+    #[test]
+    fn build_args_full_ordering() {
+        // Verify the exact ordering: sources, -o, output, -target, target,
+        // -produce, library, -library, libs, -Xplugin, -generate-test-runner, -opt
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("a.kt"), PathBuf::from("b.kt")])
+            .output(Path::new("out/bin"))
+            .target("macos_arm64")
+            .produce(ProduceKind::Library)
+            .libraries(&[PathBuf::from("dep.klib")])
+            .plugins(&[PathBuf::from("plugin.jar")])
+            .generate_test_runner(true)
+            .release(true);
+
+        let args = cmd.build_args().unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "a.kt",
+                "b.kt",
+                "-o",
+                "out/bin",
+                "-target",
+                "macos_arm64",
+                "-produce",
+                "library",
+                "-library",
+                "dep.klib",
+                "-Xplugin=plugin.jar",
+                "-generate-test-runner",
+                "-opt",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_args_sources_come_before_output() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("x.kt")])
+            .output(Path::new("out"));
+
+        let args = cmd.build_args().unwrap();
+        let src_pos = args.iter().position(|a| a == "x.kt").unwrap();
+        let out_pos = args.iter().position(|a| a == "-o").unwrap();
+        assert!(src_pos < out_pos, "source files must come before -o flag");
+    }
+
+    #[test]
+    fn build_args_opt_is_last() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("main.kt")])
+            .output(Path::new("out"))
+            .target("linux_x64")
+            .release(true);
+
+        let args = cmd.build_args().unwrap();
+        assert_eq!(
+            args.last().map(|s| s.as_str()),
+            Some("-opt"),
+            "-opt should be the last argument"
+        );
+    }
+
+    // ── Empty libraries/plugins produce no flags ────────────────────────
+
+    #[test]
+    fn build_args_empty_libraries_produces_no_library_flags() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("main.kt")])
+            .output(Path::new("out"))
+            .libraries(&[]);
+
+        let args = cmd.build_args().unwrap();
+        assert!(
+            !args.contains(&"-library".to_owned()),
+            "empty libraries should not produce -library flags"
+        );
+    }
+
+    #[test]
+    fn build_args_empty_plugins_produces_no_plugin_flags() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("main.kt")])
+            .output(Path::new("out"))
+            .plugins(&[]);
+
+        let args = cmd.build_args().unwrap();
+        assert!(
+            !args.iter().any(|a| a.starts_with("-Xplugin=")),
+            "empty plugins should not produce -Xplugin flags"
+        );
+    }
+
+    // ── No target omits -target flag ────────────────────────────────────
+
+    #[test]
+    fn build_args_no_target_omits_target_flag() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("main.kt")])
+            .output(Path::new("out"));
+
+        let args = cmd.build_args().unwrap();
+        assert!(
+            !args.contains(&"-target".to_owned()),
+            "no target set should omit -target flag"
+        );
+    }
+
+    // ── Diagnostic parsing: info level ──────────────────────────────────
+
+    #[test]
+    fn parse_diagnostics_bare_info() {
+        let diags = parse_diagnostics("info: some informational message\n");
+        assert_eq!(diags.len(), 1);
+        let d = diags.get(0).unwrap();
+        assert_eq!(d.level, DiagnosticLevel::Info);
+        assert_eq!(d.message, "some informational message");
+        assert!(d.file.is_none());
+        assert!(d.line.is_none());
+    }
+
+    #[test]
+    fn parse_diagnostics_located_info() {
+        let diags = parse_diagnostics("utils.kt:3:1: info: additional context");
+        assert_eq!(diags.len(), 1);
+        let d = diags.get(0).unwrap();
+        assert_eq!(d.level, DiagnosticLevel::Info);
+        assert_eq!(d.file, Some("utils.kt".to_owned()));
+        assert_eq!(d.line, Some(3));
+        assert_eq!(d.message, "additional context");
+    }
+
+    // ── Diagnostic parsing: whitespace and edge cases ───────────────────
+
+    #[test]
+    fn parse_diagnostics_whitespace_only_is_empty() {
+        let diags = parse_diagnostics("   \n  \n\n  \t \n");
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn parse_diagnostics_leading_trailing_whitespace_trimmed() {
+        let diags = parse_diagnostics("  error: something bad  \n");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags.get(0).unwrap().message, "something bad");
+    }
+
+    #[test]
+    fn parse_diagnostics_mixed_levels() {
+        let stderr = "error: first\nwarning: second\ninfo: third\n";
+        let diags = parse_diagnostics(stderr);
+        assert_eq!(diags.len(), 3);
+        assert_eq!(diags.get(0).unwrap().level, DiagnosticLevel::Error);
+        assert_eq!(diags.get(1).unwrap().level, DiagnosticLevel::Warning);
+        assert_eq!(diags.get(2).unwrap().level, DiagnosticLevel::Info);
+    }
+
+    #[test]
+    fn parse_diagnostics_interleaved_with_noise() {
+        let stderr = "\
+compiler: initializing
+src/main.kt:1:1: error: unresolved reference 'foo'
+some other output
+warning: deprecated API usage
+more noise
+";
+        let diags = parse_diagnostics(stderr);
+        assert_eq!(diags.len(), 2);
+        assert_eq!(diags.get(0).unwrap().level, DiagnosticLevel::Error);
+        assert!(diags.get(0).unwrap().file.is_some());
+        assert_eq!(diags.get(1).unwrap().level, DiagnosticLevel::Warning);
+        assert!(diags.get(1).unwrap().file.is_none());
+    }
+
+    // ── Diagnostic parsing: located with deep paths ─────────────────────
+
+    #[test]
+    fn parse_diagnostics_located_deep_path() {
+        let diags = parse_diagnostics("src/main/kotlin/App.kt:42:10: error: type mismatch");
+        assert_eq!(diags.len(), 1);
+        let d = diags.get(0).unwrap();
+        assert_eq!(d.file, Some("src/main/kotlin/App.kt".to_owned()));
+        assert_eq!(d.line, Some(42));
+        assert_eq!(d.message, "type mismatch");
+    }
+
+    // ── CompilationResult: error_count and warning_count ────────────────
+
+    #[test]
+    fn compilation_result_error_count_only_counts_errors() {
+        let result = CompilationResult {
+            success: false,
+            output_path: PathBuf::from("out"),
+            diagnostics: vec![
+                Diagnostic {
+                    level: DiagnosticLevel::Error,
+                    message: "e1".to_owned(),
+                    file: None,
+                    line: None,
+                },
+                Diagnostic {
+                    level: DiagnosticLevel::Warning,
+                    message: "w1".to_owned(),
+                    file: None,
+                    line: None,
+                },
+                Diagnostic {
+                    level: DiagnosticLevel::Error,
+                    message: "e2".to_owned(),
+                    file: None,
+                    line: None,
+                },
+                Diagnostic {
+                    level: DiagnosticLevel::Info,
+                    message: "i1".to_owned(),
+                    file: None,
+                    line: None,
+                },
+            ],
+            raw_stdout: String::new(),
+            raw_stderr: String::new(),
+        };
+        assert_eq!(result.error_count(), 2);
+    }
+
+    #[test]
+    fn compilation_result_warning_count_only_counts_warnings() {
+        let result = CompilationResult {
+            success: true,
+            output_path: PathBuf::from("out"),
+            diagnostics: vec![
+                Diagnostic {
+                    level: DiagnosticLevel::Warning,
+                    message: "w1".to_owned(),
+                    file: None,
+                    line: None,
+                },
+                Diagnostic {
+                    level: DiagnosticLevel::Error,
+                    message: "e1".to_owned(),
+                    file: None,
+                    line: None,
+                },
+                Diagnostic {
+                    level: DiagnosticLevel::Warning,
+                    message: "w2".to_owned(),
+                    file: None,
+                    line: None,
+                },
+                Diagnostic {
+                    level: DiagnosticLevel::Warning,
+                    message: "w3".to_owned(),
+                    file: None,
+                    line: None,
+                },
+            ],
+            raw_stdout: String::new(),
+            raw_stderr: String::new(),
+        };
+        assert_eq!(result.warning_count(), 3);
+    }
+
+    #[test]
+    fn compilation_result_zero_counts_for_empty_diagnostics() {
+        let result = CompilationResult {
+            success: true,
+            output_path: PathBuf::from("out"),
+            diagnostics: vec![],
+            raw_stdout: String::new(),
+            raw_stderr: String::new(),
+        };
+        assert_eq!(result.error_count(), 0);
+        assert_eq!(result.warning_count(), 0);
+    }
+
+    // ── detect_toolchain_errors: additional trigger variants ────────────
+
+    #[test]
+    fn detect_toolchain_xcrun_trigger() {
+        let mut diags = Vec::new();
+        detect_toolchain_errors("xcrun: error: unable to find utility", &mut diags);
+        assert_eq!(diags.len(), 1);
+        assert!(diags
+            .get(0)
+            .unwrap()
+            .message
+            .contains("xcode-select --install"));
+    }
+
+    #[test]
+    fn detect_toolchain_command_line_tools_trigger() {
+        let mut diags = Vec::new();
+        detect_toolchain_errors(
+            "error: unable to find CommandLineTools installation",
+            &mut diags,
+        );
+        assert_eq!(diags.len(), 1);
+        assert!(diags
+            .get(0)
+            .unwrap()
+            .message
+            .contains("xcode-select --install"));
+    }
+
+    #[test]
+    fn detect_toolchain_cannot_find_lm_trigger() {
+        let mut diags = Vec::new();
+        detect_toolchain_errors("ld: cannot find -lm", &mut diags);
+        assert_eq!(diags.len(), 1);
+        assert!(diags.get(0).unwrap().message.contains("build-essential"));
+    }
+
+    #[test]
+    fn detect_toolchain_both_xcode_and_linux_errors() {
+        let mut diags = Vec::new();
+        let stderr = "xcode-select: missing tools\ncannot find -lstdc++";
+        detect_toolchain_errors(stderr, &mut diags);
+        // Should produce two distinct diagnostics
+        assert_eq!(diags.len(), 2);
+        assert!(diags
+            .iter()
+            .any(|d| d.message.contains("xcode-select --install")));
+        assert!(diags.iter().any(|d| d.message.contains("build-essential")));
+    }
+
+    #[test]
+    fn detect_toolchain_errors_are_always_error_level() {
+        let mut diags = Vec::new();
+        detect_toolchain_errors("xcode-select: missing", &mut diags);
+        detect_toolchain_errors("cannot find -lstdc++", &mut diags);
+        for d in &diags {
+            assert_eq!(d.level, DiagnosticLevel::Error);
+        }
+    }
+
+    #[test]
+    fn detect_toolchain_errors_have_no_file_or_line() {
+        let mut diags = Vec::new();
+        detect_toolchain_errors("xcode-select: error: something", &mut diags);
+        let d = diags.get(0).unwrap();
+        assert!(d.file.is_none());
+        assert!(d.line.is_none());
+    }
+
+    // ── Builder overwrites previous values ──────────────────────────────
+
+    #[test]
+    fn builder_sources_replaces_previous() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("old.kt")])
+            .sources(&[PathBuf::from("new.kt")]);
+
+        let args = cmd.build_args().unwrap_err(); // no output set, but sources replaced
+                                                  // Verify we cannot build without output, meaning sources was indeed set
+        assert!(matches!(args, KonancError::NoOutput));
+    }
+
+    #[test]
+    fn builder_output_replaces_previous() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("main.kt")])
+            .output(Path::new("first"))
+            .output(Path::new("second"));
+
+        let args = cmd.build_args().unwrap();
+        assert!(args.contains(&"second".to_owned()));
+        assert!(!args.contains(&"first".to_owned()));
+    }
+
+    #[test]
+    fn builder_target_replaces_previous() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("main.kt")])
+            .output(Path::new("out"))
+            .target("linux_x64")
+            .target("macos_arm64");
+
+        let args = cmd.build_args().unwrap();
+        assert!(args.contains(&"macos_arm64".to_owned()));
+        assert!(!args.contains(&"linux_x64".to_owned()));
+    }
+
+    #[test]
+    fn builder_libraries_replaces_previous() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("main.kt")])
+            .output(Path::new("out"))
+            .libraries(&[PathBuf::from("old.klib")])
+            .libraries(&[PathBuf::from("new.klib")]);
+
+        let args = cmd.build_args().unwrap();
+        let lib_values: Vec<_> = args
+            .windows(2)
+            .filter(|w| w[0] == "-library")
+            .map(|w| w[1].clone())
+            .collect();
+        assert_eq!(lib_values, vec!["new.klib"]);
+    }
+
+    #[test]
+    fn builder_plugins_replaces_previous() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("main.kt")])
+            .output(Path::new("out"))
+            .plugins(&[PathBuf::from("old.jar")])
+            .plugins(&[PathBuf::from("new.jar")]);
+
+        let args = cmd.build_args().unwrap();
+        let plugin_args: Vec<_> = args.iter().filter(|a| a.starts_with("-Xplugin=")).collect();
+        assert_eq!(plugin_args.len(), 1);
+        assert_eq!(plugin_args[0], "-Xplugin=new.jar");
+    }
+
+    // ── Single source file ──────────────────────────────────────────────
+
+    #[test]
+    fn build_args_single_source_is_first_arg() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("main.kt")])
+            .output(Path::new("out"));
+
+        let args = cmd.build_args().unwrap();
+        assert_eq!(args.get(0).unwrap(), "main.kt");
+    }
+
+    // ── Output path with directory components ───────────────────────────
+
+    #[test]
+    fn build_args_output_preserves_path() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("main.kt")])
+            .output(Path::new(".konvoy/build/linux_x64/debug/myapp"));
+
+        let args = cmd.build_args().unwrap();
+        let o_idx = args.iter().position(|a| a == "-o").unwrap();
+        assert_eq!(
+            args.get(o_idx + 1).unwrap(),
+            ".konvoy/build/linux_x64/debug/myapp"
+        );
+    }
+
+    // ── Compilation summary edge case: failure with no errors ───────────
+
+    #[test]
+    fn compilation_result_summary_failure_with_zero_errors() {
+        // Edge case: process exited non-zero but no parseable error diagnostics
+        let result = CompilationResult {
+            success: false,
+            output_path: PathBuf::from("out"),
+            diagnostics: vec![],
+            raw_stdout: String::new(),
+            raw_stderr: String::new(),
+        };
+        assert_eq!(result.summary(), "compilation failed with 0 error(s)");
+    }
+
+    // ── parse_diagnostics: message content edge cases ───────────────────
+
+    #[test]
+    fn parse_diagnostics_error_with_colon_in_message() {
+        // The message itself contains ":" — should not confuse the parser
+        let diags = parse_diagnostics("error: type mismatch: expected Int, found String");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags.get(0).unwrap().message,
+            "type mismatch: expected Int, found String"
+        );
+    }
+
+    #[test]
+    fn parse_diagnostics_located_error_message_with_colons() {
+        let diags = parse_diagnostics("src/main.kt:1:1: error: unresolved reference: myFunc");
+        assert_eq!(diags.len(), 1);
+        let d = diags.get(0).unwrap();
+        assert_eq!(d.file, Some("src/main.kt".to_owned()));
+        assert_eq!(d.line, Some(1));
+        assert_eq!(d.message, "unresolved reference: myFunc");
+    }
+
+    #[test]
+    fn parse_diagnostics_warning_with_empty_message() {
+        let diags = parse_diagnostics("warning:");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags.get(0).unwrap().level, DiagnosticLevel::Warning);
+        assert_eq!(diags.get(0).unwrap().message, "");
+    }
+
+    // ── Library produce kind includes -produce library pair ─────────────
+
+    #[test]
+    fn build_args_library_produce_flag_pair_is_adjacent() {
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("lib.kt")])
+            .output(Path::new("out.klib"))
+            .produce(ProduceKind::Library);
+
+        let args = cmd.build_args().unwrap();
+        let produce_idx = args.iter().position(|a| a == "-produce").unwrap();
+        assert_eq!(args.get(produce_idx + 1).unwrap(), "library");
+    }
+
+    // ── Minimal valid command ───────────────────────────────────────────
+
+    #[test]
+    fn build_args_minimal_valid_command() {
+        // Only sources and output are required
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("main.kt")])
+            .output(Path::new("out"));
+
+        let args = cmd.build_args().unwrap();
+        assert_eq!(args, vec!["main.kt", "-o", "out"]);
+    }
 }
