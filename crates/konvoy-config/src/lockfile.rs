@@ -56,8 +56,14 @@ pub struct DependencyLock {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase", tag = "source_type")]
 pub enum DepSource {
-    Path { path: String },
-    // Future: Git { url: String, commit: String },
+    Path {
+        path: String,
+    },
+    Maven {
+        version: String,
+        maven_coordinate: String,
+        targets: std::collections::BTreeMap<String, String>,
+    },
 }
 
 impl Lockfile {
@@ -434,6 +440,117 @@ konanc_version = "2.1.0"
     /// Create a unique temporary directory that is auto-cleaned on drop.
     fn make_test_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn round_trip_with_maven_dep() {
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "aabbccdd".to_owned());
+        targets.insert("macos_arm64".to_owned(), "11223344".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-coroutines".to_owned(),
+            source: DepSource::Maven {
+                version: "1.8.0".to_owned(),
+                maven_coordinate: "org.jetbrains.kotlinx:kotlinx-coroutines-core-{target}:1.8.0:klib".to_owned(),
+                targets,
+            },
+            source_hash: "maven-hash-1234".to_owned(),
+        });
+        lockfile.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
+        let reparsed = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(lockfile, reparsed);
+        assert_eq!(reparsed.dependencies.len(), 1);
+        let dep = reparsed
+            .dependencies
+            .first()
+            .unwrap_or_else(|| panic!("missing dep"));
+        assert_eq!(dep.name, "kotlinx-coroutines");
+        match &dep.source {
+            DepSource::Maven {
+                version,
+                maven_coordinate,
+                targets,
+            } => {
+                assert_eq!(version, "1.8.0");
+                assert!(maven_coordinate.contains("kotlinx-coroutines"));
+                assert_eq!(targets.len(), 2);
+                assert_eq!(targets.get("linux_x64").unwrap(), "aabbccdd");
+                assert_eq!(targets.get("macos_arm64").unwrap(), "11223344");
+            }
+            other => panic!("expected Maven source, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maven_dep_serialization_format() {
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "deadbeef".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-datetime".to_owned(),
+            source: DepSource::Maven {
+                version: "0.6.0".to_owned(),
+                maven_coordinate: "org.jetbrains.kotlinx:kotlinx-datetime-{target}:0.6.0:klib".to_owned(),
+                targets,
+            },
+            source_hash: "hash-5678".to_owned(),
+        });
+        let content = toml::to_string_pretty(&lockfile).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            content.contains("source_type = \"maven\""),
+            "content was: {content}"
+        );
+        assert!(
+            content.contains("version = \"0.6.0\""),
+            "content was: {content}"
+        );
+        assert!(
+            content.contains("maven_coordinate"),
+            "content was: {content}"
+        );
+        assert!(
+            content.contains("[dependencies.targets]")
+                || content.contains("targets")
+                    && content.contains("linux_x64"),
+            "content was: {content}"
+        );
+    }
+
+    #[test]
+    fn backward_compat_path_deps_still_work() {
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        fs::write(
+            &path,
+            r#"
+[toolchain]
+konanc_version = "2.1.0"
+
+[[dependencies]]
+name = "my-utils"
+source_type = "path"
+path = "../my-utils"
+source_hash = "abcdef1234"
+"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        let lockfile = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(lockfile.dependencies.len(), 1);
+        let dep = lockfile
+            .dependencies
+            .first()
+            .unwrap_or_else(|| panic!("missing dep"));
+        assert_eq!(dep.name, "my-utils");
+        match &dep.source {
+            DepSource::Path { path } => {
+                assert_eq!(path, "../my-utils");
+            }
+            other => panic!("expected Path source, got: {other:?}"),
+        }
     }
 
     mod property_tests {
