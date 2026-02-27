@@ -576,14 +576,14 @@ test_update_preserves_path_deps() {
     cd update-preserve
     konvoy build >/dev/null 2>&1
     assert_file_contains konvoy.lock "path-lib"
-    assert_file_contains konvoy.lock "../path-lib"
+    assert_file_contains konvoy.lock 'source_type = "path"'
 
     # Now add a Maven dep and run update — path dep should be preserved.
     printf 'kotlinx-datetime = { version = "0.6.0" }\n' >> konvoy.toml
     konvoy update >/dev/null 2>&1
     assert_file_contains konvoy.lock "path-lib"
+    assert_file_contains konvoy.lock 'source_type = "path"'
     assert_file_contains konvoy.lock "kotlinx-datetime"
-    assert_file_contains konvoy.lock "../path-lib"
 }
 
 test_update_unknown_library_fails() {
