@@ -6,11 +6,16 @@ use sha2::{Digest, Sha256};
 
 use crate::error::UtilError;
 
+/// Format a finalized SHA-256 hasher as a lowercase hex string.
+pub(crate) fn finalize_hex(hasher: Sha256) -> String {
+    format!("{:x}", hasher.finalize())
+}
+
 /// Compute the SHA-256 hex digest of a byte slice.
 pub fn sha256_bytes(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    finalize_hex(hasher)
 }
 
 /// Compute the SHA-256 hex digest of a file using streaming reads.
@@ -41,7 +46,7 @@ pub fn sha256_file(path: &Path) -> Result<String, UtilError> {
         };
         hasher.update(chunk);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(finalize_hex(hasher))
 }
 
 /// Hash all files matching `pattern` inside `dir`, sorted by relative path for determinism.
@@ -80,7 +85,7 @@ pub fn sha256_dir(dir: &Path, pattern: &str) -> Result<String, UtilError> {
         hasher.update(&data);
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(finalize_hex(hasher))
 }
 
 /// Combine multiple string parts into a single composite SHA-256 hash.
@@ -94,7 +99,7 @@ pub fn sha256_multi(parts: &[&str]) -> String {
         hasher.update(len_bytes);
         hasher.update(part.as_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    finalize_hex(hasher)
 }
 
 #[cfg(test)]
