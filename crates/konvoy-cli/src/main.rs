@@ -473,6 +473,75 @@ fn cmd_doctor() -> CliResult {
                         }
                     }
                 }
+
+                // Check Maven dependencies against curated library index.
+                let maven_deps: Vec<_> = manifest
+                    .dependencies
+                    .iter()
+                    .filter(|(_, spec)| spec.version.is_some())
+                    .collect();
+
+                if !maven_deps.is_empty() {
+                    for (dep_name, dep_spec) in &maven_deps {
+                        if let Some(ref dep_version) = dep_spec.version {
+                            match konvoy_engine::library::lookup(dep_name) {
+                                Ok(Some(_)) => {
+                                    eprintln!("  [ok] Library: {} {}", dep_name, dep_version);
+                                }
+                                Ok(None) => {
+                                    let available =
+                                        konvoy_engine::library::available_library_names()
+                                            .unwrap_or_else(|_| "none".to_owned());
+                                    eprintln!("  [!!] Library: unknown library '{}' — available libraries: {}", dep_name, available);
+                                    issues = issues.saturating_add(1);
+                                }
+                                Err(e) => {
+                                    eprintln!("  [!!] Library: {}: {}", dep_name, e);
+                                    issues = issues.saturating_add(1);
+                                }
+                            }
+                        }
+                    }
+
+                    // Check lockfile entries for Maven deps.
+                    let lockfile_path = cwd.join("konvoy.lock");
+                    if lockfile_path.exists() {
+                        match konvoy_config::lockfile::Lockfile::from_path(&lockfile_path) {
+                            Ok(lockfile) => {
+                                for (dep_name, _) in &maven_deps {
+                                    let has_entry = lockfile.dependencies.iter().any(|d| {
+                                        d.name == **dep_name
+                                            && matches!(
+                                                &d.source,
+                                                konvoy_config::lockfile::DepSource::Maven { .. }
+                                            )
+                                    });
+                                    if has_entry {
+                                        eprintln!("  [ok] Lockfile entry: {}", dep_name);
+                                    } else {
+                                        eprintln!("  [!!] Lockfile entry: '{}' not found — run 'konvoy update'", dep_name);
+                                        issues = issues.saturating_add(1);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("  [!!] Lockfile: {}", e);
+                                issues = issues.saturating_add(1);
+                            }
+                        }
+                    } else {
+                        eprintln!("  [!!] No konvoy.lock found — run 'konvoy update' to resolve Maven dependencies");
+                        issues = issues.saturating_add(1);
+                    }
+                }
+
+                // List available libraries.
+                match konvoy_engine::library::available_library_names() {
+                    Ok(names) if !names.is_empty() => {
+                        eprintln!("  Available libraries: {}", names);
+                    }
+                    _ => {}
+                }
             }
             Err(e) => {
                 eprintln!("  [!!] konvoy.toml: {e}");
