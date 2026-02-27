@@ -797,9 +797,7 @@ mod tests {
 
     #[test]
     fn build_args_empty_sources_returns_no_sources_error() {
-        let cmd = KonancCommand::new()
-            .sources(&[])
-            .output(Path::new("out"));
+        let cmd = KonancCommand::new().sources(&[]).output(Path::new("out"));
         let err = cmd.build_args().unwrap_err();
         assert!(matches!(err, KonancError::NoSources));
     }
@@ -871,10 +869,7 @@ mod tests {
         let args = cmd.build_args().unwrap();
         let src_pos = args.iter().position(|a| a == "x.kt").unwrap();
         let out_pos = args.iter().position(|a| a == "-o").unwrap();
-        assert!(
-            src_pos < out_pos,
-            "source files must come before -o flag"
-        );
+        assert!(src_pos < out_pos, "source files must come before -o flag");
     }
 
     #[test]
@@ -1008,8 +1003,7 @@ more noise
 
     #[test]
     fn parse_diagnostics_located_deep_path() {
-        let diags =
-            parse_diagnostics("src/main/kotlin/App.kt:42:10: error: type mismatch");
+        let diags = parse_diagnostics("src/main/kotlin/App.kt:42:10: error: type mismatch");
         assert_eq!(diags.len(), 1);
         let d = diags.get(0).unwrap();
         assert_eq!(d.file, Some("src/main/kotlin/App.kt".to_owned()));
@@ -1113,7 +1107,11 @@ more noise
         let mut diags = Vec::new();
         detect_toolchain_errors("xcrun: error: unable to find utility", &mut diags);
         assert_eq!(diags.len(), 1);
-        assert!(diags.get(0).unwrap().message.contains("xcode-select --install"));
+        assert!(diags
+            .get(0)
+            .unwrap()
+            .message
+            .contains("xcode-select --install"));
     }
 
     #[test]
@@ -1124,7 +1122,11 @@ more noise
             &mut diags,
         );
         assert_eq!(diags.len(), 1);
-        assert!(diags.get(0).unwrap().message.contains("xcode-select --install"));
+        assert!(diags
+            .get(0)
+            .unwrap()
+            .message
+            .contains("xcode-select --install"));
     }
 
     #[test]
@@ -1142,7 +1144,9 @@ more noise
         detect_toolchain_errors(stderr, &mut diags);
         // Should produce two distinct diagnostics
         assert_eq!(diags.len(), 2);
-        assert!(diags.iter().any(|d| d.message.contains("xcode-select --install")));
+        assert!(diags
+            .iter()
+            .any(|d| d.message.contains("xcode-select --install")));
         assert!(diags.iter().any(|d| d.message.contains("build-essential")));
     }
 
@@ -1174,7 +1178,7 @@ more noise
             .sources(&[PathBuf::from("new.kt")]);
 
         let args = cmd.build_args().unwrap_err(); // no output set, but sources replaced
-        // Verify we cannot build without output, meaning sources was indeed set
+                                                  // Verify we cannot build without output, meaning sources was indeed set
         assert!(matches!(args, KonancError::NoOutput));
     }
 
@@ -1292,9 +1296,7 @@ more noise
 
     #[test]
     fn parse_diagnostics_located_error_message_with_colons() {
-        let diags = parse_diagnostics(
-            "src/main.kt:1:1: error: unresolved reference: myFunc",
-        );
+        let diags = parse_diagnostics("src/main.kt:1:1: error: unresolved reference: myFunc");
         assert_eq!(diags.len(), 1);
         let d = diags.get(0).unwrap();
         assert_eq!(d.file, Some("src/main.kt".to_owned()));
