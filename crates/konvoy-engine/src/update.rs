@@ -41,8 +41,7 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
     let manifest = Manifest::from_path(&manifest_path)?;
 
     let lockfile_path = project_root.join("konvoy.lock");
-    let mut lockfile =
-        Lockfile::from_path(&lockfile_path).map_err(|e| EngineError::Lockfile(e.to_string()))?;
+    let mut lockfile = Lockfile::from_path(&lockfile_path)?;
 
     // 2. Collect Maven deps (those with `version` set).
     let maven_deps: Vec<_> = manifest
@@ -52,9 +51,7 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
         .collect();
 
     if maven_deps.is_empty() {
-        lockfile
-            .write_to(&lockfile_path)
-            .map_err(|e| EngineError::Lockfile(e.to_string()))?;
+        lockfile.write_to(&lockfile_path)?;
         return Ok(UpdateResult { updated_count: 0 });
     }
 
@@ -186,9 +183,7 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
     lockfile.dependencies.sort_by(|a, b| a.name.cmp(&b.name));
 
     // 4. Write updated lockfile.
-    lockfile
-        .write_to(&lockfile_path)
-        .map_err(|e| EngineError::Lockfile(e.to_string()))?;
+    lockfile.write_to(&lockfile_path)?;
 
     Ok(UpdateResult {
         updated_count: maven_deps.len(),
