@@ -5,6 +5,7 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::error::UtilError;
+use crate::hash::finalize_hex;
 
 /// Convert `usize` to `u64`. Infallible on 32-bit and 64-bit platforms.
 fn u64_from_usize(n: usize) -> u64 {
@@ -101,7 +102,7 @@ pub fn download_with_progress(
         eprintln!("    Downloaded {label} {version} ({mb} MB)");
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(finalize_hex(hasher))
 }
 
 #[cfg(test)]
