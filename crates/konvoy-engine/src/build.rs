@@ -443,10 +443,7 @@ pub(crate) fn lockfile_toml_content(lockfile: &Lockfile) -> Result<String, Engin
 /// # Errors
 /// Returns an error if a Maven dependency is missing from the lockfile, the
 /// target hash is not present, or the download/hash verification fails.
-fn resolve_maven_deps(
-    lockfile: &Lockfile,
-    target: &Target,
-) -> Result<Vec<PathBuf>, EngineError> {
+fn resolve_maven_deps(lockfile: &Lockfile, target: &Target) -> Result<Vec<PathBuf>, EngineError> {
     // Collect all Maven dependency entries from the lockfile (direct + transitive).
     let maven_locks: Vec<&DependencyLock> = lockfile
         .dependencies
