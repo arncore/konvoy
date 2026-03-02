@@ -2532,7 +2532,7 @@ mod tests {
     fn check_lockfile_staleness_maven_dep_missing() {
         // Manifest has a Maven dep, lockfile doesn't have it -> LockfileUpdateRequired.
         let manifest = konvoy_config::manifest::Manifest::from_str(
-            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-coroutines = { version = \"1.8.0\" }\n",
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-coroutines = { maven = \"org.jetbrains.kotlinx:kotlinx-coroutines-core\", version = \"1.8.0\" }\n",
             "konvoy.toml",
         )
         .unwrap();
@@ -2551,7 +2551,7 @@ mod tests {
     fn check_lockfile_staleness_maven_dep_present() {
         // Manifest has a Maven dep, lockfile has it -> Ok.
         let manifest = konvoy_config::manifest::Manifest::from_str(
-            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-coroutines = { version = \"1.8.0\" }\n",
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-coroutines = { maven = \"org.jetbrains.kotlinx:kotlinx-coroutines-core\", version = \"1.8.0\" }\n",
             "konvoy.toml",
         )
         .unwrap();
@@ -2562,9 +2562,9 @@ mod tests {
             name: "kotlinx-coroutines".to_owned(),
             source: DepSource::Maven {
                 version: "1.8.0".to_owned(),
-                maven_coordinate:
-                    "org.jetbrains.kotlinx:kotlinx-coroutines-core-{target}:1.8.0:klib".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
                 targets,
+                required_by: Vec::new(),
             },
             source_hash: "maven-hash".to_owned(),
         });
@@ -2598,7 +2598,7 @@ mod tests {
     fn resolve_maven_deps_missing_lockfile_entry() {
         // Maven dep in manifest, not in lockfile -> error.
         let manifest = konvoy_config::manifest::Manifest::from_str(
-            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-coroutines = { version = \"1.8.0\" }\n",
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-coroutines = { maven = \"org.jetbrains.kotlinx:kotlinx-coroutines-core\", version = \"1.8.0\" }\n",
             "konvoy.toml",
         )
         .unwrap();
@@ -2627,9 +2627,9 @@ mod tests {
             name: "kotlinx-coroutines".to_owned(),
             source: DepSource::Maven {
                 version: "1.8.0".to_owned(),
-                maven_coordinate:
-                    "org.jetbrains.kotlinx:kotlinx-coroutines-core-{target}:1.8.0:klib".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
                 targets,
+                required_by: Vec::new(),
             },
             source_hash: "maven-hash".to_owned(),
         });

@@ -936,7 +936,7 @@ kotlin = "2.1.0"
 
 [dependencies]
 my-lib = { path = "../my-lib" }
-kotlinx-coroutines = { version = "1.8.0" }
+kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }
 "#,
         )
         .unwrap();
