@@ -425,7 +425,7 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "konvoy-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "konvoy-config",
@@ -433,11 +433,12 @@ dependencies = [
  "konvoy-konanc",
  "konvoy-targets",
  "konvoy-util",
+ "tempfile",
 ]
 
 [[package]]
 name = "konvoy-config"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "proptest",
  "serde",
@@ -448,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "konvoy-engine"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "konvoy-config",
  "konvoy-konanc",
@@ -464,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "konvoy-konanc"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "flate2",
  "konvoy-util",
@@ -475,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "konvoy-targets"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "proptest",
  "thiserror",
@@ -483,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "konvoy-util"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "glob",
  "sha2",
