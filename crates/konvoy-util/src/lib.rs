@@ -7,4 +7,5 @@ pub mod error;
 pub mod fs;
 pub mod hash;
 pub mod maven;
+pub mod pom;
 pub mod process;
