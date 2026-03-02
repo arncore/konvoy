@@ -258,7 +258,7 @@ name = "my-app"
 kotlin = "2.1.0"
 
 [dependencies]
-unknown-lib = { version = "1.0.0" }
+unknown-lib = { maven = "com.example:unknown-lib", version = "1.0.0" }
 "#,
         );
 
@@ -373,7 +373,7 @@ name = "my-app"
 kotlin = "2.1.0"
 
 [dependencies]
-kotlinx-coroutines = { version = "1.8.0" }
+kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }
 "#,
         );
         // Pre-populate lockfile with a Maven dep at the same version.
