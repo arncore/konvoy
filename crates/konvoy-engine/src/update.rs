@@ -13,7 +13,7 @@
 //! 6. Write the full dependency set to `konvoy.lock` with `required_by`
 //!    populated for transitive deps.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::Path;
 
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
@@ -102,7 +102,7 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
     }
 
     // 4. Resolve transitive dependencies via BFS on POM files.
-    let all_deps = resolve_transitive(&direct_deps, &manifest)?;
+    let all_deps = resolve_transitive(&direct_deps)?;
 
     eprintln!(
         "  Resolved {} dependencies ({} direct, {} transitive)",
@@ -267,9 +267,11 @@ struct ResolvedMavenDep {
 ///
 /// Returns an error if a POM cannot be fetched or parsed, a version conflict
 /// is detected, or a dependency cycle is found.
+/// A BFS queue entry: (group_id, artifact_id, version, requirer_name, ancestor_path).
+type BfsEntry = (String, String, String, Option<String>, Vec<String>);
+
 fn resolve_transitive(
     direct_deps: &[ResolvedMavenDep],
-    _manifest: &Manifest,
 ) -> Result<Vec<ResolvedMavenDep>, EngineError> {
     // Use the first known target for POM fetching — the transitive graph is
     // identical across targets since every Kotlin/Native artifact publishes
@@ -297,26 +299,25 @@ fn resolve_transitive(
     let mut resolved: HashMap<String, ResolvedMavenDep> = HashMap::new();
     // Track who requires each dep: `groupId:artifactId` -> set of requirer names.
     let mut required_by_map: HashMap<String, BTreeSet<String>> = HashMap::new();
-    // BFS queue: (group_id, artifact_id, version, requirer_name).
-    let mut queue: VecDeque<(String, String, String, Option<String>)> = VecDeque::new();
-    // Cycle detection: track what is currently in the queue/being processed.
-    let mut visited: HashSet<String> = HashSet::new();
+    // BFS queue: (group_id, artifact_id, version, requirer_name, ancestor_path).
+    // The ancestor_path tracks the dependency chain from root for cycle detection.
+    let mut queue: VecDeque<BfsEntry> = VecDeque::new();
 
     // Seed the queue with direct deps.
     for dep in direct_deps {
         let key = format!("{}:{}", dep.group_id, dep.artifact_id);
         resolved.insert(key.clone(), dep.clone());
-        visited.insert(key);
         queue.push_back((
             dep.group_id.clone(),
             dep.artifact_id.clone(),
             dep.version.clone(),
             None,
+            vec![key],
         ));
     }
 
     // BFS loop.
-    while let Some((group_id, artifact_id, version, requirer)) = queue.pop_front() {
+    while let Some((group_id, artifact_id, version, requirer, path)) = queue.pop_front() {
         let key = format!("{group_id}:{artifact_id}");
 
         // Record who required this dep.
@@ -421,11 +422,11 @@ fn resolve_transitive(
                 .or_default()
                 .insert(parent_name);
 
-            // Check for cycles.
-            if !visited.insert(dep_key.clone()) {
-                // Already visited in this resolution — this is fine for diamonds,
-                // the conflict check above handles version differences.
-                continue;
+            // Check for cycles: if this dep appears in the current resolution path,
+            // we have a circular dependency.
+            if path.contains(&dep_key) {
+                let cycle = format!("{} -> {dep_key}", path.join(" -> "));
+                return Err(EngineError::MavenDependencyCycle { cycle });
             }
 
             let new_dep = ResolvedMavenDep {
@@ -436,14 +437,17 @@ fn resolve_transitive(
                 required_by: req_by,
             };
 
-            resolved.insert(dep_key, new_dep);
+            // Enqueue for further transitive resolution with extended path.
+            let mut child_path = path.clone();
+            child_path.push(dep_key.clone());
 
-            // Enqueue for further transitive resolution.
+            resolved.insert(dep_key, new_dep);
             queue.push_back((
                 pom_dep.group_id.clone(),
                 base_artifact_id,
                 resolved_version,
                 Some(dep_name),
+                child_path,
             ));
         }
     }
@@ -729,7 +733,7 @@ kotlin = "2.1.0"
     }
 
     #[test]
-    fn update_idempotent_skip_existing_maven_dep() {
+    fn lockfile_maven_dep_round_trips_correctly() {
         let project = make_project(
             r#"
 [package]
@@ -742,7 +746,7 @@ kotlin = "2.1.0"
 kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }
 "#,
         );
-        // Pre-populate lockfile with a Maven dep at the same version.
+        // Write a lockfile with a Maven dep and verify it round-trips.
         let mut lockfile = Lockfile::with_toolchain("2.1.0");
         let mut targets = BTreeMap::new();
         targets.insert("linux_x64".to_owned(), "hash-lx64".to_owned());
@@ -763,15 +767,6 @@ kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", 
             .write_to(&project.path().join("konvoy.lock"))
             .unwrap();
 
-        // Running update should be idempotent (skip the already-resolved dep).
-        // Note: this will attempt POM fetching for transitive resolution but
-        // the direct dep will match the lockfile. Since we can't mock the
-        // network in unit tests, the transitive resolution will try fetching
-        // POMs and may fail. The idempotent skip only applies to the download
-        // phase for deps that are already fully resolved.
-        //
-        // For a true idempotency test, we'd need either network access or
-        // a mock layer. This test verifies the lockfile-preservation logic.
         let reparsed = Lockfile::from_path(&project.path().join("konvoy.lock")).unwrap();
         assert_eq!(reparsed.dependencies.len(), 1);
         let dep = &reparsed.dependencies[0];
@@ -898,20 +893,41 @@ kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", 
 
     #[test]
     fn resolve_transitive_empty_direct_deps() {
-        let manifest = Manifest::from_str(
-            r#"
-[package]
-name = "my-app"
-
-[toolchain]
-kotlin = "2.1.0"
-"#,
-            "konvoy.toml",
-        )
-        .unwrap();
-
-        let result = resolve_transitive(&[], &manifest).unwrap();
+        let result = resolve_transitive(&[]).unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn version_conflict_error_is_actionable() {
+        let err = EngineError::MavenVersionConflict {
+            maven: "com.example:lib".to_owned(),
+            details: "  A requires 1.0\n  B requires 2.0".to_owned(),
+            hint_name: "lib".to_owned(),
+            hint_version: "2.0".to_owned(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("hint:"), "should include a hint: {msg}");
+        assert!(
+            msg.contains("konvoy.toml"),
+            "should reference konvoy.toml: {msg}"
+        );
+    }
+
+    #[test]
+    fn cycle_detection_error_is_actionable() {
+        let err = EngineError::MavenDependencyCycle {
+            cycle: "a:x -> b:y -> a:x".to_owned(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("cycle detected"), "should say cycle: {msg}");
+        assert!(
+            msg.contains("a:x -> b:y -> a:x"),
+            "should show cycle path: {msg}"
+        );
+        assert!(
+            msg.contains("remove one of these dependencies"),
+            "should be actionable: {msg}"
+        );
     }
 
     #[test]

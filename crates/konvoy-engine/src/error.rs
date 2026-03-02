@@ -192,6 +192,6 @@ pub enum EngineError {
     },
 
     /// A cycle was detected during Maven transitive dependency resolution.
-    #[error("maven dependency cycle detected: {cycle}")]
+    #[error("maven dependency cycle detected: {cycle} — remove one of these dependencies from konvoy.toml or file an issue upstream")]
     MavenDependencyCycle { cycle: String },
 }
