@@ -8,7 +8,6 @@ pub mod detekt;
 mod diagnostics;
 pub mod error;
 pub mod init;
-pub mod library;
 pub mod plugin;
 pub mod resolve;
 pub mod test_build;

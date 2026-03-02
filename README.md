@@ -141,7 +141,7 @@ my-utils/
 
 ### Maven dependencies
 
-Depend on external Kotlin/Native libraries from Maven Central using a curated library index:
+Depend on external Kotlin/Native libraries from Maven Central using direct Maven coordinates:
 
 ```toml
 [package]
@@ -151,32 +151,19 @@ name = "my-app"
 kotlin = "2.1.0"
 
 [dependencies]
-kotlinx-coroutines = { version = "1.8.0" }
-kotlinx-datetime = { version = "0.6.0" }
+kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }
+kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
 my-utils = { path = "../my-utils" }
 ```
 
-After adding a Maven dependency, run `konvoy update` to resolve versions and populate `konvoy.lock` with per-target SHA-256 hashes. At build time, only the klib for your current target is downloaded — subsequent builds use the cached artifact.
+After adding a Maven dependency, run `konvoy update` to resolve versions (including transitive dependencies via POM files) and populate `konvoy.lock` with per-target SHA-256 hashes. At build time, only the klib for your current target is downloaded — subsequent builds use the cached artifact.
 
 ```
 konvoy update    # resolve deps, download klibs, write hashes to konvoy.lock
 konvoy build     # downloads only the klib needed for your host target
 ```
 
-Each dependency must have exactly one of `path` or `version` — not both.
-
-### Available libraries
-
-Konvoy ships with a curated index of popular Kotlin/Native libraries:
-
-| Name | Maven artifact |
-|------|---------------|
-| `kotlinx-coroutines` | `org.jetbrains.kotlinx:kotlinx-coroutines-core` |
-| `kotlinx-datetime` | `org.jetbrains.kotlinx:kotlinx-datetime` |
-| `kotlinx-io` | `org.jetbrains.kotlinx:kotlinx-io-core` |
-| `kotlinx-atomicfu` | `org.jetbrains.kotlinx:atomicfu` |
-
-Run `konvoy doctor` to see the full list of available libraries.
+Each dependency must have exactly one source type — either `path` or `maven` + `version` — not both.
 
 ### Plugins
 

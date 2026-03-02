@@ -488,32 +488,19 @@ fn cmd_doctor() -> CliResult {
                     }
                 }
 
-                // Check Maven dependencies against curated library index.
+                // Check Maven dependencies and lockfile entries.
                 let maven_deps: Vec<_> = manifest
                     .dependencies
                     .iter()
-                    .filter(|(_, spec)| spec.version.is_some())
+                    .filter(|(_, spec)| spec.maven.is_some() && spec.version.is_some())
                     .collect();
 
                 if !maven_deps.is_empty() {
                     for (dep_name, dep_spec) in &maven_deps {
-                        if let Some(ref dep_version) = dep_spec.version {
-                            match konvoy_engine::library::lookup(dep_name) {
-                                Ok(Some(_)) => {
-                                    eprintln!("  [ok] Library: {} {}", dep_name, dep_version);
-                                }
-                                Ok(None) => {
-                                    let available =
-                                        konvoy_engine::library::available_library_names()
-                                            .unwrap_or_else(|_| "none".to_owned());
-                                    eprintln!("  [!!] Library: unknown library '{}' — available libraries: {}", dep_name, available);
-                                    issues = issues.saturating_add(1);
-                                }
-                                Err(e) => {
-                                    eprintln!("  [!!] Library: {}: {}", dep_name, e);
-                                    issues = issues.saturating_add(1);
-                                }
-                            }
+                        if let (Some(ref maven), Some(ref dep_version)) =
+                            (&dep_spec.maven, &dep_spec.version)
+                        {
+                            eprintln!("  [ok] Maven dep: {} {} ({})", dep_name, dep_version, maven);
                         }
                     }
 
@@ -547,14 +534,6 @@ fn cmd_doctor() -> CliResult {
                         eprintln!("  [!!] No konvoy.lock found — run 'konvoy update' to resolve Maven dependencies");
                         issues = issues.saturating_add(1);
                     }
-                }
-
-                // List available libraries.
-                match konvoy_engine::library::available_library_names() {
-                    Ok(names) if !names.is_empty() => {
-                        eprintln!("  Available libraries: {}", names);
-                    }
-                    _ => {}
                 }
             }
             Err(e) => {
