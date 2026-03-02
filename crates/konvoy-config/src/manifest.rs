@@ -276,7 +276,7 @@ pub enum ManifestError {
         "dependency `{name}` has `maven` without `version` in {path} — add `version = \"X.Y.Z\"`"
     )]
     DependencyMavenWithoutVersion { path: String, name: String },
-    #[error("dependency '{name}' has `version` without `maven` coordinate in {path} — add `maven = \"groupId:artifactId\"`")]
+    #[error("dependency `{name}` has `version` without `maven` coordinate in {path} — add `maven = \"groupId:artifactId\"`")]
     DependencyVersionWithoutMaven { path: String, name: String },
     #[error("dependency `{name}` has invalid maven coordinate `{maven}` in {path} — expected format `groupId:artifactId` (exactly one colon)")]
     DependencyInvalidMaven {
