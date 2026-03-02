@@ -207,7 +207,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     all_library_paths.extend(plugin_klibs);
 
     // 7b. Resolve and download Maven dependency klibs for the current target.
-    let maven_klibs = resolve_maven_deps(&manifest, &effective_lockfile, &target)?;
+    let maven_klibs = resolve_maven_deps(&effective_lockfile, &target)?;
     all_library_paths.extend(maven_klibs);
 
     // 8. Build the root project.
@@ -444,7 +444,6 @@ pub(crate) fn lockfile_toml_content(lockfile: &Lockfile) -> Result<String, Engin
 /// Returns an error if a Maven dependency is missing from the lockfile, the
 /// target hash is not present, or the download/hash verification fails.
 fn resolve_maven_deps(
-    _manifest: &Manifest,
     lockfile: &Lockfile,
     target: &Target,
 ) -> Result<Vec<PathBuf>, EngineError> {
@@ -2577,15 +2576,10 @@ mod tests {
     #[test]
     fn resolve_maven_deps_no_maven_deps() {
         // Only path deps in manifest -> empty vec.
-        let manifest = konvoy_config::manifest::Manifest::from_str(
-            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nmy-lib = { path = \"../my-lib\" }\n",
-            "konvoy.toml",
-        )
-        .unwrap();
         let lockfile = Lockfile::with_toolchain("2.1.0");
         let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
 
-        let result = resolve_maven_deps(&manifest, &lockfile, &target).unwrap();
+        let result = resolve_maven_deps(&lockfile, &target).unwrap();
         assert!(
             result.is_empty(),
             "expected empty vec for path-only deps, got: {result:?}"
@@ -2596,15 +2590,10 @@ mod tests {
     fn resolve_maven_deps_empty_lockfile_returns_empty() {
         // Maven dep in manifest but not in lockfile returns empty vec.
         // Staleness is caught by check_lockfile_staleness, not resolve_maven_deps.
-        let manifest = konvoy_config::manifest::Manifest::from_str(
-            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-coroutines = { maven = \"org.jetbrains.kotlinx:kotlinx-coroutines-core\", version = \"1.8.0\" }\n",
-            "konvoy.toml",
-        )
-        .unwrap();
         let lockfile = Lockfile::with_toolchain("2.1.0");
         let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
 
-        let result = resolve_maven_deps(&manifest, &lockfile, &target).unwrap();
+        let result = resolve_maven_deps(&lockfile, &target).unwrap();
         assert!(
             result.is_empty(),
             "expected empty vec when lockfile has no Maven entries, got: {result:?}"
@@ -2625,14 +2614,9 @@ mod tests {
             },
             source_hash: "hash".to_owned(),
         });
-        let manifest = konvoy_config::manifest::Manifest::from_str(
-            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
-            "konvoy.toml",
-        )
-        .unwrap();
         let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
 
-        let result = resolve_maven_deps(&manifest, &lockfile, &target);
+        let result = resolve_maven_deps(&lockfile, &target);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
