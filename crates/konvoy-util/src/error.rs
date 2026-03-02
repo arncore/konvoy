@@ -57,8 +57,4 @@ pub enum UtilError {
     /// A POM uses a property placeholder that konvoy does not resolve.
     #[error("unsupported property \"{property}\" in POM — only ${{project.version}} and ${{project.groupId}} are supported")]
     PomUnsupportedProperty { property: String },
-
-    /// A POM parent chain exceeds the supported depth of one.
-    #[error("POM parent chain too deep — konvoy supports at most one level of parent inheritance")]
-    PomDeepParentChain,
 }

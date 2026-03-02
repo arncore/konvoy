@@ -2,13 +2,13 @@
 //!
 //! Handles:
 //! - `<dependencies>` extraction with scope filtering (compile only)
-//! - Single-level `<parent>` inheritance for `groupId` and `version`
+//! - Inline `<parent>` inheritance for `groupId` and `version`
+//! - Caller-supplied fallback values for `groupId` and `version` (from `konvoy.toml`)
 //! - Property interpolation for `${project.version}` and `${project.groupId}`
 //!
 //! Rejects with actionable errors:
 //! - Version ranges (e.g. `[1.0,2.0)`)
 //! - Property placeholders beyond `${project.version}` / `${project.groupId}`
-//! - Parent chains deeper than one level
 
 use crate::error::UtilError;
 use crate::maven::MAVEN_CENTRAL;
@@ -144,12 +144,6 @@ fn extract_parent_identity(root: &roxmltree::Node<'_, '_>) -> Option<PomIdentity
     })
 }
 
-/// Check whether a `<project>` root contains a `<parent>` element.
-fn has_parent(root: &roxmltree::Node<'_, '_>) -> bool {
-    root.children()
-        .any(|n| n.is_element() && n.tag_name().name() == "parent")
-}
-
 // ---------------------------------------------------------------------------
 // Dependency extraction
 // ---------------------------------------------------------------------------
@@ -229,21 +223,32 @@ fn extract_dependencies(
 
 /// Parse a POM XML string into a [`Pom`].
 ///
-/// If the POM has a `<parent>` element, `groupId` and `version` are inherited
-/// from it when not specified directly on the project. Property interpolation
-/// is limited to `${project.version}` and `${project.groupId}`.
+/// Resolution order for `groupId` and `version`:
+/// 1. The POM's own `<groupId>` / `<version>` elements
+/// 2. The POM's inline `<parent>` element (no external fetch)
+/// 3. Caller-supplied fallback values (`known_group_id` / `known_version`)
 ///
-/// Dependencies are filtered to compile-scope only; optional dependencies are
-/// skipped entirely.
+/// The caller-supplied values typically come from the Maven coordinate in
+/// `konvoy.toml` and the pinned version in `konvoy.lock`, so no parent POM
+/// fetch is ever required.
+///
+/// Property interpolation is limited to `${project.version}` and
+/// `${project.groupId}`. Dependencies are filtered to compile-scope only;
+/// optional dependencies are skipped entirely.
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// - The XML is malformed or missing required elements (`artifactId`, etc.)
+/// - `groupId` or `version` cannot be resolved from any source
 /// - A dependency uses a version range (e.g. `[1.0,2.0)`)
 /// - A property placeholder other than `${project.version}` or
 ///   `${project.groupId}` is encountered
-pub fn parse_pom(xml: &str) -> Result<Pom, UtilError> {
+pub fn parse_pom(
+    xml: &str,
+    known_group_id: Option<&str>,
+    known_version: Option<&str>,
+) -> Result<Pom, UtilError> {
     let doc = roxmltree::Document::parse(xml).map_err(|e| UtilError::PomParse {
         reason: e.to_string(),
     })?;
@@ -253,97 +258,26 @@ pub fn parse_pom(xml: &str) -> Result<Pom, UtilError> {
     let identity = extract_identity(&root);
     let parent_identity = extract_parent_identity(&root);
 
-    // Resolve groupId: project > parent > error.
+    // Resolve groupId: project > inline parent > caller-supplied > error.
     let group_id = identity
         .group_id
         .or_else(|| parent_identity.as_ref().and_then(|p| p.group_id.clone()))
+        .or_else(|| known_group_id.map(ToOwned::to_owned))
         .ok_or_else(|| UtilError::PomParse {
-            reason: "POM is missing <groupId> and has no <parent> to inherit from".to_owned(),
+            reason: "POM is missing <groupId> and has no <parent> to inherit from — check the maven coordinate in konvoy.toml".to_owned(),
         })?;
 
     let artifact_id = identity.artifact_id.ok_or_else(|| UtilError::PomParse {
         reason: "POM is missing <artifactId>".to_owned(),
     })?;
 
-    // Resolve version: project > parent > error.
+    // Resolve version: project > inline parent > caller-supplied > error.
     let version = identity
         .version
         .or_else(|| parent_identity.as_ref().and_then(|p| p.version.clone()))
+        .or_else(|| known_version.map(ToOwned::to_owned))
         .ok_or_else(|| UtilError::PomParse {
-            reason: "POM is missing <version> and has no <parent> to inherit from".to_owned(),
-        })?;
-
-    let dependencies = extract_dependencies(&root, &version, &group_id)?;
-
-    Ok(Pom {
-        group_id,
-        artifact_id,
-        version,
-        dependencies,
-    })
-}
-
-/// Parse a POM XML string with an optional parent POM for inheritance.
-///
-/// When `parent_xml` is provided, values from the parent's `<project>`
-/// element are used to fill in missing `groupId` and `version` on the
-/// child POM and its dependencies.
-///
-/// Only one level of parent inheritance is supported. If the parent POM
-/// itself has a `<parent>`, this function returns an error.
-///
-/// # Errors
-///
-/// Returns the same errors as [`parse_pom`], plus:
-/// - `PomDeepParentChain` if the parent POM contains its own `<parent>`
-/// - Any parse error from the parent XML
-pub fn parse_pom_with_parent(xml: &str, parent_xml: Option<&str>) -> Result<Pom, UtilError> {
-    let Some(parent_src) = parent_xml else {
-        return parse_pom(xml);
-    };
-
-    // Parse the parent POM.
-    let parent_doc = roxmltree::Document::parse(parent_src).map_err(|e| UtilError::PomParse {
-        reason: format!("parent POM: {e}"),
-    })?;
-    let parent_root = parent_doc.root_element();
-
-    // Reject deep parent chains.
-    if has_parent(&parent_root) {
-        return Err(UtilError::PomDeepParentChain);
-    }
-
-    let parent_id = extract_identity(&parent_root);
-
-    // Parse the child POM document.
-    let doc = roxmltree::Document::parse(xml).map_err(|e| UtilError::PomParse {
-        reason: e.to_string(),
-    })?;
-    let root = doc.root_element();
-
-    let identity = extract_identity(&root);
-
-    // Resolve from: child > child's inline <parent> > external parent POM.
-    let inline_parent = extract_parent_identity(&root);
-
-    let group_id = identity
-        .group_id
-        .or_else(|| inline_parent.as_ref().and_then(|p| p.group_id.clone()))
-        .or(parent_id.group_id)
-        .ok_or_else(|| UtilError::PomParse {
-            reason: "POM is missing <groupId> and parent does not provide one".to_owned(),
-        })?;
-
-    let artifact_id = identity.artifact_id.ok_or_else(|| UtilError::PomParse {
-        reason: "POM is missing <artifactId>".to_owned(),
-    })?;
-
-    let version = identity
-        .version
-        .or_else(|| inline_parent.as_ref().and_then(|p| p.version.clone()))
-        .or(parent_id.version)
-        .ok_or_else(|| UtilError::PomParse {
-            reason: "POM is missing <version> and parent does not provide one".to_owned(),
+            reason: "POM is missing <version> and has no <parent> to inherit from — check the version in konvoy.toml".to_owned(),
         })?;
 
     let dependencies = extract_dependencies(&root, &version, &group_id)?;
@@ -443,7 +377,7 @@ mod tests {
 
     #[test]
     fn parse_real_pom_extracts_compile_deps() {
-        let pom = parse_pom(COROUTINES_POM).unwrap();
+        let pom = parse_pom(COROUTINES_POM, None, None).unwrap();
         assert_eq!(pom.group_id, "org.jetbrains.kotlinx");
         assert_eq!(pom.artifact_id, "kotlinx-coroutines-core-macosarm64");
         assert_eq!(pom.version, "1.9.0");
@@ -462,7 +396,7 @@ mod tests {
 
     #[test]
     fn parse_pom_skips_test_scope() {
-        let pom = parse_pom(COROUTINES_POM).unwrap();
+        let pom = parse_pom(COROUTINES_POM, None, None).unwrap();
         // The test-scoped dependency should not be present.
         assert!(!pom
             .dependencies
@@ -471,41 +405,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_pom_with_parent_inherits_version() {
-        let parent_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<project>
-  <groupId>com.example</groupId>
-  <artifactId>parent-pom</artifactId>
-  <version>3.0.0</version>
-</project>"#;
-
-        let child_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<project>
-  <parent>
-    <groupId>com.example</groupId>
-    <artifactId>parent-pom</artifactId>
-    <version>3.0.0</version>
-  </parent>
-  <artifactId>child-lib</artifactId>
-  <dependencies>
-    <dependency>
-      <groupId>org.other</groupId>
-      <artifactId>some-lib</artifactId>
-      <version>1.0.0</version>
-    </dependency>
-  </dependencies>
-</project>"#;
-
-        let pom = parse_pom_with_parent(child_xml, Some(parent_xml)).unwrap();
-        assert_eq!(pom.group_id, "com.example");
-        assert_eq!(pom.artifact_id, "child-lib");
-        assert_eq!(pom.version, "3.0.0");
-        assert_eq!(pom.dependencies.len(), 1);
-    }
-
-    #[test]
-    fn parse_pom_inherits_from_inline_parent() {
-        // When no external parent XML is given, the inline <parent> is used.
+    fn inherits_from_inline_parent() {
+        // The inline <parent> is used when the POM itself lacks groupId/version.
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <project>
   <parent>
@@ -516,10 +417,67 @@ mod tests {
   <artifactId>child</artifactId>
 </project>"#;
 
-        let pom = parse_pom(xml).unwrap();
+        let pom = parse_pom(xml, None, None).unwrap();
         assert_eq!(pom.group_id, "com.example");
         assert_eq!(pom.version, "2.0.0");
         assert_eq!(pom.artifact_id, "child");
+    }
+
+    #[test]
+    fn caller_supplied_fallback_for_group_id() {
+        // POM has no groupId and no parent — caller supplies it.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <artifactId>orphan</artifactId>
+  <version>1.0.0</version>
+</project>"#;
+
+        let pom = parse_pom(xml, Some("com.caller"), None).unwrap();
+        assert_eq!(pom.group_id, "com.caller");
+    }
+
+    #[test]
+    fn caller_supplied_fallback_for_version() {
+        // POM has no version and no parent — caller supplies it.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <groupId>com.example</groupId>
+  <artifactId>no-ver</artifactId>
+</project>"#;
+
+        let pom = parse_pom(xml, None, Some("9.9.9")).unwrap();
+        assert_eq!(pom.version, "9.9.9");
+    }
+
+    #[test]
+    fn pom_value_takes_precedence_over_caller_fallback() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <groupId>com.pom</groupId>
+  <artifactId>lib</artifactId>
+  <version>1.0.0</version>
+</project>"#;
+
+        let pom = parse_pom(xml, Some("com.caller"), Some("9.9.9")).unwrap();
+        assert_eq!(pom.group_id, "com.pom");
+        assert_eq!(pom.version, "1.0.0");
+    }
+
+    #[test]
+    fn inline_parent_takes_precedence_over_caller_fallback() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <parent>
+    <groupId>com.parent</groupId>
+    <artifactId>parent</artifactId>
+    <version>3.0.0</version>
+  </parent>
+  <artifactId>child</artifactId>
+</project>"#;
+
+        let pom = parse_pom(xml, Some("com.caller"), Some("9.9.9")).unwrap();
+        assert_eq!(pom.group_id, "com.parent");
+        assert_eq!(pom.version, "3.0.0");
     }
 
     #[test]
@@ -538,7 +496,7 @@ mod tests {
   </dependencies>
 </project>"#;
 
-        let err = parse_pom(xml).unwrap_err();
+        let err = parse_pom(xml, None, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("version range"), "error was: {msg}");
         assert!(msg.contains("[1.0,2.0)"), "error was: {msg}");
@@ -567,7 +525,7 @@ mod tests {
   </dependencies>
 </project>"#;
 
-        let pom = parse_pom(xml).unwrap();
+        let pom = parse_pom(xml, None, None).unwrap();
         assert_eq!(pom.dependencies.len(), 1);
         assert_eq!(pom.dependencies.first().unwrap().artifact_id, "required");
     }
@@ -606,7 +564,7 @@ mod tests {
   </dependencies>
 </project>"#;
 
-        let pom = parse_pom(xml).unwrap();
+        let pom = parse_pom(xml, None, None).unwrap();
         assert_eq!(pom.dependencies.len(), 1);
         assert_eq!(pom.dependencies.first().unwrap().artifact_id, "compile-dep");
     }
@@ -627,7 +585,7 @@ mod tests {
   </dependencies>
 </project>"#;
 
-        let pom = parse_pom(xml).unwrap();
+        let pom = parse_pom(xml, None, None).unwrap();
         assert_eq!(pom.dependencies.first().unwrap().version, "5.0.0");
     }
 
@@ -647,7 +605,7 @@ mod tests {
   </dependencies>
 </project>"#;
 
-        let pom = parse_pom(xml).unwrap();
+        let pom = parse_pom(xml, None, None).unwrap();
         assert_eq!(
             pom.dependencies.first().unwrap().group_id,
             "com.example.group"
@@ -670,39 +628,10 @@ mod tests {
   </dependencies>
 </project>"#;
 
-        let err = parse_pom(xml).unwrap_err();
+        let err = parse_pom(xml, None, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("unsupported property"), "error was: {msg}");
         assert!(msg.contains("${some.custom.version}"), "error was: {msg}");
-    }
-
-    #[test]
-    fn reject_deep_parent_chain() {
-        let grandparent_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<project>
-  <parent>
-    <groupId>com.example</groupId>
-    <artifactId>grandparent</artifactId>
-    <version>1.0.0</version>
-  </parent>
-  <groupId>com.example</groupId>
-  <artifactId>parent-pom</artifactId>
-  <version>2.0.0</version>
-</project>"#;
-
-        let child_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<project>
-  <parent>
-    <groupId>com.example</groupId>
-    <artifactId>parent-pom</artifactId>
-    <version>2.0.0</version>
-  </parent>
-  <artifactId>child</artifactId>
-</project>"#;
-
-        let err = parse_pom_with_parent(child_xml, Some(grandparent_xml)).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("parent chain too deep"), "error was: {msg}");
     }
 
     #[test]
@@ -732,7 +661,7 @@ mod tests {
   <version>1.0.0</version>
 </project>"#;
 
-        let pom = parse_pom(xml).unwrap();
+        let pom = parse_pom(xml, None, None).unwrap();
         assert!(pom.dependencies.is_empty());
         assert_eq!(pom.artifact_id, "no-deps");
     }
@@ -747,7 +676,7 @@ mod tests {
   <dependencies/>
 </project>"#;
 
-        let pom = parse_pom(xml).unwrap();
+        let pom = parse_pom(xml, None, None).unwrap();
         assert!(pom.dependencies.is_empty());
     }
 
@@ -759,41 +688,49 @@ mod tests {
   <version>1.0.0</version>
 </project>"#;
 
-        let err = parse_pom(xml).unwrap_err();
+        let err = parse_pom(xml, None, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("missing <artifactId>"), "error was: {msg}");
     }
 
     #[test]
-    fn parse_pom_missing_group_id_and_no_parent_errors() {
+    fn missing_group_id_no_fallback_errors() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <project>
   <artifactId>orphan</artifactId>
   <version>1.0.0</version>
 </project>"#;
 
-        let err = parse_pom(xml).unwrap_err();
+        let err = parse_pom(xml, None, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("missing <groupId>"), "error was: {msg}");
+        assert!(
+            msg.contains("konvoy.toml"),
+            "error should be actionable: {msg}"
+        );
     }
 
     #[test]
-    fn parse_pom_missing_version_and_no_parent_errors() {
+    fn missing_version_no_fallback_errors() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <project>
   <groupId>com.example</groupId>
   <artifactId>no-ver</artifactId>
 </project>"#;
 
-        let err = parse_pom(xml).unwrap_err();
+        let err = parse_pom(xml, None, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("missing <version>"), "error was: {msg}");
+        assert!(
+            msg.contains("konvoy.toml"),
+            "error should be actionable: {msg}"
+        );
     }
 
     #[test]
     fn parse_pom_malformed_xml_errors() {
         let xml = "this is not xml at all";
-        let err = parse_pom(xml).unwrap_err();
+        let err = parse_pom(xml, None, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("cannot parse POM"), "error was: {msg}");
     }
@@ -815,22 +752,9 @@ mod tests {
   </dependencies>
 </project>"#;
 
-        let pom = parse_pom(xml).unwrap();
+        let pom = parse_pom(xml, None, None).unwrap();
         assert_eq!(pom.dependencies.len(), 1);
         assert_eq!(pom.dependencies.first().unwrap().artifact_id, "no-scope");
-    }
-
-    #[test]
-    fn parse_pom_with_parent_none_falls_back_to_parse_pom() {
-        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<project>
-  <groupId>com.example</groupId>
-  <artifactId>standalone</artifactId>
-  <version>1.0.0</version>
-</project>"#;
-
-        let pom = parse_pom_with_parent(xml, None).unwrap();
-        assert_eq!(pom.artifact_id, "standalone");
     }
 
     #[test]
@@ -887,21 +811,14 @@ mod tests {
   </dependencies>
 </project>"#;
 
-        let pom = parse_pom(xml).unwrap();
+        let pom = parse_pom(xml, None, None).unwrap();
         assert_eq!(pom.dependencies.len(), 1);
         assert_eq!(pom.dependencies.first().unwrap().version, "");
     }
 
     #[test]
-    fn parse_pom_with_parent_child_overrides_parent_version() {
-        let parent_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<project>
-  <groupId>com.example</groupId>
-  <artifactId>parent</artifactId>
-  <version>1.0.0</version>
-</project>"#;
-
-        let child_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+    fn child_overrides_inline_parent_version() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <project>
   <parent>
     <groupId>com.example</groupId>
@@ -912,8 +829,8 @@ mod tests {
   <version>2.0.0</version>
 </project>"#;
 
-        let pom = parse_pom_with_parent(child_xml, Some(parent_xml)).unwrap();
-        // Child's own version takes precedence.
+        let pom = parse_pom(xml, None, None).unwrap();
+        // Child's own version takes precedence over parent.
         assert_eq!(pom.version, "2.0.0");
     }
 
@@ -933,7 +850,7 @@ mod tests {
   </dependencies>
 </project>"#;
 
-        let err = parse_pom(xml).unwrap_err();
+        let err = parse_pom(xml, None, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("version range"), "error was: {msg}");
     }
