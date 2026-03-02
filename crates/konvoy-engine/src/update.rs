@@ -142,8 +142,10 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
         // Clean up the temp directory.
         let _ = std::fs::remove_dir_all(&tmp_base);
 
-        // Build the maven coordinate template (with {target} placeholder) for the lockfile.
-        let maven_coordinate = descriptor.maven.replace("{version}", version);
+        // Extract the canonical groupId:artifactId from the descriptor template.
+        // Template format: "groupId:artifactId-{target}:{version}:klib"
+        // We take the first two colon-separated segments and strip placeholders.
+        let maven = extract_maven_group_artifact(&descriptor.maven);
 
         // Compute a deterministic source_hash from the target hashes.
         let hash_input: String = targets_map
@@ -157,8 +159,9 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
             name: (*dep_name).clone(),
             source: DepSource::Maven {
                 version: version.clone(),
-                maven_coordinate,
+                maven,
                 targets: targets_map,
+                required_by: Vec::new(),
             },
             source_hash,
         });
@@ -185,6 +188,25 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
     Ok(UpdateResult {
         updated_count: maven_deps.len(),
     })
+}
+
+/// Extract the canonical `groupId:artifactId` from a Maven coordinate template.
+///
+/// The template looks like `"org.jetbrains.kotlinx:kotlinx-coroutines-core-{target}:{version}:klib"`.
+/// This function takes the first two colon-separated segments and strips placeholder
+/// fragments (`{target}`, `{version}`) and any resulting trailing hyphens.
+fn extract_maven_group_artifact(template: &str) -> String {
+    let mut parts = template.split(':');
+    match (parts.next(), parts.next()) {
+        (Some(group_id), Some(artifact_segment)) => {
+            let artifact_raw = artifact_segment
+                .replace("{target}", "")
+                .replace("{version}", "");
+            let artifact_id = artifact_raw.trim_end_matches('-');
+            format!("{group_id}:{artifact_id}")
+        }
+        _ => template.to_owned(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -387,9 +409,9 @@ kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", 
             name: "kotlinx-coroutines".to_owned(),
             source: DepSource::Maven {
                 version: "1.8.0".to_owned(),
-                maven_coordinate:
-                    "org.jetbrains.kotlinx:kotlinx-coroutines-core-{target}:1.8.0:klib".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
                 targets: targets.clone(),
+                required_by: Vec::new(),
             },
             source_hash: "existing-hash".to_owned(),
         });
@@ -411,5 +433,32 @@ kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", 
             DepSource::Maven { version, .. } => assert_eq!(version, "1.8.0"),
             other => panic!("expected Maven source, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn extract_group_artifact_from_template() {
+        assert_eq!(
+            super::extract_maven_group_artifact(
+                "org.jetbrains.kotlinx:kotlinx-coroutines-core-{target}:{version}:klib"
+            ),
+            "org.jetbrains.kotlinx:kotlinx-coroutines-core"
+        );
+    }
+
+    #[test]
+    fn extract_group_artifact_no_target_suffix() {
+        assert_eq!(
+            super::extract_maven_group_artifact("org.jetbrains.kotlinx:atomicfu:{version}:klib"),
+            "org.jetbrains.kotlinx:atomicfu"
+        );
+    }
+
+    #[test]
+    fn extract_group_artifact_single_segment() {
+        // Edge case: if template has no colon, return as-is.
+        assert_eq!(
+            super::extract_maven_group_artifact("no-colon-here"),
+            "no-colon-here"
+        );
     }
 }

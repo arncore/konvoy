@@ -61,8 +61,13 @@ pub enum DepSource {
     },
     Maven {
         version: String,
-        maven_coordinate: String,
+        /// The canonical `groupId:artifactId` coordinate (no template placeholders).
+        maven: String,
         targets: std::collections::BTreeMap<String, String>,
+        /// Names of dependencies that pulled this one in transitively.
+        /// Empty for direct deps declared in `konvoy.toml`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        required_by: Vec<String>,
     },
 }
 
@@ -455,9 +460,9 @@ konanc_version = "2.1.0"
             name: "kotlinx-coroutines".to_owned(),
             source: DepSource::Maven {
                 version: "1.8.0".to_owned(),
-                maven_coordinate:
-                    "org.jetbrains.kotlinx:kotlinx-coroutines-core-{target}:1.8.0:klib".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
                 targets,
+                required_by: Vec::new(),
             },
             source_hash: "maven-hash-1234".to_owned(),
         });
@@ -473,14 +478,16 @@ konanc_version = "2.1.0"
         match &dep.source {
             DepSource::Maven {
                 version,
-                maven_coordinate,
+                maven,
                 targets,
+                required_by,
             } => {
                 assert_eq!(version, "1.8.0");
-                assert!(maven_coordinate.contains("kotlinx-coroutines"));
+                assert_eq!(maven, "org.jetbrains.kotlinx:kotlinx-coroutines-core");
                 assert_eq!(targets.len(), 2);
                 assert_eq!(targets.get("linux_x64").unwrap(), "aabbccdd");
                 assert_eq!(targets.get("macos_arm64").unwrap(), "11223344");
+                assert!(required_by.is_empty());
             }
             other => panic!("expected Maven source, got: {other:?}"),
         }
@@ -495,9 +502,9 @@ konanc_version = "2.1.0"
             name: "kotlinx-datetime".to_owned(),
             source: DepSource::Maven {
                 version: "0.6.0".to_owned(),
-                maven_coordinate: "org.jetbrains.kotlinx:kotlinx-datetime-{target}:0.6.0:klib"
-                    .to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-datetime".to_owned(),
                 targets,
+                required_by: Vec::new(),
             },
             source_hash: "hash-5678".to_owned(),
         });
@@ -511,8 +518,12 @@ konanc_version = "2.1.0"
             "content was: {content}"
         );
         assert!(
-            content.contains("maven_coordinate"),
+            content.contains("maven = \"org.jetbrains.kotlinx:kotlinx-datetime\""),
             "content was: {content}"
+        );
+        assert!(
+            !content.contains("required_by"),
+            "required_by should be omitted for direct deps, content was: {content}"
         );
         assert!(
             content.contains("[dependencies.targets]")
@@ -553,6 +564,129 @@ source_hash = "abcdef1234"
             }
             other => panic!("expected Path source, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn round_trip_with_required_by() {
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "789xyz".to_owned());
+        targets.insert("macos_arm64".to_owned(), "uvw012".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets,
+                required_by: vec!["kotlinx-coroutines".to_owned()],
+            },
+            source_hash: "transitive-hash".to_owned(),
+        });
+        lockfile.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
+        let reparsed = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(lockfile, reparsed);
+        let dep = reparsed
+            .dependencies
+            .first()
+            .unwrap_or_else(|| panic!("missing dep"));
+        match &dep.source {
+            DepSource::Maven {
+                version,
+                maven,
+                required_by,
+                ..
+            } => {
+                assert_eq!(version, "0.23.1");
+                assert_eq!(maven, "org.jetbrains.kotlinx:atomicfu");
+                assert_eq!(required_by, &["kotlinx-coroutines"]);
+            }
+            other => panic!("expected Maven source, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn required_by_omitted_for_direct_deps() {
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "aabb".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-coroutines".to_owned(),
+            source: DepSource::Maven {
+                version: "1.8.0".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
+                targets,
+                required_by: Vec::new(),
+            },
+            source_hash: "direct-hash".to_owned(),
+        });
+        let content = toml::to_string_pretty(&lockfile).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            !content.contains("required_by"),
+            "required_by should not appear for direct deps, content was: {content}"
+        );
+    }
+
+    #[test]
+    fn required_by_present_for_transitive_deps() {
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "ccdd".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets,
+                required_by: vec!["kotlinx-coroutines".to_owned()],
+            },
+            source_hash: "transitive-hash".to_owned(),
+        });
+        let content = toml::to_string_pretty(&lockfile).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            content.contains("required_by"),
+            "required_by should appear for transitive deps, content was: {content}"
+        );
+        assert!(
+            content.contains("kotlinx-coroutines"),
+            "required_by should contain parent dep name, content was: {content}"
+        );
+    }
+
+    #[test]
+    fn maven_field_is_plain_group_artifact() {
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "eeff".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-coroutines".to_owned(),
+            source: DepSource::Maven {
+                version: "1.8.0".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
+                targets,
+                required_by: Vec::new(),
+            },
+            source_hash: "some-hash".to_owned(),
+        });
+        lockfile.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
+        let content = fs::read_to_string(&path).unwrap();
+        // The maven field should not contain template placeholders.
+        assert!(
+            !content.contains("{target}"),
+            "maven field should not contain {{target}}, content was: {content}"
+        );
+        assert!(
+            !content.contains("{version}"),
+            "maven field should not contain {{version}}, content was: {content}"
+        );
+        // It should be plain groupId:artifactId.
+        assert!(
+            content.contains("maven = \"org.jetbrains.kotlinx:kotlinx-coroutines-core\""),
+            "maven field should be plain groupId:artifactId, content was: {content}"
+        );
     }
 
     mod property_tests {
