@@ -272,10 +272,12 @@ test_build_lifecycle() {
     run_output=$(konvoy run 2>/dev/null)
     assert_contains "$run_output" "Hello, lifecycle!"
 
-    # Clean removes artifacts.
+    # Clean removes build artifacts but preserves .konvoy/.
     assert_dir_exists .konvoy
+    assert_dir_exists .konvoy/build
     konvoy clean >/dev/null 2>&1
-    assert_dir_not_exists .konvoy
+    assert_dir_not_exists .konvoy/build
+    assert_dir_exists .konvoy
 
     # Rebuild after clean recompiles.
     local out3
@@ -294,6 +296,55 @@ test_clean_no_konvoy_dir_ok() {
     mkdir -p src
     printf '[package]\nname = "noop"\n\n[toolchain]\nkotlin = "2.1.0"\n' > konvoy.toml
     konvoy clean >/dev/null 2>&1
+}
+
+test_clean_default_preserves_cache() {
+    konvoy init --name clean-keep >/dev/null 2>&1
+    cd clean-keep
+    konvoy build >/dev/null 2>&1
+
+    # Create a cache dir to simulate non-build state.
+    mkdir -p .konvoy/cache
+    echo '{}' > .konvoy/cache/key.json
+
+    konvoy clean >/dev/null 2>&1
+
+    assert_dir_not_exists .konvoy/build
+    assert_dir_exists .konvoy/cache
+    assert_file_exists .konvoy/cache/key.json
+}
+
+test_clean_all_removes_everything() {
+    konvoy init --name clean-all >/dev/null 2>&1
+    cd clean-all
+    konvoy build >/dev/null 2>&1
+
+    mkdir -p .konvoy/cache
+    echo '{}' > .konvoy/cache/key.json
+
+    konvoy clean --all >/dev/null 2>&1
+
+    assert_dir_not_exists .konvoy
+}
+
+test_clean_all_no_konvoy_dir_ok() {
+    mkdir -p src
+    printf '[package]\nname = "noop"\n\n[toolchain]\nkotlin = "2.1.0"\n' > konvoy.toml
+    konvoy clean --all >/dev/null 2>&1
+}
+
+test_clean_rebuild_after_default() {
+    konvoy init --name clean-rebuild >/dev/null 2>&1
+    cd clean-rebuild
+    konvoy build >/dev/null 2>&1
+
+    konvoy clean >/dev/null 2>&1
+    assert_dir_not_exists .konvoy/build
+
+    # Rebuild should recompile.
+    local output
+    output=$(konvoy build 2>&1)
+    assert_contains "$output" "Compiling"
 }
 
 # ---------------------------------------------------------------------------
@@ -1118,6 +1169,10 @@ run_test test_init_includes_toolchain
 run_test test_build_lifecycle
 run_test test_build_release
 run_test test_clean_no_konvoy_dir_ok
+run_test test_clean_default_preserves_cache
+run_test test_clean_all_removes_everything
+run_test test_clean_all_no_konvoy_dir_ok
+run_test test_clean_rebuild_after_default
 
 # doctor (runs after build so toolchain is installed)
 run_test test_doctor_all_ok
