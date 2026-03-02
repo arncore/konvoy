@@ -70,6 +70,9 @@ pub struct DependencySpec {
     /// Maven dependency version requirement (e.g. "1.8.0").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Maven coordinate in `groupId:artifactId` format (e.g. "org.jetbrains.kotlinx:kotlinx-coroutines-core").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maven: Option<String>,
 }
 
 fn default_entrypoint() -> String {
@@ -157,20 +160,49 @@ fn validate(manifest: &Manifest, path: &str) -> Result<(), ManifestError> {
                 name: name.clone(),
             });
         }
-        match (&spec.path, &spec.version) {
-            (Some(_), Some(_)) => {
-                return Err(ManifestError::DependencyAmbiguousSource {
+        // maven + path is an error — pick one source type.
+        if spec.maven.is_some() && spec.path.is_some() {
+            return Err(ManifestError::DependencyMavenWithPath {
+                path: path.to_owned(),
+                name: name.clone(),
+            });
+        }
+        // version without maven is an error — needs a coordinate.
+        if spec.version.is_some() && spec.maven.is_none() {
+            return Err(ManifestError::DependencyVersionWithoutMaven {
+                path: path.to_owned(),
+                name: name.clone(),
+            });
+        }
+        // maven without version is an error — needs a pinned version.
+        if spec.maven.is_some() && spec.version.is_none() {
+            return Err(ManifestError::DependencyMavenWithoutVersion {
+                path: path.to_owned(),
+                name: name.clone(),
+            });
+        }
+        // Validate maven coordinate format: exactly one colon, non-empty parts.
+        if let Some(ref maven) = spec.maven {
+            let valid = match maven.split_once(':') {
+                Some((group, artifact)) => {
+                    !group.is_empty() && !artifact.is_empty() && !artifact.contains(':')
+                }
+                None => false,
+            };
+            if !valid {
+                return Err(ManifestError::DependencyInvalidMaven {
                     path: path.to_owned(),
                     name: name.clone(),
+                    maven: maven.clone(),
                 });
             }
-            (None, None) => {
-                return Err(ManifestError::DependencyNoSource {
-                    path: path.to_owned(),
-                    name: name.clone(),
-                });
-            }
-            _ => {} // exactly one is set — valid
+        }
+        // No source at all — need path or maven+version.
+        if spec.path.is_none() && spec.maven.is_none() && spec.version.is_none() {
+            return Err(ManifestError::DependencyNoSource {
+                path: path.to_owned(),
+                name: name.clone(),
+            });
         }
     }
     Ok(())
@@ -236,10 +268,22 @@ pub enum ManifestError {
     InvalidEntrypoint { path: String, entrypoint: String },
     #[error("invalid [toolchain] in {path}: {message}")]
     InvalidToolchain { path: String, message: String },
-    #[error("dependency `{name}` has no source (set `path` or `version`) in {path}")]
+    #[error("dependency `{name}` has no source (set `path` or `maven` + `version`) in {path}")]
     DependencyNoSource { path: String, name: String },
-    #[error("dependency `{name}` has both `path` and `version` set in {path} — use exactly one")]
-    DependencyAmbiguousSource { path: String, name: String },
+    #[error("dependency `{name}` has both `maven` and `path` set in {path} — use exactly one")]
+    DependencyMavenWithPath { path: String, name: String },
+    #[error(
+        "dependency `{name}` has `maven` without `version` in {path} — add `version = \"X.Y.Z\"`"
+    )]
+    DependencyMavenWithoutVersion { path: String, name: String },
+    #[error("dependency '{name}' has `version` without `maven` coordinate in {path} — add `maven = \"groupId:artifactId\"`")]
+    DependencyVersionWithoutMaven { path: String, name: String },
+    #[error("dependency `{name}` has invalid maven coordinate `{maven}` in {path} — expected format `groupId:artifactId` (exactly one colon)")]
+    DependencyInvalidMaven {
+        path: String,
+        name: String,
+        maven: String,
+    },
     #[error("dependency name `{name}` contains invalid characters in {path}")]
     DependencyInvalidName { path: String, name: String },
     #[error("dependency `{name}` references itself in {path}")]
@@ -825,7 +869,7 @@ name = "no-plugins"
 name = "my-app"
 {TOOLCHAIN}
 [dependencies]
-kotlinx-coroutines = {{ version = "1.8.0" }}
+kotlinx-coroutines = {{ maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }}
 "#
         );
         let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
@@ -835,24 +879,31 @@ kotlinx-coroutines = {{ version = "1.8.0" }}
             .get("kotlinx-coroutines")
             .unwrap_or_else(|| panic!("missing dep"));
         assert_eq!(dep.version.as_deref(), Some("1.8.0"));
+        assert_eq!(
+            dep.maven.as_deref(),
+            Some("org.jetbrains.kotlinx:kotlinx-coroutines-core")
+        );
         assert!(dep.path.is_none());
     }
 
     #[test]
-    fn reject_dependency_both_path_and_version() {
+    fn reject_dependency_maven_with_path() {
         let toml = format!(
             r#"
 [package]
 name = "my-app"
 {TOOLCHAIN}
 [dependencies]
-bad-dep = {{ path = "../x", version = "1.0" }}
+bad-dep = {{ maven = "com.example:lib", version = "1.0", path = "../x" }}
 "#
         );
         let result = Manifest::from_str(&toml, "konvoy.toml");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("both"), "error was: {err}");
+        assert!(
+            err.contains("maven") && err.contains("path"),
+            "error was: {err}"
+        );
     }
 
     #[test]
@@ -863,7 +914,7 @@ bad-dep = {{ path = "../x", version = "1.0" }}
 name = "with-maven"
 {TOOLCHAIN}
 [dependencies]
-kotlinx-coroutines = {{ version = "1.8.0" }}
+kotlinx-coroutines = {{ maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }}
 "#
         );
         let original = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
@@ -882,8 +933,8 @@ name = "my-app"
 {TOOLCHAIN}
 [dependencies]
 my-local-lib = {{ path = "../my-lib" }}
-kotlinx-coroutines = {{ version = "1.8.0" }}
-kotlinx-datetime = {{ version = "0.6.0" }}
+kotlinx-coroutines = {{ maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }}
+kotlinx-datetime = {{ maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }}
 "#
         );
         let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap_or_else(|e| panic!("{e}"));
@@ -894,18 +945,157 @@ kotlinx-datetime = {{ version = "0.6.0" }}
             .unwrap_or_else(|| panic!("missing local dep"));
         assert_eq!(local.path.as_deref(), Some("../my-lib"));
         assert!(local.version.is_none());
+        assert!(local.maven.is_none());
         let coroutines = manifest
             .dependencies
             .get("kotlinx-coroutines")
             .unwrap_or_else(|| panic!("missing coroutines dep"));
         assert_eq!(coroutines.version.as_deref(), Some("1.8.0"));
+        assert_eq!(
+            coroutines.maven.as_deref(),
+            Some("org.jetbrains.kotlinx:kotlinx-coroutines-core")
+        );
         assert!(coroutines.path.is_none());
         let datetime = manifest
             .dependencies
             .get("kotlinx-datetime")
             .unwrap_or_else(|| panic!("missing datetime dep"));
         assert_eq!(datetime.version.as_deref(), Some("0.6.0"));
+        assert_eq!(
+            datetime.maven.as_deref(),
+            Some("org.jetbrains.kotlinx:kotlinx-datetime")
+        );
         assert!(datetime.path.is_none());
+    }
+
+    #[test]
+    fn reject_version_without_maven() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+some-lib = {{ version = "1.0.0" }}
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("version") && err.contains("maven"),
+            "error was: {err}"
+        );
+        assert!(
+            err.contains("add `maven = \"groupId:artifactId\"`"),
+            "error should be actionable: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_maven_without_version() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+some-lib = {{ maven = "com.example:lib" }}
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("maven") && err.contains("version"),
+            "error was: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_maven_no_colon() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+bad-dep = {{ maven = "nocolon", version = "1.0" }}
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid maven coordinate"), "error was: {err}");
+    }
+
+    #[test]
+    fn reject_maven_multiple_colons() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+bad-dep = {{ maven = "a:b:c", version = "1.0" }}
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid maven coordinate"), "error was: {err}");
+    }
+
+    #[test]
+    fn reject_maven_leading_colon() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+bad-dep = {{ maven = ":artifact", version = "1.0" }}
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid maven coordinate"), "error was: {err}");
+    }
+
+    #[test]
+    fn reject_maven_trailing_colon() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+bad-dep = {{ maven = "group:", version = "1.0" }}
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid maven coordinate"), "error was: {err}");
+    }
+
+    #[test]
+    fn reject_dependency_no_source_updated_message() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+bad-dep = {{}}
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("no source"), "error was: {err}");
+        assert!(err.contains("maven"), "error should mention maven: {err}");
     }
 
     mod property_tests {
