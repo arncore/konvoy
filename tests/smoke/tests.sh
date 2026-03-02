@@ -279,10 +279,10 @@ test_build_lifecycle() {
     assert_dir_not_exists .konvoy/build
     assert_dir_exists .konvoy
 
-    # Rebuild after clean recompiles.
-    local out3
-    out3=$(konvoy build 2>&1)
-    assert_contains "$out3" "Compiling"
+    # Rebuild after clean restores the binary (may be a cache hit from
+    # the global content-addressed cache at ~/.konvoy/).
+    konvoy build >/dev/null 2>&1
+    assert_file_exists .konvoy/build/linux_x64/debug/lifecycle
 }
 
 test_build_release() {
@@ -341,10 +341,9 @@ test_clean_rebuild_after_default() {
     konvoy clean >/dev/null 2>&1
     assert_dir_not_exists .konvoy/build
 
-    # Rebuild should recompile.
-    local output
-    output=$(konvoy build 2>&1)
-    assert_contains "$output" "Compiling"
+    # Rebuild should succeed (may be a cache hit from global cache).
+    konvoy build >/dev/null 2>&1
+    assert_file_exists .konvoy/build/linux_x64/debug/clean-rebuild
 }
 
 # ---------------------------------------------------------------------------
