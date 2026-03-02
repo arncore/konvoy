@@ -207,7 +207,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     all_library_paths.extend(plugin_klibs);
 
     // 7b. Resolve and download Maven dependency klibs for the current target.
-    let maven_klibs = resolve_maven_deps(&manifest, &effective_lockfile, &target)?;
+    let maven_klibs = resolve_maven_deps(&effective_lockfile, &target)?;
     all_library_paths.extend(maven_klibs);
 
     // 8. Build the root project.
@@ -434,82 +434,76 @@ pub(crate) fn lockfile_toml_content(lockfile: &Lockfile) -> Result<String, Engin
 
 /// Resolve Maven dependencies for the current build target.
 ///
-/// For each dependency in the manifest that has `version` set (Maven dep),
-/// look up the lockfile for the expected SHA-256 hash, download the klib
-/// via `ensure_artifact()` to the Maven cache, and return the list of klib
-/// paths to pass to `konanc -library`.
+/// Iterates over all Maven dependency entries in the lockfile (both direct
+/// and transitive), downloads the per-target `.klib` artifact, verifies the
+/// SHA-256 hash, and returns the list of klib paths to pass to `konanc -library`.
 ///
 /// Only the klib for the current build target is downloaded (lazy download).
 ///
 /// # Errors
 /// Returns an error if a Maven dependency is missing from the lockfile, the
 /// target hash is not present, or the download/hash verification fails.
-fn resolve_maven_deps(
-    manifest: &Manifest,
-    lockfile: &Lockfile,
-    target: &Target,
-) -> Result<Vec<PathBuf>, EngineError> {
-    let maven_deps: Vec<(&String, &konvoy_config::manifest::DependencySpec)> = manifest
+fn resolve_maven_deps(lockfile: &Lockfile, target: &Target) -> Result<Vec<PathBuf>, EngineError> {
+    // Collect all Maven dependency entries from the lockfile (direct + transitive).
+    let maven_locks: Vec<&DependencyLock> = lockfile
         .dependencies
         .iter()
-        .filter(|(_, spec)| spec.version.is_some())
+        .filter(|d| matches!(&d.source, DepSource::Maven { .. }))
         .collect();
 
-    if maven_deps.is_empty() {
+    if maven_locks.is_empty() {
         return Ok(Vec::new());
     }
 
     let cache_root = konvoy_util::fs::konvoy_home()?.join("cache").join("maven");
     let target_str = target.to_string();
+    let maven_suffix = target.to_maven_suffix();
 
-    let klib_paths: Vec<Result<PathBuf, EngineError>> = maven_deps
+    let klib_paths: Vec<Result<PathBuf, EngineError>> = maven_locks
         .par_iter()
-        .map(|(name, spec)| {
-            // Safe: `maven_deps` is filtered for `version.is_some()` above.
-            let Some(version) = &spec.version else {
-                // Unreachable due to filter, but return empty path to satisfy types.
-                return Ok(PathBuf::new());
+        .map(|lock_entry| {
+            let dep_name = lock_entry.name.clone();
+
+            let (version, maven_coord, targets) = match &lock_entry.source {
+                DepSource::Maven {
+                    version,
+                    maven,
+                    targets,
+                    ..
+                } => (version, maven, targets),
+                DepSource::Path { .. } => {
+                    return Err(EngineError::MissingLockfileEntry { name: dep_name });
+                }
             };
 
-            let dep_name = (*name).clone();
+            // Split "groupId:artifactId" into parts.
+            let (group_id, artifact_id) =
+                maven_coord
+                    .split_once(':')
+                    .ok_or_else(|| EngineError::Metadata {
+                        message: format!(
+                            "invalid maven coordinate `{maven_coord}` for dependency `{dep_name}`"
+                        ),
+                    })?;
 
-            // Look up the library descriptor to resolve the Maven coordinate.
-            let descriptor = crate::library::lookup(name)?.ok_or_else(|| {
-                let available = crate::library::available_library_names().unwrap_or_default();
-                EngineError::UnknownLibrary {
-                    name: dep_name.clone(),
-                    available,
-                }
-            })?;
+            // Build the per-target artifact ID (e.g. "kotlinx-coroutines-core-linuxx64").
+            let per_target_artifact_id = format!("{artifact_id}-{maven_suffix}");
 
-            // Resolve the coordinate for this specific target.
-            let coord = crate::library::resolve_coordinate(&descriptor, version, target)?;
-
-            // Find the lockfile entry for this dependency.
-            let lock_entry = lockfile
-                .dependencies
-                .iter()
-                .find(|d| d.name == **name)
-                .ok_or_else(|| EngineError::MissingLockfileEntry {
-                    name: dep_name.clone(),
-                })?;
+            let coord = konvoy_util::maven::MavenCoordinate::new(
+                group_id,
+                &per_target_artifact_id,
+                version,
+            )
+            .with_packaging("klib");
 
             // Extract the expected SHA-256 for this target from the lockfile.
-            let expected_sha256 = match &lock_entry.source {
-                DepSource::Maven { targets, .. } => {
-                    targets
-                        .get(&target_str)
-                        .ok_or_else(|| EngineError::MissingTargetHash {
-                            name: dep_name.clone(),
-                            target: target_str.clone(),
-                        })?
-                }
-                DepSource::Path { .. } => {
-                    return Err(EngineError::MissingLockfileEntry {
+            let expected_sha256 =
+                targets
+                    .get(&target_str)
+                    .ok_or_else(|| EngineError::MissingTargetHash {
                         name: dep_name.clone(),
-                    });
-                }
-            };
+                        target: target_str.clone(),
+                    })?;
 
             // Compute the cache path and download URL.
             let dest = coord.cache_path(&cache_root);
@@ -520,7 +514,7 @@ fn resolve_maven_deps(
                 &url,
                 &dest,
                 Some(expected_sha256),
-                name,
+                &dep_name,
                 version,
             )
             .map_err(|e| EngineError::LibraryDownloadFailed {
@@ -591,10 +585,10 @@ fn check_lockfile_staleness(manifest: &Manifest, lockfile: &Lockfile) -> Result<
         }
     }
 
-    // If the manifest has Maven dependencies (version is Some), the lockfile must
+    // If the manifest has Maven dependencies (maven + version set), the lockfile must
     // have matching Maven entries for each.
     for (dep_name, dep_spec) in &manifest.dependencies {
-        if dep_spec.version.is_some() {
+        if dep_spec.maven.is_some() && dep_spec.version.is_some() {
             let has_maven_entry = lockfile
                 .dependencies
                 .iter()
@@ -2579,15 +2573,10 @@ mod tests {
     #[test]
     fn resolve_maven_deps_no_maven_deps() {
         // Only path deps in manifest -> empty vec.
-        let manifest = konvoy_config::manifest::Manifest::from_str(
-            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nmy-lib = { path = \"../my-lib\" }\n",
-            "konvoy.toml",
-        )
-        .unwrap();
         let lockfile = Lockfile::with_toolchain("2.1.0");
         let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
 
-        let result = resolve_maven_deps(&manifest, &lockfile, &target).unwrap();
+        let result = resolve_maven_deps(&lockfile, &target).unwrap();
         assert!(
             result.is_empty(),
             "expected empty vec for path-only deps, got: {result:?}"
@@ -2595,22 +2584,41 @@ mod tests {
     }
 
     #[test]
-    fn resolve_maven_deps_missing_lockfile_entry() {
-        // Maven dep in manifest, not in lockfile -> error.
-        let manifest = konvoy_config::manifest::Manifest::from_str(
-            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-coroutines = { maven = \"org.jetbrains.kotlinx:kotlinx-coroutines-core\", version = \"1.8.0\" }\n",
-            "konvoy.toml",
-        )
-        .unwrap();
+    fn resolve_maven_deps_empty_lockfile_returns_empty() {
+        // Maven dep in manifest but not in lockfile returns empty vec.
+        // Staleness is caught by check_lockfile_staleness, not resolve_maven_deps.
         let lockfile = Lockfile::with_toolchain("2.1.0");
         let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
 
-        let result = resolve_maven_deps(&manifest, &lockfile, &target);
+        let result = resolve_maven_deps(&lockfile, &target).unwrap();
+        assert!(
+            result.is_empty(),
+            "expected empty vec when lockfile has no Maven entries, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_maven_deps_missing_target_hash() {
+        // Lockfile has a Maven dep but is missing the hash for the build target.
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-coroutines".to_owned(),
+            source: DepSource::Maven {
+                version: "1.8.0".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
+                targets: std::collections::BTreeMap::new(),
+                required_by: Vec::new(),
+            },
+            source_hash: "hash".to_owned(),
+        });
+        let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
+
+        let result = resolve_maven_deps(&lockfile, &target);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("not in lockfile"),
-            "expected missing lockfile entry error, got: {err}"
+            err.contains("no hash for target"),
+            "expected missing target hash error, got: {err}"
         );
     }
 
