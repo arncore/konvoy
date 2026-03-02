@@ -181,4 +181,17 @@ pub enum EngineError {
         expected: String,
         actual: String,
     },
+
+    /// Two dependency paths require different versions of the same Maven artifact.
+    #[error("version conflict for '{maven}'\n{details}\n  hint: add an explicit version in konvoy.toml:\n    {hint_name} = {{ maven = \"{maven}\", version = \"{hint_version}\" }}")]
+    MavenVersionConflict {
+        maven: String,
+        details: String,
+        hint_name: String,
+        hint_version: String,
+    },
+
+    /// A cycle was detected during Maven transitive dependency resolution.
+    #[error("maven dependency cycle detected: {cycle}")]
+    MavenDependencyCycle { cycle: String },
 }
