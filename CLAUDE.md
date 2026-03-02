@@ -28,6 +28,7 @@ Konvoy is a native-first Kotlin build tool implemented in Rust. The goal is to m
 - **Managed toolchains:** `~/.konvoy/toolchains/<version>/` (konanc + bundled JRE)
 - **Managed tools:** `~/.konvoy/tools/detekt/<version>/` (detekt-cli JAR)
 - **Maven cache:** `~/.konvoy/cache/maven/<group>/<artifact>/<version>/` (downloaded klibs)
+- **POM cache:** `~/.konvoy/cache/pom/<group>/<artifact>-<version>.pom` (fetched POM files for transitive resolution)
 
 ## Current scope
 

@@ -77,7 +77,7 @@ hello/
 - `konvoy run [--target <triple|host>] [--release] [--force] [--locked] [-- <args…>]` — build and run
 - `konvoy test [--target <triple|host>] [--release] [--verbose] [--force] [--locked] [--filter <pattern>]` — build and run tests
 - `konvoy lint [--verbose] [--config <path>] [--locked]` — run detekt static analysis on Kotlin sources
-- `konvoy update` — resolve Maven dependencies and update `konvoy.lock`
+- `konvoy update` — resolve Maven dependencies (including transitives via POM) and update `konvoy.lock`
 - `konvoy clean` — remove build artifacts
 - `konvoy doctor` — check environment, toolchain, and dependency setup
 - `konvoy toolchain install [<version>]` — install a Kotlin/Native version
@@ -156,14 +156,50 @@ kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version =
 my-utils = { path = "../my-utils" }
 ```
 
-After adding a Maven dependency, run `konvoy update` to resolve versions (including transitive dependencies via POM files) and populate `konvoy.lock` with per-target SHA-256 hashes. At build time, only the klib for your current target is downloaded — subsequent builds use the cached artifact.
+The `maven` field is a standard Maven coordinate (`groupId:artifactId`). The `version` field pins the exact version to use.
+
+Each dependency must have exactly one source type — either `path` or `maven` + `version` — not both.
+
+#### Workflow
+
+After adding or changing a Maven dependency, run `konvoy update` to resolve and lock:
 
 ```
-konvoy update    # resolve deps, download klibs, write hashes to konvoy.lock
+konvoy update    # resolve deps, fetch POMs, write hashes to konvoy.lock
 konvoy build     # downloads only the klib needed for your host target
 ```
 
-Each dependency must have exactly one source type — either `path` or `maven` + `version` — not both.
+`konvoy update` performs these steps:
+
+1. Reads `[dependencies]` from `konvoy.toml`
+2. Fetches each dependency's POM from Maven Central
+3. Walks transitive dependencies via POM `<dependency>` entries (BFS)
+4. Detects version conflicts and dependency cycles with actionable errors
+5. Downloads the per-target `.klib` for each supported platform
+6. Writes SHA-256 hashes to `konvoy.lock`
+
+At build time (`konvoy build`), only the klib for your current host target is downloaded from the Maven cache. Subsequent builds reuse cached artifacts from `~/.konvoy/cache/maven/`.
+
+#### Lockfile
+
+`konvoy.lock` pins the exact version and per-target SHA-256 hash for every Maven dependency (direct and transitive). Transitive dependencies include a `required-by` field tracing the dependency chain back to `konvoy.toml`:
+
+```toml
+[[dependencies]]
+name = "kotlinx-coroutines"
+source_type = "maven"
+version = "1.8.0"
+maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core"
+source_hash = "..."
+
+[dependencies.targets]
+linux_x64 = "sha256:..."
+macos_arm64 = "sha256:..."
+```
+
+Transitive dependencies are tracked automatically with a `required_by` field listing which direct dependency pulled them in.
+
+Use `--locked` on build/test/run to error if the lockfile is out of date instead of silently updating.
 
 ### Plugins
 
