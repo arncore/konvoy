@@ -166,8 +166,12 @@ pub enum EngineError {
     #[error("no hash for target `{target}` in lockfile for dependency `{name}` — run `konvoy update` to resolve")]
     MissingTargetHash { name: String, target: String },
 
-    /// A library klib hash mismatch was detected after download.
-    #[error("library `{name}` klib hash mismatch — expected {expected}, got {actual}; run `konvoy update` to refresh")]
+    /// A library klib hash mismatch was detected after a fresh download.
+    ///
+    /// Unlike `ArtifactHashMismatch` (cached file mismatch), this fires when
+    /// the just-downloaded content doesn't match the lockfile. This points at
+    /// a network-level issue (MITM, CDN corruption) or a stale lockfile.
+    #[error("library `{name}` hash mismatch after download\n  expected: {expected}\n  got:      {actual}\n\n  This can happen if:\n    - the download was intercepted or corrupted in transit\n    - the lockfile hashes are stale (e.g. the upstream artifact was republished)\n\n  To fix: run `konvoy update` to re-resolve and re-hash all dependencies.\n  If this keeps happening, check your network connection for interference.")]
     LibraryHashMismatch {
         name: String,
         expected: String,

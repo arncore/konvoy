@@ -31,7 +31,7 @@ pub enum UtilError {
     InvalidVersion { version: String },
 
     /// An artifact hash does not match the expected value.
-    #[error("artifact hash mismatch for {path} — expected {expected}, got {actual}")]
+    #[error("artifact hash mismatch for {path}\n  expected: {expected}\n  got:      {actual}\n\n  This can happen if:\n    - the file was corrupted on disk (e.g. interrupted download, disk error)\n    - the file was tampered with (e.g. malware or unauthorized modification)\n    - the lockfile hashes are stale (e.g. manual edits to konvoy.lock)\n\n  To fix: inspect or delete the file above, then re-run the build.\n  If the problem persists, run `konvoy update` to re-resolve all dependencies.")]
     ArtifactHashMismatch {
         path: String,
         expected: String,
