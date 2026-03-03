@@ -62,6 +62,18 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
     let lockfile_path = project_root.join("konvoy.lock");
     let mut lockfile = Lockfile::from_path(&lockfile_path)?;
 
+    // Ensure the toolchain section is populated so `konvoy build` can
+    // recognise the lockfile without discarding dependency entries.
+    if lockfile.toolchain.is_none() {
+        lockfile.toolchain = Some(konvoy_config::lockfile::ToolchainLock {
+            konanc_version: manifest.toolchain.kotlin.clone(),
+            konanc_tarball_sha256: None,
+            jre_tarball_sha256: None,
+            detekt_version: None,
+            detekt_jar_sha256: None,
+        });
+    }
+
     // 2. Collect Maven deps (those with `maven` + `version` set).
     let maven_deps: Vec<_> = manifest
         .dependencies
@@ -928,6 +940,59 @@ kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", 
             msg.contains("remove one of these dependencies"),
             "should be actionable: {msg}"
         );
+    }
+
+    #[test]
+    fn update_populates_toolchain_when_missing() {
+        // Regression: `konvoy update` on a fresh project (no prior lockfile)
+        // must write a `[toolchain]` section so that `konvoy build` does not
+        // discard the dependency entries.
+        let project = make_project(
+            r#"
+[package]
+name = "my-app"
+
+[toolchain]
+kotlin = "2.1.0"
+"#,
+        );
+        // No konvoy.lock on disk — `update` creates it from scratch.
+        let result = update(project.path()).unwrap();
+        assert_eq!(result.updated_count, 0);
+
+        let reparsed = Lockfile::from_path(&project.path().join("konvoy.lock")).unwrap();
+        assert!(
+            reparsed.toolchain.is_some(),
+            "lockfile written by `update` must have a [toolchain] section"
+        );
+        assert_eq!(reparsed.toolchain.as_ref().unwrap().konanc_version, "2.1.0");
+    }
+
+    #[test]
+    fn update_does_not_overwrite_existing_toolchain() {
+        // If a lockfile already has a [toolchain] section with tarball hashes,
+        // `update` should not overwrite it with a bare version-only section.
+        let project = make_project(
+            r#"
+[package]
+name = "my-app"
+
+[toolchain]
+kotlin = "2.1.0"
+"#,
+        );
+        let lockfile = Lockfile::with_managed_toolchain("2.1.0", Some("tc-hash"), Some("jre-hash"));
+        lockfile
+            .write_to(&project.path().join("konvoy.lock"))
+            .unwrap();
+
+        let result = update(project.path()).unwrap();
+        assert_eq!(result.updated_count, 0);
+
+        let reparsed = Lockfile::from_path(&project.path().join("konvoy.lock")).unwrap();
+        let tc = reparsed.toolchain.as_ref().unwrap();
+        assert_eq!(tc.konanc_tarball_sha256.as_deref(), Some("tc-hash"));
+        assert_eq!(tc.jre_tarball_sha256.as_deref(), Some("jre-hash"));
     }
 
     #[test]
