@@ -121,11 +121,16 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
                 // Lockfile is missing or has a different version. Build
                 // the same lockfile that `update_lockfile_if_needed` would
                 // write so the cache key is stable from the first build.
-                Lockfile::with_managed_toolchain(
+                // Preserve existing dependencies and plugins from the
+                // on-disk lockfile (e.g. Maven deps written by `konvoy update`).
+                let mut stabilized = Lockfile::with_managed_toolchain(
                     &konanc.version,
                     resolved.konanc_tarball_sha256.as_deref(),
                     resolved.jre_tarball_sha256.as_deref(),
-                )
+                );
+                stabilized.dependencies = lockfile.dependencies.clone();
+                stabilized.plugins = lockfile.plugins.clone();
+                stabilized
             }
         }
     };

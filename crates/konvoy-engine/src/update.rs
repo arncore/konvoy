@@ -62,6 +62,18 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
     let lockfile_path = project_root.join("konvoy.lock");
     let mut lockfile = Lockfile::from_path(&lockfile_path)?;
 
+    // Ensure the toolchain section is populated so `konvoy build` can
+    // recognise the lockfile without discarding dependency entries.
+    if lockfile.toolchain.is_none() {
+        lockfile.toolchain = Some(konvoy_config::lockfile::ToolchainLock {
+            konanc_version: manifest.toolchain.kotlin.clone(),
+            konanc_tarball_sha256: None,
+            jre_tarball_sha256: None,
+            detekt_version: None,
+            detekt_jar_sha256: None,
+        });
+    }
+
     // 2. Collect Maven deps (those with `maven` + `version` set).
     let maven_deps: Vec<_> = manifest
         .dependencies
