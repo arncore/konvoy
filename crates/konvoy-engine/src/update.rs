@@ -965,10 +965,7 @@ kotlin = "2.1.0"
             reparsed.toolchain.is_some(),
             "lockfile written by `update` must have a [toolchain] section"
         );
-        assert_eq!(
-            reparsed.toolchain.as_ref().unwrap().konanc_version,
-            "2.1.0"
-        );
+        assert_eq!(reparsed.toolchain.as_ref().unwrap().konanc_version, "2.1.0");
     }
 
     #[test]
@@ -984,8 +981,7 @@ name = "my-app"
 kotlin = "2.1.0"
 "#,
         );
-        let lockfile =
-            Lockfile::with_managed_toolchain("2.1.0", Some("tc-hash"), Some("jre-hash"));
+        let lockfile = Lockfile::with_managed_toolchain("2.1.0", Some("tc-hash"), Some("jre-hash"));
         lockfile
             .write_to(&project.path().join("konvoy.lock"))
             .unwrap();
