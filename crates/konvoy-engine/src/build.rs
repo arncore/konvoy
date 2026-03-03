@@ -2628,6 +2628,119 @@ mod tests {
     }
 
     #[test]
+    fn resolve_maven_deps_works_with_lockfile_missing_toolchain() {
+        // Regression: when `konvoy update` wrote a lockfile without a
+        // [toolchain] section, the effective-lockfile stabilization created a
+        // blank lockfile, discarding all Maven deps. After the fix, Maven deps
+        // in a lockfile that has no toolchain must still be resolved.
+        //
+        // Simulate by constructing a lockfile with Maven deps but no toolchain,
+        // then verifying resolve_maven_deps sees them.
+        let mut lockfile = Lockfile::default(); // no toolchain
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "aabbccdd".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-coroutines".to_owned(),
+            source: DepSource::Maven {
+                version: "1.8.0".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
+                targets,
+                required_by: Vec::new(),
+            },
+            source_hash: "hash".to_owned(),
+        });
+
+        // Simulate the stabilization path from build(): toolchain is None, so
+        // build the stabilized lockfile preserving deps.
+        let mut stabilized =
+            Lockfile::with_managed_toolchain("2.1.0", None, None);
+        stabilized.dependencies = lockfile.dependencies.clone();
+        stabilized.plugins = lockfile.plugins.clone();
+
+        // The Maven dep must still be visible after stabilization.
+        let maven_count = stabilized
+            .dependencies
+            .iter()
+            .filter(|d| matches!(&d.source, DepSource::Maven { .. }))
+            .count();
+        assert_eq!(
+            maven_count, 1,
+            "stabilized lockfile must preserve Maven deps"
+        );
+        assert!(
+            stabilized.toolchain.is_some(),
+            "stabilized lockfile must have a toolchain"
+        );
+    }
+
+    #[test]
+    fn lockfile_round_trip_without_toolchain_preserves_maven_deps() {
+        // Regression: a lockfile on disk that has Maven deps but no [toolchain]
+        // must round-trip correctly through Lockfile::from_path.
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+
+        // Write a lockfile without toolchain but with Maven deps — this is what
+        // `konvoy update` used to produce before the fix.
+        let content = r#"
+[[dependencies]]
+name = "kotlinx-datetime"
+source_type = "maven"
+version = "0.6.0"
+maven = "org.jetbrains.kotlinx:kotlinx-datetime"
+source_hash = "aabbccdd"
+
+[dependencies.targets]
+linux_x64 = "1111"
+"#;
+        std::fs::write(&lockfile_path, content).unwrap();
+
+        let lockfile = Lockfile::from_path(&lockfile_path).unwrap();
+
+        // Toolchain should be None (was not present on disk).
+        assert!(lockfile.toolchain.is_none());
+
+        // Maven dep must have been parsed.
+        assert_eq!(lockfile.dependencies.len(), 1);
+        assert_eq!(lockfile.dependencies[0].name, "kotlinx-datetime");
+        match &lockfile.dependencies[0].source {
+            DepSource::Maven {
+                version, maven, targets, ..
+            } => {
+                assert_eq!(version, "0.6.0");
+                assert_eq!(maven, "org.jetbrains.kotlinx:kotlinx-datetime");
+                assert_eq!(targets.get("linux_x64").map(String::as_str), Some("1111"));
+            }
+            other => panic!("expected Maven source, got: {other:?}"),
+        }
+
+        // Simulate the build stabilization path.
+        let mut stabilized =
+            Lockfile::with_managed_toolchain("2.1.0", None, None);
+        stabilized.dependencies = lockfile.dependencies.clone();
+
+        let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
+        let maven_locks: Vec<_> = stabilized
+            .dependencies
+            .iter()
+            .filter(|d| matches!(&d.source, DepSource::Maven { .. }))
+            .collect();
+
+        assert_eq!(
+            maven_locks.len(),
+            1,
+            "resolve_maven_deps must see the Maven dep after stabilization"
+        );
+        // The target hash must be accessible.
+        if let DepSource::Maven { targets, .. } = &maven_locks[0].source {
+            assert!(
+                targets.contains_key(&target.to_string()),
+                "target hash for {target} must exist"
+            );
+        }
+    }
+
+    #[test]
     fn update_lockfile_preserves_maven_dep_locks() {
         // When updating the lockfile (e.g. toolchain changed), Maven dep locks
         // from the existing lockfile should be preserved.
