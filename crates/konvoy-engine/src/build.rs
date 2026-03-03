@@ -2652,8 +2652,7 @@ mod tests {
 
         // Simulate the stabilization path from build(): toolchain is None, so
         // build the stabilized lockfile preserving deps.
-        let mut stabilized =
-            Lockfile::with_managed_toolchain("2.1.0", None, None);
+        let mut stabilized = Lockfile::with_managed_toolchain("2.1.0", None, None);
         stabilized.dependencies = lockfile.dependencies.clone();
         stabilized.plugins = lockfile.plugins.clone();
 
@@ -2705,7 +2704,10 @@ linux_x64 = "1111"
         assert_eq!(lockfile.dependencies[0].name, "kotlinx-datetime");
         match &lockfile.dependencies[0].source {
             DepSource::Maven {
-                version, maven, targets, ..
+                version,
+                maven,
+                targets,
+                ..
             } => {
                 assert_eq!(version, "0.6.0");
                 assert_eq!(maven, "org.jetbrains.kotlinx:kotlinx-datetime");
@@ -2715,8 +2717,7 @@ linux_x64 = "1111"
         }
 
         // Simulate the build stabilization path.
-        let mut stabilized =
-            Lockfile::with_managed_toolchain("2.1.0", None, None);
+        let mut stabilized = Lockfile::with_managed_toolchain("2.1.0", None, None);
         stabilized.dependencies = lockfile.dependencies.clone();
 
         let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
