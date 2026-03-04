@@ -320,6 +320,8 @@ konvoy lint --verbose              # show raw detekt output
 
 ### VS Code
 
+> **VS Code Marketplace listing coming soon.** For now, install manually from [Releases](https://github.com/arncore/konvoy/releases).
+
 The [Konvoy for VS Code](editors/code) extension provides:
 
 - **Commands** — Build, Run, Test, Lint, Clean, Doctor, Update, and Toolchain management via `Ctrl+Shift+P`
