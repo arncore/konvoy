@@ -16,13 +16,31 @@ const EXPECTED_COMMAND_IDS = [
 ];
 
 suite('Commands', () => {
-    suiteSetup(async () => {
-        // Ensure the extension is activated before running command tests.
-        // The test runner opens a workspace with konvoy.toml, but activation
-        // may be deferred until VS Code processes the workspaceContains event.
-        const ext = vscode.extensions.getExtension('konvoy.konvoy-vscode');
-        if (ext && !ext.isActive) {
-            await ext.activate();
+    // Register commands directly so tests don't depend on extension
+    // activation (which requires extensionDependencies like fwcd.kotlin
+    // that aren't available in CI).
+    let disposables: vscode.Disposable[] = [];
+
+    suiteSetup(() => {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { registerCommands } = require('../../commands');
+        disposables = registerCommands();
+    });
+
+    suiteTeardown(() => {
+        for (const d of disposables) {
+            d.dispose();
+        }
+    });
+
+    test('registerCommands returns 11 disposables', () => {
+        assert.strictEqual(
+            disposables.length,
+            11,
+            `Expected 11 disposables, got ${disposables.length}`,
+        );
+        for (const d of disposables) {
+            assert.ok(d.dispose, 'Each disposable must have a dispose method');
         }
     });
 
@@ -45,28 +63,4 @@ suite('Commands', () => {
             );
         });
     }
-
-    test('registerCommands returns 11 disposables', () => {
-        // Import and call registerCommands directly to verify it returns
-        // the correct number of disposables. We dispose them immediately
-        // to avoid duplicate registrations.
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const { registerCommands } = require('../../commands');
-        const disposables: vscode.Disposable[] = registerCommands();
-        try {
-            assert.strictEqual(
-                disposables.length,
-                11,
-                `Expected 11 disposables, got ${disposables.length}`,
-            );
-            for (const d of disposables) {
-                assert.ok(d.dispose, 'Each disposable must have a dispose method');
-            }
-        } finally {
-            // Clean up to avoid duplicate command registrations
-            for (const d of disposables) {
-                d.dispose();
-            }
-        }
-    });
 });
