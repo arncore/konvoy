@@ -18,6 +18,9 @@
   "extensionDependencies": [
     "fwcd.kotlin"
   ],
+  "extensionPack": [
+    "GitLens.detekt"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
