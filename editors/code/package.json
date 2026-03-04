@@ -34,11 +34,13 @@
       },
       {
         "command": "konvoy.run",
-        "title": "Konvoy: Run"
+        "title": "Konvoy: Run",
+        "icon": "$(play)"
       },
       {
         "command": "konvoy.runRelease",
-        "title": "Konvoy: Run (Release)"
+        "title": "Konvoy: Run (Release)",
+        "icon": "$(play)"
       },
       {
         "command": "konvoy.test",
@@ -164,7 +166,21 @@
           "command"
         ]
       }
-    ]
+    ],
+    "menus": {
+      "editor/title/run": [
+        {
+          "command": "konvoy.run",
+          "group": "navigation@1",
+          "when": "resourceFilename == 'konvoy.toml' || resourceExtname == '.kt'"
+        },
+        {
+          "command": "konvoy.runRelease",
+          "group": "navigation@2",
+          "when": "resourceFilename == 'konvoy.toml' || resourceExtname == '.kt'"
+        }
+      ]
+    }
   },
   "scripts": {
     "build": "esbuild --bundle src/extension.ts --outfile=out/extension.js --external:vscode --platform=node --format=cjs",
