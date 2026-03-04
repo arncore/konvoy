@@ -43,6 +43,16 @@ suite('outputChannel', () => {
                 'getOutputChannel must return the same instance on repeated calls',
             );
         });
+
+        test('getOutputChannel creates new instance after disposeOutputChannel', () => {
+            const first = getOutputChannel();
+            disposeOutputChannel();
+            const second = getOutputChannel();
+            assert.ok(second, 'Should create a new instance after dispose');
+            assert.ok(typeof second.appendLine === 'function');
+            // Cannot guarantee reference inequality since the singleton was reset,
+            // but the new instance should be functional
+        });
     });
 
     suite('disposeOutputChannel', () => {

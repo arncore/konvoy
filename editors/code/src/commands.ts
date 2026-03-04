@@ -127,3 +127,9 @@ export function registerCommands(): vscode.Disposable[] {
         vscode.commands.registerCommand(config.id, () => runCommand(config)),
     );
 }
+
+/** @internal Exposed for testing only. */
+export const _testing = {
+    isRunning: (): boolean => runningProcess !== undefined,
+    setRunning: (proc: cp.ChildProcess | undefined): void => { runningProcess = proc; },
+};

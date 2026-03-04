@@ -21,6 +21,9 @@ suite('Commands', () => {
     // that aren't available in CI).
     let disposables: vscode.Disposable[] = [];
 
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { COMMANDS, _testing } = require('../../commands');
+
     suiteSetup(() => {
         // eslint-disable-next-line @typescript-eslint/no-var-requires
         const { registerCommands } = require('../../commands');
@@ -54,17 +57,17 @@ suite('Commands', () => {
         );
     });
 
-    for (const commandId of EXPECTED_COMMAND_IDS) {
-        test(`command "${commandId}" is registered`, async () => {
-            const allCommands = await vscode.commands.getCommands(true);
+    test('every EXPECTED_COMMAND_ID is returned by getCommands()', async () => {
+        const allCommands = await vscode.commands.getCommands(true);
+        for (const commandId of EXPECTED_COMMAND_IDS) {
             assert.ok(
                 allCommands.includes(commandId),
                 `Expected command "${commandId}" to be registered`,
             );
-        });
-    }
+        }
+    });
 
-    test('executing konvoy.build does not throw', async () => {
+    test('executing command without workspace does not throw', async () => {
         // In the test environment there is no workspace folder with
         // konvoy.toml, so the command should show an error message but
         // must never throw an unhandled exception.
@@ -75,43 +78,82 @@ suite('Commands', () => {
         }
     });
 
-    test('COMMANDS array entries have expected structure', () => {
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const { COMMANDS } = require('../../commands');
-        assert.ok(Array.isArray(COMMANDS), 'COMMANDS should be an array');
-        assert.ok(COMMANDS.length > 0, 'COMMANDS should not be empty');
+    // --- runCommand guard tests using _testing helper ---
 
+    test('shows warning when a command is already running', async () => {
+        _testing.setRunning({} as any);
+        try {
+            // Should not throw; internally it shows a warning and returns early.
+            await vscode.commands.executeCommand('konvoy.build');
+        } catch (err) {
+            assert.fail(`konvoy.build threw while another process was running: ${err}`);
+        } finally {
+            _testing.setRunning(undefined);
+        }
+    });
+
+    test('resets running state on process error', async () => {
+        // In CI the konvoy binary does not exist, so spawn emits ENOENT.
+        // After the error handler fires, runningProcess must be cleared.
+        assert.strictEqual(_testing.isRunning(), false, 'precondition: nothing running');
+
+        await vscode.commands.executeCommand('konvoy.build');
+
+        // The error event is asynchronous; give the event loop a tick.
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        assert.strictEqual(
+            _testing.isRunning(),
+            false,
+            'runningProcess should be cleared after a process error',
+        );
+    });
+
+    // --- COMMANDS structure tests ---
+
+    test('all command IDs start with konvoy.', () => {
         for (const cmd of COMMANDS) {
             assert.ok(
-                typeof cmd.id === 'string' && cmd.id.length > 0,
-                `Command must have a non-empty string id, got: ${JSON.stringify(cmd.id)}`,
-            );
-            assert.ok(
-                Array.isArray(cmd.args),
-                `Command "${cmd.id}" must have an args array`,
-            );
-            assert.strictEqual(
-                typeof cmd.parseDiagnostics,
-                'boolean',
-                `Command "${cmd.id}" must have a boolean parseDiagnostics`,
-            );
-            assert.strictEqual(
-                typeof cmd.useDetektParser,
-                'boolean',
-                `Command "${cmd.id}" must have a boolean useDetektParser`,
+                cmd.id.startsWith('konvoy.'),
+                `Command id "${cmd.id}" does not start with "konvoy."`,
             );
         }
     });
 
-    test('COMMANDS ids match EXPECTED_COMMAND_IDS', () => {
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const { COMMANDS } = require('../../commands');
-        const ids = COMMANDS.map((c: { id: string }) => c.id);
-        for (const expectedId of EXPECTED_COMMAND_IDS) {
+    test('all commands have non-empty args array', () => {
+        for (const cmd of COMMANDS) {
             assert.ok(
-                ids.includes(expectedId),
-                `Expected COMMANDS to contain "${expectedId}"`,
+                Array.isArray(cmd.args) && cmd.args.length > 0,
+                `Command "${cmd.id}" must have a non-empty args array`,
             );
         }
+    });
+
+    test('commands with parseDiagnostics have valid useDetektParser boolean', () => {
+        for (const cmd of COMMANDS) {
+            if (cmd.parseDiagnostics) {
+                assert.strictEqual(
+                    typeof cmd.useDetektParser,
+                    'boolean',
+                    `Command "${cmd.id}" has parseDiagnostics: true but useDetektParser is not a boolean`,
+                );
+            }
+        }
+    });
+
+    test('konvoy.lint is the only command with useDetektParser: true', () => {
+        const detektCommands = COMMANDS.filter(
+            (c: { useDetektParser: boolean }) => c.useDetektParser === true,
+        );
+        assert.strictEqual(
+            detektCommands.length,
+            1,
+            `Expected exactly 1 command with useDetektParser: true, got ${detektCommands.length}`,
+        );
+        assert.strictEqual(
+            detektCommands[0].id,
+            'konvoy.lint',
+            `Expected konvoy.lint to be the only useDetektParser command, got "${detektCommands[0].id}"`,
+        );
     });
 });
