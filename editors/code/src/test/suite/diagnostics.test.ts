@@ -83,6 +83,58 @@ suite('parseKonancDiagnostics', () => {
         assert.strictEqual(result[0].severity, 'warning');
         assert.strictEqual(result[1].severity, 'info');
     });
+
+    test('parses paths with spaces', () => {
+        const output = 'my project/src/main.kt:10:5: error: bad';
+        const result = parseKonancDiagnostics(output);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].file, 'my project/src/main.kt');
+        assert.strictEqual(result[0].line, 10);
+        assert.strictEqual(result[0].column, 5);
+        assert.strictEqual(result[0].severity, 'error');
+        assert.strictEqual(result[0].message, 'bad');
+    });
+
+    test('captures full message including colons', () => {
+        const output = 'src/main.kt:10:5: error: type mismatch: expected Int, got String';
+        const result = parseKonancDiagnostics(output);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].message, 'type mismatch: expected Int, got String');
+    });
+
+    test('handles Windows \\r\\n line endings', () => {
+        const output = 'src/main.kt:10:5: error: bad\r\n';
+        const result = parseKonancDiagnostics(output);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].file, 'src/main.kt');
+        assert.strictEqual(result[0].severity, 'error');
+        assert.strictEqual(result[0].message, 'bad');
+    });
+
+    test('returns empty array for whitespace-only lines', () => {
+        const output = '   \n   \n   ';
+        const result = parseKonancDiagnostics(output);
+        assert.deepStrictEqual(result, []);
+    });
+
+    test('parses bare diagnostic with empty message', () => {
+        const output = 'error: ';
+        const result = parseKonancDiagnostics(output);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].severity, 'error');
+        assert.strictEqual(result[0].message, '');
+    });
+
+    test('parses diagnostics with leading whitespace on lines', () => {
+        const output = '  src/main.kt:10:5: error: foo  ';
+        const result = parseKonancDiagnostics(output);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].file, 'src/main.kt');
+        assert.strictEqual(result[0].line, 10);
+        assert.strictEqual(result[0].column, 5);
+        assert.strictEqual(result[0].severity, 'error');
+        assert.strictEqual(result[0].message, 'foo');
+    });
 });
 
 suite('parseDetektDiagnostics', () => {
@@ -137,5 +189,58 @@ suite('parseDetektDiagnostics', () => {
         for (const diag of result) {
             assert.strictEqual(diag.severity, 'warning');
         }
+    });
+
+    test('parses paths with spaces', () => {
+        const output = 'my dir/src/main.kt:3:5: Magic number [MagicNumber]';
+        const result = parseDetektDiagnostics(output);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].file, 'my dir/src/main.kt');
+        assert.strictEqual(result[0].line, 3);
+        assert.strictEqual(result[0].column, 5);
+        assert.strictEqual(result[0].message, 'Magic number');
+        assert.strictEqual(result[0].rule, 'MagicNumber');
+    });
+
+    test('parses rule names with underscores and digits', () => {
+        const output = 'src/main.kt:3:5: Msg [Rule_123]';
+        const result = parseDetektDiagnostics(output);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].message, 'Msg');
+        assert.strictEqual(result[0].rule, 'Rule_123');
+    });
+
+    test('captures last bracket group as rule when message contains brackets', () => {
+        const output = 'src/main.kt:3:5: found [unused] import [UnusedImport]';
+        const result = parseDetektDiagnostics(output);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].message, 'found [unused] import');
+        assert.strictEqual(result[0].rule, 'UnusedImport');
+    });
+
+    test('handles Windows \\r\\n line endings', () => {
+        const output = 'src/main.kt:3:5: Magic number [MagicNumber]\r\n';
+        const result = parseDetektDiagnostics(output);
+        assert.strictEqual(result.length, 1);
+        assert.strictEqual(result[0].file, 'src/main.kt');
+        assert.strictEqual(result[0].message, 'Magic number');
+        assert.strictEqual(result[0].rule, 'MagicNumber');
+    });
+
+    test('filters out non-diagnostic summary lines in mixed output', () => {
+        const output = [
+            'detekt finished in 1234ms',
+            'src/main.kt:3:5: Magic number [MagicNumber]',
+            '',
+            'Overall debt: 10min',
+            'src/util.kt:7:1: LongMethod - Method too long [detekt.complexity]',
+            'Complexity report:',
+        ].join('\n');
+        const result = parseDetektDiagnostics(output);
+        assert.strictEqual(result.length, 2);
+        assert.strictEqual(result[0].file, 'src/main.kt');
+        assert.strictEqual(result[0].rule, 'MagicNumber');
+        assert.strictEqual(result[1].file, 'src/util.kt');
+        assert.strictEqual(result[1].rule, 'LongMethod');
     });
 });
