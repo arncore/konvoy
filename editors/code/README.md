@@ -4,6 +4,8 @@ VS Code extension for [Konvoy](../../README.md), a native-first Kotlin build too
 
 ## Install
 
+> **VS Code Marketplace listing coming soon.** For now, install manually using one of the methods below.
+
 ### From GitHub Releases
 
 1. Download the latest `.vsix` from [Releases](https://github.com/arncore/konvoy/releases)
