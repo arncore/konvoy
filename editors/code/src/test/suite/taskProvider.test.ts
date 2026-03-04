@@ -2,6 +2,13 @@ import * as assert from 'assert';
 import * as vscode from 'vscode';
 
 suite('TaskProvider', () => {
+    suiteSetup(async () => {
+        const ext = vscode.extensions.getExtension('konvoy.konvoy-vscode');
+        if (ext && !ext.isActive) {
+            await ext.activate();
+        }
+    });
+
     test('fetching konvoy tasks does not throw', async () => {
         // fetchTasks may return an empty array if no konvoy.toml exists in
         // the test workspace, but it must not throw.

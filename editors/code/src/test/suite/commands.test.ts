@@ -16,6 +16,16 @@ const EXPECTED_COMMAND_IDS = [
 ];
 
 suite('Commands', () => {
+    suiteSetup(async () => {
+        // Ensure the extension is activated before running command tests.
+        // The test runner opens a workspace with konvoy.toml, but activation
+        // may be deferred until VS Code processes the workspaceContains event.
+        const ext = vscode.extensions.getExtension('konvoy.konvoy-vscode');
+        if (ext && !ext.isActive) {
+            await ext.activate();
+        }
+    });
+
     test('all 11 konvoy commands are registered', async () => {
         const allCommands = await vscode.commands.getCommands(true);
         const konvoyCommands = allCommands.filter(id => id.startsWith('konvoy.'));
