@@ -140,11 +140,14 @@
       {
         "name": "konvoy-bare",
         "owner": "konvoy",
+        "fileLocation": ["relative", "${workspaceFolder}"],
         "pattern": [
           {
-            "regexp": "^(error|warning|info):\\s*(.*)$",
-            "severity": 1,
-            "message": 2
+            "regexp": "^(.+)?:?(\\d+)?:?\\s*(error|warning|info):\\s*(.*)$",
+            "file": 1,
+            "line": 2,
+            "severity": 3,
+            "message": 4
           }
         ]
       }
