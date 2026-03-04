@@ -16,7 +16,7 @@ const TASK_CONFIGS = [
     { command: 'doctor',          label: 'doctor',          args: ['doctor'],                          group: undefined,              isDefault: false, problemMatcher: '$konvoy-bare'   },
 ];
 
-class KonvoyTaskProvider implements vscode.TaskProvider {
+export class KonvoyTaskProvider implements vscode.TaskProvider {
     private tasks: vscode.Task[] | undefined;
 
     provideTasks(): vscode.Task[] {

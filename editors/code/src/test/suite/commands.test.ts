@@ -63,4 +63,55 @@ suite('Commands', () => {
             );
         });
     }
+
+    test('executing konvoy.build does not throw', async () => {
+        // In the test environment there is no workspace folder with
+        // konvoy.toml, so the command should show an error message but
+        // must never throw an unhandled exception.
+        try {
+            await vscode.commands.executeCommand('konvoy.build');
+        } catch (err) {
+            assert.fail(`konvoy.build threw an unexpected error: ${err}`);
+        }
+    });
+
+    test('COMMANDS array entries have expected structure', () => {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { COMMANDS } = require('../../commands');
+        assert.ok(Array.isArray(COMMANDS), 'COMMANDS should be an array');
+        assert.ok(COMMANDS.length > 0, 'COMMANDS should not be empty');
+
+        for (const cmd of COMMANDS) {
+            assert.ok(
+                typeof cmd.id === 'string' && cmd.id.length > 0,
+                `Command must have a non-empty string id, got: ${JSON.stringify(cmd.id)}`,
+            );
+            assert.ok(
+                Array.isArray(cmd.args),
+                `Command "${cmd.id}" must have an args array`,
+            );
+            assert.strictEqual(
+                typeof cmd.parseDiagnostics,
+                'boolean',
+                `Command "${cmd.id}" must have a boolean parseDiagnostics`,
+            );
+            assert.strictEqual(
+                typeof cmd.useDetektParser,
+                'boolean',
+                `Command "${cmd.id}" must have a boolean useDetektParser`,
+            );
+        }
+    });
+
+    test('COMMANDS ids match EXPECTED_COMMAND_IDS', () => {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { COMMANDS } = require('../../commands');
+        const ids = COMMANDS.map((c: { id: string }) => c.id);
+        for (const expectedId of EXPECTED_COMMAND_IDS) {
+            assert.ok(
+                ids.includes(expectedId),
+                `Expected COMMANDS to contain "${expectedId}"`,
+            );
+        }
+    });
 });

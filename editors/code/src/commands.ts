@@ -18,7 +18,7 @@ interface CommandConfig {
     useDetektParser: boolean;
 }
 
-const COMMANDS: CommandConfig[] = [
+export const COMMANDS: CommandConfig[] = [
     { id: 'konvoy.build',            args: ['build', '--verbose'],               parseDiagnostics: true,  useDetektParser: false },
     { id: 'konvoy.buildRelease',     args: ['build', '--release', '--verbose'],  parseDiagnostics: true,  useDetektParser: false },
     { id: 'konvoy.run',              args: ['run', '--verbose'],                 parseDiagnostics: true,  useDetektParser: false },
