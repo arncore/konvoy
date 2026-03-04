@@ -237,4 +237,66 @@ mod tests {
         let b = a.clone();
         assert_eq!(a, b);
     }
+
+    #[test]
+    fn metadata_file_inequality_different_sha256() {
+        let a = MetadataFile {
+            name: "lib.klib".to_owned(),
+            url: "lib-1.0.klib".to_owned(),
+            sha256: Some("abc".to_owned()),
+        };
+        let b = MetadataFile {
+            name: "lib.klib".to_owned(),
+            url: "lib-1.0.klib".to_owned(),
+            sha256: Some("def".to_owned()),
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn metadata_file_sha256_none_vs_some_not_equal() {
+        let a = MetadataFile {
+            name: "lib.klib".to_owned(),
+            url: "lib-1.0.klib".to_owned(),
+            sha256: None,
+        };
+        let b = MetadataFile {
+            name: "lib.klib".to_owned(),
+            url: "lib-1.0.klib".to_owned(),
+            sha256: Some("abc".to_owned()),
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn artifact_metadata_inequality_different_files() {
+        let a = ArtifactMetadata {
+            dependencies: Vec::new(),
+            files: vec![MetadataFile {
+                name: "lib.klib".to_owned(),
+                url: "lib-1.0.klib".to_owned(),
+                sha256: Some("abc".to_owned()),
+            }],
+        };
+        let b = ArtifactMetadata {
+            dependencies: Vec::new(),
+            files: Vec::new(),
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn metadata_dep_inequality() {
+        let a = MetadataDep {
+            group_id: "org.example".to_owned(),
+            artifact_id: "lib".to_owned(),
+            version: "1.0".to_owned(),
+        };
+        let b = MetadataDep {
+            group_id: "org.example".to_owned(),
+            artifact_id: "lib".to_owned(),
+            version: "2.0".to_owned(),
+        };
+        assert_ne!(a, b);
+    }
 }

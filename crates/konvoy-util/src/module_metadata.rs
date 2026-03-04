@@ -522,4 +522,114 @@ mod tests {
             Ok(Some(_)) => panic!("should not find a nonexistent artifact"),
         }
     }
+
+    #[test]
+    fn parse_module_empty_json_object_errors() {
+        // A JSON object with no `variants` key at all should still parse
+        // (serde default gives empty vec), but fail because no matching variant.
+        let json = r#"{}"#;
+        let err = parse_module_metadata(json).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ApiElements-published"), "error was: {msg}");
+    }
+
+    #[test]
+    fn parse_module_dep_with_version_key_but_no_requires_is_skipped() {
+        // A dependency with a `version` object but no `requires` field inside
+        // it should be skipped (the filter_map returns None).
+        let json = r#"{
+  "formatVersion": "1.1",
+  "variants": [
+    {
+      "name": "linuxX64ApiElements-published",
+      "dependencies": [
+        {
+          "group": "org.example",
+          "module": "preferred-only",
+          "version": { "prefers": "1.0" }
+        },
+        {
+          "group": "org.example",
+          "module": "has-requires",
+          "version": { "requires": "2.0" }
+        }
+      ],
+      "files": []
+    }
+  ]
+}"#;
+        let metadata = parse_module_metadata(json).unwrap();
+        // Only the dep with `requires` should be included.
+        assert_eq!(metadata.dependencies.len(), 1);
+        assert_eq!(
+            metadata.dependencies.first().unwrap().artifact_id,
+            "has-requires"
+        );
+    }
+
+    #[test]
+    fn parse_module_dep_with_null_version_requires_is_skipped() {
+        // A dependency where `version.requires` is explicitly null should be
+        // skipped, not panic.
+        let json = r#"{
+  "formatVersion": "1.1",
+  "variants": [
+    {
+      "name": "linuxX64ApiElements-published",
+      "dependencies": [
+        {
+          "group": "org.example",
+          "module": "null-requires",
+          "version": { "requires": null }
+        }
+      ],
+      "files": []
+    }
+  ]
+}"#;
+        let metadata = parse_module_metadata(json).unwrap();
+        assert!(
+            metadata.dependencies.is_empty(),
+            "dep with null requires should be skipped"
+        );
+    }
+
+    #[test]
+    fn parse_module_extra_fields_are_ignored() {
+        // Unknown fields in the JSON (e.g. `capabilities`, `attributes`)
+        // should be silently ignored, not cause parse errors.
+        let json = r#"{
+  "formatVersion": "1.1",
+  "createdBy": { "gradle": { "version": "8.2" } },
+  "variants": [
+    {
+      "name": "linuxX64ApiElements-published",
+      "attributes": { "org.gradle.usage": "kotlin-api" },
+      "capabilities": [{ "group": "org.example", "name": "lib", "version": "1.0" }],
+      "dependencies": [
+        {
+          "group": "org.example",
+          "module": "dep",
+          "version": { "requires": "1.0" },
+          "excludes": [{ "group": "*", "module": "excluded" }]
+        }
+      ],
+      "files": [
+        {
+          "name": "lib.klib",
+          "url": "lib-1.0.klib",
+          "size": 12345,
+          "sha512": "ignored-hash",
+          "md5": "also-ignored"
+        }
+      ]
+    }
+  ]
+}"#;
+        let metadata = parse_module_metadata(json).unwrap();
+        assert_eq!(metadata.dependencies.len(), 1);
+        assert_eq!(metadata.files.len(), 1);
+        // sha256 is None because it was not present (sha512/md5 are different fields).
+        assert!(metadata.files.first().unwrap().sha256.is_none());
+    }
 }

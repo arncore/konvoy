@@ -361,4 +361,25 @@ mod tests {
         assert_eq!(coord.classifier.as_deref(), Some("sources"));
         assert_eq!(coord.filename(), "lib-1.0.0-sources.klib");
     }
+
+    #[test]
+    fn parse_sets_classifier_to_none() {
+        // `MavenCoordinate::parse()` does not support classifiers in the
+        // coordinate string — classifier is always None after parsing and
+        // must be set explicitly via `with_classifier()`.
+        let coord = MavenCoordinate::parse("org.jetbrains.kotlinx:atomicfu:0.23.1:klib").unwrap();
+        assert!(
+            coord.classifier.is_none(),
+            "parse() should never set classifier"
+        );
+    }
+
+    #[test]
+    fn new_sets_classifier_to_none() {
+        let coord = MavenCoordinate::new("org.example", "lib", "1.0.0");
+        assert!(
+            coord.classifier.is_none(),
+            "new() should default classifier to None"
+        );
+    }
 }

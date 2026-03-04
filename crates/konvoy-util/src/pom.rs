@@ -914,6 +914,22 @@ mod tests {
     }
 
     #[test]
+    fn strip_target_suffix_empty_artifact_id() {
+        // An empty artifact ID should remain empty.
+        assert_eq!(strip_target_suffix("", "linuxx64"), "");
+    }
+
+    #[test]
+    fn strip_target_suffix_suffix_in_middle_not_stripped() {
+        // If the target suffix appears in the middle (not at the end), it
+        // should NOT be stripped.
+        assert_eq!(
+            strip_target_suffix("linuxx64-special-lib", "linuxx64"),
+            "linuxx64-special-lib"
+        );
+    }
+
+    #[test]
     fn pom_to_metadata_strips_suffixes_and_returns_empty_files() {
         let pom = parse_pom(COROUTINES_POM, None, None).unwrap();
         let metadata = pom_to_metadata(&pom, "macosarm64");

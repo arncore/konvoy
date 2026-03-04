@@ -1128,4 +1128,145 @@ kotlin = "2.1.0"
             "classifier should appear in serialized lockfile, content was: {content}"
         );
     }
+
+    #[test]
+    fn resolved_maven_dep_classifier_field_defaults_to_none() {
+        // ResolvedMavenDep should have classifier None for regular deps.
+        let dep = ResolvedMavenDep {
+            name: "atomicfu".to_owned(),
+            group_id: "org.jetbrains.kotlinx".to_owned(),
+            artifact_id: "atomicfu".to_owned(),
+            version: "0.23.1".to_owned(),
+            required_by: Vec::new(),
+            classifier: None,
+        };
+        assert!(dep.classifier.is_none());
+    }
+
+    #[test]
+    fn resolved_maven_dep_classifier_some_for_cinterop() {
+        // ResolvedMavenDep can hold a classifier for cinterop deps.
+        let dep = ResolvedMavenDep {
+            name: "atomicfu-cinterop-interop".to_owned(),
+            group_id: "org.jetbrains.kotlinx".to_owned(),
+            artifact_id: "atomicfu".to_owned(),
+            version: "0.23.1".to_owned(),
+            required_by: vec!["atomicfu".to_owned()],
+            classifier: Some("cinterop-interop".to_owned()),
+        };
+        assert_eq!(dep.classifier.as_deref(), Some("cinterop-interop"));
+    }
+
+    #[test]
+    fn update_preserves_already_locked_classifier_dep() {
+        // When a dep with a specific classifier is already locked at the
+        // same version, it should be preserved (not re-downloaded). The
+        // lockfile output should contain both the main klib and the
+        // cinterop klib with classifiers intact.
+        let project = make_project(
+            r#"
+[package]
+name = "my-app"
+
+[toolchain]
+kotlin = "2.1.0"
+
+[dependencies]
+atomicfu = { maven = "org.jetbrains.kotlinx:atomicfu", version = "0.23.1" }
+"#,
+        );
+
+        // Build a lockfile with both the main klib and cinterop klib.
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+
+        // Main klib (no classifier).
+        let mut targets1 = BTreeMap::new();
+        targets1.insert("linux_x64".to_owned(), "main-hash".to_owned());
+        targets1.insert("macos_arm64".to_owned(), "main-hash-mac".to_owned());
+        targets1.insert("macos_x64".to_owned(), "main-hash-macx".to_owned());
+        targets1.insert("linux_arm64".to_owned(), "main-hash-la64".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets: targets1,
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "main-source-hash".to_owned(),
+        });
+
+        // Cinterop klib (with classifier).
+        let mut targets2 = BTreeMap::new();
+        targets2.insert("linux_x64".to_owned(), "cinterop-hash".to_owned());
+        targets2.insert("macos_arm64".to_owned(), "cinterop-hash-mac".to_owned());
+        targets2.insert("macos_x64".to_owned(), "cinterop-hash-macx".to_owned());
+        targets2.insert("linux_arm64".to_owned(), "cinterop-hash-la64".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu-cinterop-interop".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets: targets2,
+                required_by: vec!["atomicfu".to_owned()],
+                classifier: Some("cinterop-interop".to_owned()),
+            },
+            source_hash: "cinterop-source-hash".to_owned(),
+        });
+
+        lockfile
+            .write_to(&project.path().join("konvoy.lock"))
+            .unwrap();
+
+        // Running update should detect these as already locked (same version
+        // and classifier) and skip re-downloading.
+        let result = update(project.path()).unwrap();
+        // updated_count reflects total resolved deps (already-locked or new).
+        assert!(
+            result.updated_count >= 2,
+            "should resolve at least 2 deps (main + cinterop)"
+        );
+
+        // Both deps should be preserved in the lockfile.
+        let reparsed = Lockfile::from_path(&project.path().join("konvoy.lock")).unwrap();
+        let cinterop = reparsed
+            .dependencies
+            .iter()
+            .find(|d| d.name == "atomicfu-cinterop-interop");
+        assert!(
+            cinterop.is_some(),
+            "cinterop dep should be preserved in lockfile after update"
+        );
+        let cinterop = cinterop.unwrap();
+        match &cinterop.source {
+            DepSource::Maven { classifier, .. } => {
+                assert_eq!(classifier.as_deref(), Some("cinterop-interop"));
+            }
+            other => panic!("expected Maven source, got: {other:?}"),
+        }
+        // The main klib should also be present.
+        let main = reparsed.dependencies.iter().find(|d| {
+            d.name == "atomicfu"
+                && matches!(
+                    &d.source,
+                    DepSource::Maven {
+                        classifier: None,
+                        ..
+                    }
+                )
+        });
+        assert!(
+            main.is_some(),
+            "main klib dep (no classifier) should be preserved"
+        );
+    }
+
+    #[test]
+    fn extract_classifier_from_full_maven_central_url() {
+        // Test with a URL that includes the full Maven Central path.
+        let url = "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/atomicfu-linuxx64/0.23.1/atomicfu-linuxx64-0.23.1-cinterop-interop.klib";
+        let cls = extract_classifier_from_url(url, "0.23.1");
+        assert_eq!(cls.as_deref(), Some("cinterop-interop"));
+    }
 }
