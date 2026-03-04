@@ -1,0 +1,6 @@
+[package]
+name = "test-project"
+version = "0.1.0"
+
+[toolchain]
+kotlin = "2.1.0"
