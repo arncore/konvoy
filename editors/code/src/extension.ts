@@ -1,21 +1,11 @@
 import * as vscode from 'vscode';
 import { getKonvoyPath } from './konvoyBinary';
 import { getOutputChannel, disposeOutputChannel } from './outputChannel';
-import { watchManifests, getBestWorkspaceFolder } from './workspaceDetector';
-
-const COMMAND_IDS = [
-    'konvoy.build',
-    'konvoy.buildRelease',
-    'konvoy.run',
-    'konvoy.runRelease',
-    'konvoy.test',
-    'konvoy.lint',
-    'konvoy.update',
-    'konvoy.clean',
-    'konvoy.doctor',
-    'konvoy.toolchainInstall',
-    'konvoy.toolchainList',
-] as const;
+import { watchManifests } from './workspaceDetector';
+import { registerCommands } from './commands';
+import { registerTaskProvider } from './taskProvider';
+import { registerTomlSupport } from './tomlSupport';
+import { disposeDiagnosticCollection } from './diagnostics';
 
 export function activate(context: vscode.ExtensionContext): void {
     const output = getOutputChannel();
@@ -28,19 +18,23 @@ export function activate(context: vscode.ExtensionContext): void {
     );
     context.subscriptions.push(watcher);
 
-    // Register stub commands -- will be replaced by the commands module
-    for (const id of COMMAND_IDS) {
-        const disposable = vscode.commands.registerCommand(id, () => {
-            // TODO: replace with real command implementation (commands module)
-            vscode.window.showInformationMessage(`${id}: not yet implemented`);
-        });
-        context.subscriptions.push(disposable);
+    // Register commands
+    const commandDisposables = registerCommands();
+    for (const d of commandDisposables) {
+        context.subscriptions.push(d);
     }
 
-    // TODO: register task provider (taskProvider module)
-    // TODO: register TOML support (tomlSupport module)
+    // Register task provider
+    context.subscriptions.push(registerTaskProvider());
+
+    // Register TOML language support
+    const tomlDisposables = registerTomlSupport(context);
+    for (const d of tomlDisposables) {
+        context.subscriptions.push(d);
+    }
 }
 
 export function deactivate(): void {
+    disposeDiagnosticCollection();
     disposeOutputChannel();
 }

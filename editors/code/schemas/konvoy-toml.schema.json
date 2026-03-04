@@ -1,25 +1,103 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "konvoy.toml",
-  "description": "Schema for the Konvoy build tool manifest",
+  "description": "Konvoy project manifest",
   "type": "object",
+  "required": ["package", "toolchain"],
+  "additionalProperties": false,
   "properties": {
     "package": {
       "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
       "properties": {
-        "name": { "type": "string" },
-        "version": { "type": "string" },
-        "kind": { "type": "string", "enum": ["bin", "lib"] }
-      },
-      "required": ["name", "version"]
+        "name": {
+          "type": "string",
+          "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]*$",
+          "description": "Project name. Must start with a letter or underscore."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["bin", "lib"],
+          "default": "bin",
+          "description": "Package type: 'bin' for executable, 'lib' for Kotlin/Native library."
+        },
+        "version": {
+          "type": "string",
+          "description": "Package version (optional)."
+        },
+        "entrypoint": {
+          "type": "string",
+          "description": "Entry point file. Default: src/main.kt (bin) or src/lib.kt (lib). Must end with .kt for bin projects.",
+          "default": "src/main.kt"
+        }
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "required": ["kotlin"],
+      "additionalProperties": false,
+      "properties": {
+        "kotlin": {
+          "type": "string",
+          "description": "Kotlin/Native version, e.g. '2.1.0'.",
+          "minLength": 1
+        },
+        "detekt": {
+          "type": "string",
+          "description": "Detekt version for linting, e.g. '1.23.7'. Enables 'konvoy lint'.",
+          "minLength": 1
+        }
+      }
     },
     "dependencies": {
       "type": "object",
-      "additionalProperties": true
+      "description": "Project dependencies. Each entry must have exactly one of 'path' or 'version'.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "required": ["path"],
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Path to local dependency project."
+              }
+            }
+          },
+          {
+            "required": ["version"],
+            "properties": {
+              "version": {
+                "type": "string",
+                "description": "Maven dependency version."
+              }
+            }
+          }
+        ]
+      }
     },
     "plugins": {
       "type": "object",
-      "additionalProperties": true
+      "description": "Compiler plugins.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["version"],
+        "additionalProperties": false,
+        "properties": {
+          "version": {
+            "type": "string",
+            "description": "Plugin version.",
+            "minLength": 1
+          },
+          "modules": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Specific modules to include."
+          }
+        }
+      }
     }
   }
 }

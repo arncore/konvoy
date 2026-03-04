@@ -1,6 +1,145 @@
 {
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
   "scopeName": "source.konvoy-toml",
+  "name": "Konvoy TOML",
   "patterns": [
-    { "include": "source.toml" }
-  ]
+    { "include": "#comment" },
+    { "include": "#array-of-tables" },
+    { "include": "#table" },
+    { "include": "#key-value" }
+  ],
+  "repository": {
+    "comment": {
+      "match": "(#).*$",
+      "name": "comment.line.number-sign.konvoy-toml",
+      "captures": {
+        "1": { "name": "punctuation.definition.comment.konvoy-toml" }
+      }
+    },
+    "array-of-tables": {
+      "match": "^\\s*(\\[\\[)\\s*([^\\]]+)\\s*(\\]\\])",
+      "captures": {
+        "1": { "name": "punctuation.definition.array.table.konvoy-toml" },
+        "2": { "name": "entity.name.section.konvoy-toml" },
+        "3": { "name": "punctuation.definition.array.table.konvoy-toml" }
+      }
+    },
+    "table": {
+      "match": "^\\s*(\\[)\\s*([^\\]]+)\\s*(\\])",
+      "captures": {
+        "1": { "name": "punctuation.definition.table.konvoy-toml" },
+        "2": { "name": "entity.name.section.konvoy-toml" },
+        "3": { "name": "punctuation.definition.table.konvoy-toml" }
+      }
+    },
+    "key-value": {
+      "begin": "^\\s*([A-Za-z0-9_-]+)\\s*(=)",
+      "beginCaptures": {
+        "1": { "name": "variable.other.key.konvoy-toml" },
+        "2": { "name": "keyword.operator.assignment.konvoy-toml" }
+      },
+      "end": "$",
+      "patterns": [
+        { "include": "#comment" },
+        { "include": "#value" }
+      ]
+    },
+    "value": {
+      "patterns": [
+        { "include": "#string-triple-double" },
+        { "include": "#string-triple-single" },
+        { "include": "#string-double" },
+        { "include": "#string-single" },
+        { "include": "#boolean" },
+        { "include": "#date" },
+        { "include": "#float" },
+        { "include": "#integer" },
+        { "include": "#inline-table" },
+        { "include": "#array" }
+      ]
+    },
+    "string-triple-double": {
+      "begin": "\"\"\"",
+      "end": "\"\"\"",
+      "name": "string.quoted.triple.double.konvoy-toml",
+      "patterns": [
+        {
+          "match": "\\\\[btnfr\"\\\\]",
+          "name": "constant.character.escape.konvoy-toml"
+        }
+      ]
+    },
+    "string-triple-single": {
+      "begin": "'''",
+      "end": "'''",
+      "name": "string.quoted.triple.single.konvoy-toml"
+    },
+    "string-double": {
+      "begin": "\"",
+      "end": "\"",
+      "name": "string.quoted.double.konvoy-toml",
+      "patterns": [
+        {
+          "match": "\\\\[btnfr\"\\\\uU]",
+          "name": "constant.character.escape.konvoy-toml"
+        }
+      ]
+    },
+    "string-single": {
+      "begin": "'",
+      "end": "'",
+      "name": "string.quoted.single.konvoy-toml"
+    },
+    "boolean": {
+      "match": "\\b(true|false)\\b",
+      "name": "constant.language.boolean.konvoy-toml"
+    },
+    "date": {
+      "match": "\\d{4}-\\d{2}-\\d{2}([T ]\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})?)?",
+      "name": "constant.other.date.konvoy-toml"
+    },
+    "float": {
+      "match": "[+-]?(?:\\d+\\.\\d*|\\d*\\.\\d+)(?:[eE][+-]?\\d+)?|[+-]?(?:inf|nan)",
+      "name": "constant.numeric.float.konvoy-toml"
+    },
+    "integer": {
+      "match": "[+-]?(?:0x[0-9A-Fa-f_]+|0o[0-7_]+|0b[01_]+|\\d[\\d_]*)",
+      "name": "constant.numeric.integer.konvoy-toml"
+    },
+    "inline-table": {
+      "begin": "(\\{)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.table.inline.begin.konvoy-toml" }
+      },
+      "end": "(\\})",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.table.inline.end.konvoy-toml" }
+      },
+      "patterns": [
+        { "include": "#comment" },
+        {
+          "match": "([A-Za-z0-9_-]+)\\s*(=)",
+          "captures": {
+            "1": { "name": "variable.other.key.konvoy-toml" },
+            "2": { "name": "keyword.operator.assignment.konvoy-toml" }
+          }
+        },
+        { "include": "#value" }
+      ]
+    },
+    "array": {
+      "begin": "(\\[)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.array.begin.konvoy-toml" }
+      },
+      "end": "(\\])",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.array.end.konvoy-toml" }
+      },
+      "patterns": [
+        { "include": "#comment" },
+        { "include": "#value" }
+      ]
+    }
+  }
 }
