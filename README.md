@@ -15,6 +15,27 @@ Konvoy avoids Gradle/Maven-style complexity by providing:
 
 **Scope note:** Konvoy is native-first. JVM builds are intentionally out of scope.
 
+## Table of contents
+
+- [Status](#status)
+- [Supported platforms](#supported-platforms)
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [Project layout](#project-layout)
+- [Commands](#commands)
+- [Output contract](#output-contract)
+- [Design goals](#design-goals)
+- [Dependencies](#dependencies)
+  - [Path dependencies](#path-dependencies)
+  - [Maven dependencies](#maven-dependencies)
+  - [Plugins](#plugins)
+- [Testing](#testing)
+- [Managed toolchains](#managed-toolchains)
+- [Linting](#linting)
+- [Editor support](#editor-support)
+- [Development](#development)
+- [Roadmap](#roadmap-high-level)
+
 ## Status
 
 Early-stage prototype / design-driven build. Expect rapid iteration and breaking changes.
