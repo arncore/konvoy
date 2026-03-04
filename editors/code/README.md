@@ -1,6 +1,6 @@
 # Konvoy for VS Code
 
-VS Code extension for [Konvoy](../../README.md), a native-first Kotlin build tool.
+VS Code extension for [Konvoy](https://github.com/arncore/konvoy), a native-first Kotlin build tool.
 
 ## Install
 
