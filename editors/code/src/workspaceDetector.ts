@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
 import * as path from 'path';
 
 const MANIFEST_NAME = 'konvoy.toml';
@@ -12,10 +13,8 @@ export function findKonvoyWorkspaces(): vscode.WorkspaceFolder[] {
         return [];
     }
     return folders.filter(folder => {
-        const manifestUri = vscode.Uri.joinPath(folder.uri, MANIFEST_NAME);
-        // We can't do async stat here, so rely on the activation event
-        // (workspaceContains:konvoy.toml) having already confirmed existence.
-        return true;
+        const manifestPath = path.join(folder.uri.fsPath, MANIFEST_NAME);
+        return fs.existsSync(manifestPath);
     });
 }
 

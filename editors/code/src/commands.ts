@@ -104,7 +104,10 @@ function runCommand(config: CommandConfig): void {
             applyDiagnostics(folder.uri.fsPath, diagnostics, getDiagnosticCollection());
         }
 
-        if (code !== 0) {
+        if (code === null) {
+            output.show(true);
+            vscode.window.showWarningMessage(`konvoy ${config.args[0]} was terminated by a signal.`);
+        } else if (code !== 0) {
             output.show(true);
             vscode.window.showErrorMessage(`konvoy ${config.args[0]} failed (exit code ${code}).`);
         } else {
