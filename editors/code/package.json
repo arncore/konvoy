@@ -1,0 +1,180 @@
+{
+  "name": "konvoy-vscode",
+  "displayName": "Konvoy",
+  "description": "Konvoy build tool integration for VS Code",
+  "publisher": "konvoy",
+  "version": "0.1.0",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "activationEvents": [
+    "workspaceContains:konvoy.toml"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "konvoy.build",
+        "title": "Konvoy: Build"
+      },
+      {
+        "command": "konvoy.buildRelease",
+        "title": "Konvoy: Build (Release)"
+      },
+      {
+        "command": "konvoy.run",
+        "title": "Konvoy: Run"
+      },
+      {
+        "command": "konvoy.runRelease",
+        "title": "Konvoy: Run (Release)"
+      },
+      {
+        "command": "konvoy.test",
+        "title": "Konvoy: Test"
+      },
+      {
+        "command": "konvoy.lint",
+        "title": "Konvoy: Lint"
+      },
+      {
+        "command": "konvoy.update",
+        "title": "Konvoy: Update"
+      },
+      {
+        "command": "konvoy.clean",
+        "title": "Konvoy: Clean"
+      },
+      {
+        "command": "konvoy.doctor",
+        "title": "Konvoy: Doctor"
+      },
+      {
+        "command": "konvoy.toolchainInstall",
+        "title": "Konvoy: Install Toolchain"
+      },
+      {
+        "command": "konvoy.toolchainList",
+        "title": "Konvoy: List Toolchains"
+      }
+    ],
+    "configuration": {
+      "title": "Konvoy",
+      "properties": {
+        "konvoy.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to konvoy binary (empty = use PATH)"
+        },
+        "konvoy.defaultTarget": {
+          "type": "string",
+          "enum": [
+            "",
+            "linux_x64",
+            "linux_arm64",
+            "macos_x64",
+            "macos_arm64"
+          ],
+          "default": "",
+          "description": "Default target platform for builds"
+        },
+        "konvoy.showBuildOutputOnSuccess": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show the output panel even when the build succeeds"
+        }
+      }
+    },
+    "languages": [
+      {
+        "id": "konvoy-toml",
+        "filenames": [
+          "konvoy.toml"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "konvoy-toml",
+        "scopeName": "source.konvoy-toml",
+        "path": "./syntaxes/konvoy-toml.tmLanguage.json"
+      }
+    ],
+    "jsonValidation": [
+      {
+        "fileMatch": "konvoy.toml",
+        "url": "./schemas/konvoy-toml.schema.json"
+      }
+    ],
+    "problemMatchers": [
+      {
+        "name": "konvoy-konanc",
+        "owner": "konvoy",
+        "fileLocation": [
+          "relative",
+          "${workspaceFolder}"
+        ],
+        "pattern": [
+          {
+            "regexp": "^(.+\\.kt):(\\d+):(\\d+)?:?\\s*(error|warning|info):\\s*(.*)$",
+            "file": 1,
+            "line": 2,
+            "column": 3,
+            "severity": 4,
+            "message": 5
+          }
+        ]
+      },
+      {
+        "name": "konvoy-bare",
+        "owner": "konvoy",
+        "pattern": [
+          {
+            "regexp": "^(error|warning|info):\\s*(.*)$",
+            "severity": 1,
+            "message": 2
+          }
+        ]
+      }
+    ],
+    "taskDefinitions": [
+      {
+        "type": "konvoy",
+        "properties": {
+          "command": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command"
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "build": "esbuild --bundle src/extension.ts --outfile=out/extension.js --external:vscode --platform=node --format=cjs",
+    "watch": "esbuild --bundle src/extension.ts --outfile=out/extension.js --external:vscode --platform=node --format=cjs --watch",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js",
+    "pretest": "npm run build",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "@types/mocha": "^10.0.0",
+    "typescript": "^5.3.0",
+    "esbuild": "^0.19.0",
+    "@vscode/test-electron": "^2.3.0",
+    "mocha": "^10.2.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.0.0"
+  }
+}

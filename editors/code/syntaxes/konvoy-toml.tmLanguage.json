@@ -1,0 +1,6 @@
+{
+  "scopeName": "source.konvoy-toml",
+  "patterns": [
+    { "include": "source.toml" }
+  ]
+}
