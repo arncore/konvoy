@@ -28,7 +28,7 @@ Konvoy is a native-first Kotlin build tool implemented in Rust. The goal is to m
 - **Managed toolchains:** `~/.konvoy/toolchains/<version>/` (konanc + bundled JRE)
 - **Managed tools:** `~/.konvoy/tools/detekt/<version>/` (detekt-cli JAR)
 - **Maven cache:** `~/.konvoy/cache/maven/<group>/<artifact>/<version>/` (downloaded klibs)
-- **Library index:** `libraries/<name>.toml` (curated Maven coordinate templates)
+- **POM cache:** `~/.konvoy/cache/pom/<group>/<artifact>-<version>.pom` (fetched POM files for transitive resolution)
 
 ## Current scope
 
@@ -37,10 +37,9 @@ Konvoy is a native-first Kotlin build tool implemented in Rust. The goal is to m
 - Compiler: invoke `konanc` as an external process via managed toolchains
 - Managed toolchains: automatic download of Kotlin/Native + bundled JRE to `~/.konvoy/toolchains/`
 - Commands: `init`, `build`, `run`, `test`, `lint`, `update`, `clean`, `doctor`, `toolchain install/list`
-- Dependencies: path-based (`{ path = "..." }`) and Maven-based (`{ version = "1.0.0" }`) via curated library index
+- Dependencies: path-based (`{ path = "..." }`) and Maven-based (`{ maven = "groupId:artifactId", version = "1.0.0" }`) with POM-based transitive resolution
 - Maven dependencies: `konvoy update` resolves versions and pins per-target SHA-256 hashes in `konvoy.lock`; `konvoy build` lazily downloads only the klib for the current target
 - Plugin system: data-driven compiler plugins (e.g. `serialization`) via `[plugins]` in `konvoy.toml`
-- Curated library index: embedded TOML descriptors in `libraries/`; adding a library is just dropping a `.toml` file
 - No C interop beyond detection placeholders
 
 ## Implementation structure (recommended crates)

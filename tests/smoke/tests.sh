@@ -538,7 +538,7 @@ test_update_no_maven_deps_noop() {
     assert_contains "$output" "Updated 0 dependencies"
     # Lockfile should exist but have no Maven entries.
     assert_file_exists konvoy.lock
-    assert_file_not_contains konvoy.lock "maven_coordinate"
+    assert_file_not_contains konvoy.lock "maven ="
 }
 
 test_update_resolves_maven_dep() {
@@ -547,18 +547,16 @@ test_update_resolves_maven_dep() {
     cat >> update-resolve/konvoy.toml << 'TOML'
 
 [dependencies]
-kotlinx-datetime = { version = "0.6.0" }
+kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
 TOML
     cd update-resolve
     local output
     output=$(konvoy update 2>&1)
     assert_contains "$output" "Resolving kotlinx-datetime 0.6.0"
-    assert_contains "$output" "Updated 1 dependencies"
 
     # Lockfile should contain Maven dep entries.
     assert_file_exists konvoy.lock
     assert_file_contains konvoy.lock "kotlinx-datetime"
-    assert_file_contains konvoy.lock "maven_coordinate"
     assert_file_contains konvoy.lock "0.6.0"
     # Should have per-target hashes.
     assert_file_contains konvoy.lock "linux_x64"
@@ -573,7 +571,7 @@ test_update_idempotent() {
     cat >> update-idem/konvoy.toml << 'TOML'
 
 [dependencies]
-kotlinx-datetime = { version = "0.6.0" }
+kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
 TOML
     cd update-idem
 
@@ -602,15 +600,14 @@ test_update_multiple_deps() {
     cat >> update-multi/konvoy.toml << 'TOML'
 
 [dependencies]
-kotlinx-coroutines = { version = "1.8.0" }
-kotlinx-datetime = { version = "0.6.0" }
+kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }
+kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
 TOML
     cd update-multi
     local output
     output=$(konvoy update 2>&1)
     assert_contains "$output" "Resolving kotlinx-coroutines 1.8.0"
     assert_contains "$output" "Resolving kotlinx-datetime 0.6.0"
-    assert_contains "$output" "Updated 2 dependencies"
 
     assert_file_contains konvoy.lock "kotlinx-coroutines"
     assert_file_contains konvoy.lock "kotlinx-datetime"
@@ -629,31 +626,11 @@ test_update_preserves_path_deps() {
     assert_file_contains konvoy.lock 'source_type = "path"'
 
     # Now add a Maven dep and run update — path dep should be preserved.
-    printf 'kotlinx-datetime = { version = "0.6.0" }\n' >> konvoy.toml
+    printf 'kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }\n' >> konvoy.toml
     konvoy update >/dev/null 2>&1
     assert_file_contains konvoy.lock "path-lib"
     assert_file_contains konvoy.lock 'source_type = "path"'
     assert_file_contains konvoy.lock "kotlinx-datetime"
-}
-
-test_update_unknown_library_fails() {
-    # Unknown library name should produce actionable error.
-    konvoy init --name update-unknown >/dev/null 2>&1
-    cat >> update-unknown/konvoy.toml << 'TOML'
-
-[dependencies]
-nonexistent-lib = { version = "1.0.0" }
-TOML
-    cd update-unknown
-    local output
-    if output=$(konvoy update 2>&1); then
-        echo "    expected update to fail with unknown library" >&2
-        return 1
-    fi
-    assert_contains "$output" "unknown library"
-    assert_contains "$output" "nonexistent-lib"
-    # Error should list available libraries.
-    assert_contains "$output" "kotlinx-coroutines"
 }
 
 test_update_version_change_re_resolves() {
@@ -662,7 +639,7 @@ test_update_version_change_re_resolves() {
     cat >> update-ver/konvoy.toml << 'TOML'
 
 [dependencies]
-kotlinx-atomicfu = { version = "0.23.2" }
+kotlinx-atomicfu = { maven = "org.jetbrains.kotlinx:atomicfu", version = "0.23.2" }
 TOML
     cd update-ver
 
@@ -692,8 +669,8 @@ test_update_removing_dep_cleans_lockfile() {
     cat >> update-remove/konvoy.toml << 'TOML'
 
 [dependencies]
-kotlinx-datetime = { version = "0.6.0" }
-kotlinx-atomicfu = { version = "0.26.1" }
+kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
+kotlinx-atomicfu = { maven = "org.jetbrains.kotlinx:atomicfu", version = "0.26.1" }
 TOML
     cd update-remove
 
@@ -709,13 +686,13 @@ TOML
     assert_file_not_contains konvoy.lock "kotlinx-atomicfu"
 }
 
-test_maven_dep_manifest_both_path_and_version_fails() {
-    # A dependency with both path and version should be rejected.
+test_maven_dep_manifest_both_path_and_maven_fails() {
+    # A dependency with both path and maven should be rejected.
     konvoy init --name both-fail >/dev/null 2>&1
     cat >> both-fail/konvoy.toml << 'TOML'
 
 [dependencies]
-bad-dep = { path = "../bad", version = "1.0.0" }
+bad-dep = { path = "../bad", maven = "org.example:bad", version = "1.0.0" }
 TOML
     cd both-fail
     local output
@@ -732,7 +709,7 @@ test_build_maven_dep_without_update_fails() {
     cat >> no-update/konvoy.toml << 'TOML'
 
 [dependencies]
-kotlinx-datetime = { version = "0.6.0" }
+kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
 TOML
     cd no-update
     # Build without running update first.
@@ -750,7 +727,7 @@ test_build_maven_dep_locked_without_update_fails() {
     cat >> locked-maven/konvoy.toml << 'TOML'
 
 [dependencies]
-kotlinx-datetime = { version = "0.6.0" }
+kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
 TOML
     cd locked-maven
     # Create a lockfile with toolchain but no Maven entries.
@@ -769,7 +746,7 @@ test_maven_dep_build_lifecycle() {
     cat >> maven-app/konvoy.toml << 'TOML'
 
 [dependencies]
-kotlinx-datetime = { version = "0.6.0" }
+kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
 TOML
     # Source that uses kotlinx-datetime (import proves the klib was linked).
     cat > maven-app/src/main.kt << 'KOTLIN'
@@ -809,7 +786,7 @@ KOTLIN
 
     # Step 6: lockfile still has Maven entries after build.
     assert_file_contains konvoy.lock "kotlinx-datetime"
-    assert_file_contains konvoy.lock "maven_coordinate"
+    assert_file_contains konvoy.lock "maven ="
 }
 
 test_maven_dep_mixed_with_path_dep_build() {
@@ -820,7 +797,7 @@ test_maven_dep_mixed_with_path_dep_build() {
 
 [dependencies]
 mix-lib = { path = "../mix-lib" }
-kotlinx-datetime = { version = "0.6.0" }
+kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
 TOML
     cat > mix-app/src/main.kt << 'KOTLIN'
 import kotlinx.datetime.Clock
@@ -843,50 +820,24 @@ KOTLIN
     assert_file_contains konvoy.lock "mix-lib"
     assert_file_contains konvoy.lock "../mix-lib"
     assert_file_contains konvoy.lock "kotlinx-datetime"
-    assert_file_contains konvoy.lock "maven_coordinate"
+    assert_file_contains konvoy.lock "maven ="
 }
 
 test_doctor_maven_dep_checks() {
-    # Doctor should check Maven deps against the curated index.
+    # Doctor should check Maven deps and lockfile entries.
     konvoy init --name doc-maven >/dev/null 2>&1
     cat >> doc-maven/konvoy.toml << 'TOML'
 
 [dependencies]
-kotlinx-datetime = { version = "0.6.0" }
+kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
 TOML
     cd doc-maven
     konvoy update >/dev/null 2>&1
 
     local output
     output=$(konvoy doctor 2>&1)
-    assert_contains "$output" "[ok] Library: kotlinx-datetime"
+    assert_contains "$output" "[ok] Maven dep: kotlinx-datetime"
     assert_contains "$output" "[ok] Lockfile entry: kotlinx-datetime"
-    assert_contains "$output" "Available libraries:"
-}
-
-test_doctor_unknown_maven_dep_warns() {
-    # Doctor should warn about unknown Maven deps.
-    konvoy init --name doc-unknown >/dev/null 2>&1
-    # Manually write a manifest with an unknown library name.
-    # We can't use konvoy update (it will fail), so just check doctor.
-    cat > doc-unknown/konvoy.toml << 'TOML'
-[package]
-name = "doc-unknown"
-
-[toolchain]
-kotlin = "2.1.0"
-
-[dependencies]
-fake-lib = { version = "1.0.0" }
-TOML
-    mkdir -p doc-unknown/src
-    echo 'fun main() {}' > doc-unknown/src/main.kt
-    cd doc-unknown
-
-    local output
-    output=$(konvoy doctor 2>&1)
-    assert_contains "$output" "unknown library"
-    assert_contains "$output" "fake-lib"
 }
 
 test_doctor_missing_lockfile_entry_warns() {
@@ -895,7 +846,7 @@ test_doctor_missing_lockfile_entry_warns() {
     cat >> doc-missing/konvoy.toml << 'TOML'
 
 [dependencies]
-kotlinx-datetime = { version = "0.6.0" }
+kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
 TOML
     cd doc-missing
     # Create lockfile without Maven entries.
@@ -913,7 +864,7 @@ test_doctor_no_lockfile_warns() {
     cat >> doc-nolock/konvoy.toml << 'TOML'
 
 [dependencies]
-kotlinx-datetime = { version = "0.6.0" }
+kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
 TOML
     cd doc-nolock
 
@@ -921,19 +872,6 @@ TOML
     output=$(konvoy doctor 2>&1)
     assert_contains "$output" "No konvoy.lock"
     assert_contains "$output" "konvoy update"
-}
-
-test_doctor_available_libraries() {
-    # Doctor should always list available libraries.
-    konvoy init --name doc-avail >/dev/null 2>&1
-    cd doc-avail
-    konvoy build >/dev/null 2>&1
-
-    local output
-    output=$(konvoy doctor 2>&1)
-    assert_contains "$output" "Available libraries:"
-    assert_contains "$output" "kotlinx-coroutines"
-    assert_contains "$output" "kotlinx-datetime"
 }
 
 # ---------------------------------------------------------------------------
@@ -1213,20 +1151,16 @@ run_test test_update_resolves_maven_dep
 run_test test_update_idempotent
 run_test test_update_multiple_deps
 run_test test_update_preserves_path_deps
-run_test test_update_unknown_library_fails
 run_test test_update_version_change_re_resolves
 run_test test_update_removing_dep_cleans_lockfile
-run_test test_maven_dep_manifest_both_path_and_version_fails
+run_test test_maven_dep_manifest_both_path_and_maven_fails
 run_test test_build_maven_dep_without_update_fails
 run_test test_build_maven_dep_locked_without_update_fails
 run_test test_maven_dep_build_lifecycle
 run_test test_maven_dep_mixed_with_path_dep_build
 run_test test_doctor_maven_dep_checks
-run_test test_doctor_unknown_maven_dep_warns
 run_test test_doctor_missing_lockfile_entry_warns
 run_test test_doctor_no_lockfile_warns
-run_test test_doctor_available_libraries
-
 # error cases
 run_test test_build_outside_project_fails
 run_test test_run_outside_project_fails

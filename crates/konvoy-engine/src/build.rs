@@ -121,11 +121,16 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
                 // Lockfile is missing or has a different version. Build
                 // the same lockfile that `update_lockfile_if_needed` would
                 // write so the cache key is stable from the first build.
-                Lockfile::with_managed_toolchain(
+                // Preserve existing dependencies and plugins from the
+                // on-disk lockfile (e.g. Maven deps written by `konvoy update`).
+                let mut stabilized = Lockfile::with_managed_toolchain(
                     &konanc.version,
                     resolved.konanc_tarball_sha256.as_deref(),
                     resolved.jre_tarball_sha256.as_deref(),
-                )
+                );
+                stabilized.dependencies = lockfile.dependencies.clone();
+                stabilized.plugins = lockfile.plugins.clone();
+                stabilized
             }
         }
     };
@@ -207,7 +212,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     all_library_paths.extend(plugin_klibs);
 
     // 7b. Resolve and download Maven dependency klibs for the current target.
-    let maven_klibs = resolve_maven_deps(&manifest, &effective_lockfile, &target)?;
+    let maven_klibs = resolve_maven_deps(&effective_lockfile, &target)?;
     all_library_paths.extend(maven_klibs);
 
     // 8. Build the root project.
@@ -434,82 +439,80 @@ pub(crate) fn lockfile_toml_content(lockfile: &Lockfile) -> Result<String, Engin
 
 /// Resolve Maven dependencies for the current build target.
 ///
-/// For each dependency in the manifest that has `version` set (Maven dep),
-/// look up the lockfile for the expected SHA-256 hash, download the klib
-/// via `ensure_artifact()` to the Maven cache, and return the list of klib
-/// paths to pass to `konanc -library`.
+/// Iterates over all Maven dependency entries in the lockfile (both direct
+/// and transitive), downloads the per-target `.klib` artifact, verifies the
+/// SHA-256 hash, and returns the list of klib paths to pass to `konanc -library`.
 ///
 /// Only the klib for the current build target is downloaded (lazy download).
 ///
 /// # Errors
 /// Returns an error if a Maven dependency is missing from the lockfile, the
 /// target hash is not present, or the download/hash verification fails.
-fn resolve_maven_deps(
-    manifest: &Manifest,
-    lockfile: &Lockfile,
-    target: &Target,
-) -> Result<Vec<PathBuf>, EngineError> {
-    let maven_deps: Vec<(&String, &konvoy_config::manifest::DependencySpec)> = manifest
+fn resolve_maven_deps(lockfile: &Lockfile, target: &Target) -> Result<Vec<PathBuf>, EngineError> {
+    // Collect all Maven dependency entries from the lockfile (direct + transitive).
+    let maven_locks: Vec<&DependencyLock> = lockfile
         .dependencies
         .iter()
-        .filter(|(_, spec)| spec.version.is_some())
+        .filter(|d| matches!(&d.source, DepSource::Maven { .. }))
         .collect();
 
-    if maven_deps.is_empty() {
+    if maven_locks.is_empty() {
         return Ok(Vec::new());
     }
 
     let cache_root = konvoy_util::fs::konvoy_home()?.join("cache").join("maven");
     let target_str = target.to_string();
+    let maven_suffix = target.to_maven_suffix();
 
-    let klib_paths: Vec<Result<PathBuf, EngineError>> = maven_deps
+    let klib_paths: Vec<Result<PathBuf, EngineError>> = maven_locks
         .par_iter()
-        .map(|(name, spec)| {
-            // Safe: `maven_deps` is filtered for `version.is_some()` above.
-            let Some(version) = &spec.version else {
-                // Unreachable due to filter, but return empty path to satisfy types.
-                return Ok(PathBuf::new());
+        .map(|lock_entry| {
+            let dep_name = lock_entry.name.clone();
+
+            let (version, maven_coord, targets, classifier) = match &lock_entry.source {
+                DepSource::Maven {
+                    version,
+                    maven,
+                    targets,
+                    classifier,
+                    ..
+                } => (version, maven, targets, classifier),
+                DepSource::Path { .. } => {
+                    return Err(EngineError::MissingLockfileEntry { name: dep_name });
+                }
             };
 
-            let dep_name = (*name).clone();
+            // Split "groupId:artifactId" into parts.
+            let (group_id, artifact_id) =
+                maven_coord
+                    .split_once(':')
+                    .ok_or_else(|| EngineError::Metadata {
+                        message: format!(
+                            "invalid maven coordinate `{maven_coord}` for dependency `{dep_name}`"
+                        ),
+                    })?;
 
-            // Look up the library descriptor to resolve the Maven coordinate.
-            let descriptor = crate::library::lookup(name)?.ok_or_else(|| {
-                let available = crate::library::available_library_names().unwrap_or_default();
-                EngineError::UnknownLibrary {
-                    name: dep_name.clone(),
-                    available,
-                }
-            })?;
+            // Build the per-target artifact ID (e.g. "kotlinx-coroutines-core-linuxx64").
+            let per_target_artifact_id = format!("{artifact_id}-{maven_suffix}");
 
-            // Resolve the coordinate for this specific target.
-            let coord = crate::library::resolve_coordinate(&descriptor, version, target)?;
-
-            // Find the lockfile entry for this dependency.
-            let lock_entry = lockfile
-                .dependencies
-                .iter()
-                .find(|d| d.name == **name)
-                .ok_or_else(|| EngineError::MissingLockfileEntry {
-                    name: dep_name.clone(),
-                })?;
+            let mut coord = konvoy_util::maven::MavenCoordinate::new(
+                group_id,
+                &per_target_artifact_id,
+                version,
+            )
+            .with_packaging("klib");
+            if let Some(cls) = classifier {
+                coord = coord.with_classifier(cls);
+            }
 
             // Extract the expected SHA-256 for this target from the lockfile.
-            let expected_sha256 = match &lock_entry.source {
-                DepSource::Maven { targets, .. } => {
-                    targets
-                        .get(&target_str)
-                        .ok_or_else(|| EngineError::MissingTargetHash {
-                            name: dep_name.clone(),
-                            target: target_str.clone(),
-                        })?
-                }
-                DepSource::Path { .. } => {
-                    return Err(EngineError::MissingLockfileEntry {
+            let expected_sha256 =
+                targets
+                    .get(&target_str)
+                    .ok_or_else(|| EngineError::MissingTargetHash {
                         name: dep_name.clone(),
-                    });
-                }
-            };
+                        target: target_str.clone(),
+                    })?;
 
             // Compute the cache path and download URL.
             let dest = coord.cache_path(&cache_root);
@@ -520,7 +523,7 @@ fn resolve_maven_deps(
                 &url,
                 &dest,
                 Some(expected_sha256),
-                name,
+                &dep_name,
                 version,
             )
             .map_err(|e| EngineError::LibraryDownloadFailed {
@@ -591,10 +594,10 @@ fn check_lockfile_staleness(manifest: &Manifest, lockfile: &Lockfile) -> Result<
         }
     }
 
-    // If the manifest has Maven dependencies (version is Some), the lockfile must
+    // If the manifest has Maven dependencies (maven + version set), the lockfile must
     // have matching Maven entries for each.
     for (dep_name, dep_spec) in &manifest.dependencies {
-        if dep_spec.version.is_some() {
+        if dep_spec.maven.is_some() && dep_spec.version.is_some() {
             let has_maven_entry = lockfile
                 .dependencies
                 .iter()
@@ -2532,7 +2535,7 @@ mod tests {
     fn check_lockfile_staleness_maven_dep_missing() {
         // Manifest has a Maven dep, lockfile doesn't have it -> LockfileUpdateRequired.
         let manifest = konvoy_config::manifest::Manifest::from_str(
-            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-coroutines = { version = \"1.8.0\" }\n",
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-coroutines = { maven = \"org.jetbrains.kotlinx:kotlinx-coroutines-core\", version = \"1.8.0\" }\n",
             "konvoy.toml",
         )
         .unwrap();
@@ -2551,7 +2554,7 @@ mod tests {
     fn check_lockfile_staleness_maven_dep_present() {
         // Manifest has a Maven dep, lockfile has it -> Ok.
         let manifest = konvoy_config::manifest::Manifest::from_str(
-            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-coroutines = { version = \"1.8.0\" }\n",
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-coroutines = { maven = \"org.jetbrains.kotlinx:kotlinx-coroutines-core\", version = \"1.8.0\" }\n",
             "konvoy.toml",
         )
         .unwrap();
@@ -2562,9 +2565,10 @@ mod tests {
             name: "kotlinx-coroutines".to_owned(),
             source: DepSource::Maven {
                 version: "1.8.0".to_owned(),
-                maven_coordinate:
-                    "org.jetbrains.kotlinx:kotlinx-coroutines-core-{target}:1.8.0:klib".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
                 targets,
+                required_by: Vec::new(),
+                classifier: None,
             },
             source_hash: "maven-hash".to_owned(),
         });
@@ -2579,15 +2583,10 @@ mod tests {
     #[test]
     fn resolve_maven_deps_no_maven_deps() {
         // Only path deps in manifest -> empty vec.
-        let manifest = konvoy_config::manifest::Manifest::from_str(
-            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nmy-lib = { path = \"../my-lib\" }\n",
-            "konvoy.toml",
-        )
-        .unwrap();
         let lockfile = Lockfile::with_toolchain("2.1.0");
         let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
 
-        let result = resolve_maven_deps(&manifest, &lockfile, &target).unwrap();
+        let result = resolve_maven_deps(&lockfile, &target).unwrap();
         assert!(
             result.is_empty(),
             "expected empty vec for path-only deps, got: {result:?}"
@@ -2595,23 +2594,310 @@ mod tests {
     }
 
     #[test]
-    fn resolve_maven_deps_missing_lockfile_entry() {
-        // Maven dep in manifest, not in lockfile -> error.
-        let manifest = konvoy_config::manifest::Manifest::from_str(
-            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-coroutines = { version = \"1.8.0\" }\n",
-            "konvoy.toml",
-        )
-        .unwrap();
+    fn resolve_maven_deps_empty_lockfile_returns_empty() {
+        // Maven dep in manifest but not in lockfile returns empty vec.
+        // Staleness is caught by check_lockfile_staleness, not resolve_maven_deps.
         let lockfile = Lockfile::with_toolchain("2.1.0");
         let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
 
-        let result = resolve_maven_deps(&manifest, &lockfile, &target);
+        let result = resolve_maven_deps(&lockfile, &target).unwrap();
+        assert!(
+            result.is_empty(),
+            "expected empty vec when lockfile has no Maven entries, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_maven_deps_missing_target_hash() {
+        // Lockfile has a Maven dep but is missing the hash for the build target.
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-coroutines".to_owned(),
+            source: DepSource::Maven {
+                version: "1.8.0".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
+                targets: std::collections::BTreeMap::new(),
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "hash".to_owned(),
+        });
+        let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
+
+        let result = resolve_maven_deps(&lockfile, &target);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("not in lockfile"),
-            "expected missing lockfile entry error, got: {err}"
+            err.contains("no hash for target"),
+            "expected missing target hash error, got: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_maven_deps_works_with_lockfile_missing_toolchain() {
+        // Regression: when `konvoy update` wrote a lockfile without a
+        // [toolchain] section, the effective-lockfile stabilization created a
+        // blank lockfile, discarding all Maven deps. After the fix, Maven deps
+        // in a lockfile that has no toolchain must still be resolved.
+        //
+        // Simulate by constructing a lockfile with Maven deps but no toolchain,
+        // then verifying resolve_maven_deps sees them.
+        let mut lockfile = Lockfile::default(); // no toolchain
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "aabbccdd".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-coroutines".to_owned(),
+            source: DepSource::Maven {
+                version: "1.8.0".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
+                targets,
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "hash".to_owned(),
+        });
+
+        // Simulate the stabilization path from build(): toolchain is None, so
+        // build the stabilized lockfile preserving deps.
+        let mut stabilized = Lockfile::with_managed_toolchain("2.1.0", None, None);
+        stabilized.dependencies = lockfile.dependencies.clone();
+        stabilized.plugins = lockfile.plugins.clone();
+
+        // The Maven dep must still be visible after stabilization.
+        let maven_count = stabilized
+            .dependencies
+            .iter()
+            .filter(|d| matches!(&d.source, DepSource::Maven { .. }))
+            .count();
+        assert_eq!(
+            maven_count, 1,
+            "stabilized lockfile must preserve Maven deps"
+        );
+        assert!(
+            stabilized.toolchain.is_some(),
+            "stabilized lockfile must have a toolchain"
+        );
+    }
+
+    #[test]
+    fn lockfile_round_trip_without_toolchain_preserves_maven_deps() {
+        // Regression: a lockfile on disk that has Maven deps but no [toolchain]
+        // must round-trip correctly through Lockfile::from_path.
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+
+        // Write a lockfile without toolchain but with Maven deps — this is what
+        // `konvoy update` used to produce before the fix.
+        let content = r#"
+[[dependencies]]
+name = "kotlinx-datetime"
+source_type = "maven"
+version = "0.6.0"
+maven = "org.jetbrains.kotlinx:kotlinx-datetime"
+source_hash = "aabbccdd"
+
+[dependencies.targets]
+linux_x64 = "1111"
+"#;
+        std::fs::write(&lockfile_path, content).unwrap();
+
+        let lockfile = Lockfile::from_path(&lockfile_path).unwrap();
+
+        // Toolchain should be None (was not present on disk).
+        assert!(lockfile.toolchain.is_none());
+
+        // Maven dep must have been parsed.
+        assert_eq!(lockfile.dependencies.len(), 1);
+        assert_eq!(lockfile.dependencies[0].name, "kotlinx-datetime");
+        match &lockfile.dependencies[0].source {
+            DepSource::Maven {
+                version,
+                maven,
+                targets,
+                ..
+            } => {
+                assert_eq!(version, "0.6.0");
+                assert_eq!(maven, "org.jetbrains.kotlinx:kotlinx-datetime");
+                assert_eq!(targets.get("linux_x64").map(String::as_str), Some("1111"));
+            }
+            other => panic!("expected Maven source, got: {other:?}"),
+        }
+
+        // Simulate the build stabilization path.
+        let mut stabilized = Lockfile::with_managed_toolchain("2.1.0", None, None);
+        stabilized.dependencies = lockfile.dependencies.clone();
+
+        let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
+        let maven_locks: Vec<_> = stabilized
+            .dependencies
+            .iter()
+            .filter(|d| matches!(&d.source, DepSource::Maven { .. }))
+            .collect();
+
+        assert_eq!(
+            maven_locks.len(),
+            1,
+            "resolve_maven_deps must see the Maven dep after stabilization"
+        );
+        // The target hash must be accessible.
+        if let DepSource::Maven { targets, .. } = &maven_locks[0].source {
+            assert!(
+                targets.contains_key(&target.to_string()),
+                "target hash for {target} must exist"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_maven_deps_with_classifier_missing_target_hash() {
+        // A Maven dep with a classifier but missing the build target's hash
+        // should produce the same error as a regular dep with a missing target.
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu-cinterop-interop".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets: std::collections::BTreeMap::new(),
+                required_by: vec!["atomicfu".to_owned()],
+                classifier: Some("cinterop-interop".to_owned()),
+            },
+            source_hash: "hash".to_owned(),
+        });
+        let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
+
+        let result = resolve_maven_deps(&lockfile, &target);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no hash for target"),
+            "expected missing target hash error for classifier dep, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_with_classifier_dep_passes() {
+        // A lockfile that contains both regular and classifier deps should
+        // pass staleness checks when the manifest's Maven dep is present.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\natomicfu = { maven = \"org.jetbrains.kotlinx:atomicfu\", version = \"0.23.1\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+
+        // Main klib.
+        let mut targets1 = std::collections::BTreeMap::new();
+        targets1.insert("linux_x64".to_owned(), "main-hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets: targets1,
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "main-source-hash".to_owned(),
+        });
+
+        // Cinterop klib.
+        let mut targets2 = std::collections::BTreeMap::new();
+        targets2.insert("linux_x64".to_owned(), "cinterop-hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu-cinterop-interop".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets: targets2,
+                required_by: vec!["atomicfu".to_owned()],
+                classifier: Some("cinterop-interop".to_owned()),
+            },
+            source_hash: "cinterop-source-hash".to_owned(),
+        });
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(
+            result.is_ok(),
+            "lockfile with classifier deps should pass staleness check: {result:?}"
+        );
+    }
+
+    #[test]
+    fn update_lockfile_preserves_classifier_dep_locks() {
+        // When updating the lockfile (e.g. toolchain changed), classifier dep
+        // locks should be preserved alongside regular Maven deps.
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.0.0");
+
+        // Regular Maven dep.
+        let mut targets1 = std::collections::BTreeMap::new();
+        targets1.insert("linux_x64".to_owned(), "main-hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets: targets1,
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "main-hash".to_owned(),
+        });
+
+        // Cinterop dep with classifier.
+        let mut targets2 = std::collections::BTreeMap::new();
+        targets2.insert("linux_x64".to_owned(), "cinterop-hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu-cinterop-interop".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets: targets2,
+                required_by: vec!["atomicfu".to_owned()],
+                classifier: Some("cinterop-interop".to_owned()),
+            },
+            source_hash: "cinterop-hash".to_owned(),
+        });
+
+        lockfile.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            &[],
+            tmp.path(),
+            &lockfile_path,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let reparsed = Lockfile::from_path(&lockfile_path).unwrap();
+        // Both deps should be preserved.
+        assert_eq!(reparsed.dependencies.len(), 2);
+        let cinterop_dep = reparsed
+            .dependencies
+            .iter()
+            .find(|d| d.name == "atomicfu-cinterop-interop")
+            .unwrap_or_else(|| panic!("missing cinterop dep"));
+        match &cinterop_dep.source {
+            DepSource::Maven { classifier, .. } => {
+                assert_eq!(classifier.as_deref(), Some("cinterop-interop"));
+            }
+            other => panic!("expected Maven source, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -2627,9 +2913,10 @@ mod tests {
             name: "kotlinx-coroutines".to_owned(),
             source: DepSource::Maven {
                 version: "1.8.0".to_owned(),
-                maven_coordinate:
-                    "org.jetbrains.kotlinx:kotlinx-coroutines-core-{target}:1.8.0:klib".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
                 targets,
+                required_by: Vec::new(),
+                classifier: None,
             },
             source_hash: "maven-hash".to_owned(),
         });

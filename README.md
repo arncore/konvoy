@@ -1,5 +1,8 @@
 # Konvoy
 
+[![CI](https://github.com/arncore/konvoy/actions/workflows/ci.yml/badge.svg)](https://github.com/arncore/konvoy/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/arncore/konvoy/branch/main/graph/badge.svg)](https://codecov.io/gh/arncore/konvoy)
+
 Konvoy is a native-first Kotlin build tool focused on making Kotlin/Native compilation as easy, fast, and painless as Cargo.
 
 Konvoy avoids Gradle/Maven-style complexity by providing:
@@ -77,7 +80,7 @@ hello/
 - `konvoy run [--target <triple|host>] [--release] [--force] [--locked] [-- <args…>]` — build and run
 - `konvoy test [--target <triple|host>] [--release] [--verbose] [--force] [--locked] [--filter <pattern>]` — build and run tests
 - `konvoy lint [--verbose] [--config <path>] [--locked]` — run detekt static analysis on Kotlin sources
-- `konvoy update` — resolve Maven dependencies and update `konvoy.lock`
+- `konvoy update` — resolve Maven dependencies (including transitives via POM) and update `konvoy.lock`
 - `konvoy clean` — remove build artifacts
 - `konvoy doctor` — check environment, toolchain, and dependency setup
 - `konvoy toolchain install [<version>]` — install a Kotlin/Native version
@@ -141,7 +144,7 @@ my-utils/
 
 ### Maven dependencies
 
-Depend on external Kotlin/Native libraries from Maven Central using a curated library index:
+Depend on external Kotlin/Native libraries from Maven Central using direct Maven coordinates:
 
 ```toml
 [package]
@@ -151,32 +154,55 @@ name = "my-app"
 kotlin = "2.1.0"
 
 [dependencies]
-kotlinx-coroutines = { version = "1.8.0" }
-kotlinx-datetime = { version = "0.6.0" }
+kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }
+kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
 my-utils = { path = "../my-utils" }
 ```
 
-After adding a Maven dependency, run `konvoy update` to resolve versions and populate `konvoy.lock` with per-target SHA-256 hashes. At build time, only the klib for your current target is downloaded — subsequent builds use the cached artifact.
+The `maven` field is a standard Maven coordinate (`groupId:artifactId`). The `version` field pins the exact version to use.
+
+Each dependency must have exactly one source type — either `path` or `maven` + `version` — not both.
+
+#### Workflow
+
+After adding or changing a Maven dependency, run `konvoy update` to resolve and lock:
 
 ```
-konvoy update    # resolve deps, download klibs, write hashes to konvoy.lock
+konvoy update    # resolve deps, fetch POMs, write hashes to konvoy.lock
 konvoy build     # downloads only the klib needed for your host target
 ```
 
-Each dependency must have exactly one of `path` or `version` — not both.
+`konvoy update` performs these steps:
 
-### Available libraries
+1. Reads `[dependencies]` from `konvoy.toml`
+2. Fetches each dependency's POM from Maven Central
+3. Walks transitive dependencies via POM `<dependency>` entries (BFS)
+4. Detects version conflicts and dependency cycles with actionable errors
+5. Downloads the per-target `.klib` for each supported platform
+6. Writes SHA-256 hashes to `konvoy.lock`
 
-Konvoy ships with a curated index of popular Kotlin/Native libraries:
+At build time (`konvoy build`), only the klib for your current host target is downloaded from the Maven cache. Subsequent builds reuse cached artifacts from `~/.konvoy/cache/maven/`.
 
-| Name | Maven artifact |
-|------|---------------|
-| `kotlinx-coroutines` | `org.jetbrains.kotlinx:kotlinx-coroutines-core` |
-| `kotlinx-datetime` | `org.jetbrains.kotlinx:kotlinx-datetime` |
-| `kotlinx-io` | `org.jetbrains.kotlinx:kotlinx-io-core` |
-| `kotlinx-atomicfu` | `org.jetbrains.kotlinx:atomicfu` |
+#### Lockfile
 
-Run `konvoy doctor` to see the full list of available libraries.
+`konvoy.lock` pins the exact version and per-target SHA-256 hash for every Maven dependency (direct and transitive). Transitive dependencies include a `required-by` field tracing the dependency chain back to `konvoy.toml`:
+
+```toml
+[[dependencies]]
+name = "kotlinx-coroutines"
+source_type = "maven"
+version = "1.8.0"
+maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core"
+source_hash = "..."
+
+[dependencies.targets]
+linux_x64 = "sha256:..."
+macos_arm64 = "sha256:..."
+```
+
+Transitive dependencies are tracked automatically with a `required_by` field listing which direct dependency pulled them in.
+
+Use `--locked` on build/test/run to error if the lockfile is out of date instead of silently updating.
 
 ### Plugins
 
@@ -268,6 +294,28 @@ konvoy lint                        # run with defaults or detekt.yml
 konvoy lint --config my-rules.yml  # use custom config
 konvoy lint --verbose              # show raw detekt output
 ```
+
+## Editor support
+
+### VS Code
+
+The [Konvoy for VS Code](editors/code) extension provides:
+
+- **Commands** — Build, Run, Test, Lint, Clean, Doctor, Update, and Toolchain management via `Ctrl+Shift+P`
+- **Run button** — Play button in the editor title bar for `.kt` files and `konvoy.toml`
+- **`konvoy.toml` support** — Syntax highlighting, validation on save, autocomplete, and hover docs
+- **Diagnostics** — Build errors and detekt findings in the Problems panel
+- **Tasks** — Auto-detected konvoy tasks via `Ctrl+Shift+B`
+
+Install from [Releases](https://github.com/arncore/konvoy/releases):
+
+```
+code --install-extension konvoy-vscode-1.0.0.vsix
+```
+
+Or in VS Code: `Ctrl+Shift+P` → "Extensions: Install from VSIX..."
+
+See the [extension README](editors/code/README.md) for full details.
 
 ## Roadmap (high level)
 

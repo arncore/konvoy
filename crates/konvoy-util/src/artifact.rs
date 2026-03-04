@@ -214,7 +214,21 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("artifact hash mismatch"), "error was: {err}");
+        assert!(err.contains("hash mismatch"), "error was: {err}");
+        // Error must explain possible causes so the user understands what happened.
+        assert!(
+            err.contains("corrupted on disk"),
+            "error should mention disk corruption: {err}"
+        );
+        assert!(
+            err.contains("tampered with"),
+            "error should mention tampering: {err}"
+        );
+        // Error must tell the user what to do.
+        assert!(
+            err.contains("inspect or delete"),
+            "error should tell the user to inspect/delete the file: {err}"
+        );
     }
 
     #[test]

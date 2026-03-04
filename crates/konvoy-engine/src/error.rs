@@ -137,14 +137,6 @@ pub enum EngineError {
     #[error("invalid plugin `{name}` configuration: {reason}")]
     InvalidPluginConfig { name: String, reason: String },
 
-    /// A library descriptor is invalid.
-    #[error("invalid library descriptor `{name}`: {reason}")]
-    InvalidLibraryDescriptor { name: String, reason: String },
-
-    /// An unknown library was referenced in the manifest.
-    #[error("unknown library `{name}` — available libraries: {available}")]
-    UnknownLibrary { name: String, available: String },
-
     /// Plugin artifact download failed.
     #[error("cannot download plugin `{name}` artifact: {message}")]
     PluginDownload { name: String, message: String },
@@ -174,11 +166,28 @@ pub enum EngineError {
     #[error("no hash for target `{target}` in lockfile for dependency `{name}` — run `konvoy update` to resolve")]
     MissingTargetHash { name: String, target: String },
 
-    /// A library klib hash mismatch was detected after download.
-    #[error("library `{name}` klib hash mismatch — expected {expected}, got {actual}; run `konvoy update` to refresh")]
+    /// A library klib hash mismatch was detected after a fresh download.
+    ///
+    /// Unlike `ArtifactHashMismatch` (cached file mismatch), this fires when
+    /// the just-downloaded content doesn't match the lockfile. This points at
+    /// a network-level issue (MITM, CDN corruption) or a stale lockfile.
+    #[error("library `{name}` hash mismatch after download\n  expected: {expected}\n  got:      {actual}\n\n  This can happen if:\n    - the download was intercepted or corrupted in transit\n    - the lockfile hashes are stale (e.g. the upstream artifact was republished)\n\n  To fix: run `konvoy update` to re-resolve and re-hash all dependencies.\n  If this keeps happening, check your network connection for interference.")]
     LibraryHashMismatch {
         name: String,
         expected: String,
         actual: String,
     },
+
+    /// Two dependency paths require different versions of the same Maven artifact.
+    #[error("version conflict for '{maven}'\n{details}\n  hint: add an explicit version in konvoy.toml:\n    {hint_name} = {{ maven = \"{maven}\", version = \"{hint_version}\" }}")]
+    MavenVersionConflict {
+        maven: String,
+        details: String,
+        hint_name: String,
+        hint_version: String,
+    },
+
+    /// A cycle was detected during Maven transitive dependency resolution.
+    #[error("maven dependency cycle detected: {cycle} — remove one of these dependencies from konvoy.toml or file an issue upstream")]
+    MavenDependencyCycle { cycle: String },
 }
