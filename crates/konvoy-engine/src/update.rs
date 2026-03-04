@@ -23,6 +23,7 @@ use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile};
 use konvoy_config::manifest::Manifest;
 use konvoy_util::maven::MAVEN_CENTRAL;
 use konvoy_util::metadata::ArtifactMetadata;
+use konvoy_util::pom::strip_target_suffix;
 
 use crate::error::EngineError;
 
@@ -619,20 +620,6 @@ fn is_filtered_dependency(group_id: &str, artifact_id: &str) -> bool {
     false
 }
 
-/// Strip a known Maven target suffix from an artifact ID.
-///
-/// Per-target POMs reference dependencies with target-suffixed artifact IDs
-/// (e.g. `atomicfu-macosarm64`). We strip that suffix to get the base
-/// artifact ID (`atomicfu`).
-fn strip_target_suffix(artifact_id: &str, maven_suffix: &str) -> String {
-    let suffix = format!("-{maven_suffix}");
-    if let Some(base) = artifact_id.strip_suffix(&suffix) {
-        base.to_owned()
-    } else {
-        artifact_id.to_owned()
-    }
-}
-
 /// Derive a user-friendly dependency name from a Maven artifact ID.
 ///
 /// Examples:
@@ -901,23 +888,6 @@ kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", 
             "kotlinx-coroutines-core"
         ));
         assert!(!is_filtered_dependency("org.jetbrains.kotlinx", "atomicfu"));
-    }
-
-    #[test]
-    fn strip_target_suffix_removes_suffix() {
-        assert_eq!(
-            strip_target_suffix("atomicfu-macosarm64", "macosarm64"),
-            "atomicfu"
-        );
-        assert_eq!(
-            strip_target_suffix("kotlinx-coroutines-core-linuxx64", "linuxx64"),
-            "kotlinx-coroutines-core"
-        );
-    }
-
-    #[test]
-    fn strip_target_suffix_no_suffix() {
-        assert_eq!(strip_target_suffix("atomicfu", "macosarm64"), "atomicfu");
     }
 
     #[test]

@@ -347,7 +347,7 @@ pub fn fetch_pom(group_id: &str, artifact_id: &str, version: &str) -> Result<Str
 /// Per-target POMs reference dependencies with target-suffixed artifact IDs
 /// (e.g. `atomicfu-macosarm64`). We strip that suffix to get the base
 /// artifact ID (`atomicfu`).
-fn strip_target_suffix(artifact_id: &str, maven_suffix: &str) -> String {
+pub fn strip_target_suffix(artifact_id: &str, maven_suffix: &str) -> String {
     let suffix = format!("-{maven_suffix}");
     if let Some(base) = artifact_id.strip_suffix(&suffix) {
         base.to_owned()
