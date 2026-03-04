@@ -817,6 +817,108 @@ linux_x64 = "hash123"
         }
     }
 
+    #[test]
+    fn round_trip_mixed_deps_with_and_without_classifier() {
+        // A lockfile with both a regular Maven dep (no classifier) and a
+        // cinterop dep (with classifier) should round-trip correctly.
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+
+        // Main klib (no classifier).
+        let mut targets1 = std::collections::BTreeMap::new();
+        targets1.insert("linux_x64".to_owned(), "main-hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets: targets1,
+                required_by: vec!["kotlinx-coroutines".to_owned()],
+                classifier: None,
+            },
+            source_hash: "main-source-hash".to_owned(),
+        });
+
+        // Cinterop klib (with classifier).
+        let mut targets2 = std::collections::BTreeMap::new();
+        targets2.insert("linux_x64".to_owned(), "cinterop-hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu-cinterop-interop".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets: targets2,
+                required_by: vec!["atomicfu".to_owned()],
+                classifier: Some("cinterop-interop".to_owned()),
+            },
+            source_hash: "cinterop-source-hash".to_owned(),
+        });
+
+        lockfile.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
+        let reparsed = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(lockfile, reparsed);
+        assert_eq!(reparsed.dependencies.len(), 2);
+
+        // Verify the first dep has no classifier.
+        match &reparsed.dependencies.first().unwrap().source {
+            DepSource::Maven { classifier, .. } => {
+                assert!(classifier.is_none());
+            }
+            other => panic!("expected Maven source, got: {other:?}"),
+        }
+        // Verify the second dep has a classifier.
+        match &reparsed.dependencies.get(1).unwrap().source {
+            DepSource::Maven { classifier, .. } => {
+                assert_eq!(classifier.as_deref(), Some("cinterop-interop"));
+            }
+            other => panic!("expected Maven source, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backward_compat_old_lockfile_without_classifier_or_required_by() {
+        // An old lockfile that has neither classifier nor required_by should
+        // parse correctly with both defaulting to their zero values.
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        fs::write(
+            &path,
+            r#"
+[toolchain]
+konanc_version = "2.1.0"
+
+[[dependencies]]
+name = "kotlinx-coroutines"
+source_type = "maven"
+version = "1.8.0"
+maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core"
+source_hash = "old-hash"
+
+[dependencies.targets]
+linux_x64 = "aabb"
+macos_arm64 = "ccdd"
+"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        let lockfile = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(lockfile.dependencies.len(), 1);
+        match &lockfile.dependencies.first().unwrap().source {
+            DepSource::Maven {
+                classifier,
+                required_by,
+                targets,
+                ..
+            } => {
+                assert!(classifier.is_none());
+                assert!(required_by.is_empty());
+                assert_eq!(targets.len(), 2);
+            }
+            other => panic!("expected Maven source, got: {other:?}"),
+        }
+    }
+
     mod property_tests {
         use super::*;
         use proptest::prelude::*;

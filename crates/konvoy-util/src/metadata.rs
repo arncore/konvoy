@@ -145,4 +145,96 @@ mod tests {
         );
         assert!(result.is_err());
     }
+
+    #[test]
+    fn artifact_metadata_empty_deps_and_files() {
+        let metadata = ArtifactMetadata {
+            dependencies: Vec::new(),
+            files: Vec::new(),
+        };
+        assert!(metadata.dependencies.is_empty());
+        assert!(metadata.files.is_empty());
+    }
+
+    #[test]
+    fn artifact_metadata_equality() {
+        let a = ArtifactMetadata {
+            dependencies: vec![MetadataDep {
+                group_id: "org.example".to_owned(),
+                artifact_id: "lib".to_owned(),
+                version: "1.0".to_owned(),
+            }],
+            files: vec![MetadataFile {
+                name: "lib.klib".to_owned(),
+                url: "lib-1.0.klib".to_owned(),
+                sha256: Some("abc123".to_owned()),
+            }],
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn artifact_metadata_inequality_different_deps() {
+        let a = ArtifactMetadata {
+            dependencies: vec![MetadataDep {
+                group_id: "org.a".to_owned(),
+                artifact_id: "lib".to_owned(),
+                version: "1.0".to_owned(),
+            }],
+            files: Vec::new(),
+        };
+        let b = ArtifactMetadata {
+            dependencies: vec![MetadataDep {
+                group_id: "org.b".to_owned(),
+                artifact_id: "lib".to_owned(),
+                version: "1.0".to_owned(),
+            }],
+            files: Vec::new(),
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn artifact_metadata_with_multiple_files() {
+        let metadata = ArtifactMetadata {
+            dependencies: Vec::new(),
+            files: vec![
+                MetadataFile {
+                    name: "lib.klib".to_owned(),
+                    url: "lib-1.0.klib".to_owned(),
+                    sha256: Some("abc".to_owned()),
+                },
+                MetadataFile {
+                    name: "lib-cinterop-native.klib".to_owned(),
+                    url: "lib-1.0-cinterop-native.klib".to_owned(),
+                    sha256: Some("def".to_owned()),
+                },
+            ],
+        };
+        assert_eq!(metadata.files.len(), 2);
+        assert!(metadata.files.iter().any(|f| f.name.contains("cinterop")));
+    }
+
+    #[test]
+    fn metadata_dep_equality() {
+        let a = MetadataDep {
+            group_id: "org.example".to_owned(),
+            artifact_id: "lib".to_owned(),
+            version: "1.0".to_owned(),
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn metadata_file_equality() {
+        let a = MetadataFile {
+            name: "lib.klib".to_owned(),
+            url: "lib-1.0.klib".to_owned(),
+            sha256: Some("abc".to_owned()),
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
 }

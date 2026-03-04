@@ -946,4 +946,100 @@ mod tests {
         assert!(metadata.dependencies.is_empty());
         assert!(metadata.files.is_empty());
     }
+
+    #[test]
+    fn pom_to_metadata_strips_different_target_suffixes() {
+        // Verify that different target suffixes are stripped correctly.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <groupId>com.example</groupId>
+  <artifactId>lib-macosarm64</artifactId>
+  <version>1.0.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>com.other</groupId>
+      <artifactId>dep-macosarm64</artifactId>
+      <version>2.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>com.other</groupId>
+      <artifactId>no-suffix</artifactId>
+      <version>3.0.0</version>
+    </dependency>
+  </dependencies>
+</project>"#;
+        let pom = parse_pom(xml, None, None).unwrap();
+        let metadata = pom_to_metadata(&pom, "macosarm64");
+
+        assert_eq!(metadata.dependencies.len(), 2);
+        // "dep-macosarm64" should be stripped to "dep".
+        assert_eq!(metadata.dependencies.first().unwrap().artifact_id, "dep");
+        // "no-suffix" stays unchanged.
+        assert_eq!(
+            metadata.dependencies.get(1).unwrap().artifact_id,
+            "no-suffix"
+        );
+    }
+
+    #[test]
+    fn pom_to_metadata_always_returns_empty_files() {
+        // Regardless of the POM content, the files list should always be empty
+        // because POM files do not contain information about cinterop klibs.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <groupId>com.example</groupId>
+  <artifactId>big-lib-linuxx64</artifactId>
+  <version>5.0.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>com.a</groupId>
+      <artifactId>dep1-linuxx64</artifactId>
+      <version>1.0</version>
+    </dependency>
+    <dependency>
+      <groupId>com.b</groupId>
+      <artifactId>dep2-linuxx64</artifactId>
+      <version>2.0</version>
+    </dependency>
+    <dependency>
+      <groupId>com.c</groupId>
+      <artifactId>dep3-linuxx64</artifactId>
+      <version>3.0</version>
+    </dependency>
+  </dependencies>
+</project>"#;
+        let pom = parse_pom(xml, None, None).unwrap();
+        let metadata = pom_to_metadata(&pom, "linuxx64");
+
+        assert_eq!(metadata.dependencies.len(), 3);
+        assert!(
+            metadata.files.is_empty(),
+            "POM adapter must never produce files"
+        );
+    }
+
+    #[test]
+    fn pom_to_metadata_preserves_group_and_version() {
+        // Verify that group_id and version are passed through unchanged.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <groupId>org.jetbrains.kotlinx</groupId>
+  <artifactId>atomicfu-linuxx64</artifactId>
+  <version>0.23.1</version>
+  <dependencies>
+    <dependency>
+      <groupId>org.jetbrains.kotlin</groupId>
+      <artifactId>kotlin-native-prebuilt-linuxx64</artifactId>
+      <version>1.9.21</version>
+    </dependency>
+  </dependencies>
+</project>"#;
+        let pom = parse_pom(xml, None, None).unwrap();
+        let metadata = pom_to_metadata(&pom, "linuxx64");
+
+        let dep = metadata.dependencies.first().unwrap();
+        assert_eq!(dep.group_id, "org.jetbrains.kotlin");
+        assert_eq!(dep.artifact_id, "kotlin-native-prebuilt");
+        assert_eq!(dep.version, "1.9.21");
+    }
 }

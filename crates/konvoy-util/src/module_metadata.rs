@@ -395,6 +395,122 @@ mod tests {
     }
 
     #[test]
+    fn parse_module_variant_with_null_files_returns_empty_files() {
+        // A variant can have `files: null` (serialized as missing).
+        let json = r#"{
+  "formatVersion": "1.1",
+  "variants": [
+    {
+      "name": "linuxX64ApiElements-published",
+      "dependencies": [],
+      "files": null
+    }
+  ]
+}"#;
+        let metadata = parse_module_metadata(json).unwrap();
+        assert!(metadata.files.is_empty());
+        assert!(metadata.dependencies.is_empty());
+    }
+
+    #[test]
+    fn parse_module_variant_with_no_deps_key_returns_empty_deps() {
+        // A variant may omit the `dependencies` key entirely.
+        let json = r#"{
+  "formatVersion": "1.1",
+  "variants": [
+    {
+      "name": "linuxX64ApiElements-published",
+      "files": [
+        {
+          "name": "lib.klib",
+          "url": "lib-1.0.klib"
+        }
+      ]
+    }
+  ]
+}"#;
+        let metadata = parse_module_metadata(json).unwrap();
+        assert!(metadata.dependencies.is_empty());
+        assert_eq!(metadata.files.len(), 1);
+    }
+
+    #[test]
+    fn parse_module_file_without_sha256() {
+        // Files may omit sha256 — it should be `None`.
+        let json = r#"{
+  "formatVersion": "1.1",
+  "variants": [
+    {
+      "name": "linuxX64ApiElements-published",
+      "files": [
+        {
+          "name": "lib.klib",
+          "url": "lib-1.0.klib"
+        }
+      ]
+    }
+  ]
+}"#;
+        let metadata = parse_module_metadata(json).unwrap();
+        let file = metadata.files.first().unwrap();
+        assert!(file.sha256.is_none());
+    }
+
+    #[test]
+    fn parse_module_multiple_cinterop_files() {
+        // An artifact may publish multiple cinterop klibs alongside the main klib.
+        let json = r#"{
+  "formatVersion": "1.1",
+  "variants": [
+    {
+      "name": "linuxX64ApiElements-published",
+      "files": [
+        { "name": "lib.klib", "url": "lib-linuxx64-1.0.klib", "sha256": "aaa" },
+        { "name": "lib-cinterop-foo.klib", "url": "lib-linuxx64-1.0-cinterop-foo.klib", "sha256": "bbb" },
+        { "name": "lib-cinterop-bar.klib", "url": "lib-linuxx64-1.0-cinterop-bar.klib", "sha256": "ccc" }
+      ]
+    }
+  ]
+}"#;
+        let metadata = parse_module_metadata(json).unwrap();
+        assert_eq!(metadata.files.len(), 3);
+        let cinterop_files: Vec<_> = metadata
+            .files
+            .iter()
+            .filter(|f| f.name.contains("cinterop"))
+            .collect();
+        assert_eq!(cinterop_files.len(), 2);
+    }
+
+    #[test]
+    fn parse_module_picks_first_matching_api_elements_variant() {
+        // If there are multiple variants ending in ApiElements-published
+        // (unusual but possible), the first one is used.
+        let json = r#"{
+  "formatVersion": "1.1",
+  "variants": [
+    {
+      "name": "linuxX64ApiElements-published",
+      "dependencies": [
+        { "group": "org.example", "module": "first", "version": { "requires": "1.0" } }
+      ],
+      "files": []
+    },
+    {
+      "name": "macosArm64ApiElements-published",
+      "dependencies": [
+        { "group": "org.example", "module": "second", "version": { "requires": "2.0" } }
+      ],
+      "files": []
+    }
+  ]
+}"#;
+        let metadata = parse_module_metadata(json).unwrap();
+        assert_eq!(metadata.dependencies.len(), 1);
+        assert_eq!(metadata.dependencies.first().unwrap().artifact_id, "first");
+    }
+
+    #[test]
     fn fetch_module_metadata_nonexistent_returns_none() {
         // Use a non-existent artifact to test 404 handling.
         let result = fetch_module_metadata("com.nonexistent.fake", "no-such-artifact", "0.0.0");

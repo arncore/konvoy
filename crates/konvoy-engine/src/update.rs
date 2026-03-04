@@ -1088,4 +1088,74 @@ kotlin = "2.1.0"
         let cls = extract_classifier_from_url("some-file.klib", "0.23.1");
         assert!(cls.is_none());
     }
+
+    #[test]
+    fn extract_classifier_complex_cinterop_name() {
+        // Classifier with multiple dashes.
+        let cls =
+            extract_classifier_from_url("lib-linuxx64-1.0.0-cinterop-native-mt.klib", "1.0.0");
+        assert_eq!(cls.as_deref(), Some("cinterop-native-mt"));
+    }
+
+    #[test]
+    fn extract_classifier_empty_classifier_returns_none() {
+        // URL where there is nothing between version-dash and .klib.
+        let cls = extract_classifier_from_url("lib-linuxx64-1.0.0-.klib", "1.0.0");
+        assert!(cls.is_none());
+    }
+
+    #[test]
+    fn extract_classifier_from_full_url_path() {
+        // Extract classifier even when URL is a relative path with directory.
+        let cls =
+            extract_classifier_from_url("atomicfu-linuxx64-0.23.1-cinterop-interop.klib", "0.23.1");
+        assert_eq!(cls.as_deref(), Some("cinterop-interop"));
+    }
+
+    #[test]
+    fn extract_classifier_version_appears_multiple_times() {
+        // If version appears multiple times, classifier is taken after the first match.
+        let cls = extract_classifier_from_url("lib-0.23.1-0.23.1-cinterop-x.klib", "0.23.1");
+        // After first "0.23.1-", the rest is "0.23.1-cinterop-x.klib".
+        // strip_suffix(".klib") gives "0.23.1-cinterop-x".
+        assert_eq!(cls.as_deref(), Some("0.23.1-cinterop-x"));
+    }
+
+    #[test]
+    fn extract_classifier_non_klib_extension_returns_none() {
+        let cls = extract_classifier_from_url("lib-1.0-sources.jar", "1.0");
+        assert!(cls.is_none());
+    }
+
+    #[test]
+    fn resolve_transitive_no_direct_deps_returns_empty() {
+        let result = resolve_transitive(&[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn lockfile_classifier_written_for_cinterop_deps() {
+        // Verify that when a lockfile is written with a cinterop dep,
+        // the classifier field appears in the serialized TOML.
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        let mut targets = BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu-cinterop-interop".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets,
+                required_by: vec!["atomicfu".to_owned()],
+                classifier: Some("cinterop-interop".to_owned()),
+            },
+            source_hash: "cinterop-hash".to_owned(),
+        });
+        let content =
+            toml::to_string_pretty(&lockfile).unwrap_or_else(|e| panic!("serialize: {e}"));
+        assert!(
+            content.contains("classifier = \"cinterop-interop\""),
+            "classifier should appear in serialized lockfile, content was: {content}"
+        );
+    }
 }
