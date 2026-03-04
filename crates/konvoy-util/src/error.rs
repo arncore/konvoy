@@ -57,4 +57,8 @@ pub enum UtilError {
     /// A POM uses a property placeholder that konvoy does not resolve.
     #[error("unsupported property \"{property}\" in POM — only ${{project.version}} and ${{project.groupId}} are supported")]
     PomUnsupportedProperty { property: String },
+
+    /// Gradle Module Metadata could not be parsed.
+    #[error("cannot parse module metadata: {reason}")]
+    ModuleMetadataParse { reason: String },
 }

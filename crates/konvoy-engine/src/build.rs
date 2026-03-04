@@ -469,13 +469,14 @@ fn resolve_maven_deps(lockfile: &Lockfile, target: &Target) -> Result<Vec<PathBu
         .map(|lock_entry| {
             let dep_name = lock_entry.name.clone();
 
-            let (version, maven_coord, targets) = match &lock_entry.source {
+            let (version, maven_coord, targets, classifier) = match &lock_entry.source {
                 DepSource::Maven {
                     version,
                     maven,
                     targets,
+                    classifier,
                     ..
-                } => (version, maven, targets),
+                } => (version, maven, targets, classifier),
                 DepSource::Path { .. } => {
                     return Err(EngineError::MissingLockfileEntry { name: dep_name });
                 }
@@ -494,12 +495,15 @@ fn resolve_maven_deps(lockfile: &Lockfile, target: &Target) -> Result<Vec<PathBu
             // Build the per-target artifact ID (e.g. "kotlinx-coroutines-core-linuxx64").
             let per_target_artifact_id = format!("{artifact_id}-{maven_suffix}");
 
-            let coord = konvoy_util::maven::MavenCoordinate::new(
+            let mut coord = konvoy_util::maven::MavenCoordinate::new(
                 group_id,
                 &per_target_artifact_id,
                 version,
             )
             .with_packaging("klib");
+            if let Some(cls) = classifier {
+                coord = coord.with_classifier(cls);
+            }
 
             // Extract the expected SHA-256 for this target from the lockfile.
             let expected_sha256 =
@@ -2564,6 +2568,7 @@ mod tests {
                 maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
                 targets,
                 required_by: Vec::new(),
+                classifier: None,
             },
             source_hash: "maven-hash".to_owned(),
         });
@@ -2613,6 +2618,7 @@ mod tests {
                 maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
                 targets: std::collections::BTreeMap::new(),
                 required_by: Vec::new(),
+                classifier: None,
             },
             source_hash: "hash".to_owned(),
         });
@@ -2646,6 +2652,7 @@ mod tests {
                 maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
                 targets,
                 required_by: Vec::new(),
+                classifier: None,
             },
             source_hash: "hash".to_owned(),
         });
@@ -2742,6 +2749,158 @@ linux_x64 = "1111"
     }
 
     #[test]
+    fn resolve_maven_deps_with_classifier_missing_target_hash() {
+        // A Maven dep with a classifier but missing the build target's hash
+        // should produce the same error as a regular dep with a missing target.
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu-cinterop-interop".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets: std::collections::BTreeMap::new(),
+                required_by: vec!["atomicfu".to_owned()],
+                classifier: Some("cinterop-interop".to_owned()),
+            },
+            source_hash: "hash".to_owned(),
+        });
+        let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
+
+        let result = resolve_maven_deps(&lockfile, &target);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no hash for target"),
+            "expected missing target hash error for classifier dep, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_with_classifier_dep_passes() {
+        // A lockfile that contains both regular and classifier deps should
+        // pass staleness checks when the manifest's Maven dep is present.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\natomicfu = { maven = \"org.jetbrains.kotlinx:atomicfu\", version = \"0.23.1\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+
+        // Main klib.
+        let mut targets1 = std::collections::BTreeMap::new();
+        targets1.insert("linux_x64".to_owned(), "main-hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets: targets1,
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "main-source-hash".to_owned(),
+        });
+
+        // Cinterop klib.
+        let mut targets2 = std::collections::BTreeMap::new();
+        targets2.insert("linux_x64".to_owned(), "cinterop-hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu-cinterop-interop".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets: targets2,
+                required_by: vec!["atomicfu".to_owned()],
+                classifier: Some("cinterop-interop".to_owned()),
+            },
+            source_hash: "cinterop-source-hash".to_owned(),
+        });
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(
+            result.is_ok(),
+            "lockfile with classifier deps should pass staleness check: {result:?}"
+        );
+    }
+
+    #[test]
+    fn update_lockfile_preserves_classifier_dep_locks() {
+        // When updating the lockfile (e.g. toolchain changed), classifier dep
+        // locks should be preserved alongside regular Maven deps.
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.0.0");
+
+        // Regular Maven dep.
+        let mut targets1 = std::collections::BTreeMap::new();
+        targets1.insert("linux_x64".to_owned(), "main-hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets: targets1,
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "main-hash".to_owned(),
+        });
+
+        // Cinterop dep with classifier.
+        let mut targets2 = std::collections::BTreeMap::new();
+        targets2.insert("linux_x64".to_owned(), "cinterop-hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu-cinterop-interop".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets: targets2,
+                required_by: vec!["atomicfu".to_owned()],
+                classifier: Some("cinterop-interop".to_owned()),
+            },
+            source_hash: "cinterop-hash".to_owned(),
+        });
+
+        lockfile.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            &[],
+            tmp.path(),
+            &lockfile_path,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let reparsed = Lockfile::from_path(&lockfile_path).unwrap();
+        // Both deps should be preserved.
+        assert_eq!(reparsed.dependencies.len(), 2);
+        let cinterop_dep = reparsed
+            .dependencies
+            .iter()
+            .find(|d| d.name == "atomicfu-cinterop-interop")
+            .unwrap_or_else(|| panic!("missing cinterop dep"));
+        match &cinterop_dep.source {
+            DepSource::Maven { classifier, .. } => {
+                assert_eq!(classifier.as_deref(), Some("cinterop-interop"));
+            }
+            other => panic!("expected Maven source, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn update_lockfile_preserves_maven_dep_locks() {
         // When updating the lockfile (e.g. toolchain changed), Maven dep locks
         // from the existing lockfile should be preserved.
@@ -2757,6 +2916,7 @@ linux_x64 = "1111"
                 maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
                 targets,
                 required_by: Vec::new(),
+                classifier: None,
             },
             source_hash: "maven-hash".to_owned(),
         });

@@ -488,6 +488,8 @@ version = "1.0.0"
 dependencies = [
  "glob",
  "roxmltree",
+ "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror",

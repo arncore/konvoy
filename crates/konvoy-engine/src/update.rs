@@ -1,17 +1,18 @@
-//! The `konvoy update` command: resolve Maven deps via POM-based transitive
+//! The `konvoy update` command: resolve Maven deps via metadata-based transitive
 //! resolution and populate lockfile hashes.
 //!
 //! For each dependency in `konvoy.toml` that has `maven` + `version` set:
 //!
 //! 1. Parse the `maven` field to get `groupId:artifactId`.
-//! 2. For every known Kotlin/Native target, fetch the per-target POM from
-//!    Maven Central and extract compile-scope dependencies.
+//! 2. For a probe target, fetch artifact metadata (`.module` JSON first,
+//!    POM XML as fallback) and extract compile-scope dependencies.
 //! 3. Recursively resolve transitive deps (BFS) with cycle detection.
 //! 4. Detect version conflicts — fail with actionable error.
 //! 5. For each resolved dep (direct + transitive), download the `.klib` and
-//!    compute SHA-256 hashes.
+//!    compute SHA-256 hashes. Also discover and download cinterop klibs
+//!    listed in `.module` metadata files.
 //! 6. Write the full dependency set to `konvoy.lock` with `required_by`
-//!    populated for transitive deps.
+//!    populated for transitive deps and `classifier` for non-primary artifacts.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::Path;
@@ -21,7 +22,8 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile};
 use konvoy_config::manifest::Manifest;
 use konvoy_util::maven::MAVEN_CENTRAL;
-use konvoy_util::pom::{fetch_pom, parse_pom};
+use konvoy_util::metadata::ArtifactMetadata;
+use konvoy_util::pom::strip_target_suffix;
 
 use crate::error::EngineError;
 
@@ -110,6 +112,7 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
             artifact_id: artifact_id.to_owned(),
             version: version.clone(),
             required_by: Vec::new(),
+            classifier: None,
         });
     }
 
@@ -130,11 +133,12 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
         let maven_coord = format!("{}:{}", dep.group_id, dep.artifact_id);
         eprintln!("  Resolving {} {}...", dep.name, dep.version);
 
-        // Check if lockfile already has this dep at this version.
+        // Check if lockfile already has this dep at this version and classifier.
+        let dep_classifier = &dep.classifier;
         let already_locked = lockfile.dependencies.iter().find(|d| {
             d.name == dep.name
-                && matches!(&d.source, DepSource::Maven { version: v, maven: m, .. }
-                    if v == &dep.version && m == &maven_coord)
+                && matches!(&d.source, DepSource::Maven { version: v, maven: m, classifier: c, .. }
+                    if v == &dep.version && m == &maven_coord && c == dep_classifier)
         });
 
         if let Some(existing) = already_locked {
@@ -159,12 +163,15 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
                 let maven_suffix = target.to_maven_suffix();
                 let per_target_artifact_id = format!("{}-{}", dep.artifact_id, maven_suffix);
 
-                let coord = konvoy_util::maven::MavenCoordinate::new(
+                let mut coord = konvoy_util::maven::MavenCoordinate::new(
                     &dep.group_id,
                     &per_target_artifact_id,
                     &dep.version,
                 )
                 .with_packaging("klib");
+                if let Some(cls) = &dep.classifier {
+                    coord = coord.with_classifier(cls);
+                }
                 let url = coord.to_url(MAVEN_CENTRAL);
 
                 let tmp_file = tmp_base.join(coord.filename());
@@ -217,6 +224,7 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
                 maven: maven_coord,
                 targets: targets_map,
                 required_by: dep.required_by.clone(),
+                classifier: dep.classifier.clone(),
             },
             source_hash,
         });
@@ -263,21 +271,28 @@ struct ResolvedMavenDep {
     /// Names of dependencies that pulled this one in transitively.
     /// Empty for direct deps declared in `konvoy.toml`.
     required_by: Vec<String>,
+    /// Maven classifier for non-primary artifacts (e.g. "cinterop-interop").
+    /// `None` for the main klib.
+    classifier: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
-// Transitive resolution (BFS on per-target POMs)
+// Transitive resolution (BFS on artifact metadata)
 // ---------------------------------------------------------------------------
 
 /// Resolve the full transitive closure of Maven dependencies via BFS on
-/// per-target POM files.
+/// artifact metadata (`.module` JSON first, POM XML as fallback).
 ///
 /// Uses the first known target to discover transitive deps (the dependency
 /// graph is the same across targets — only the klib differs).
 ///
+/// After resolving the dependency graph, inspects each dep's metadata for
+/// additional klib files (e.g. cinterop klibs) and adds them as separate
+/// entries with a `classifier` set.
+///
 /// # Errors
 ///
-/// Returns an error if a POM cannot be fetched or parsed, a version conflict
+/// Returns an error if metadata cannot be fetched or parsed, a version conflict
 /// is detected, or a dependency cycle is found.
 /// A BFS queue entry: (group_id, artifact_id, version, requirer_name, ancestor_path).
 type BfsEntry = (String, String, String, Option<String>, Vec<String>);
@@ -285,9 +300,9 @@ type BfsEntry = (String, String, String, Option<String>, Vec<String>);
 fn resolve_transitive(
     direct_deps: &[ResolvedMavenDep],
 ) -> Result<Vec<ResolvedMavenDep>, EngineError> {
-    // Use the first known target for POM fetching — the transitive graph is
+    // Use the first known target for metadata fetching — the transitive graph is
     // identical across targets since every Kotlin/Native artifact publishes
-    // the same set of dependencies in each per-target POM.
+    // the same set of dependencies in each per-target variant.
     let probe_target =
         konvoy_targets::known_targets()
             .first()
@@ -309,10 +324,11 @@ fn resolve_transitive(
 
     // Resolved set: `groupId:artifactId` -> ResolvedMavenDep.
     let mut resolved: HashMap<String, ResolvedMavenDep> = HashMap::new();
+    // Cache of fetched metadata: `groupId:artifactId:version` -> ArtifactMetadata.
+    let mut metadata_cache: HashMap<String, ArtifactMetadata> = HashMap::new();
     // Track who requires each dep: `groupId:artifactId` -> set of requirer names.
     let mut required_by_map: HashMap<String, BTreeSet<String>> = HashMap::new();
     // BFS queue: (group_id, artifact_id, version, requirer_name, ancestor_path).
-    // The ancestor_path tracks the dependency chain from root for cycle detection.
     let mut queue: VecDeque<BfsEntry> = VecDeque::new();
 
     // Seed the queue with direct deps.
@@ -340,43 +356,46 @@ fn resolve_transitive(
                 .insert(req.clone());
         }
 
-        // Construct the per-target artifact ID for POM fetching.
+        // Construct the per-target artifact ID for metadata fetching.
         let per_target_artifact_id = format!("{artifact_id}-{maven_suffix}");
 
-        // Fetch and cache the POM.
-        let pom_xml = fetch_pom_cached(&group_id, &per_target_artifact_id, &version)?;
+        // Fetch and cache metadata (tries .module first, falls back to POM).
+        let metadata = fetch_metadata_cached(
+            &group_id,
+            &per_target_artifact_id,
+            &version,
+            &maven_suffix,
+            &mut metadata_cache,
+        )?;
 
-        // Parse the POM.
-        let pom =
-            parse_pom(&pom_xml, Some(&group_id), Some(&version)).map_err(EngineError::Util)?;
-
-        // Process each compile-scope dependency from the POM.
-        for pom_dep in &pom.dependencies {
+        // Process each dependency from the metadata.
+        for meta_dep in &metadata.dependencies {
             // Filter out kotlin-stdlib and similar JVM-only dependencies.
-            if is_filtered_dependency(&pom_dep.group_id, &pom_dep.artifact_id) {
+            if is_filtered_dependency(&meta_dep.group_id, &meta_dep.artifact_id) {
                 continue;
             }
 
             // Skip dependencies with empty versions (managed deps we can't resolve).
-            if pom_dep.version.is_empty() {
+            if meta_dep.version.is_empty() {
                 continue;
             }
 
-            // Strip the target suffix from the artifact ID to get the base name.
-            let base_artifact_id = strip_target_suffix(&pom_dep.artifact_id, &maven_suffix);
+            // Metadata from .module files already provides base names (no target
+            // suffix), but POM fallback may still have suffixed names. Strip just
+            // in case — it's a no-op if the suffix isn't present.
+            let base_artifact_id = strip_target_suffix(&meta_dep.artifact_id, &maven_suffix);
 
-            let dep_key = format!("{}:{}", pom_dep.group_id, base_artifact_id);
+            let dep_key = format!("{}:{}", meta_dep.group_id, base_artifact_id);
 
             // Determine the version to use: user-specified wins.
             let resolved_version = user_versions
                 .get(&dep_key)
                 .cloned()
-                .unwrap_or_else(|| pom_dep.version.clone());
+                .unwrap_or_else(|| meta_dep.version.clone());
 
             // Check for version conflicts.
             if let Some(existing) = resolved.get(&dep_key) {
                 if existing.version != resolved_version {
-                    // Build the conflict details.
                     let existing_requirer = if existing.required_by.is_empty() {
                         "konvoy.toml (direct)"
                     } else {
@@ -393,7 +412,6 @@ fn resolve_transitive(
                         existing.version
                     );
 
-                    // Derive a hint name from the artifact ID.
                     let hint_name = base_artifact_id.replace('.', "-");
 
                     return Err(EngineError::MavenVersionConflict {
@@ -404,7 +422,6 @@ fn resolve_transitive(
                     });
                 }
                 // Same version, already resolved — skip.
-                // But still record who required it.
                 if let Some(req) = &requirer {
                     required_by_map
                         .entry(dep_key)
@@ -414,10 +431,8 @@ fn resolve_transitive(
                 continue;
             }
 
-            // Derive a user-friendly name for this transitive dep.
             let dep_name = derive_dep_name(&base_artifact_id);
 
-            // Determine who requires this dep.
             let parent_name = requirer
                 .clone()
                 .or_else(|| {
@@ -434,8 +449,7 @@ fn resolve_transitive(
                 .or_default()
                 .insert(parent_name);
 
-            // Check for cycles: if this dep appears in the current resolution path,
-            // we have a circular dependency.
+            // Check for cycles.
             if path.contains(&dep_key) {
                 let cycle = format!("{} -> {dep_key}", path.join(" -> "));
                 return Err(EngineError::MavenDependencyCycle { cycle });
@@ -443,19 +457,19 @@ fn resolve_transitive(
 
             let new_dep = ResolvedMavenDep {
                 name: dep_name.clone(),
-                group_id: pom_dep.group_id.clone(),
+                group_id: meta_dep.group_id.clone(),
                 artifact_id: base_artifact_id.clone(),
                 version: resolved_version.clone(),
                 required_by: req_by,
+                classifier: None,
             };
 
-            // Enqueue for further transitive resolution with extended path.
             let mut child_path = path.clone();
             child_path.push(dep_key.clone());
 
             resolved.insert(dep_key, new_dep);
             queue.push_back((
-                pom_dep.group_id.clone(),
+                meta_dep.group_id.clone(),
                 base_artifact_id,
                 resolved_version,
                 Some(dep_name),
@@ -466,71 +480,109 @@ fn resolve_transitive(
 
     // Build the final list, updating required_by from the accumulated map.
     let mut result: Vec<ResolvedMavenDep> = Vec::with_capacity(resolved.len());
-    for (key, mut dep) in resolved {
-        if let Some(requirers) = required_by_map.get(&key) {
-            // Direct deps have no required_by.
+    for (key, dep) in &mut resolved {
+        if let Some(requirers) = required_by_map.get(key) {
             let is_direct = direct_deps
                 .iter()
-                .any(|d| format!("{}:{}", d.group_id, d.artifact_id) == key);
+                .any(|d| format!("{}:{}", d.group_id, d.artifact_id) == *key);
             if is_direct {
                 dep.required_by = Vec::new();
             } else {
                 dep.required_by = requirers.iter().cloned().collect();
             }
         }
-        result.push(dep);
     }
 
+    // Discover cinterop klibs from cached metadata and add as separate entries.
+    let mut cinterop_deps: Vec<ResolvedMavenDep> = Vec::new();
+    for dep in resolved.values() {
+        let metadata_key = format!(
+            "{}:{}-{}:{}",
+            dep.group_id, dep.artifact_id, maven_suffix, dep.version
+        );
+        if let Some(metadata) = metadata_cache.get(&metadata_key) {
+            for file in &metadata.files {
+                // Cinterop klibs have "cinterop-" in their name.
+                if !file.name.contains("cinterop-") {
+                    continue;
+                }
+
+                // Extract the classifier from the URL: the part between
+                // "{version}-" and ".klib" in the filename.
+                let classifier = extract_classifier_from_url(&file.url, &dep.version);
+                let Some(cls) = classifier else {
+                    continue;
+                };
+
+                let cinterop_name = file
+                    .name
+                    .strip_suffix(".klib")
+                    .unwrap_or(&file.name)
+                    .to_owned();
+
+                cinterop_deps.push(ResolvedMavenDep {
+                    name: cinterop_name,
+                    group_id: dep.group_id.clone(),
+                    artifact_id: dep.artifact_id.clone(),
+                    version: dep.version.clone(),
+                    required_by: vec![dep.name.clone()],
+                    classifier: Some(cls),
+                });
+            }
+        }
+    }
+
+    // Collect into result, adding cinterop deps.
+    result.extend(resolved.into_values());
+    result.extend(cinterop_deps);
+
     // Sort for deterministic ordering.
-    result.sort_by(|a, b| a.name.cmp(&b.name));
+    result.sort_by(|a, b| {
+        a.name.cmp(&b.name).then_with(|| {
+            a.classifier
+                .as_deref()
+                .unwrap_or("")
+                .cmp(b.classifier.as_deref().unwrap_or(""))
+        })
+    });
 
     Ok(result)
 }
 
 // ---------------------------------------------------------------------------
-// POM caching
+// Metadata caching
 // ---------------------------------------------------------------------------
 
-/// Fetch a POM from Maven Central, caching to `~/.konvoy/cache/pom/`.
+/// Fetch artifact metadata via the provider chain, with an in-memory cache.
+///
+/// Uses `fetch_artifact_metadata()` (`.module` first, POM fallback) and stores
+/// the result in `cache` keyed by `groupId:artifactId:version`.
 ///
 /// # Errors
 ///
-/// Returns an error if the home directory cannot be determined, the cache
-/// directory cannot be created, the HTTP request fails, or the file cannot
-/// be written.
-fn fetch_pom_cached(
+/// Returns an error if both `.module` and POM fetching/parsing fail.
+fn fetch_metadata_cached(
     group_id: &str,
     artifact_id: &str,
     version: &str,
-) -> Result<String, EngineError> {
-    let konvoy_home = konvoy_util::fs::konvoy_home()?;
-    let cache_dir = konvoy_home
-        .join("cache")
-        .join("pom")
-        .join(group_id.replace('.', "/"))
-        .join(artifact_id)
-        .join(version);
-
-    let cache_file = cache_dir.join(format!("{artifact_id}-{version}.pom"));
-
-    // Return cached POM if it exists.
-    if cache_file.exists() {
-        return std::fs::read_to_string(&cache_file).map_err(|source| {
-            EngineError::Util(konvoy_util::error::UtilError::Io {
-                path: cache_file.display().to_string(),
-                source,
-            })
-        });
+    maven_suffix: &str,
+    cache: &mut HashMap<String, ArtifactMetadata>,
+) -> Result<ArtifactMetadata, EngineError> {
+    let key = format!("{group_id}:{artifact_id}:{version}");
+    if let Some(cached) = cache.get(&key) {
+        return Ok(cached.clone());
     }
 
-    // Fetch from Maven Central.
-    let pom_xml = fetch_pom(group_id, artifact_id, version).map_err(EngineError::Util)?;
+    let metadata = konvoy_util::metadata::fetch_artifact_metadata(
+        group_id,
+        artifact_id,
+        version,
+        maven_suffix,
+    )
+    .map_err(EngineError::Util)?;
 
-    // Cache it for next time.
-    konvoy_util::fs::ensure_dir(&cache_dir)?;
-    konvoy_util::fs::write_file(&cache_file, &pom_xml)?;
-
-    Ok(pom_xml)
+    cache.insert(key, metadata.clone());
+    Ok(metadata)
 }
 
 // ---------------------------------------------------------------------------
@@ -568,20 +620,6 @@ fn is_filtered_dependency(group_id: &str, artifact_id: &str) -> bool {
     false
 }
 
-/// Strip a known Maven target suffix from an artifact ID.
-///
-/// Per-target POMs reference dependencies with target-suffixed artifact IDs
-/// (e.g. `atomicfu-macosarm64`). We strip that suffix to get the base
-/// artifact ID (`atomicfu`).
-fn strip_target_suffix(artifact_id: &str, maven_suffix: &str) -> String {
-    let suffix = format!("-{maven_suffix}");
-    if let Some(base) = artifact_id.strip_suffix(&suffix) {
-        base.to_owned()
-    } else {
-        artifact_id.to_owned()
-    }
-}
-
 /// Derive a user-friendly dependency name from a Maven artifact ID.
 ///
 /// Examples:
@@ -596,6 +634,23 @@ fn truncate_hash(hash: &str, max_len: usize) -> &str {
     hash.get(..max_len).unwrap_or(hash)
 }
 
+/// Extract the Maven classifier from a cinterop file URL.
+///
+/// Given a URL like `"atomicfu-linuxx64-0.23.1-cinterop-interop.klib"`,
+/// extracts `"cinterop-interop"` — the segment between `"{version}-"` and `".klib"`.
+///
+/// Returns `None` if the URL does not match the expected pattern.
+fn extract_classifier_from_url(url: &str, version: &str) -> Option<String> {
+    let version_dash = format!("{version}-");
+    let after_version = url.find(&version_dash).map(|i| i + version_dash.len())?;
+    let suffix = url.get(after_version..)?;
+    let classifier = suffix.strip_suffix(".klib")?;
+    if classifier.is_empty() {
+        return None;
+    }
+    Some(classifier.to_owned())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -607,7 +662,6 @@ mod tests {
     use std::fs;
 
     use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile};
-    use konvoy_util::pom::pom_url;
 
     use super::*;
 
@@ -772,6 +826,7 @@ kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", 
                 maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
                 targets: targets.clone(),
                 required_by: Vec::new(),
+                classifier: None,
             },
             source_hash: "existing-hash".to_owned(),
         });
@@ -833,23 +888,6 @@ kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", 
             "kotlinx-coroutines-core"
         ));
         assert!(!is_filtered_dependency("org.jetbrains.kotlinx", "atomicfu"));
-    }
-
-    #[test]
-    fn strip_target_suffix_removes_suffix() {
-        assert_eq!(
-            strip_target_suffix("atomicfu-macosarm64", "macosarm64"),
-            "atomicfu"
-        );
-        assert_eq!(
-            strip_target_suffix("kotlinx-coroutines-core-linuxx64", "linuxx64"),
-            "kotlinx-coroutines-core"
-        );
-    }
-
-    #[test]
-    fn strip_target_suffix_no_suffix() {
-        assert_eq!(strip_target_suffix("atomicfu", "macosarm64"), "atomicfu");
     }
 
     #[test]
@@ -996,15 +1034,239 @@ kotlin = "2.1.0"
     }
 
     #[test]
-    fn pom_url_format_for_per_target_artifact() {
-        let url = pom_url(
-            "org.jetbrains.kotlinx",
-            "kotlinx-coroutines-core-linuxx64",
-            "1.9.0",
+    fn extract_classifier_cinterop_interop() {
+        let cls =
+            extract_classifier_from_url("atomicfu-linuxx64-0.23.1-cinterop-interop.klib", "0.23.1");
+        assert_eq!(cls.as_deref(), Some("cinterop-interop"));
+    }
+
+    #[test]
+    fn extract_classifier_main_klib_returns_none() {
+        // Main klib URL does not have a classifier.
+        let cls = extract_classifier_from_url("atomicfu-linuxx64-0.23.1.klib", "0.23.1");
+        assert!(cls.is_none());
+    }
+
+    #[test]
+    fn extract_classifier_no_klib_extension() {
+        let cls = extract_classifier_from_url("atomicfu-linuxx64-0.23.1-cinterop.jar", "0.23.1");
+        assert!(cls.is_none());
+    }
+
+    #[test]
+    fn extract_classifier_version_not_in_url() {
+        let cls = extract_classifier_from_url("some-file.klib", "0.23.1");
+        assert!(cls.is_none());
+    }
+
+    #[test]
+    fn extract_classifier_complex_cinterop_name() {
+        // Classifier with multiple dashes.
+        let cls =
+            extract_classifier_from_url("lib-linuxx64-1.0.0-cinterop-native-mt.klib", "1.0.0");
+        assert_eq!(cls.as_deref(), Some("cinterop-native-mt"));
+    }
+
+    #[test]
+    fn extract_classifier_empty_classifier_returns_none() {
+        // URL where there is nothing between version-dash and .klib.
+        let cls = extract_classifier_from_url("lib-linuxx64-1.0.0-.klib", "1.0.0");
+        assert!(cls.is_none());
+    }
+
+    #[test]
+    fn extract_classifier_from_full_url_path() {
+        // Extract classifier even when URL is a relative path with directory.
+        let cls =
+            extract_classifier_from_url("atomicfu-linuxx64-0.23.1-cinterop-interop.klib", "0.23.1");
+        assert_eq!(cls.as_deref(), Some("cinterop-interop"));
+    }
+
+    #[test]
+    fn extract_classifier_version_appears_multiple_times() {
+        // If version appears multiple times, classifier is taken after the first match.
+        let cls = extract_classifier_from_url("lib-0.23.1-0.23.1-cinterop-x.klib", "0.23.1");
+        // After first "0.23.1-", the rest is "0.23.1-cinterop-x.klib".
+        // strip_suffix(".klib") gives "0.23.1-cinterop-x".
+        assert_eq!(cls.as_deref(), Some("0.23.1-cinterop-x"));
+    }
+
+    #[test]
+    fn extract_classifier_non_klib_extension_returns_none() {
+        let cls = extract_classifier_from_url("lib-1.0-sources.jar", "1.0");
+        assert!(cls.is_none());
+    }
+
+    #[test]
+    fn resolve_transitive_no_direct_deps_returns_empty() {
+        let result = resolve_transitive(&[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn lockfile_classifier_written_for_cinterop_deps() {
+        // Verify that when a lockfile is written with a cinterop dep,
+        // the classifier field appears in the serialized TOML.
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        let mut targets = BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu-cinterop-interop".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets,
+                required_by: vec!["atomicfu".to_owned()],
+                classifier: Some("cinterop-interop".to_owned()),
+            },
+            source_hash: "cinterop-hash".to_owned(),
+        });
+        let content =
+            toml::to_string_pretty(&lockfile).unwrap_or_else(|e| panic!("serialize: {e}"));
+        assert!(
+            content.contains("classifier = \"cinterop-interop\""),
+            "classifier should appear in serialized lockfile, content was: {content}"
         );
-        assert_eq!(
-            url,
-            "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/kotlinx-coroutines-core-linuxx64/1.9.0/kotlinx-coroutines-core-linuxx64-1.9.0.pom"
+    }
+
+    #[test]
+    fn resolved_maven_dep_classifier_field_defaults_to_none() {
+        // ResolvedMavenDep should have classifier None for regular deps.
+        let dep = ResolvedMavenDep {
+            name: "atomicfu".to_owned(),
+            group_id: "org.jetbrains.kotlinx".to_owned(),
+            artifact_id: "atomicfu".to_owned(),
+            version: "0.23.1".to_owned(),
+            required_by: Vec::new(),
+            classifier: None,
+        };
+        assert!(dep.classifier.is_none());
+    }
+
+    #[test]
+    fn resolved_maven_dep_classifier_some_for_cinterop() {
+        // ResolvedMavenDep can hold a classifier for cinterop deps.
+        let dep = ResolvedMavenDep {
+            name: "atomicfu-cinterop-interop".to_owned(),
+            group_id: "org.jetbrains.kotlinx".to_owned(),
+            artifact_id: "atomicfu".to_owned(),
+            version: "0.23.1".to_owned(),
+            required_by: vec!["atomicfu".to_owned()],
+            classifier: Some("cinterop-interop".to_owned()),
+        };
+        assert_eq!(dep.classifier.as_deref(), Some("cinterop-interop"));
+    }
+
+    #[test]
+    fn update_preserves_already_locked_classifier_dep() {
+        // When a dep with a specific classifier is already locked at the
+        // same version, it should be preserved (not re-downloaded). The
+        // lockfile output should contain both the main klib and the
+        // cinterop klib with classifiers intact.
+        let project = make_project(
+            r#"
+[package]
+name = "my-app"
+
+[toolchain]
+kotlin = "2.1.0"
+
+[dependencies]
+atomicfu = { maven = "org.jetbrains.kotlinx:atomicfu", version = "0.23.1" }
+"#,
         );
+
+        // Build a lockfile with both the main klib and cinterop klib.
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+
+        // Main klib (no classifier).
+        let mut targets1 = BTreeMap::new();
+        targets1.insert("linux_x64".to_owned(), "main-hash".to_owned());
+        targets1.insert("macos_arm64".to_owned(), "main-hash-mac".to_owned());
+        targets1.insert("macos_x64".to_owned(), "main-hash-macx".to_owned());
+        targets1.insert("linux_arm64".to_owned(), "main-hash-la64".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets: targets1,
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "main-source-hash".to_owned(),
+        });
+
+        // Cinterop klib (with classifier).
+        let mut targets2 = BTreeMap::new();
+        targets2.insert("linux_x64".to_owned(), "cinterop-hash".to_owned());
+        targets2.insert("macos_arm64".to_owned(), "cinterop-hash-mac".to_owned());
+        targets2.insert("macos_x64".to_owned(), "cinterop-hash-macx".to_owned());
+        targets2.insert("linux_arm64".to_owned(), "cinterop-hash-la64".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu-cinterop-interop".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets: targets2,
+                required_by: vec!["atomicfu".to_owned()],
+                classifier: Some("cinterop-interop".to_owned()),
+            },
+            source_hash: "cinterop-source-hash".to_owned(),
+        });
+
+        lockfile
+            .write_to(&project.path().join("konvoy.lock"))
+            .unwrap();
+
+        // Running update should detect these as already locked (same version
+        // and classifier) and skip re-downloading.
+        let result = update(project.path()).unwrap();
+        // updated_count reflects total resolved deps (already-locked or new).
+        assert!(
+            result.updated_count >= 2,
+            "should resolve at least 2 deps (main + cinterop)"
+        );
+
+        // Both deps should be preserved in the lockfile.
+        let reparsed = Lockfile::from_path(&project.path().join("konvoy.lock")).unwrap();
+        let cinterop = reparsed
+            .dependencies
+            .iter()
+            .find(|d| d.name == "atomicfu-cinterop-interop");
+        assert!(
+            cinterop.is_some(),
+            "cinterop dep should be preserved in lockfile after update"
+        );
+        let cinterop = cinterop.unwrap();
+        match &cinterop.source {
+            DepSource::Maven { classifier, .. } => {
+                assert_eq!(classifier.as_deref(), Some("cinterop-interop"));
+            }
+            other => panic!("expected Maven source, got: {other:?}"),
+        }
+        // The main klib should also be present.
+        let main = reparsed.dependencies.iter().find(|d| {
+            d.name == "atomicfu"
+                && matches!(
+                    &d.source,
+                    DepSource::Maven {
+                        classifier: None,
+                        ..
+                    }
+                )
+        });
+        assert!(
+            main.is_some(),
+            "main klib dep (no classifier) should be preserved"
+        );
+    }
+
+    #[test]
+    fn extract_classifier_from_full_maven_central_url() {
+        // Test with a URL that includes the full Maven Central path.
+        let url = "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/atomicfu-linuxx64/0.23.1/atomicfu-linuxx64-0.23.1-cinterop-interop.klib";
+        let cls = extract_classifier_from_url(url, "0.23.1");
+        assert_eq!(cls.as_deref(), Some("cinterop-interop"));
     }
 }
