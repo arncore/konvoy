@@ -3,7 +3,7 @@
   "displayName": "Konvoy",
   "description": "Konvoy build tool integration for VS Code",
   "publisher": "konvoy",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
