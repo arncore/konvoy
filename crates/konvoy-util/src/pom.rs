@@ -12,6 +12,7 @@
 
 use crate::error::UtilError;
 use crate::maven::MAVEN_CENTRAL;
+use crate::metadata::{ArtifactMetadata, MetadataDep};
 
 /// A parsed Maven POM, containing identity and compile-scope dependencies.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,6 +336,46 @@ pub fn fetch_pom(group_id: &str, artifact_id: &str, version: &str) -> Result<Str
         })?;
 
     Ok(body)
+}
+
+// ---------------------------------------------------------------------------
+// Public API — POM to metadata adapter
+// ---------------------------------------------------------------------------
+
+/// Strip a known Maven target suffix from an artifact ID.
+///
+/// Per-target POMs reference dependencies with target-suffixed artifact IDs
+/// (e.g. `atomicfu-macosarm64`). We strip that suffix to get the base
+/// artifact ID (`atomicfu`).
+fn strip_target_suffix(artifact_id: &str, maven_suffix: &str) -> String {
+    let suffix = format!("-{maven_suffix}");
+    if let Some(base) = artifact_id.strip_suffix(&suffix) {
+        base.to_owned()
+    } else {
+        artifact_id.to_owned()
+    }
+}
+
+/// Convert a parsed [`Pom`] into [`ArtifactMetadata`].
+///
+/// Strips target suffixes from dependency artifact IDs using `maven_suffix`
+/// (e.g. `"linuxx64"`) and returns an empty `files` list because POM files
+/// do not contain information about cinterop or other additional artifacts.
+pub fn pom_to_metadata(pom: &Pom, maven_suffix: &str) -> ArtifactMetadata {
+    let dependencies = pom
+        .dependencies
+        .iter()
+        .map(|d| MetadataDep {
+            group_id: d.group_id.clone(),
+            artifact_id: strip_target_suffix(&d.artifact_id, maven_suffix),
+            version: d.version.clone(),
+        })
+        .collect();
+
+    ArtifactMetadata {
+        dependencies,
+        files: Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -853,5 +894,56 @@ mod tests {
         let err = parse_pom(xml, None, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("version range"), "error was: {msg}");
+    }
+
+    #[test]
+    fn strip_target_suffix_removes_suffix() {
+        assert_eq!(
+            strip_target_suffix("atomicfu-macosarm64", "macosarm64"),
+            "atomicfu"
+        );
+        assert_eq!(
+            strip_target_suffix("kotlinx-coroutines-core-linuxx64", "linuxx64"),
+            "kotlinx-coroutines-core"
+        );
+    }
+
+    #[test]
+    fn strip_target_suffix_no_suffix() {
+        assert_eq!(strip_target_suffix("atomicfu", "macosarm64"), "atomicfu");
+    }
+
+    #[test]
+    fn pom_to_metadata_strips_suffixes_and_returns_empty_files() {
+        let pom = parse_pom(COROUTINES_POM, None, None).unwrap();
+        let metadata = pom_to_metadata(&pom, "macosarm64");
+
+        assert_eq!(metadata.dependencies.len(), 2);
+
+        let dep0 = metadata.dependencies.first().unwrap();
+        assert_eq!(dep0.group_id, "org.jetbrains.kotlinx");
+        // "atomicfu-macosarm64" should be stripped to "atomicfu".
+        assert_eq!(dep0.artifact_id, "atomicfu");
+        assert_eq!(dep0.version, "0.25.0");
+
+        let dep1 = metadata.dependencies.get(1).unwrap();
+        assert_eq!(dep1.artifact_id, "kotlin-stdlib");
+
+        // POM adapter returns no files (POM doesn't know about cinterop klibs).
+        assert!(metadata.files.is_empty());
+    }
+
+    #[test]
+    fn pom_to_metadata_empty_deps() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <groupId>com.example</groupId>
+  <artifactId>no-deps</artifactId>
+  <version>1.0.0</version>
+</project>"#;
+        let pom = parse_pom(xml, None, None).unwrap();
+        let metadata = pom_to_metadata(&pom, "linuxx64");
+        assert!(metadata.dependencies.is_empty());
+        assert!(metadata.files.is_empty());
     }
 }

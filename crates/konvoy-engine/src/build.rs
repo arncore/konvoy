@@ -469,13 +469,14 @@ fn resolve_maven_deps(lockfile: &Lockfile, target: &Target) -> Result<Vec<PathBu
         .map(|lock_entry| {
             let dep_name = lock_entry.name.clone();
 
-            let (version, maven_coord, targets) = match &lock_entry.source {
+            let (version, maven_coord, targets, classifier) = match &lock_entry.source {
                 DepSource::Maven {
                     version,
                     maven,
                     targets,
+                    classifier,
                     ..
-                } => (version, maven, targets),
+                } => (version, maven, targets, classifier),
                 DepSource::Path { .. } => {
                     return Err(EngineError::MissingLockfileEntry { name: dep_name });
                 }
@@ -494,12 +495,15 @@ fn resolve_maven_deps(lockfile: &Lockfile, target: &Target) -> Result<Vec<PathBu
             // Build the per-target artifact ID (e.g. "kotlinx-coroutines-core-linuxx64").
             let per_target_artifact_id = format!("{artifact_id}-{maven_suffix}");
 
-            let coord = konvoy_util::maven::MavenCoordinate::new(
+            let mut coord = konvoy_util::maven::MavenCoordinate::new(
                 group_id,
                 &per_target_artifact_id,
                 version,
             )
             .with_packaging("klib");
+            if let Some(cls) = classifier {
+                coord = coord.with_classifier(cls);
+            }
 
             // Extract the expected SHA-256 for this target from the lockfile.
             let expected_sha256 =
@@ -2564,6 +2568,7 @@ mod tests {
                 maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
                 targets,
                 required_by: Vec::new(),
+                classifier: None,
             },
             source_hash: "maven-hash".to_owned(),
         });
@@ -2613,6 +2618,7 @@ mod tests {
                 maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
                 targets: std::collections::BTreeMap::new(),
                 required_by: Vec::new(),
+                classifier: None,
             },
             source_hash: "hash".to_owned(),
         });
@@ -2646,6 +2652,7 @@ mod tests {
                 maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
                 targets,
                 required_by: Vec::new(),
+                classifier: None,
             },
             source_hash: "hash".to_owned(),
         });
@@ -2757,6 +2764,7 @@ linux_x64 = "1111"
                 maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
                 targets,
                 required_by: Vec::new(),
+                classifier: None,
             },
             source_hash: "maven-hash".to_owned(),
         });

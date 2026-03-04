@@ -18,22 +18,37 @@ pub struct MavenCoordinate {
     pub version: String,
     /// File extension / packaging type (defaults to `"jar"`).
     pub packaging: String,
+    /// Optional Maven classifier (e.g. `"cinterop-interop"`).
+    ///
+    /// When set, the filename includes the classifier:
+    /// `{artifact_id}-{version}-{classifier}.{packaging}`
+    pub classifier: Option<String>,
 }
 
 impl MavenCoordinate {
-    /// Create a new coordinate with default packaging ("jar").
+    /// Create a new coordinate with default packaging ("jar") and no classifier.
     pub fn new(group_id: &str, artifact_id: &str, version: &str) -> Self {
         Self {
             group_id: group_id.to_owned(),
             artifact_id: artifact_id.to_owned(),
             version: version.to_owned(),
             packaging: "jar".to_owned(),
+            classifier: None,
         }
     }
 
     /// Builder method to override the packaging type.
     pub fn with_packaging(mut self, packaging: &str) -> Self {
         self.packaging = packaging.to_owned();
+        self
+    }
+
+    /// Builder method to set a Maven classifier.
+    ///
+    /// When set, the filename becomes
+    /// `{artifact_id}-{version}-{classifier}.{packaging}`.
+    pub fn with_classifier(mut self, classifier: &str) -> Self {
+        self.classifier = Some(classifier.to_owned());
         self
     }
 
@@ -96,16 +111,25 @@ impl MavenCoordinate {
             });
         };
 
-        let mut result = Self::new(group, artifact, version);
+        let mut parsed = Self::new(group, artifact, version);
         if let Some(pkg) = parts.get(3) {
-            result.packaging = (*pkg).to_owned();
+            parsed.packaging = (*pkg).to_owned();
         }
-        Ok(result)
+        Ok(parsed)
     }
 
-    /// The filename for this artifact: `"{artifact_id}-{version}.{packaging}"`.
+    /// The filename for this artifact.
+    ///
+    /// Without classifier: `"{artifact_id}-{version}.{packaging}"`
+    /// With classifier: `"{artifact_id}-{version}-{classifier}.{packaging}"`
     pub fn filename(&self) -> String {
-        format!("{}-{}.{}", self.artifact_id, self.version, self.packaging)
+        match &self.classifier {
+            Some(cls) => format!(
+                "{}-{}-{cls}.{}",
+                self.artifact_id, self.version, self.packaging
+            ),
+            None => format!("{}-{}.{}", self.artifact_id, self.version, self.packaging),
+        }
     }
 
     /// The repository-relative path for this artifact.
@@ -273,5 +297,68 @@ mod tests {
         let coord = MavenCoordinate::new("org.example", "mylib", "1.0.0").with_packaging("klib");
         assert_eq!(coord.packaging, "klib");
         assert_eq!(coord.filename(), "mylib-1.0.0.klib");
+    }
+
+    #[test]
+    fn classifier_in_filename() {
+        let coord = MavenCoordinate::new("org.jetbrains.kotlinx", "atomicfu-linuxx64", "0.23.1")
+            .with_packaging("klib")
+            .with_classifier("cinterop-interop");
+        assert_eq!(
+            coord.filename(),
+            "atomicfu-linuxx64-0.23.1-cinterop-interop.klib"
+        );
+    }
+
+    #[test]
+    fn classifier_in_repository_path() {
+        let coord = MavenCoordinate::new("org.jetbrains.kotlinx", "atomicfu-linuxx64", "0.23.1")
+            .with_packaging("klib")
+            .with_classifier("cinterop-interop");
+        let path = coord.repository_path();
+        assert_eq!(
+            path,
+            "org/jetbrains/kotlinx/atomicfu-linuxx64/0.23.1/atomicfu-linuxx64-0.23.1-cinterop-interop.klib"
+        );
+    }
+
+    #[test]
+    fn classifier_in_to_url() {
+        let coord = MavenCoordinate::new("org.jetbrains.kotlinx", "atomicfu-linuxx64", "0.23.1")
+            .with_packaging("klib")
+            .with_classifier("cinterop-interop");
+        let url = coord.to_url(MAVEN_CENTRAL);
+        assert_eq!(
+            url,
+            "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/atomicfu-linuxx64/0.23.1/atomicfu-linuxx64-0.23.1-cinterop-interop.klib"
+        );
+    }
+
+    #[test]
+    fn classifier_in_cache_path() {
+        let coord = MavenCoordinate::new("org.jetbrains.kotlinx", "atomicfu-linuxx64", "0.23.1")
+            .with_packaging("klib")
+            .with_classifier("cinterop-interop");
+        let cache = coord.cache_path(Path::new("/home/user/.konvoy/cache"));
+        assert_eq!(
+            cache,
+            Path::new("/home/user/.konvoy/cache/org/jetbrains/kotlinx/atomicfu-linuxx64/0.23.1/atomicfu-linuxx64-0.23.1-cinterop-interop.klib")
+        );
+    }
+
+    #[test]
+    fn no_classifier_unchanged_behavior() {
+        let coord = MavenCoordinate::new("org.example", "lib", "1.0.0").with_packaging("klib");
+        assert!(coord.classifier.is_none());
+        assert_eq!(coord.filename(), "lib-1.0.0.klib");
+    }
+
+    #[test]
+    fn with_classifier_builder_chaining() {
+        let coord = MavenCoordinate::new("org.example", "lib", "1.0.0")
+            .with_packaging("klib")
+            .with_classifier("sources");
+        assert_eq!(coord.classifier.as_deref(), Some("sources"));
+        assert_eq!(coord.filename(), "lib-1.0.0-sources.klib");
     }
 }

@@ -68,6 +68,13 @@ pub enum DepSource {
         /// Empty for direct deps declared in `konvoy.toml`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         required_by: Vec<String>,
+        /// Maven classifier for non-primary artifacts (e.g. `"cinterop-interop"`).
+        ///
+        /// When set, the download URL includes the classifier in the filename:
+        /// `{artifact}-{target}-{version}-{classifier}.klib`.
+        /// Most dependencies do not have a classifier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        classifier: Option<String>,
     },
 }
 
@@ -463,6 +470,7 @@ konanc_version = "2.1.0"
                 maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
                 targets,
                 required_by: Vec::new(),
+                classifier: None,
             },
             source_hash: "maven-hash-1234".to_owned(),
         });
@@ -481,6 +489,7 @@ konanc_version = "2.1.0"
                 maven,
                 targets,
                 required_by,
+                classifier,
             } => {
                 assert_eq!(version, "1.8.0");
                 assert_eq!(maven, "org.jetbrains.kotlinx:kotlinx-coroutines-core");
@@ -488,6 +497,7 @@ konanc_version = "2.1.0"
                 assert_eq!(targets.get("linux_x64").unwrap(), "aabbccdd");
                 assert_eq!(targets.get("macos_arm64").unwrap(), "11223344");
                 assert!(required_by.is_empty());
+                assert!(classifier.is_none());
             }
             other => panic!("expected Maven source, got: {other:?}"),
         }
@@ -505,6 +515,7 @@ konanc_version = "2.1.0"
                 maven: "org.jetbrains.kotlinx:kotlinx-datetime".to_owned(),
                 targets,
                 required_by: Vec::new(),
+                classifier: None,
             },
             source_hash: "hash-5678".to_owned(),
         });
@@ -581,6 +592,7 @@ source_hash = "abcdef1234"
                 maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
                 targets,
                 required_by: vec!["kotlinx-coroutines".to_owned()],
+                classifier: None,
             },
             source_hash: "transitive-hash".to_owned(),
         });
@@ -618,6 +630,7 @@ source_hash = "abcdef1234"
                 maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
                 targets,
                 required_by: Vec::new(),
+                classifier: None,
             },
             source_hash: "direct-hash".to_owned(),
         });
@@ -640,6 +653,7 @@ source_hash = "abcdef1234"
                 maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
                 targets,
                 required_by: vec!["kotlinx-coroutines".to_owned()],
+                classifier: None,
             },
             source_hash: "transitive-hash".to_owned(),
         });
@@ -668,6 +682,7 @@ source_hash = "abcdef1234"
                 maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
                 targets,
                 required_by: Vec::new(),
+                classifier: None,
             },
             source_hash: "some-hash".to_owned(),
         });
@@ -687,6 +702,119 @@ source_hash = "abcdef1234"
             content.contains("maven = \"org.jetbrains.kotlinx:kotlinx-coroutines-core\""),
             "maven field should be plain groupId:artifactId, content was: {content}"
         );
+    }
+
+    #[test]
+    fn round_trip_with_classifier() {
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "cinterop-hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu-cinterop-interop".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets,
+                required_by: vec!["atomicfu".to_owned()],
+                classifier: Some("cinterop-interop".to_owned()),
+            },
+            source_hash: "classifier-hash".to_owned(),
+        });
+        lockfile.write_to(&path).unwrap_or_else(|e| panic!("{e}"));
+        let reparsed = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(lockfile, reparsed);
+        let dep = reparsed
+            .dependencies
+            .first()
+            .unwrap_or_else(|| panic!("missing dep"));
+        match &dep.source {
+            DepSource::Maven { classifier, .. } => {
+                assert_eq!(classifier.as_deref(), Some("cinterop-interop"));
+            }
+            other => panic!("expected Maven source, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classifier_omitted_in_toml_when_none() {
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets,
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "some-hash".to_owned(),
+        });
+        let content = toml::to_string_pretty(&lockfile).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            !content.contains("classifier"),
+            "classifier should not appear when None, content was: {content}"
+        );
+    }
+
+    #[test]
+    fn classifier_present_in_toml_when_set() {
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "atomicfu-cinterop-interop".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets,
+                required_by: vec!["atomicfu".to_owned()],
+                classifier: Some("cinterop-interop".to_owned()),
+            },
+            source_hash: "hash".to_owned(),
+        });
+        let content = toml::to_string_pretty(&lockfile).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            content.contains("classifier = \"cinterop-interop\""),
+            "classifier should appear when Some, content was: {content}"
+        );
+    }
+
+    #[test]
+    fn backward_compat_no_classifier_field() {
+        // Old lockfiles without a classifier field should parse correctly.
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        fs::write(
+            &path,
+            r#"
+[toolchain]
+konanc_version = "2.1.0"
+
+[[dependencies]]
+name = "atomicfu"
+source_type = "maven"
+version = "0.23.1"
+maven = "org.jetbrains.kotlinx:atomicfu"
+source_hash = "abcdef"
+
+[dependencies.targets]
+linux_x64 = "hash123"
+"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        let lockfile = Lockfile::from_path(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(lockfile.dependencies.len(), 1);
+        match &lockfile.dependencies.first().unwrap().source {
+            DepSource::Maven { classifier, .. } => {
+                assert!(classifier.is_none(), "classifier should default to None");
+            }
+            other => panic!("expected Maven source, got: {other:?}"),
+        }
     }
 
     mod property_tests {
