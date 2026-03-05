@@ -391,13 +391,12 @@ test_init_no_plugins_section() {
 }
 
 test_plugin_manifest_parses() {
-    # A manifest with [plugins.serialization] must be accepted by konvoy.
+    # A manifest with [plugins] using { maven, version } must be accepted.
     konvoy init --name plug-parse >/dev/null 2>&1
     cat >> plug-parse/konvoy.toml << 'TOML'
 
-[plugins.serialization]
-version = "1.7.3"
-modules = ["json"]
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
 TOML
     cd plug-parse
     # Build will fail at plugin download (no cached artifacts), but must NOT
@@ -411,57 +410,54 @@ TOML
     fi
 }
 
-test_plugin_unknown_name_error() {
-    konvoy init --name plug-unknown >/dev/null 2>&1
-    cat >> plug-unknown/konvoy.toml << 'TOML'
-
-[plugins.nonexistent]
-version = "1.0.0"
-TOML
-    cd plug-unknown
-    local output
-    if output=$(konvoy build 2>&1); then
-        echo "    expected build to fail with unknown plugin name" >&2
-        return 1
-    fi
-    assert_contains "$output" "unknown plugin"
-    assert_contains "$output" "nonexistent"
-    # Error should list available plugins so the user knows what to use.
-    assert_contains "$output" "serialization"
-}
-
-test_plugin_unknown_module_error() {
-    konvoy init --name plug-mod >/dev/null 2>&1
-    cat >> plug-mod/konvoy.toml << 'TOML'
-
-[plugins.serialization]
-version = "1.7.3"
-modules = ["nonexistent_module"]
-TOML
-    cd plug-mod
-    local output
-    if output=$(konvoy build 2>&1); then
-        echo "    expected build to fail with unknown module name" >&2
-        return 1
-    fi
-    assert_contains "$output" "unknown module"
-    assert_contains "$output" "nonexistent_module"
-}
-
 test_plugin_empty_version_error() {
     konvoy init --name plug-ver >/dev/null 2>&1
     cat >> plug-ver/konvoy.toml << 'TOML'
 
-[plugins.serialization]
-version = ""
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin" }
 TOML
     cd plug-ver
     local output
     if output=$(konvoy build 2>&1); then
-        echo "    expected build to fail with empty plugin version" >&2
+        echo "    expected build to fail with missing plugin version" >&2
         return 1
     fi
     assert_contains "$output" "version"
+}
+
+test_plugin_without_maven_fails() {
+    # A plugin entry without `maven` should be rejected.
+    konvoy init --name plug-no-maven >/dev/null 2>&1
+    cat >> plug-no-maven/konvoy.toml << 'TOML'
+
+[plugins]
+bad = { version = "1.0.0" }
+TOML
+    cd plug-no-maven
+    local output
+    if output=$(konvoy build 2>&1); then
+        echo "    expected build to fail with missing maven coordinate" >&2
+        return 1
+    fi
+    assert_contains "$output" "maven"
+}
+
+test_plugin_with_path_fails() {
+    # Plugins must use maven coordinates, not path.
+    konvoy init --name plug-path >/dev/null 2>&1
+    cat >> plug-path/konvoy.toml << 'TOML'
+
+[plugins]
+bad = { path = "../foo" }
+TOML
+    cd plug-path
+    local output
+    if output=$(konvoy build 2>&1); then
+        echo "    expected build to fail with path-based plugin" >&2
+        return 1
+    fi
+    assert_contains "$output" "path"
 }
 
 test_plugin_locked_no_entries_error() {
@@ -469,8 +465,8 @@ test_plugin_locked_no_entries_error() {
     konvoy init --name plug-locked >/dev/null 2>&1
     cat >> plug-locked/konvoy.toml << 'TOML'
 
-[plugins.serialization]
-version = "1.7.3"
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
 TOML
     cd plug-locked
     # Write a valid lockfile that's missing plugin entries.
@@ -488,8 +484,12 @@ test_plugin_build_lifecycle() {
     konvoy init --name plug-app >/dev/null 2>&1
     cat >> plug-app/konvoy.toml << 'TOML'
 
-[plugins.serialization]
-version = "1.7.3"
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+
+[dependencies]
+kotlinx-serialization-core = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-core", version = "1.8.0" }
+kotlinx-serialization-json = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-json", version = "1.8.0" }
 TOML
     # Write Kotlin source that uses the @Serializable annotation.
     cat > plug-app/src/main.kt << 'KOTLIN'
@@ -504,6 +504,9 @@ fun main() {
 KOTLIN
     cd plug-app
 
+    # Resolve Maven dependencies first.
+    konvoy update >/dev/null 2>&1
+
     # First build downloads plugin artifacts and compiles.
     local out1
     out1=$(konvoy build 2>&1)
@@ -512,13 +515,35 @@ KOTLIN
     # Lockfile should contain plugin entries after build.
     assert_file_exists konvoy.lock
     assert_file_contains konvoy.lock "[[plugins]]"
-    assert_file_contains konvoy.lock "serialization"
+    assert_file_contains konvoy.lock "kotlin-serialization"
     assert_file_contains konvoy.lock "sha256"
+    # Plugin lockfile should have maven and version fields.
+    assert_file_contains konvoy.lock "maven ="
+    assert_file_contains konvoy.lock "version ="
 
     # --locked should succeed now that the lockfile has plugin entries.
     # (May recompile due to lockfile content change — that's fine,
     #  the key assertion is that --locked doesn't error out.)
     konvoy build --locked 2>&1
+}
+
+test_plugin_kotlin_placeholder_resolves() {
+    # version = "{kotlin}" should resolve to the toolchain version in the lockfile.
+    konvoy init --name plug-placeholder >/dev/null 2>&1
+    cat >> plug-placeholder/konvoy.toml << 'TOML'
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+TOML
+    cd plug-placeholder
+
+    # Build to generate lockfile with resolved plugin entries.
+    konvoy build >/dev/null 2>&1 || true
+
+    # The lockfile must not contain the literal placeholder.
+    if [ -f konvoy.lock ]; then
+        assert_file_not_contains konvoy.lock "{kotlin}"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -703,22 +728,32 @@ TOML
     assert_contains "$output" "bad-dep"
 }
 
-test_build_maven_dep_without_update_fails() {
-    # Building with a Maven dep but no lockfile entry should error.
+test_build_maven_dep_without_update_succeeds() {
+    # Building with a Maven dep without running `konvoy update` first should
+    # auto-resolve the dependency and succeed.
     konvoy init --name no-update >/dev/null 2>&1
     cat >> no-update/konvoy.toml << 'TOML'
 
 [dependencies]
 kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
 TOML
+    cat > no-update/src/main.kt << 'KOTLIN'
+import kotlinx.datetime.Clock
+
+fun main() {
+    val now = Clock.System.now()
+    println("Hello at $now")
+}
+KOTLIN
     cd no-update
-    # Build without running update first.
+    # Build without running update first — should auto-resolve.
     local output
-    if output=$(konvoy build 2>&1); then
-        echo "    expected build to fail without konvoy update" >&2
-        return 1
-    fi
-    assert_contains "$output" "lockfile"
+    output=$(konvoy build 2>&1)
+    assert_contains "$output" "Compiling"
+    assert_file_exists .konvoy/build/linux_x64/debug/no-update
+    # Lockfile should be created with the Maven dep entry.
+    assert_file_exists konvoy.lock
+    assert_file_contains konvoy.lock "kotlinx-datetime"
 }
 
 test_build_maven_dep_locked_without_update_fails() {
@@ -1138,11 +1173,12 @@ run_test test_lint_no_sources_warns
 # plugins
 run_test test_init_no_plugins_section
 run_test test_plugin_manifest_parses
-run_test test_plugin_unknown_name_error
-run_test test_plugin_unknown_module_error
 run_test test_plugin_empty_version_error
+run_test test_plugin_without_maven_fails
+run_test test_plugin_with_path_fails
 run_test test_plugin_locked_no_entries_error
 run_test test_plugin_build_lifecycle
+run_test test_plugin_kotlin_placeholder_resolves
 
 # Maven dependencies
 run_test test_update_help
@@ -1154,7 +1190,7 @@ run_test test_update_preserves_path_deps
 run_test test_update_version_change_re_resolves
 run_test test_update_removing_dep_cleans_lockfile
 run_test test_maven_dep_manifest_both_path_and_maven_fails
-run_test test_build_maven_dep_without_update_fails
+run_test test_build_maven_dep_without_update_succeeds
 run_test test_build_maven_dep_locked_without_update_fails
 run_test test_maven_dep_build_lifecycle
 run_test test_maven_dep_mixed_with_path_dep_build

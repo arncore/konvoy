@@ -12,18 +12,7 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dependencies: BTreeMap<String, DependencySpec>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub plugins: BTreeMap<String, PluginConfig>,
-}
-
-/// Configuration for a single plugin in `[plugins.<name>]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PluginConfig {
-    /// The version of the plugin (e.g. `"1.8.0"`).
-    pub version: String,
-    /// Optional list of specific modules to include (beyond `always = true` modules).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub modules: Vec<String>,
+    pub plugins: BTreeMap<String, DependencySpec>,
 }
 
 /// Toolchain specification declaring the Kotlin/Native version and optional tools.
@@ -137,13 +126,54 @@ fn validate(manifest: &Manifest, path: &str) -> Result<(), ManifestError> {
         });
     }
     // Validate plugins.
-    for (name, config) in &manifest.plugins {
-        if config.version.is_empty() {
+    for (name, spec) in &manifest.plugins {
+        // Plugins must use Maven coordinates, not path dependencies.
+        if spec.path.is_some() {
             return Err(ManifestError::InvalidPluginConfig {
                 path: path.to_owned(),
                 name: name.clone(),
-                reason: "version must not be empty".to_owned(),
+                reason: "plugins must use `maven` coordinates, not `path`".to_owned(),
             });
+        }
+        if spec.maven.is_none() {
+            return Err(ManifestError::InvalidPluginConfig {
+                path: path.to_owned(),
+                name: name.clone(),
+                reason: "plugin must have `maven` set to a `groupId:artifactId` coordinate"
+                    .to_owned(),
+            });
+        }
+        if spec.version.is_none() {
+            return Err(ManifestError::InvalidPluginConfig {
+                path: path.to_owned(),
+                name: name.clone(),
+                reason: "plugin must have `version` set".to_owned(),
+            });
+        }
+        if spec.version.as_ref().is_some_and(|v| v.trim().is_empty()) {
+            return Err(ManifestError::InvalidPluginConfig {
+                path: path.to_owned(),
+                name: name.clone(),
+                reason: "plugin `version` must not be empty or whitespace".to_owned(),
+            });
+        }
+        // Validate maven coordinate format (reuse same colon-check as deps).
+        if let Some(ref maven) = spec.maven {
+            let valid = match maven.split_once(':') {
+                Some((group, artifact)) => {
+                    !group.is_empty() && !artifact.is_empty() && !artifact.contains(':')
+                }
+                None => false,
+            };
+            if !valid {
+                return Err(ManifestError::InvalidPluginConfig {
+                    path: path.to_owned(),
+                    name: name.clone(),
+                    reason: format!(
+                        "invalid maven coordinate `{maven}` — expected `groupId:artifactId`"
+                    ),
+                });
+            }
         }
     }
     // Validate dependencies.
@@ -177,6 +207,13 @@ fn validate(manifest: &Manifest, path: &str) -> Result<(), ManifestError> {
         // maven without version is an error — needs a pinned version.
         if spec.maven.is_some() && spec.version.is_none() {
             return Err(ManifestError::DependencyMavenWithoutVersion {
+                path: path.to_owned(),
+                name: name.clone(),
+            });
+        }
+        // Empty or whitespace-only version is an error.
+        if spec.version.as_ref().is_some_and(|v| v.trim().is_empty()) {
+            return Err(ManifestError::DependencyEmptyVersion {
                 path: path.to_owned(),
                 name: name.clone(),
             });
@@ -278,6 +315,8 @@ pub enum ManifestError {
     DependencyMavenWithoutVersion { path: String, name: String },
     #[error("dependency `{name}` has `version` without `maven` coordinate in {path} — add `maven = \"groupId:artifactId\"`")]
     DependencyVersionWithoutMaven { path: String, name: String },
+    #[error("dependency `{name}` version must not be empty or whitespace in {path}")]
+    DependencyEmptyVersion { path: String, name: String },
     #[error("dependency `{name}` has invalid maven coordinate `{maven}` in {path} — expected format `groupId:artifactId` (exactly one colon)")]
     DependencyInvalidMaven {
         path: String,
@@ -745,38 +784,22 @@ unknown = true
 [package]
 name = "my-app"
 {TOOLCHAIN}
-[plugins.serialization]
-version = "1.8.0"
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+version = "{{kotlin}}"
 "#
         );
         let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
         assert_eq!(manifest.plugins.len(), 1);
         let plugin = manifest
             .plugins
-            .get("serialization")
+            .get("kotlin-serialization")
             .unwrap_or_else(|| panic!("missing plugin"));
-        assert_eq!(plugin.version, "1.8.0");
-        assert!(plugin.modules.is_empty());
-    }
-
-    #[test]
-    fn parse_manifest_with_plugin_modules() {
-        let toml = format!(
-            r#"
-[package]
-name = "my-app"
-{TOOLCHAIN}
-[plugins.serialization]
-version = "1.8.0"
-modules = ["json", "cbor"]
-"#
+        assert_eq!(
+            plugin.maven.as_deref(),
+            Some("org.jetbrains.kotlin:kotlin-serialization-compiler-plugin")
         );
-        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
-        let plugin = manifest
-            .plugins
-            .get("serialization")
-            .unwrap_or_else(|| panic!("missing plugin"));
-        assert_eq!(plugin.modules, vec!["json", "cbor"]);
+        assert_eq!(plugin.version.as_deref(), Some("{kotlin}"));
     }
 
     #[test]
@@ -792,22 +815,273 @@ name = "my-app"
     }
 
     #[test]
-    fn reject_empty_plugin_version() {
+    fn reject_plugin_without_version() {
         let toml = format!(
             r#"
 [package]
 name = "my-app"
 {TOOLCHAIN}
-[plugins.serialization]
-version = ""
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("version"), "error was: {err}");
+    }
+
+    #[test]
+    fn reject_plugin_without_maven() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.kotlin-serialization]
+version = "1.8.0"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("maven"), "error was: {err}");
+    }
+
+    #[test]
+    fn reject_plugin_with_path() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.my-plugin]
+path = "../plugin"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("plugins must use `maven`"), "error was: {err}");
+    }
+
+    #[test]
+    fn reject_plugin_invalid_maven_coordinate() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.bad-plugin]
+maven = "nocolon"
+version = "1.0"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid maven coordinate"), "error was: {err}");
+    }
+
+    #[test]
+    fn plugin_accepts_kotlin_placeholder_version() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+version = "{{kotlin}}"
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        let plugin = manifest
+            .plugins
+            .get("kotlin-serialization")
+            .unwrap_or_else(|| panic!("missing plugin"));
+        assert_eq!(plugin.version.as_deref(), Some("{kotlin}"));
+    }
+
+    #[test]
+    fn reject_plugin_maven_too_many_colons() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.bad-plugin]
+maven = "a:b:c"
+version = "1.0"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid maven coordinate"), "error was: {err}");
+    }
+
+    #[test]
+    fn reject_plugin_maven_leading_colon() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.bad-plugin]
+maven = ":artifact"
+version = "1.0"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid maven coordinate"), "error was: {err}");
+    }
+
+    #[test]
+    fn reject_plugin_maven_trailing_colon() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.bad-plugin]
+maven = "group:"
+version = "1.0"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid maven coordinate"), "error was: {err}");
+    }
+
+    #[test]
+    fn empty_plugins_table_parses() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins]
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        assert!(manifest.plugins.is_empty());
+    }
+
+    #[test]
+    fn multiple_plugins_parse() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins]
+kotlin-serialization = {{ maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{{kotlin}}" }}
+kotlin-allopen = {{ maven = "org.jetbrains.kotlin:kotlin-allopen-compiler-plugin", version = "{{kotlin}}" }}
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        assert_eq!(manifest.plugins.len(), 2);
+        assert!(manifest.plugins.contains_key("kotlin-serialization"));
+        assert!(manifest.plugins.contains_key("kotlin-allopen"));
+    }
+
+    #[test]
+    fn plugin_name_with_underscores() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.my_custom_plugin]
+maven = "com.example:my-plugin"
+version = "1.0.0"
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        assert!(manifest.plugins.contains_key("my_custom_plugin"));
+    }
+
+    #[test]
+    fn plugins_without_dependencies_section() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+version = "{{kotlin}}"
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        assert_eq!(manifest.plugins.len(), 1);
+        assert!(manifest.dependencies.is_empty());
+    }
+
+    #[test]
+    fn plugin_error_message_is_actionable() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.bad-plugin]
+version = "1.0"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        // Error should mention what field is needed.
+        assert!(
+            err.contains("maven") && err.contains("groupId:artifactId"),
+            "error should be actionable and mention expected format: {err}"
+        );
+    }
+
+    #[test]
+    fn plugin_path_error_message_is_actionable() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.my-plugin]
+path = "../plugin"
+maven = "com.example:plugin"
+version = "1.0"
 "#
         );
         let result = Manifest::from_str(&toml, "konvoy.toml");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("version must not be empty"),
-            "error was: {err}"
+            err.contains("plugins must use `maven`") && err.contains("not `path`"),
+            "error should explain what to do: {err}"
+        );
+    }
+
+    #[test]
+    fn plugin_version_error_message_is_actionable() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.my-plugin]
+maven = "com.example:plugin"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("version"),
+            "error should mention missing version: {err}"
         );
     }
 
@@ -818,7 +1092,8 @@ version = ""
 [package]
 name = "my-app"
 {TOOLCHAIN}
-[plugins.serialization]
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
 version = "1.8.0"
 unknown_field = true
 "#
@@ -834,9 +1109,9 @@ unknown_field = true
 [package]
 name = "with-plugins"
 {TOOLCHAIN}
-[plugins.serialization]
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
 version = "1.8.0"
-modules = ["json"]
 "#
         );
         let original = Manifest::from_str(&toml, "konvoy.toml").unwrap();
@@ -903,6 +1178,46 @@ bad-dep = {{ maven = "com.example:lib", version = "1.0", path = "../x" }}
         assert!(
             err.contains("maven") && err.contains("path"),
             "error was: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_dependency_empty_version() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+bad-dep = {{ maven = "com.example:lib", version = "" }}
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("empty or whitespace"),
+            "error should mention empty/whitespace: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_dependency_whitespace_only_version() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+bad-dep = {{ maven = "com.example:lib", version = "  " }}
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("empty or whitespace"),
+            "error should mention empty/whitespace: {err}"
         );
     }
 
@@ -1096,6 +1411,169 @@ bad-dep = {{}}
         let err = result.unwrap_err().to_string();
         assert!(err.contains("no source"), "error was: {err}");
         assert!(err.contains("maven"), "error should mention maven: {err}");
+    }
+
+    #[test]
+    fn reject_plugin_empty_version() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.my-plugin]
+maven = "com.example:plugin"
+version = ""
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("empty or whitespace"),
+            "error should mention empty/whitespace: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_plugin_whitespace_only_version() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.my-plugin]
+maven = "com.example:plugin"
+version = "   "
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("empty or whitespace"),
+            "error should mention empty/whitespace: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_plugin_with_both_path_and_maven() {
+        // A plugin with both path and maven should be rejected (path check comes first).
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.my-plugin]
+path = "../plugin"
+maven = "com.example:plugin"
+version = "1.0"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("plugins must use `maven`"), "error was: {err}");
+    }
+
+    #[test]
+    fn plugins_and_dependencies_both_present() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+version = "{{kotlin}}"
+
+[dependencies]
+kotlinx-coroutines = {{ maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }}
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        assert_eq!(manifest.plugins.len(), 1);
+        assert_eq!(manifest.dependencies.len(), 1);
+        assert!(manifest.plugins.contains_key("kotlin-serialization"));
+        assert!(manifest.dependencies.contains_key("kotlinx-coroutines"));
+    }
+
+    #[test]
+    fn plugins_only_no_dependencies() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+version = "{{kotlin}}"
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        assert_eq!(manifest.plugins.len(), 1);
+        assert!(manifest.dependencies.is_empty());
+    }
+
+    #[test]
+    fn round_trip_with_both_plugins_and_deps() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+kotlinx-coroutines = {{ maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }}
+
+[plugins]
+kotlin-serialization = {{ maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{{kotlin}}" }}
+"#
+        );
+        let original = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        let serialized = original.to_toml().unwrap();
+        let reparsed = Manifest::from_str(&serialized, "konvoy.toml").unwrap();
+        assert_eq!(original, reparsed);
+        assert_eq!(reparsed.plugins.len(), 1);
+        assert_eq!(reparsed.dependencies.len(), 1);
+    }
+
+    #[test]
+    fn plugin_maven_coordinate_with_dots_in_group() {
+        // Maven coordinates with deeply nested groups should be valid.
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.my-plugin]
+maven = "com.very.deep.package.name:my-artifact"
+version = "1.0.0"
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        let plugin = manifest.plugins.get("my-plugin").unwrap();
+        assert_eq!(
+            plugin.maven.as_deref(),
+            Some("com.very.deep.package.name:my-artifact")
+        );
+    }
+
+    #[test]
+    fn reject_plugin_maven_only_colon() {
+        // A maven coordinate that is just ":" should be rejected.
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.bad-plugin]
+maven = ":"
+version = "1.0"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid maven coordinate"), "error was: {err}");
     }
 
     mod property_tests {
