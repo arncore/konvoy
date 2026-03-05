@@ -80,8 +80,20 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     let lockfile_path = project_root.join("konvoy.lock");
     let lockfile = Lockfile::from_path(&lockfile_path)?;
 
-    // 3. In --locked mode, verify the lockfile is complete and consistent
-    //    with what konvoy.toml specifies before doing any work.
+    // 3. Auto-resolve Maven deps if needed (unless --locked).
+    //    When the manifest declares Maven deps that aren't in the lockfile,
+    //    run `konvoy update` automatically so users don't have to.
+    let lockfile = if !options.locked && has_unresolved_maven_deps(&manifest, &lockfile) {
+        eprintln!("  Maven dependencies not resolved — running update automatically...");
+        crate::update::update(project_root)?;
+        // Re-read the lockfile after update wrote it.
+        Lockfile::from_path(&lockfile_path)?
+    } else {
+        lockfile
+    };
+
+    // In --locked mode, verify the lockfile is complete and consistent
+    // with what konvoy.toml specifies before doing any work.
     if options.locked {
         check_lockfile_staleness(&manifest, &lockfile)?;
     }
@@ -543,6 +555,23 @@ fn resolve_maven_deps(lockfile: &Lockfile, target: &Target) -> Result<Vec<PathBu
 /// - Missing plugin entries when plugins are configured in the manifest
 ///
 /// This runs before any build work so users get fast, clear feedback.
+/// Returns `true` if the manifest declares Maven deps that have no matching
+/// lockfile entry. Used to trigger automatic `konvoy update` during build.
+fn has_unresolved_maven_deps(manifest: &Manifest, lockfile: &Lockfile) -> bool {
+    for (dep_name, dep_spec) in &manifest.dependencies {
+        if dep_spec.maven.is_some() && dep_spec.version.is_some() {
+            let has_entry = lockfile
+                .dependencies
+                .iter()
+                .any(|d| d.name == *dep_name && matches!(&d.source, DepSource::Maven { .. }));
+            if !has_entry {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn check_lockfile_staleness(manifest: &Manifest, lockfile: &Lockfile) -> Result<(), EngineError> {
     match &lockfile.toolchain {
         Some(tc) => {

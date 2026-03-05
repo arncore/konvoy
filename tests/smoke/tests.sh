@@ -728,22 +728,32 @@ TOML
     assert_contains "$output" "bad-dep"
 }
 
-test_build_maven_dep_without_update_fails() {
-    # Building with a Maven dep but no lockfile entry should error.
+test_build_maven_dep_without_update_succeeds() {
+    # Building with a Maven dep without running `konvoy update` first should
+    # auto-resolve the dependency and succeed.
     konvoy init --name no-update >/dev/null 2>&1
     cat >> no-update/konvoy.toml << 'TOML'
 
 [dependencies]
 kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
 TOML
+    cat > no-update/src/main.kt << 'KOTLIN'
+import kotlinx.datetime.Clock
+
+fun main() {
+    val now = Clock.System.now()
+    println("Hello at $now")
+}
+KOTLIN
     cd no-update
-    # Build without running update first.
+    # Build without running update first — should auto-resolve.
     local output
-    if output=$(konvoy build 2>&1); then
-        echo "    expected build to fail without konvoy update" >&2
-        return 1
-    fi
-    assert_contains "$output" "lockfile"
+    output=$(konvoy build 2>&1)
+    assert_contains "$output" "Compiling"
+    assert_file_exists .konvoy/build/linux_x64/debug/no-update
+    # Lockfile should be created with the Maven dep entry.
+    assert_file_exists konvoy.lock
+    assert_file_contains konvoy.lock "kotlinx-datetime"
 }
 
 test_build_maven_dep_locked_without_update_fails() {
@@ -1180,7 +1190,7 @@ run_test test_update_preserves_path_deps
 run_test test_update_version_change_re_resolves
 run_test test_update_removing_dep_cleans_lockfile
 run_test test_maven_dep_manifest_both_path_and_maven_fails
-run_test test_build_maven_dep_without_update_fails
+run_test test_build_maven_dep_without_update_succeeds
 run_test test_build_maven_dep_locked_without_update_fails
 run_test test_maven_dep_build_lifecycle
 run_test test_maven_dep_mixed_with_path_dep_build
