@@ -34,7 +34,6 @@ Konvoy avoids Gradle/Maven-style complexity by providing:
 - [Linting](#linting)
 - [Editor support](#editor-support)
 - [Development](#development)
-- [Roadmap](#roadmap-high-level)
 
 ## Status
 
@@ -339,13 +338,3 @@ Or in VS Code: `Ctrl+Shift+P` → "Extensions: Install from VSIX..."
 
 See the [extension README](editors/code/README.md) for full details.
 
-## Roadmap (high level)
-
-1. ~~**MVP:** host-native executable build/run + cache~~ done
-2. ~~**Tests:** built-in test framework using `kotlin.test`~~ done
-3. ~~**Targets:** explicit target triples~~ done
-4. **Dependencies:** ~~path~~ done → ~~Maven Central~~ done → git → url+sha → registry
-5. ~~**Toolchain install/pinning**~~ done
-6. ~~**Linting:** detekt integration~~ done
-7. ~~**Plugins:** data-driven compiler plugins via Maven coordinates~~ done
-8. **Remote cache** (later)
