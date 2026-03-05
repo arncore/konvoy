@@ -150,6 +150,17 @@ fn validate(manifest: &Manifest, path: &str) -> Result<(), ManifestError> {
                 reason: "plugin must have `version` set".to_owned(),
             });
         }
+        if spec
+            .version
+            .as_ref()
+            .is_some_and(|v| v.trim().is_empty())
+        {
+            return Err(ManifestError::InvalidPluginConfig {
+                path: path.to_owned(),
+                name: name.clone(),
+                reason: "plugin `version` must not be empty or whitespace".to_owned(),
+            });
+        }
         // Validate maven coordinate format (reuse same colon-check as deps).
         if let Some(ref maven) = spec.maven {
             let valid = match maven.split_once(':') {
@@ -200,6 +211,17 @@ fn validate(manifest: &Manifest, path: &str) -> Result<(), ManifestError> {
         // maven without version is an error — needs a pinned version.
         if spec.maven.is_some() && spec.version.is_none() {
             return Err(ManifestError::DependencyMavenWithoutVersion {
+                path: path.to_owned(),
+                name: name.clone(),
+            });
+        }
+        // Empty or whitespace-only version is an error.
+        if spec
+            .version
+            .as_ref()
+            .is_some_and(|v| v.trim().is_empty())
+        {
+            return Err(ManifestError::DependencyEmptyVersion {
                 path: path.to_owned(),
                 name: name.clone(),
             });
@@ -301,6 +323,8 @@ pub enum ManifestError {
     DependencyMavenWithoutVersion { path: String, name: String },
     #[error("dependency `{name}` has `version` without `maven` coordinate in {path} — add `maven = \"groupId:artifactId\"`")]
     DependencyVersionWithoutMaven { path: String, name: String },
+    #[error("dependency `{name}` version must not be empty or whitespace in {path}")]
+    DependencyEmptyVersion { path: String, name: String },
     #[error("dependency `{name}` has invalid maven coordinate `{maven}` in {path} — expected format `groupId:artifactId` (exactly one colon)")]
     DependencyInvalidMaven {
         path: String,
@@ -1166,6 +1190,46 @@ bad-dep = {{ maven = "com.example:lib", version = "1.0", path = "../x" }}
     }
 
     #[test]
+    fn reject_dependency_empty_version() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+bad-dep = {{ maven = "com.example:lib", version = "" }}
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("empty or whitespace"),
+            "error should mention empty/whitespace: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_dependency_whitespace_only_version() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+bad-dep = {{ maven = "com.example:lib", version = "  " }}
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("empty or whitespace"),
+            "error should mention empty/whitespace: {err}"
+        );
+    }
+
+    #[test]
     fn round_trip_with_maven_dep() {
         let toml = format!(
             r#"
@@ -1369,15 +1433,33 @@ maven = "com.example:plugin"
 version = ""
 "#
         );
-        // Empty version is technically valid TOML — but resolve_plugin_artifacts
-        // will produce an empty version string. The manifest validation only
-        // checks for missing `version`, so empty string parses but is useless.
-        // This test documents current behavior.
         let result = Manifest::from_str(&toml, "konvoy.toml");
-        // Empty version string is accepted at manifest parse time (not validated further).
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
         assert!(
-            result.is_ok(),
-            "empty version string is accepted by manifest parser"
+            err.contains("empty or whitespace"),
+            "error should mention empty/whitespace: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_plugin_whitespace_only_version() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.my-plugin]
+maven = "com.example:plugin"
+version = "   "
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("empty or whitespace"),
+            "error should mention empty/whitespace: {err}"
         );
     }
 
