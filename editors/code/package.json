@@ -4,7 +4,7 @@
   "description": "Konvoy build tool integration for VS Code",
   "publisher": "konvoy",
   "version": "1.1.0",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/arncore/konvoy",
