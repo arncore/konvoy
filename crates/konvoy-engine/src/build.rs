@@ -2413,6 +2413,92 @@ mod tests {
     }
 
     #[test]
+    fn check_lockfile_staleness_multiple_plugins_one_missing_errors() {
+        // Manifest declares two plugins, but lockfile only has one.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\nkotlin-allopen = { maven = \"org.jetbrains.kotlin:kotlin-allopen-compiler-plugin\", version = \"{kotlin}\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "abc123".to_owned(),
+            url: "https://example.com/serialization.jar".to_owned(),
+        });
+        // kotlin-allopen is missing from lockfile.
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("lockfile is out of date"),
+            "expected staleness error for partially missing plugins, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_multiple_plugins_all_present_succeeds() {
+        // Manifest declares two plugins, lockfile has both.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\nkotlin-allopen = { maven = \"org.jetbrains.kotlin:kotlin-allopen-compiler-plugin\", version = \"{kotlin}\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "abc123".to_owned(),
+            url: "https://example.com/serialization.jar".to_owned(),
+        });
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-allopen".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-allopen-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "def456".to_owned(),
+            url: "https://example.com/allopen.jar".to_owned(),
+        });
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(
+            result.is_ok(),
+            "both plugins present should pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_plugins_without_dependencies_succeeds() {
+        // Manifest has plugins but no [dependencies] section.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        assert!(
+            manifest.dependencies.is_empty(),
+            "manifest should have no deps"
+        );
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "abc".to_owned(),
+            url: "https://example.com/plugin.jar".to_owned(),
+        });
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(
+            result.is_ok(),
+            "plugins without dependencies should pass: {result:?}"
+        );
+    }
+
+    #[test]
     fn update_lockfile_writes_plugin_locks() {
         let tmp = tempfile::tempdir().unwrap();
         let lockfile_path = tmp.path().join("konvoy.lock");

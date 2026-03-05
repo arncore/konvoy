@@ -401,6 +401,174 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_plugin_artifacts_empty_plugins() {
+        let manifest = Manifest {
+            package: default_package(),
+            toolchain: default_toolchain(),
+            dependencies: BTreeMap::new(),
+            plugins: BTreeMap::new(),
+        };
+        let artifacts = resolve_plugin_artifacts(&manifest).unwrap();
+        assert!(artifacts.is_empty());
+    }
+
+    #[test]
+    fn resolve_plugin_artifacts_multiple_plugins() {
+        let mut plugins = BTreeMap::new();
+        plugins.insert(
+            "kotlin-serialization".to_owned(),
+            konvoy_config::manifest::DependencySpec {
+                path: None,
+                maven: Some("org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned()),
+                version: Some("{kotlin}".to_owned()),
+            },
+        );
+        plugins.insert(
+            "kotlin-allopen".to_owned(),
+            konvoy_config::manifest::DependencySpec {
+                path: None,
+                maven: Some("org.jetbrains.kotlin:kotlin-allopen-compiler-plugin".to_owned()),
+                version: Some("2.1.0".to_owned()),
+            },
+        );
+        let manifest = Manifest {
+            package: default_package(),
+            toolchain: default_toolchain(),
+            dependencies: BTreeMap::new(),
+            plugins,
+        };
+        let artifacts = resolve_plugin_artifacts(&manifest).unwrap();
+        assert_eq!(artifacts.len(), 2);
+        // BTreeMap is sorted, so kotlin-allopen comes before kotlin-serialization.
+        assert_eq!(artifacts[0].plugin_name, "kotlin-allopen");
+        assert_eq!(artifacts[1].plugin_name, "kotlin-serialization");
+    }
+
+    #[test]
+    fn build_plugin_locks_empty_results() {
+        let results: Vec<PluginArtifactResult> = Vec::new();
+        let locks = build_plugin_locks(&results);
+        assert!(locks.is_empty());
+    }
+
+    #[test]
+    fn build_plugin_locks_multiple_results() {
+        let results = vec![
+            PluginArtifactResult {
+                plugin_name: "kotlin-serialization".to_owned(),
+                path: PathBuf::from("/cache/serialization.jar"),
+                sha256: "hash1".to_owned(),
+                url: "https://example.com/serialization.jar".to_owned(),
+                freshly_downloaded: true,
+                maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+                version: "2.1.0".to_owned(),
+            },
+            PluginArtifactResult {
+                plugin_name: "kotlin-allopen".to_owned(),
+                path: PathBuf::from("/cache/allopen.jar"),
+                sha256: "hash2".to_owned(),
+                url: "https://example.com/allopen.jar".to_owned(),
+                freshly_downloaded: false,
+                maven: "org.jetbrains.kotlin:kotlin-allopen-compiler-plugin".to_owned(),
+                version: "2.1.0".to_owned(),
+            },
+        ];
+        let locks = build_plugin_locks(&results);
+        assert_eq!(locks.len(), 2);
+        assert_eq!(locks[0].name, "kotlin-serialization");
+        assert_eq!(locks[0].sha256, "hash1");
+        assert_eq!(locks[1].name, "kotlin-allopen");
+        assert_eq!(locks[1].sha256, "hash2");
+    }
+
+    #[test]
+    fn resolve_plugin_artifacts_invalid_maven_coordinate() {
+        let mut plugins = BTreeMap::new();
+        plugins.insert(
+            "bad-plugin".to_owned(),
+            konvoy_config::manifest::DependencySpec {
+                path: None,
+                maven: Some("nocolon".to_owned()),
+                version: Some("1.0.0".to_owned()),
+            },
+        );
+        let manifest = Manifest {
+            package: default_package(),
+            toolchain: default_toolchain(),
+            dependencies: BTreeMap::new(),
+            plugins,
+        };
+        let result = resolve_plugin_artifacts(&manifest);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid maven coordinate"), "error was: {err}");
+    }
+
+    #[test]
+    fn find_lockfile_hash_multiple_plugins_finds_correct_one() {
+        let lockfile = Lockfile {
+            plugins: vec![
+                PluginLock {
+                    name: "kotlin-serialization".to_owned(),
+                    maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+                    version: "2.1.0".to_owned(),
+                    sha256: "hash-ser".to_owned(),
+                    url: "https://example.com/serialization.jar".to_owned(),
+                },
+                PluginLock {
+                    name: "kotlin-allopen".to_owned(),
+                    maven: "org.jetbrains.kotlin:kotlin-allopen-compiler-plugin".to_owned(),
+                    version: "2.1.0".to_owned(),
+                    sha256: "hash-open".to_owned(),
+                    url: "https://example.com/allopen.jar".to_owned(),
+                },
+            ],
+            ..Lockfile::default()
+        };
+        assert_eq!(
+            find_lockfile_hash(&lockfile, "kotlin-serialization"),
+            Some("hash-ser")
+        );
+        assert_eq!(
+            find_lockfile_hash(&lockfile, "kotlin-allopen"),
+            Some("hash-open")
+        );
+        assert!(find_lockfile_hash(&lockfile, "nonexistent").is_none());
+    }
+
+    #[test]
+    fn resolve_plugin_url_is_maven_central() {
+        let manifest = make_manifest_with_plugin(
+            "kotlin-serialization",
+            "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin",
+            "2.1.0",
+        );
+        let artifacts = resolve_plugin_artifacts(&manifest).unwrap();
+        assert!(
+            artifacts[0]
+                .url
+                .starts_with("https://repo1.maven.org/maven2/"),
+            "url should point to Maven Central: {}",
+            artifacts[0].url
+        );
+    }
+
+    #[test]
+    fn resolve_plugin_artifacts_long_maven_coordinate() {
+        let manifest = make_manifest_with_plugin(
+            "my-very-long-plugin-name",
+            "com.very.long.organization.group.name:an-extremely-long-artifact-name-for-testing",
+            "1.2.3",
+        );
+        let artifacts = resolve_plugin_artifacts(&manifest).unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert!(artifacts[0]
+            .url
+            .contains("an-extremely-long-artifact-name-for-testing"));
+        assert_eq!(artifacts[0].maven_coord.version, "1.2.3");
+    }
+
     // -- Helpers ---------------------------------------------------------------
 
     fn default_package() -> konvoy_config::manifest::Package {

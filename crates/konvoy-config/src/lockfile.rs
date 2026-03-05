@@ -912,6 +912,118 @@ macos_arm64 = "ccdd"
         }
     }
 
+    #[test]
+    fn plugin_lock_serialization_format() {
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "abc123".to_owned(),
+            url: "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-serialization-compiler-plugin/2.1.0/kotlin-serialization-compiler-plugin-2.1.0.jar".to_owned(),
+        });
+        let content = toml::to_string_pretty(&lockfile).unwrap();
+        // New fields should be present.
+        assert!(
+            content
+                .contains("maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\""),
+            "content should have maven field: {content}"
+        );
+        assert!(
+            content.contains("version = \"2.1.0\""),
+            "content should have version field: {content}"
+        );
+        // Old fields should NOT be present.
+        assert!(
+            !content.contains("artifact ="),
+            "content should not have old artifact field: {content}"
+        );
+        assert!(
+            !content.contains("kind ="),
+            "content should not have old kind field: {content}"
+        );
+    }
+
+    #[test]
+    fn old_lockfile_with_artifact_and_kind_fields_rejected() {
+        // Old lockfile format with artifact/kind fields should be rejected
+        // because PluginLock has deny_unknown_fields.
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        fs::write(
+            &path,
+            r#"
+[toolchain]
+konanc_version = "2.1.0"
+
+[[plugins]]
+name = "serialization"
+artifact = "kotlin-serialization-compiler-plugin-2.1.0.jar"
+kind = "compiler_plugin"
+sha256 = "abc123"
+url = "https://example.com/plugin.jar"
+"#,
+        )
+        .unwrap();
+
+        let result = Lockfile::from_path(&path);
+        assert!(
+            result.is_err(),
+            "old lockfile format with artifact/kind should be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field"),
+            "error should mention unknown field: {err}"
+        );
+    }
+
+    #[test]
+    fn multiple_plugin_locks_round_trip() {
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "hash1".to_owned(),
+            url: "https://example.com/serialization.jar".to_owned(),
+        });
+        lockfile.plugins.push(PluginLock {
+            name: "kotlin-allopen".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-allopen-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "hash2".to_owned(),
+            url: "https://example.com/allopen.jar".to_owned(),
+        });
+        lockfile.write_to(&path).unwrap();
+        let reparsed = Lockfile::from_path(&path).unwrap();
+        assert_eq!(lockfile, reparsed);
+        assert_eq!(reparsed.plugins.len(), 2);
+        assert_eq!(reparsed.plugins[0].name, "kotlin-serialization");
+        assert_eq!(reparsed.plugins[1].name, "kotlin-allopen");
+    }
+
+    #[test]
+    fn plugin_lock_version_is_resolved_not_placeholder() {
+        // Verify that the version in PluginLock should be a resolved version,
+        // not a placeholder like "{kotlin}".
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(), // Resolved, not "{kotlin}".
+            sha256: "abc123".to_owned(),
+            url: "https://example.com/plugin.jar".to_owned(),
+        });
+        let content = toml::to_string_pretty(&lockfile).unwrap();
+        assert!(
+            !content.contains("{kotlin}"),
+            "lockfile should not contain placeholder: {content}"
+        );
+    }
+
     mod property_tests {
         use super::*;
         use proptest::prelude::*;
