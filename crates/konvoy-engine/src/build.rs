@@ -546,15 +546,6 @@ fn resolve_maven_deps(lockfile: &Lockfile, target: &Target) -> Result<Vec<PathBu
     klib_paths.into_iter().collect()
 }
 
-/// Check that the lockfile is complete and consistent with the manifest.
-///
-/// This is the early staleness check for `--locked` mode. It catches cases where
-/// the lockfile is missing entries that `konvoy.toml` would generate, such as:
-/// - Missing or mismatched toolchain version
-/// - Missing detekt entries when detekt is configured in the manifest
-/// - Missing plugin entries when plugins are configured in the manifest
-///
-/// This runs before any build work so users get fast, clear feedback.
 /// Returns `true` if the manifest declares Maven deps that have no matching
 /// lockfile entry. Used to trigger automatic `konvoy update` during build.
 fn has_unresolved_maven_deps(manifest: &Manifest, lockfile: &Lockfile) -> bool {
@@ -572,6 +563,16 @@ fn has_unresolved_maven_deps(manifest: &Manifest, lockfile: &Lockfile) -> bool {
     false
 }
 
+/// Check that the lockfile is complete and consistent with the manifest.
+///
+/// This is the staleness check for `--locked` mode. It catches cases where
+/// the lockfile is missing entries that `konvoy.toml` would generate:
+/// - Missing or mismatched toolchain version
+/// - Missing detekt entries when detekt is configured in the manifest
+/// - Missing plugin entries when plugins are configured in the manifest
+/// - Missing Maven dependency entries
+///
+/// Runs before any build work so users get fast, clear feedback.
 fn check_lockfile_staleness(manifest: &Manifest, lockfile: &Lockfile) -> Result<(), EngineError> {
     match &lockfile.toolchain {
         Some(tc) => {
