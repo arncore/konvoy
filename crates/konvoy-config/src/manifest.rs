@@ -12,18 +12,7 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dependencies: BTreeMap<String, DependencySpec>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub plugins: BTreeMap<String, PluginConfig>,
-}
-
-/// Configuration for a single plugin in `[plugins.<name>]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PluginConfig {
-    /// The version of the plugin (e.g. `"1.8.0"`).
-    pub version: String,
-    /// Optional list of specific modules to include (beyond `always = true` modules).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub modules: Vec<String>,
+    pub plugins: BTreeMap<String, DependencySpec>,
 }
 
 /// Toolchain specification declaring the Kotlin/Native version and optional tools.
@@ -137,13 +126,47 @@ fn validate(manifest: &Manifest, path: &str) -> Result<(), ManifestError> {
         });
     }
     // Validate plugins.
-    for (name, config) in &manifest.plugins {
-        if config.version.is_empty() {
+    for (name, spec) in &manifest.plugins {
+        // Plugins must use Maven coordinates, not path dependencies.
+        if spec.path.is_some() {
             return Err(ManifestError::InvalidPluginConfig {
                 path: path.to_owned(),
                 name: name.clone(),
-                reason: "version must not be empty".to_owned(),
+                reason: "plugins must use `maven` coordinates, not `path`".to_owned(),
             });
+        }
+        if spec.maven.is_none() {
+            return Err(ManifestError::InvalidPluginConfig {
+                path: path.to_owned(),
+                name: name.clone(),
+                reason: "plugin must have `maven` set to a `groupId:artifactId` coordinate"
+                    .to_owned(),
+            });
+        }
+        if spec.version.is_none() {
+            return Err(ManifestError::InvalidPluginConfig {
+                path: path.to_owned(),
+                name: name.clone(),
+                reason: "plugin must have `version` set".to_owned(),
+            });
+        }
+        // Validate maven coordinate format (reuse same colon-check as deps).
+        if let Some(ref maven) = spec.maven {
+            let valid = match maven.split_once(':') {
+                Some((group, artifact)) => {
+                    !group.is_empty() && !artifact.is_empty() && !artifact.contains(':')
+                }
+                None => false,
+            };
+            if !valid {
+                return Err(ManifestError::InvalidPluginConfig {
+                    path: path.to_owned(),
+                    name: name.clone(),
+                    reason: format!(
+                        "invalid maven coordinate `{maven}` — expected `groupId:artifactId`"
+                    ),
+                });
+            }
         }
     }
     // Validate dependencies.
@@ -745,38 +768,22 @@ unknown = true
 [package]
 name = "my-app"
 {TOOLCHAIN}
-[plugins.serialization]
-version = "1.8.0"
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+version = "{{kotlin}}"
 "#
         );
         let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
         assert_eq!(manifest.plugins.len(), 1);
         let plugin = manifest
             .plugins
-            .get("serialization")
+            .get("kotlin-serialization")
             .unwrap_or_else(|| panic!("missing plugin"));
-        assert_eq!(plugin.version, "1.8.0");
-        assert!(plugin.modules.is_empty());
-    }
-
-    #[test]
-    fn parse_manifest_with_plugin_modules() {
-        let toml = format!(
-            r#"
-[package]
-name = "my-app"
-{TOOLCHAIN}
-[plugins.serialization]
-version = "1.8.0"
-modules = ["json", "cbor"]
-"#
+        assert_eq!(
+            plugin.maven.as_deref(),
+            Some("org.jetbrains.kotlin:kotlin-serialization-compiler-plugin")
         );
-        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
-        let plugin = manifest
-            .plugins
-            .get("serialization")
-            .unwrap_or_else(|| panic!("missing plugin"));
-        assert_eq!(plugin.modules, vec!["json", "cbor"]);
+        assert_eq!(plugin.version.as_deref(), Some("{kotlin}"));
     }
 
     #[test]
@@ -792,23 +799,92 @@ name = "my-app"
     }
 
     #[test]
-    fn reject_empty_plugin_version() {
+    fn reject_plugin_without_version() {
         let toml = format!(
             r#"
 [package]
 name = "my-app"
 {TOOLCHAIN}
-[plugins.serialization]
-version = ""
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
 "#
         );
         let result = Manifest::from_str(&toml, "konvoy.toml");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("version must not be empty"),
-            "error was: {err}"
+        assert!(err.contains("version"), "error was: {err}");
+    }
+
+    #[test]
+    fn reject_plugin_without_maven() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.kotlin-serialization]
+version = "1.8.0"
+"#
         );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("maven"), "error was: {err}");
+    }
+
+    #[test]
+    fn reject_plugin_with_path() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.my-plugin]
+path = "../plugin"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("plugins must use `maven`"), "error was: {err}");
+    }
+
+    #[test]
+    fn reject_plugin_invalid_maven_coordinate() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.bad-plugin]
+maven = "nocolon"
+version = "1.0"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid maven coordinate"), "error was: {err}");
+    }
+
+    #[test]
+    fn plugin_accepts_kotlin_placeholder_version() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+version = "{{kotlin}}"
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        let plugin = manifest
+            .plugins
+            .get("kotlin-serialization")
+            .unwrap_or_else(|| panic!("missing plugin"));
+        assert_eq!(plugin.version.as_deref(), Some("{kotlin}"));
     }
 
     #[test]
@@ -818,7 +894,8 @@ version = ""
 [package]
 name = "my-app"
 {TOOLCHAIN}
-[plugins.serialization]
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
 version = "1.8.0"
 unknown_field = true
 "#
@@ -834,9 +911,9 @@ unknown_field = true
 [package]
 name = "with-plugins"
 {TOOLCHAIN}
-[plugins.serialization]
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
 version = "1.8.0"
-modules = ["json"]
 "#
         );
         let original = Manifest::from_str(&toml, "konvoy.toml").unwrap();

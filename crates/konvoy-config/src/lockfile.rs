@@ -17,12 +17,12 @@ pub struct Lockfile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginLock {
-    /// Human-readable plugin name (e.g. `"serialization"`).
+    /// Human-readable plugin name (e.g. `"kotlin-serialization"`).
     pub name: String,
-    /// Artifact label (e.g. `"compiler-plugin"` or module name like `"core"`).
-    pub artifact: String,
-    /// Artifact kind: `"compiler-plugin"` or `"runtime"`.
-    pub kind: String,
+    /// Maven coordinate in `groupId:artifactId` format.
+    pub maven: String,
+    /// Resolved version (e.g. `"2.1.0"`, never `"{kotlin}"`).
+    pub version: String,
     /// Hex-encoded SHA-256 hash of the artifact file.
     pub sha256: String,
     /// Download URL used to fetch this artifact.
@@ -400,23 +400,16 @@ konanc_version = "2.1.0"
         let path = dir.path().join("konvoy.lock");
         let mut lockfile = Lockfile::with_toolchain("2.1.0");
         lockfile.plugins.push(PluginLock {
-            name: "serialization".to_owned(),
-            artifact: "compiler-plugin".to_owned(),
-            kind: "compiler-plugin".to_owned(),
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
             sha256: "abc123def456".to_owned(),
             url: "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-serialization-compiler-plugin/2.1.0/kotlin-serialization-compiler-plugin-2.1.0.jar".to_owned(),
-        });
-        lockfile.plugins.push(PluginLock {
-            name: "serialization".to_owned(),
-            artifact: "core".to_owned(),
-            kind: "runtime".to_owned(),
-            sha256: "deadbeef".to_owned(),
-            url: "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/kotlinx-serialization-core-linuxx64/1.8.0/kotlinx-serialization-core-linuxx64-1.8.0.klib".to_owned(),
         });
         lockfile.write_to(&path).unwrap();
         let reparsed = Lockfile::from_path(&path).unwrap();
         assert_eq!(lockfile, reparsed);
-        assert_eq!(reparsed.plugins.len(), 2);
+        assert_eq!(reparsed.plugins.len(), 1);
     }
 
     #[test]

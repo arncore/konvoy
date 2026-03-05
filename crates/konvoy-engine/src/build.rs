@@ -180,36 +180,22 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         .filter_map(|dep| completed.get(&dep.name).cloned())
         .collect();
 
-    // 7a. Resolve and download plugin artifacts.
-    let (plugin_jars, plugin_klibs, plugin_locks) = if !manifest.plugins.is_empty() {
-        let resolved_artifacts = crate::plugin::resolve_plugin_artifacts(&manifest, &target)?;
+    // 7a. Resolve and download plugin artifacts (all plugins are compiler-plugin JARs).
+    let (plugin_jars, plugin_locks) = if !manifest.plugins.is_empty() {
+        let resolved_artifacts = crate::plugin::resolve_plugin_artifacts(&manifest)?;
         let results = crate::plugin::ensure_plugin_artifacts(
             &resolved_artifacts,
             &effective_lockfile,
             options.locked,
         )?;
         let locks = crate::plugin::build_plugin_locks(&results);
-
-        let mut jars = Vec::new();
-        let mut klibs = Vec::new();
-        for r in &results {
-            match r.kind {
-                crate::plugin::PluginArtifactKind::CompilerPlugin => {
-                    jars.push(r.path.clone());
-                }
-                crate::plugin::PluginArtifactKind::Runtime => {
-                    klibs.push(r.path.clone());
-                }
-            }
-        }
-        (jars, klibs, locks)
+        let jars: Vec<PathBuf> = results.iter().map(|r| r.path.clone()).collect();
+        (jars, locks)
     } else {
-        (Vec::new(), Vec::new(), Vec::new())
+        (Vec::new(), Vec::new())
     };
 
-    // Append runtime klibs from plugins to library paths.
     let mut all_library_paths = library_paths;
-    all_library_paths.extend(plugin_klibs);
 
     // 7b. Resolve and download Maven dependency klibs for the current target.
     let maven_klibs = resolve_maven_deps(&effective_lockfile, &target)?;
@@ -2363,7 +2349,7 @@ mod tests {
     fn check_lockfile_staleness_missing_plugin_entries_errors() {
         // Manifest declares a plugin, but lockfile has no plugin entries.
         let manifest = konvoy_config::manifest::Manifest::from_str(
-            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins.serialization]\nversion = \"1.8.0\"\nmodules = [\"json\"]\n",
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\n",
             "konvoy.toml",
         )
         .unwrap();
@@ -2382,15 +2368,15 @@ mod tests {
     fn check_lockfile_staleness_matching_plugin_entries_succeeds() {
         // Manifest declares a plugin, lockfile has matching plugin entries.
         let manifest = konvoy_config::manifest::Manifest::from_str(
-            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins.serialization]\nversion = \"1.8.0\"\nmodules = [\"json\"]\n",
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\n",
             "konvoy.toml",
         )
         .unwrap();
         let mut lockfile = Lockfile::with_toolchain("2.1.0");
         lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
-            name: "serialization".to_owned(),
-            artifact: "kotlin-serialization-compiler-plugin-2.1.0.jar".to_owned(),
-            kind: "compiler-plugin".to_owned(),
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
             sha256: "abc123".to_owned(),
             url: "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-serialization-compiler-plugin/2.1.0/kotlin-serialization-compiler-plugin-2.1.0.jar".to_owned(),
         });
@@ -2412,9 +2398,9 @@ mod tests {
         .unwrap();
         let mut lockfile = Lockfile::with_toolchain("2.1.0");
         lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
-            name: "serialization".to_owned(),
-            artifact: "some.jar".to_owned(),
-            kind: "compiler-plugin".to_owned(),
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
             sha256: "abc".to_owned(),
             url: "https://example.com/some.jar".to_owned(),
         });
@@ -2439,18 +2425,11 @@ mod tests {
 
         let plugin_locks = vec![
             konvoy_config::lockfile::PluginLock {
-                name: "serialization".to_owned(),
-                artifact: "kotlin-serialization-compiler-plugin-2.1.0.jar".to_owned(),
-                kind: "compiler-plugin".to_owned(),
+                name: "kotlin-serialization".to_owned(),
+                maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+                version: "2.1.0".to_owned(),
                 sha256: "pluginhash1".to_owned(),
                 url: "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-serialization-compiler-plugin/2.1.0/kotlin-serialization-compiler-plugin-2.1.0.jar".to_owned(),
-            },
-            konvoy_config::lockfile::PluginLock {
-                name: "serialization".to_owned(),
-                artifact: "kotlinx-serialization-core-linuxx64-1.8.0.klib".to_owned(),
-                kind: "runtime".to_owned(),
-                sha256: "pluginhash2".to_owned(),
-                url: "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/kotlinx-serialization-core-linuxx64/1.8.0/kotlinx-serialization-core-linuxx64-1.8.0.klib".to_owned(),
             },
         ];
 
@@ -2470,12 +2449,15 @@ mod tests {
         .unwrap();
 
         let reparsed = Lockfile::from_path(&lockfile_path).unwrap();
-        assert_eq!(reparsed.plugins.len(), 2);
-        assert_eq!(reparsed.plugins.first().unwrap().name, "serialization");
-        assert_eq!(reparsed.plugins.first().unwrap().kind, "compiler-plugin");
-        assert_eq!(reparsed.plugins.first().unwrap().sha256, "pluginhash1");
-        assert_eq!(reparsed.plugins.get(1).unwrap().kind, "runtime");
-        assert_eq!(reparsed.plugins.get(1).unwrap().sha256, "pluginhash2");
+        assert_eq!(reparsed.plugins.len(), 1);
+        let plugin = reparsed.plugins.first().unwrap();
+        assert_eq!(plugin.name, "kotlin-serialization");
+        assert_eq!(
+            plugin.maven,
+            "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+        );
+        assert_eq!(plugin.version, "2.1.0");
+        assert_eq!(plugin.sha256, "pluginhash1");
     }
 
     #[test]
@@ -2484,9 +2466,9 @@ mod tests {
         let lockfile_path = tmp.path().join("konvoy.lock");
         let mut lockfile = Lockfile::with_toolchain("2.1.0");
         lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
-            name: "serialization".to_owned(),
-            artifact: "old-artifact.jar".to_owned(),
-            kind: "compiler-plugin".to_owned(),
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
             sha256: "oldhash".to_owned(),
             url: "https://example.com/old.jar".to_owned(),
         });
@@ -2500,9 +2482,9 @@ mod tests {
 
         // New plugin locks differ from what's in the lockfile.
         let new_plugin_locks = vec![konvoy_config::lockfile::PluginLock {
-            name: "serialization".to_owned(),
-            artifact: "new-artifact.jar".to_owned(),
-            kind: "compiler-plugin".to_owned(),
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
             sha256: "newhash".to_owned(),
             url: "https://example.com/new.jar".to_owned(),
         }];
@@ -2526,8 +2508,8 @@ mod tests {
         assert_eq!(reparsed.plugins.len(), 1);
         assert_eq!(reparsed.plugins.first().unwrap().sha256, "newhash");
         assert_eq!(
-            reparsed.plugins.first().unwrap().artifact,
-            "new-artifact.jar"
+            reparsed.plugins.first().unwrap().maven,
+            "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
         );
     }
 
