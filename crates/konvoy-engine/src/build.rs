@@ -4062,4 +4062,106 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
         let compose_lock = locks.iter().find(|l| l.name == "compose").unwrap();
         assert_eq!(compose_lock.version, "1.5.0");
     }
+
+    // -----------------------------------------------------------------------
+    // has_unresolved_maven_deps
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn has_unresolved_maven_deps_no_deps() {
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+        assert!(!has_unresolved_maven_deps(&manifest, &lockfile));
+    }
+
+    #[test]
+    fn has_unresolved_maven_deps_path_only() {
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nutils = { path = \"../utils\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+        assert!(!has_unresolved_maven_deps(&manifest, &lockfile));
+    }
+
+    #[test]
+    fn has_unresolved_maven_deps_maven_present_in_lockfile() {
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-datetime = { maven = \"org.jetbrains.kotlinx:kotlinx-datetime\", version = \"0.6.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-datetime".to_owned(),
+            source: DepSource::Maven {
+                version: "0.6.0".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-datetime".to_owned(),
+                targets: std::collections::BTreeMap::new(),
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "hash".to_owned(),
+        });
+        assert!(!has_unresolved_maven_deps(&manifest, &lockfile));
+    }
+
+    #[test]
+    fn has_unresolved_maven_deps_maven_missing_from_lockfile() {
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-datetime = { maven = \"org.jetbrains.kotlinx:kotlinx-datetime\", version = \"0.6.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+        assert!(has_unresolved_maven_deps(&manifest, &lockfile));
+    }
+
+    #[test]
+    fn has_unresolved_maven_deps_path_entry_same_name_as_maven_dep() {
+        // Lockfile has a path dep named "kotlinx-datetime" but manifest
+        // declares it as a Maven dep — should detect as unresolved.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-datetime = { maven = \"org.jetbrains.kotlinx:kotlinx-datetime\", version = \"0.6.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-datetime".to_owned(),
+            source: DepSource::Path {
+                path: "../kotlinx-datetime".to_owned(),
+            },
+            source_hash: "hash".to_owned(),
+        });
+        assert!(has_unresolved_maven_deps(&manifest, &lockfile));
+    }
+
+    #[test]
+    fn has_unresolved_maven_deps_one_resolved_one_not() {
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-datetime = { maven = \"org.jetbrains.kotlinx:kotlinx-datetime\", version = \"0.6.0\" }\nkotlinx-coroutines = { maven = \"org.jetbrains.kotlinx:kotlinx-coroutines-core\", version = \"1.8.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-datetime".to_owned(),
+            source: DepSource::Maven {
+                version: "0.6.0".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-datetime".to_owned(),
+                targets: std::collections::BTreeMap::new(),
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "hash".to_owned(),
+        });
+        // kotlinx-coroutines is missing from lockfile.
+        assert!(has_unresolved_maven_deps(&manifest, &lockfile));
+    }
 }
