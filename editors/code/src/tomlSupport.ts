@@ -190,30 +190,54 @@ export function validateManifest(text: string): TomlDiagnostic[] {
         }
     }
 
-    // Validate [plugins.*]
+    // Validate inline-style plugins (key = { maven = "...", version = "..." })
+    const pluginsKvs = kvBySection.get('plugins') ?? [];
+    for (const kv of pluginsKvs) {
+        const val = kv.value.trim();
+        if (val.startsWith('{') && val.endsWith('}')) {
+            const hasMaven = /\bmaven\s*=/.test(val);
+            const hasVersion = /\bversion\s*=/.test(val);
+            if (!hasMaven) {
+                diagnostics.push({
+                    line: kv.line, col: kv.valueStart, endCol: kv.valueEnd,
+                    message: `Plugin "${kv.key}" must have "maven" set to a groupId:artifactId coordinate.`,
+                    severity: vscode.DiagnosticSeverity.Error,
+                });
+            }
+            if (!hasVersion) {
+                diagnostics.push({
+                    line: kv.line, col: kv.valueStart, endCol: kv.valueEnd,
+                    message: `Plugin "${kv.key}" must have "version" set.`,
+                    severity: vscode.DiagnosticSeverity.Error,
+                });
+            }
+        }
+    }
+
+    // Validate [plugins.*] sub-table format
     for (const section of sections) {
         if (!section.name.startsWith('plugins.')) {
             continue;
         }
+        const pluginName = section.name.substring('plugins.'.length);
         const pluginKvs = kvBySection.get(section.name) ?? [];
         const pluginKeys = new Map(pluginKvs.map(kv => [kv.key, kv]));
+        const hasMaven = pluginKeys.has('maven');
+        const hasVersion = pluginKeys.has('version');
 
-        const versionKv = pluginKeys.get('version');
-        if (!versionKv) {
+        if (!hasMaven) {
             diagnostics.push({
                 line: section.line, col: 0, endCol: lines[section.line].length,
-                message: `Missing required key: version in [${section.name}]`,
+                message: `Plugin "${pluginName}" must have "maven" set to a groupId:artifactId coordinate.`,
                 severity: vscode.DiagnosticSeverity.Error,
             });
-        } else {
-            const versionVal = stripQuotes(versionKv.value);
-            if (versionVal.length === 0) {
-                diagnostics.push({
-                    line: versionKv.line, col: versionKv.valueStart, endCol: versionKv.valueEnd,
-                    message: 'Plugin version must not be empty.',
-                    severity: vscode.DiagnosticSeverity.Error,
-                });
-            }
+        }
+        if (!hasVersion) {
+            diagnostics.push({
+                line: section.line, col: 0, endCol: lines[section.line].length,
+                message: `Plugin "${pluginName}" must have "version" set.`,
+                severity: vscode.DiagnosticSeverity.Error,
+            });
         }
     }
 

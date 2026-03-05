@@ -34,7 +34,6 @@ Konvoy avoids Gradle/Maven-style complexity by providing:
 - [Linting](#linting)
 - [Editor support](#editor-support)
 - [Development](#development)
-- [Roadmap](#roadmap-high-level)
 
 ## Status
 
@@ -227,18 +226,19 @@ Use `--locked` on build/test/run to error if the lockfile is out of date instead
 
 ### Plugins
 
-Konvoy supports compiler plugins via the `[plugins]` section. Plugins are data-driven — no scripting or build DSL:
+Konvoy supports compiler plugins via the `[plugins]` section. Plugins use Maven coordinates — any Kotlin/Native compiler plugin JAR on Maven Central can be used:
 
 ```toml
 [plugins]
-serialization = { version = "2.1.0" }
+serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
 ```
 
-Plugins are resolved alongside toolchain downloads. The `serialization` plugin automatically includes the `core` runtime module; additional modules (e.g., `json`, `cbor`) can be enabled:
+The `{kotlin}` placeholder resolves to the Kotlin version set in `[toolchain]`. Runtime libraries needed by the plugin (e.g., `kotlinx-serialization-core`, `kotlinx-serialization-json`) should be added as regular Maven dependencies in `[dependencies]`:
 
 ```toml
-[plugins]
-serialization = { version = "2.1.0", modules = ["json"] }
+[dependencies]
+kotlinx-serialization-core = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-core", version = "1.7.3" }
+kotlinx-serialization-json = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-json", version = "1.7.3" }
 ```
 
 ## Testing
@@ -320,6 +320,8 @@ konvoy lint --verbose              # show raw detekt output
 
 ### VS Code
 
+> **VS Code Marketplace listing coming soon.** For now, install manually from [Releases](https://github.com/arncore/konvoy/releases).
+
 The [Konvoy for VS Code](editors/code) extension provides:
 
 - **Commands** — Build, Run, Test, Lint, Clean, Doctor, Update, and Toolchain management via `Ctrl+Shift+P`
@@ -338,13 +340,3 @@ Or in VS Code: `Ctrl+Shift+P` → "Extensions: Install from VSIX..."
 
 See the [extension README](editors/code/README.md) for full details.
 
-## Roadmap (high level)
-
-1. ~~**MVP:** host-native executable build/run + cache~~ done
-2. ~~**Tests:** built-in test framework using `kotlin.test`~~ done
-3. ~~**Targets:** explicit target triples~~ done
-4. **Dependencies:** ~~path~~ done → ~~Maven Central~~ done → git → url+sha → registry
-5. ~~**Toolchain install/pinning**~~ done
-6. ~~**Linting:** detekt integration~~ done
-7. ~~**Plugins:** data-driven compiler plugins (serialization)~~ done
-8. **Remote cache** (later)

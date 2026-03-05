@@ -17,12 +17,12 @@ pub struct Lockfile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginLock {
-    /// Human-readable plugin name (e.g. `"serialization"`).
+    /// Human-readable plugin name (e.g. `"kotlin-serialization"`).
     pub name: String,
-    /// Artifact label (e.g. `"compiler-plugin"` or module name like `"core"`).
-    pub artifact: String,
-    /// Artifact kind: `"compiler-plugin"` or `"runtime"`.
-    pub kind: String,
+    /// Maven coordinate in `groupId:artifactId` format.
+    pub maven: String,
+    /// Resolved version (e.g. `"2.1.0"`, never `"{kotlin}"`).
+    pub version: String,
     /// Hex-encoded SHA-256 hash of the artifact file.
     pub sha256: String,
     /// Download URL used to fetch this artifact.
@@ -400,23 +400,16 @@ konanc_version = "2.1.0"
         let path = dir.path().join("konvoy.lock");
         let mut lockfile = Lockfile::with_toolchain("2.1.0");
         lockfile.plugins.push(PluginLock {
-            name: "serialization".to_owned(),
-            artifact: "compiler-plugin".to_owned(),
-            kind: "compiler-plugin".to_owned(),
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
             sha256: "abc123def456".to_owned(),
             url: "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-serialization-compiler-plugin/2.1.0/kotlin-serialization-compiler-plugin-2.1.0.jar".to_owned(),
-        });
-        lockfile.plugins.push(PluginLock {
-            name: "serialization".to_owned(),
-            artifact: "core".to_owned(),
-            kind: "runtime".to_owned(),
-            sha256: "deadbeef".to_owned(),
-            url: "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/kotlinx-serialization-core-linuxx64/1.8.0/kotlinx-serialization-core-linuxx64-1.8.0.klib".to_owned(),
         });
         lockfile.write_to(&path).unwrap();
         let reparsed = Lockfile::from_path(&path).unwrap();
         assert_eq!(lockfile, reparsed);
-        assert_eq!(reparsed.plugins.len(), 2);
+        assert_eq!(reparsed.plugins.len(), 1);
     }
 
     #[test]
@@ -917,6 +910,206 @@ macos_arm64 = "ccdd"
             }
             other => panic!("expected Maven source, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn plugin_lock_serialization_format() {
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "abc123".to_owned(),
+            url: "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-serialization-compiler-plugin/2.1.0/kotlin-serialization-compiler-plugin-2.1.0.jar".to_owned(),
+        });
+        let content = toml::to_string_pretty(&lockfile).unwrap();
+        // New fields should be present.
+        assert!(
+            content
+                .contains("maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\""),
+            "content should have maven field: {content}"
+        );
+        assert!(
+            content.contains("version = \"2.1.0\""),
+            "content should have version field: {content}"
+        );
+        // Old fields should NOT be present.
+        assert!(
+            !content.contains("artifact ="),
+            "content should not have old artifact field: {content}"
+        );
+        assert!(
+            !content.contains("kind ="),
+            "content should not have old kind field: {content}"
+        );
+    }
+
+    #[test]
+    fn old_lockfile_with_artifact_and_kind_fields_rejected() {
+        // Old lockfile format with artifact/kind fields should be rejected
+        // because PluginLock has deny_unknown_fields.
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        fs::write(
+            &path,
+            r#"
+[toolchain]
+konanc_version = "2.1.0"
+
+[[plugins]]
+name = "serialization"
+artifact = "kotlin-serialization-compiler-plugin-2.1.0.jar"
+kind = "compiler_plugin"
+sha256 = "abc123"
+url = "https://example.com/plugin.jar"
+"#,
+        )
+        .unwrap();
+
+        let result = Lockfile::from_path(&path);
+        assert!(
+            result.is_err(),
+            "old lockfile format with artifact/kind should be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field"),
+            "error should mention unknown field: {err}"
+        );
+    }
+
+    #[test]
+    fn multiple_plugin_locks_round_trip() {
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "hash1".to_owned(),
+            url: "https://example.com/serialization.jar".to_owned(),
+        });
+        lockfile.plugins.push(PluginLock {
+            name: "kotlin-allopen".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-allopen-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "hash2".to_owned(),
+            url: "https://example.com/allopen.jar".to_owned(),
+        });
+        lockfile.write_to(&path).unwrap();
+        let reparsed = Lockfile::from_path(&path).unwrap();
+        assert_eq!(lockfile, reparsed);
+        assert_eq!(reparsed.plugins.len(), 2);
+        assert_eq!(reparsed.plugins[0].name, "kotlin-serialization");
+        assert_eq!(reparsed.plugins[1].name, "kotlin-allopen");
+    }
+
+    #[test]
+    fn plugin_lock_version_is_resolved_not_placeholder() {
+        // Verify that the version in PluginLock should be a resolved version,
+        // not a placeholder like "{kotlin}".
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(), // Resolved, not "{kotlin}".
+            sha256: "abc123".to_owned(),
+            url: "https://example.com/plugin.jar".to_owned(),
+        });
+        let content = toml::to_string_pretty(&lockfile).unwrap();
+        assert!(
+            !content.contains("{kotlin}"),
+            "lockfile should not contain placeholder: {content}"
+        );
+    }
+
+    #[test]
+    fn round_trip_with_both_plugins_and_deps() {
+        // A lockfile with both [[dependencies]] and [[plugins]] should round-trip correctly.
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+
+        // Add a dependency.
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "dep-hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-coroutines".to_owned(),
+            source: DepSource::Maven {
+                version: "1.8.0".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
+                targets,
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "dep-source-hash".to_owned(),
+        });
+
+        // Add a plugin.
+        lockfile.plugins.push(PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "plugin-hash".to_owned(),
+            url: "https://example.com/plugin.jar".to_owned(),
+        });
+
+        lockfile.write_to(&path).unwrap();
+        let reparsed = Lockfile::from_path(&path).unwrap();
+        assert_eq!(lockfile, reparsed);
+        assert_eq!(reparsed.dependencies.len(), 1);
+        assert_eq!(reparsed.plugins.len(), 1);
+    }
+
+    #[test]
+    fn plugin_lock_url_with_query_params_round_trips() {
+        // URLs with query parameters should round-trip correctly.
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(PluginLock {
+            name: "my-plugin".to_owned(),
+            maven: "com.example:my-plugin".to_owned(),
+            version: "1.0.0".to_owned(),
+            sha256: "abc".to_owned(),
+            url: "https://repo.example.com/artifacts/my-plugin-1.0.0.jar?token=abc&ts=123"
+                .to_owned(),
+        });
+        lockfile.write_to(&path).unwrap();
+        let reparsed = Lockfile::from_path(&path).unwrap();
+        assert_eq!(lockfile, reparsed);
+        assert_eq!(
+            reparsed.plugins[0].url,
+            "https://repo.example.com/artifacts/my-plugin-1.0.0.jar?token=abc&ts=123"
+        );
+    }
+
+    #[test]
+    fn plugin_lock_missing_required_fields_rejected() {
+        // A [[plugins]] entry missing a required field (e.g. version) should be rejected.
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        fs::write(
+            &path,
+            r#"
+[toolchain]
+konanc_version = "2.1.0"
+
+[[plugins]]
+name = "my-plugin"
+maven = "com.example:my-plugin"
+sha256 = "abc123"
+url = "https://example.com/plugin.jar"
+"#,
+        )
+        .unwrap();
+
+        let result = Lockfile::from_path(&path);
+        assert!(
+            result.is_err(),
+            "plugin lock missing version should be rejected"
+        );
     }
 
     mod property_tests {

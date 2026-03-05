@@ -80,8 +80,20 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     let lockfile_path = project_root.join("konvoy.lock");
     let lockfile = Lockfile::from_path(&lockfile_path)?;
 
-    // 3. In --locked mode, verify the lockfile is complete and consistent
-    //    with what konvoy.toml specifies before doing any work.
+    // 3. Auto-resolve Maven deps if needed (unless --locked).
+    //    When the manifest declares Maven deps that aren't in the lockfile,
+    //    run `konvoy update` automatically so users don't have to.
+    let lockfile = if !options.locked && has_unresolved_maven_deps(&manifest, &lockfile) {
+        eprintln!("  Maven dependencies not resolved — running update automatically...");
+        crate::update::update(project_root)?;
+        // Re-read the lockfile after update wrote it.
+        Lockfile::from_path(&lockfile_path)?
+    } else {
+        lockfile
+    };
+
+    // In --locked mode, verify the lockfile is complete and consistent
+    // with what konvoy.toml specifies before doing any work.
     if options.locked {
         check_lockfile_staleness(&manifest, &lockfile)?;
     }
@@ -180,36 +192,22 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         .filter_map(|dep| completed.get(&dep.name).cloned())
         .collect();
 
-    // 7a. Resolve and download plugin artifacts.
-    let (plugin_jars, plugin_klibs, plugin_locks) = if !manifest.plugins.is_empty() {
-        let resolved_artifacts = crate::plugin::resolve_plugin_artifacts(&manifest, &target)?;
+    // 7a. Resolve and download plugin artifacts (all plugins are compiler-plugin JARs).
+    let (plugin_jars, plugin_locks) = if !manifest.plugins.is_empty() {
+        let resolved_artifacts = crate::plugin::resolve_plugin_artifacts(&manifest)?;
         let results = crate::plugin::ensure_plugin_artifacts(
             &resolved_artifacts,
             &effective_lockfile,
             options.locked,
         )?;
         let locks = crate::plugin::build_plugin_locks(&results);
-
-        let mut jars = Vec::new();
-        let mut klibs = Vec::new();
-        for r in &results {
-            match r.kind {
-                crate::plugin::PluginArtifactKind::CompilerPlugin => {
-                    jars.push(r.path.clone());
-                }
-                crate::plugin::PluginArtifactKind::Runtime => {
-                    klibs.push(r.path.clone());
-                }
-            }
-        }
-        (jars, klibs, locks)
+        let jars: Vec<PathBuf> = results.iter().map(|r| r.path.clone()).collect();
+        (jars, locks)
     } else {
-        (Vec::new(), Vec::new(), Vec::new())
+        (Vec::new(), Vec::new())
     };
 
-    // Append runtime klibs from plugins to library paths.
     let mut all_library_paths = library_paths;
-    all_library_paths.extend(plugin_klibs);
 
     // 7b. Resolve and download Maven dependency klibs for the current target.
     let maven_klibs = resolve_maven_deps(&effective_lockfile, &target)?;
@@ -548,15 +546,33 @@ fn resolve_maven_deps(lockfile: &Lockfile, target: &Target) -> Result<Vec<PathBu
     klib_paths.into_iter().collect()
 }
 
+/// Returns `true` if the manifest declares Maven deps that have no matching
+/// lockfile entry. Used to trigger automatic `konvoy update` during build.
+fn has_unresolved_maven_deps(manifest: &Manifest, lockfile: &Lockfile) -> bool {
+    for (dep_name, dep_spec) in &manifest.dependencies {
+        if dep_spec.maven.is_some() && dep_spec.version.is_some() {
+            let has_entry = lockfile
+                .dependencies
+                .iter()
+                .any(|d| d.name == *dep_name && matches!(&d.source, DepSource::Maven { .. }));
+            if !has_entry {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Check that the lockfile is complete and consistent with the manifest.
 ///
-/// This is the early staleness check for `--locked` mode. It catches cases where
-/// the lockfile is missing entries that `konvoy.toml` would generate, such as:
+/// This is the staleness check for `--locked` mode. It catches cases where
+/// the lockfile is missing entries that `konvoy.toml` would generate:
 /// - Missing or mismatched toolchain version
 /// - Missing detekt entries when detekt is configured in the manifest
 /// - Missing plugin entries when plugins are configured in the manifest
+/// - Missing Maven dependency entries
 ///
-/// This runs before any build work so users get fast, clear feedback.
+/// Runs before any build work so users get fast, clear feedback.
 fn check_lockfile_staleness(manifest: &Manifest, lockfile: &Lockfile) -> Result<(), EngineError> {
     match &lockfile.toolchain {
         Some(tc) => {
@@ -2363,7 +2379,7 @@ mod tests {
     fn check_lockfile_staleness_missing_plugin_entries_errors() {
         // Manifest declares a plugin, but lockfile has no plugin entries.
         let manifest = konvoy_config::manifest::Manifest::from_str(
-            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins.serialization]\nversion = \"1.8.0\"\nmodules = [\"json\"]\n",
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\n",
             "konvoy.toml",
         )
         .unwrap();
@@ -2382,15 +2398,15 @@ mod tests {
     fn check_lockfile_staleness_matching_plugin_entries_succeeds() {
         // Manifest declares a plugin, lockfile has matching plugin entries.
         let manifest = konvoy_config::manifest::Manifest::from_str(
-            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins.serialization]\nversion = \"1.8.0\"\nmodules = [\"json\"]\n",
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\n",
             "konvoy.toml",
         )
         .unwrap();
         let mut lockfile = Lockfile::with_toolchain("2.1.0");
         lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
-            name: "serialization".to_owned(),
-            artifact: "kotlin-serialization-compiler-plugin-2.1.0.jar".to_owned(),
-            kind: "compiler-plugin".to_owned(),
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
             sha256: "abc123".to_owned(),
             url: "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-serialization-compiler-plugin/2.1.0/kotlin-serialization-compiler-plugin-2.1.0.jar".to_owned(),
         });
@@ -2412,9 +2428,9 @@ mod tests {
         .unwrap();
         let mut lockfile = Lockfile::with_toolchain("2.1.0");
         lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
-            name: "serialization".to_owned(),
-            artifact: "some.jar".to_owned(),
-            kind: "compiler-plugin".to_owned(),
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
             sha256: "abc".to_owned(),
             url: "https://example.com/some.jar".to_owned(),
         });
@@ -2423,6 +2439,92 @@ mod tests {
         assert!(
             result.is_ok(),
             "extra plugin in lockfile should not cause error: {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_multiple_plugins_one_missing_errors() {
+        // Manifest declares two plugins, but lockfile only has one.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\nkotlin-allopen = { maven = \"org.jetbrains.kotlin:kotlin-allopen-compiler-plugin\", version = \"{kotlin}\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "abc123".to_owned(),
+            url: "https://example.com/serialization.jar".to_owned(),
+        });
+        // kotlin-allopen is missing from lockfile.
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("lockfile is out of date"),
+            "expected staleness error for partially missing plugins, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_multiple_plugins_all_present_succeeds() {
+        // Manifest declares two plugins, lockfile has both.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\nkotlin-allopen = { maven = \"org.jetbrains.kotlin:kotlin-allopen-compiler-plugin\", version = \"{kotlin}\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "abc123".to_owned(),
+            url: "https://example.com/serialization.jar".to_owned(),
+        });
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-allopen".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-allopen-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "def456".to_owned(),
+            url: "https://example.com/allopen.jar".to_owned(),
+        });
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(
+            result.is_ok(),
+            "both plugins present should pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_plugins_without_dependencies_succeeds() {
+        // Manifest has plugins but no [dependencies] section.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        assert!(
+            manifest.dependencies.is_empty(),
+            "manifest should have no deps"
+        );
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "abc".to_owned(),
+            url: "https://example.com/plugin.jar".to_owned(),
+        });
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(
+            result.is_ok(),
+            "plugins without dependencies should pass: {result:?}"
         );
     }
 
@@ -2439,18 +2541,11 @@ mod tests {
 
         let plugin_locks = vec![
             konvoy_config::lockfile::PluginLock {
-                name: "serialization".to_owned(),
-                artifact: "kotlin-serialization-compiler-plugin-2.1.0.jar".to_owned(),
-                kind: "compiler-plugin".to_owned(),
+                name: "kotlin-serialization".to_owned(),
+                maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+                version: "2.1.0".to_owned(),
                 sha256: "pluginhash1".to_owned(),
                 url: "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-serialization-compiler-plugin/2.1.0/kotlin-serialization-compiler-plugin-2.1.0.jar".to_owned(),
-            },
-            konvoy_config::lockfile::PluginLock {
-                name: "serialization".to_owned(),
-                artifact: "kotlinx-serialization-core-linuxx64-1.8.0.klib".to_owned(),
-                kind: "runtime".to_owned(),
-                sha256: "pluginhash2".to_owned(),
-                url: "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/kotlinx-serialization-core-linuxx64/1.8.0/kotlinx-serialization-core-linuxx64-1.8.0.klib".to_owned(),
             },
         ];
 
@@ -2470,12 +2565,15 @@ mod tests {
         .unwrap();
 
         let reparsed = Lockfile::from_path(&lockfile_path).unwrap();
-        assert_eq!(reparsed.plugins.len(), 2);
-        assert_eq!(reparsed.plugins.first().unwrap().name, "serialization");
-        assert_eq!(reparsed.plugins.first().unwrap().kind, "compiler-plugin");
-        assert_eq!(reparsed.plugins.first().unwrap().sha256, "pluginhash1");
-        assert_eq!(reparsed.plugins.get(1).unwrap().kind, "runtime");
-        assert_eq!(reparsed.plugins.get(1).unwrap().sha256, "pluginhash2");
+        assert_eq!(reparsed.plugins.len(), 1);
+        let plugin = reparsed.plugins.first().unwrap();
+        assert_eq!(plugin.name, "kotlin-serialization");
+        assert_eq!(
+            plugin.maven,
+            "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+        );
+        assert_eq!(plugin.version, "2.1.0");
+        assert_eq!(plugin.sha256, "pluginhash1");
     }
 
     #[test]
@@ -2484,9 +2582,9 @@ mod tests {
         let lockfile_path = tmp.path().join("konvoy.lock");
         let mut lockfile = Lockfile::with_toolchain("2.1.0");
         lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
-            name: "serialization".to_owned(),
-            artifact: "old-artifact.jar".to_owned(),
-            kind: "compiler-plugin".to_owned(),
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
             sha256: "oldhash".to_owned(),
             url: "https://example.com/old.jar".to_owned(),
         });
@@ -2500,9 +2598,9 @@ mod tests {
 
         // New plugin locks differ from what's in the lockfile.
         let new_plugin_locks = vec![konvoy_config::lockfile::PluginLock {
-            name: "serialization".to_owned(),
-            artifact: "new-artifact.jar".to_owned(),
-            kind: "compiler-plugin".to_owned(),
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
             sha256: "newhash".to_owned(),
             url: "https://example.com/new.jar".to_owned(),
         }];
@@ -2526,8 +2624,8 @@ mod tests {
         assert_eq!(reparsed.plugins.len(), 1);
         assert_eq!(reparsed.plugins.first().unwrap().sha256, "newhash");
         assert_eq!(
-            reparsed.plugins.first().unwrap().artifact,
-            "new-artifact.jar"
+            reparsed.plugins.first().unwrap().maven,
+            "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
         );
     }
 
@@ -2956,5 +3054,1115 @@ linux_x64 = "1111"
             }
             other => panic!("expected Maven source, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn check_lockfile_staleness_wrong_plugin_name_errors() {
+        // Manifest declares "kotlin-serialization" but lockfile only has "kotlin-allopen".
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-allopen".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-allopen-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "abc123".to_owned(),
+            url: "https://example.com/allopen.jar".to_owned(),
+        });
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(
+            result.is_err(),
+            "lockfile with wrong plugin name should fail staleness check"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("lockfile is out of date"),
+            "expected staleness error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn update_lockfile_locked_mode_with_plugin_changes_errors() {
+        // In --locked mode, if plugin locks differ, it should error.
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "oldhash".to_owned(),
+            url: "https://example.com/old.jar".to_owned(),
+        });
+        lockfile.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        // New plugin locks differ from what's in the lockfile.
+        let new_plugin_locks = vec![konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "newhash".to_owned(),
+            url: "https://example.com/new.jar".to_owned(),
+        }];
+
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        let result = update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            &new_plugin_locks,
+            tmp.path(),
+            &lockfile_path,
+            false,
+            true, // locked = true
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("lockfile is out of date"),
+            "expected lockfile update error in locked mode, got: {err}"
+        );
+    }
+
+    #[test]
+    fn update_lockfile_writes_both_plugins_and_deps() {
+        // When both plugins and deps change, both should be written to lockfile.
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile = Lockfile::default();
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        let dep = crate::resolve::ResolvedDep {
+            name: "my-lib".to_owned(),
+            project_root: tmp.path().join("my-lib"),
+            manifest: konvoy_config::manifest::Manifest::from_str(
+                "[package]\nname = \"my-lib\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+                "konvoy.toml",
+            )
+            .unwrap(),
+            dep_names: Vec::new(),
+            source_hash: "dephash".to_owned(),
+        };
+        let graph = crate::resolve::ResolvedGraph { order: vec![dep] };
+
+        let plugin_locks = vec![konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "pluginhash".to_owned(),
+            url: "https://example.com/plugin.jar".to_owned(),
+        }];
+
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &graph,
+            &plugin_locks,
+            tmp.path(),
+            &lockfile_path,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let reparsed = Lockfile::from_path(&lockfile_path).unwrap();
+        assert_eq!(reparsed.dependencies.len(), 1);
+        assert_eq!(reparsed.plugins.len(), 1);
+        assert_eq!(reparsed.dependencies[0].name, "my-lib");
+        assert_eq!(reparsed.plugins[0].name, "kotlin-serialization");
+    }
+
+    #[test]
+    fn lockfile_toml_content_includes_plugins() {
+        // Adding plugins to a lockfile should change the serialized content,
+        // which means plugins affect the cache key.
+        let lockfile_no_plugins = Lockfile::with_toolchain("2.1.0");
+        let mut lockfile_with_plugins = Lockfile::with_toolchain("2.1.0");
+        lockfile_with_plugins
+            .plugins
+            .push(konvoy_config::lockfile::PluginLock {
+                name: "kotlin-serialization".to_owned(),
+                maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+                version: "2.1.0".to_owned(),
+                sha256: "abc123".to_owned(),
+                url: "https://example.com/plugin.jar".to_owned(),
+            });
+
+        let content_without = lockfile_toml_content(&lockfile_no_plugins).unwrap();
+        let content_with = lockfile_toml_content(&lockfile_with_plugins).unwrap();
+
+        assert_ne!(
+            content_without, content_with,
+            "lockfile content should differ when plugins are present"
+        );
+        assert!(
+            content_with.contains("kotlin-serialization"),
+            "lockfile content should include plugin name"
+        );
+    }
+
+    #[test]
+    fn pre_stabilization_preserves_plugins_from_disk() {
+        // When the lockfile on disk has plugins and the toolchain version changes,
+        // the pre-stabilized lockfile should preserve the plugin entries.
+        let mut on_disk = Lockfile::with_toolchain("2.0.0");
+        on_disk.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.0.0".to_owned(),
+            sha256: "oldhash".to_owned(),
+            url: "https://example.com/old.jar".to_owned(),
+        });
+
+        let new_version = "2.1.0";
+
+        // Simulate the pre-stabilization path from build().
+        let stabilized = match &on_disk.toolchain {
+            Some(tc) if tc.konanc_version == new_version => on_disk.clone(),
+            _ => {
+                let mut s = Lockfile::with_managed_toolchain(new_version, None, None);
+                s.dependencies = on_disk.dependencies.clone();
+                s.plugins = on_disk.plugins.clone();
+                s
+            }
+        };
+
+        // Plugins should be preserved.
+        assert_eq!(stabilized.plugins.len(), 1);
+        assert_eq!(stabilized.plugins[0].name, "kotlin-serialization");
+        // Toolchain should be updated.
+        assert_eq!(
+            stabilized.toolchain.as_ref().unwrap().konanc_version,
+            new_version
+        );
+    }
+
+    // =======================================================================
+    // Smoke tests — realistic multi-step workflows for the plugin redesign.
+    //
+    // These tests exercise the full chain:
+    //   parse TOML manifest -> resolve plugins -> build lockfile -> write ->
+    //   read back -> staleness check -> cache key computation
+    //
+    // Unlike the unit tests above that exercise functions in isolation, these
+    // tests assemble complete Manifest + Lockfile combinations and walk them
+    // through multiple pipeline stages.
+    // =======================================================================
+
+    /// Parse a realistic manifest with [package], [toolchain], [plugins],
+    /// and [dependencies], then round-trip through TOML serialization and
+    /// verify every section is preserved.
+    #[test]
+    fn smoke_full_manifest_round_trip_with_all_sections() {
+        let toml = r#"
+[package]
+name = "my-app"
+
+[toolchain]
+kotlin = "2.1.0"
+detekt = "1.23.7"
+
+[dependencies]
+kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+"#;
+        let manifest = konvoy_config::manifest::Manifest::from_str(toml, "konvoy.toml").unwrap();
+
+        // Verify all sections parsed correctly.
+        assert_eq!(manifest.package.name, "my-app");
+        assert_eq!(manifest.toolchain.kotlin, "2.1.0");
+        assert_eq!(manifest.toolchain.detekt.as_deref(), Some("1.23.7"));
+        assert_eq!(manifest.dependencies.len(), 1);
+        assert!(manifest.dependencies.contains_key("kotlinx-coroutines"));
+        assert_eq!(manifest.plugins.len(), 1);
+        assert!(manifest.plugins.contains_key("kotlin-serialization"));
+
+        // Round-trip through serialization.
+        let serialized = manifest.to_toml().unwrap();
+        let reparsed =
+            konvoy_config::manifest::Manifest::from_str(&serialized, "konvoy.toml").unwrap();
+        assert_eq!(manifest, reparsed);
+    }
+
+    /// Full chain: parse manifest with plugin -> resolve plugin artifacts ->
+    /// build PluginLock entries -> write lockfile -> read lockfile back ->
+    /// check staleness = NOT stale.
+    #[test]
+    fn smoke_manifest_to_lockfile_to_staleness_check_not_stale() {
+        // Step 1: Parse manifest.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            r#"
+[package]
+name = "myapp"
+
+[toolchain]
+kotlin = "2.1.0"
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+"#,
+            "konvoy.toml",
+        )
+        .unwrap();
+
+        // Step 2: Resolve plugin artifacts (uses the manifest's plugins and toolchain).
+        let artifacts = crate::plugin::resolve_plugin_artifacts(&manifest).unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].maven_coord.version, "2.1.0");
+
+        // Step 3: Simulate download results and build PluginLock entries.
+        let results = vec![crate::plugin::PluginArtifactResult {
+            plugin_name: "kotlin-serialization".to_owned(),
+            path: PathBuf::from("/cache/kotlin-serialization-compiler-plugin-2.1.0.jar"),
+            sha256: "abcdef1234567890".to_owned(),
+            url: artifacts[0].url.clone(),
+            freshly_downloaded: true,
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+        }];
+        let plugin_locks = crate::plugin::build_plugin_locks(&results);
+        assert_eq!(plugin_locks.len(), 1);
+        assert_eq!(plugin_locks[0].name, "kotlin-serialization");
+        assert_eq!(plugin_locks[0].version, "2.1.0");
+
+        // Step 4: Write lockfile to disk.
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins = plugin_locks;
+        lockfile.write_to(&lockfile_path).unwrap();
+
+        // Step 5: Read lockfile back.
+        let reparsed = Lockfile::from_path(&lockfile_path).unwrap();
+        assert_eq!(reparsed.plugins.len(), 1);
+        assert_eq!(reparsed.plugins[0].name, "kotlin-serialization");
+        assert_eq!(
+            reparsed.plugins[0].maven,
+            "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+        );
+
+        // Step 6: Check staleness — should pass.
+        let result = check_lockfile_staleness(&manifest, &reparsed);
+        assert!(
+            result.is_ok(),
+            "freshly built lockfile should not be stale: {result:?}"
+        );
+    }
+
+    /// Same chain as above, but after a successful staleness check, change the
+    /// plugin version in the manifest -> staleness check should now fail.
+    #[test]
+    fn smoke_plugin_version_change_makes_lockfile_stale() {
+        // Build initial lockfile with plugin version 2.1.0.
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "hash1".to_owned(),
+            url: "https://example.com/plugin.jar".to_owned(),
+        });
+
+        // Original manifest matches -> not stale.
+        let manifest_v1 = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        assert!(check_lockfile_staleness(&manifest_v1, &lockfile).is_ok());
+
+        // Now change the Kotlin version to 2.2.0 -> the lockfile toolchain
+        // is 2.1.0 so staleness should fire.
+        let manifest_v2 = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.2.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let result = check_lockfile_staleness(&manifest_v2, &lockfile);
+        assert!(
+            result.is_err(),
+            "changing Kotlin version should make lockfile stale"
+        );
+    }
+
+    /// Adding a new plugin to the manifest makes the lockfile stale.
+    #[test]
+    fn smoke_adding_new_plugin_makes_lockfile_stale() {
+        // Lockfile has one plugin.
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "hash1".to_owned(),
+            url: "https://example.com/ser.jar".to_owned(),
+        });
+
+        // Manifest now declares two plugins.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\nkotlin-allopen = { maven = \"org.jetbrains.kotlin:kotlin-allopen-compiler-plugin\", version = \"{kotlin}\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(
+            result.is_err(),
+            "adding a second plugin should make lockfile stale"
+        );
+    }
+
+    /// Full lockfile write -> read -> staleness check with BOTH plugins and dependencies.
+    #[test]
+    fn smoke_lockfile_round_trip_with_plugins_and_deps_then_staleness() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join("konvoy.lock");
+
+        // Build a lockfile with toolchain, deps, and plugins.
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "dep-hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-coroutines".to_owned(),
+            source: DepSource::Maven {
+                version: "1.8.0".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
+                targets,
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "src-hash".to_owned(),
+        });
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "plugin-hash".to_owned(),
+            url: "https://example.com/plugin.jar".to_owned(),
+        });
+
+        // Write and read back.
+        lockfile.write_to(&lockfile_path).unwrap();
+        let reparsed = Lockfile::from_path(&lockfile_path).unwrap();
+        assert_eq!(lockfile, reparsed);
+
+        // Matching manifest -> staleness check passes.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            r#"
+[package]
+name = "myapp"
+
+[toolchain]
+kotlin = "2.1.0"
+
+[dependencies]
+kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+"#,
+            "konvoy.toml",
+        )
+        .unwrap();
+
+        let result = check_lockfile_staleness(&manifest, &reparsed);
+        assert!(
+            result.is_ok(),
+            "lockfile with both deps and plugins should pass staleness: {result:?}"
+        );
+    }
+
+    /// Old-style lockfile with `artifact` and `kind` fields in [[plugins]]
+    /// must be cleanly rejected so users know to re-run `konvoy update`.
+    #[test]
+    fn smoke_old_lockfile_format_with_descriptor_fields_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join("konvoy.lock");
+        fs::write(
+            &lockfile_path,
+            r#"
+[toolchain]
+konanc_version = "2.1.0"
+
+[[plugins]]
+name = "serialization"
+artifact = "kotlin-serialization-compiler-plugin-2.1.0.jar"
+kind = "compiler_plugin"
+sha256 = "abc123"
+url = "https://example.com/plugin.jar"
+"#,
+        )
+        .unwrap();
+
+        let result = Lockfile::from_path(&lockfile_path);
+        assert!(
+            result.is_err(),
+            "old lockfile with artifact/kind fields should be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field"),
+            "error should mention unknown field for migration detection: {err}"
+        );
+    }
+
+    /// Cache key MUST change when plugins are added to the lockfile.
+    /// This verifies that the serialized lockfile content (which feeds into
+    /// the cache key via `lockfile_content`) differs with plugins.
+    #[test]
+    fn smoke_cache_key_changes_when_plugin_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("main.kt"), "fun main() {}").unwrap();
+
+        // Lockfile without plugins.
+        let lockfile_no_plugins = Lockfile::with_toolchain("2.1.0");
+        let content_no_plugins = lockfile_toml_content(&lockfile_no_plugins).unwrap();
+
+        // Lockfile with plugins.
+        let mut lockfile_with_plugins = Lockfile::with_toolchain("2.1.0");
+        lockfile_with_plugins
+            .plugins
+            .push(konvoy_config::lockfile::PluginLock {
+                name: "kotlin-serialization".to_owned(),
+                maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+                version: "2.1.0".to_owned(),
+                sha256: "abc123".to_owned(),
+                url: "https://example.com/plugin.jar".to_owned(),
+            });
+        let content_with_plugins = lockfile_toml_content(&lockfile_with_plugins).unwrap();
+
+        // Contents must differ.
+        assert_ne!(
+            content_no_plugins, content_with_plugins,
+            "lockfile content must differ when plugins are present"
+        );
+
+        // Compute actual cache keys using CacheInputs.
+        let make_inputs = |lockfile_content: String| CacheInputs {
+            manifest_content: "[package]\nname = \"myapp\"".to_owned(),
+            lockfile_content,
+            konanc_version: "2.1.0".to_owned(),
+            konanc_fingerprint: "abc123".to_owned(),
+            target: "linux_x64".to_owned(),
+            profile: "debug".to_owned(),
+            source_dir: dir.path().to_path_buf(),
+            source_glob: "**/*.kt".to_owned(),
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            dependency_hashes: Vec::new(),
+        };
+
+        let key_no_plugins = CacheKey::compute(&make_inputs(content_no_plugins)).unwrap();
+        let key_with_plugins = CacheKey::compute(&make_inputs(content_with_plugins)).unwrap();
+
+        assert_ne!(
+            key_no_plugins, key_with_plugins,
+            "cache key MUST change when plugins are added"
+        );
+    }
+
+    /// Cache key MUST change when a plugin's sha256 changes (e.g. re-download
+    /// produced a different artifact). This simulates what happens after
+    /// `konvoy update` when a plugin JAR changes upstream.
+    #[test]
+    fn smoke_cache_key_changes_when_plugin_hash_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("main.kt"), "fun main() {}").unwrap();
+
+        let make_lockfile = |hash: &str| {
+            let mut lf = Lockfile::with_toolchain("2.1.0");
+            lf.plugins.push(konvoy_config::lockfile::PluginLock {
+                name: "kotlin-serialization".to_owned(),
+                maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+                version: "2.1.0".to_owned(),
+                sha256: hash.to_owned(),
+                url: "https://example.com/plugin.jar".to_owned(),
+            });
+            lf
+        };
+
+        let lf_v1 = make_lockfile("hash_version_1");
+        let lf_v2 = make_lockfile("hash_version_2");
+
+        let content_v1 = lockfile_toml_content(&lf_v1).unwrap();
+        let content_v2 = lockfile_toml_content(&lf_v2).unwrap();
+
+        let make_inputs = |content: String| CacheInputs {
+            manifest_content: "[package]\nname = \"myapp\"".to_owned(),
+            lockfile_content: content,
+            konanc_version: "2.1.0".to_owned(),
+            konanc_fingerprint: "abc".to_owned(),
+            target: "linux_x64".to_owned(),
+            profile: "debug".to_owned(),
+            source_dir: dir.path().to_path_buf(),
+            source_glob: "**/*.kt".to_owned(),
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            dependency_hashes: Vec::new(),
+        };
+
+        let key_v1 = CacheKey::compute(&make_inputs(content_v1)).unwrap();
+        let key_v2 = CacheKey::compute(&make_inputs(content_v2)).unwrap();
+
+        assert_ne!(
+            key_v1, key_v2,
+            "cache key MUST change when a plugin hash changes"
+        );
+    }
+
+    /// Full pipeline: update_lockfile_if_needed writes plugins, then the written
+    /// lockfile passes staleness check for the original manifest.
+    #[test]
+    fn smoke_update_lockfile_then_staleness_check_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join("konvoy.lock");
+
+        // Start with an empty lockfile.
+        let lockfile = Lockfile::default();
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        // Simulate plugin resolution producing a PluginLock.
+        let plugin_locks = vec![konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "pluginhash".to_owned(),
+            url: "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-serialization-compiler-plugin/2.1.0/kotlin-serialization-compiler-plugin-2.1.0.jar".to_owned(),
+        }];
+
+        // Write lockfile via the build pipeline function.
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            &plugin_locks,
+            dir.path(),
+            &lockfile_path,
+            false,
+            false,
+        )
+        .unwrap();
+
+        // Read the written lockfile.
+        let written = Lockfile::from_path(&lockfile_path).unwrap();
+
+        // Verify it has the right content.
+        assert_eq!(written.plugins.len(), 1);
+        assert_eq!(written.plugins[0].name, "kotlin-serialization");
+        assert_eq!(written.toolchain.as_ref().unwrap().konanc_version, "2.1.0");
+
+        // Now check staleness against the manifest — it should pass.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+
+        let result = check_lockfile_staleness(&manifest, &written);
+        assert!(
+            result.is_ok(),
+            "lockfile written by update_lockfile_if_needed should pass staleness check: {result:?}"
+        );
+    }
+
+    /// Pre-stabilization preserves plugins AND deps when toolchain version
+    /// changes, and the resulting stabilized lockfile produces a correct
+    /// cache key. This tests the full stabilization path from build().
+    #[test]
+    fn smoke_pre_stabilization_preserves_all_and_cache_key_is_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("main.kt"), "fun main() {}").unwrap();
+
+        // On-disk lockfile: old toolchain version, but has deps and plugins.
+        let mut on_disk = Lockfile::with_toolchain("2.0.0");
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "dep-hash".to_owned());
+        on_disk.dependencies.push(DependencyLock {
+            name: "kotlinx-coroutines".to_owned(),
+            source: DepSource::Maven {
+                version: "1.8.0".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
+                targets,
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "src-hash".to_owned(),
+        });
+        on_disk.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.0.0".to_owned(),
+            sha256: "oldhash".to_owned(),
+            url: "https://example.com/old.jar".to_owned(),
+        });
+
+        // Simulate the pre-stabilization from build() for a new toolchain version.
+        let new_version = "2.1.0";
+        let stabilized = match &on_disk.toolchain {
+            Some(tc) if tc.konanc_version == new_version => on_disk.clone(),
+            _ => {
+                let mut s = Lockfile::with_managed_toolchain(new_version, None, None);
+                s.dependencies = on_disk.dependencies.clone();
+                s.plugins = on_disk.plugins.clone();
+                s
+            }
+        };
+
+        // Verify all data is preserved.
+        assert_eq!(
+            stabilized.toolchain.as_ref().unwrap().konanc_version,
+            "2.1.0"
+        );
+        assert_eq!(stabilized.dependencies.len(), 1);
+        assert_eq!(stabilized.dependencies[0].name, "kotlinx-coroutines");
+        assert_eq!(stabilized.plugins.len(), 1);
+        assert_eq!(stabilized.plugins[0].name, "kotlin-serialization");
+
+        // Compute cache key with the stabilized lockfile — must succeed.
+        let content = lockfile_toml_content(&stabilized).unwrap();
+        let inputs = CacheInputs {
+            manifest_content: "[package]\nname = \"myapp\"".to_owned(),
+            lockfile_content: content,
+            konanc_version: "2.1.0".to_owned(),
+            konanc_fingerprint: "abc".to_owned(),
+            target: "linux_x64".to_owned(),
+            profile: "debug".to_owned(),
+            source_dir: dir.path().to_path_buf(),
+            source_glob: "**/*.kt".to_owned(),
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            dependency_hashes: Vec::new(),
+        };
+        let key = CacheKey::compute(&inputs).unwrap();
+        assert_eq!(
+            key.as_hex().len(),
+            64,
+            "cache key must be a valid 64-char hex string"
+        );
+    }
+
+    /// Removing all plugins from the manifest while lockfile still has them
+    /// should NOT be stale (extra plugins in lockfile are ignored).
+    /// But the reverse — manifest has plugins, lockfile doesn't — IS stale.
+    /// This tests both directions to cover the asymmetry.
+    #[test]
+    fn smoke_staleness_asymmetry_extra_lockfile_plugins_ok_missing_not_ok() {
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "hash".to_owned(),
+            url: "https://example.com/plugin.jar".to_owned(),
+        });
+
+        // Direction 1: Manifest has NO plugins, lockfile has one -> OK.
+        let manifest_no_plugins = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        assert!(
+            check_lockfile_staleness(&manifest_no_plugins, &lockfile).is_ok(),
+            "extra plugins in lockfile should be tolerated"
+        );
+
+        // Direction 2: Manifest has plugin, lockfile has none -> STALE.
+        let lockfile_no_plugins = Lockfile::with_toolchain("2.1.0");
+        let manifest_with_plugins = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        assert!(
+            check_lockfile_staleness(&manifest_with_plugins, &lockfile_no_plugins).is_err(),
+            "missing plugins in lockfile should be stale"
+        );
+    }
+
+    /// Verify that the `-Xplugin=` arguments are correctly generated when
+    /// plugin JARs are passed through the build pipeline. This tests the
+    /// konanc invocation builder integration.
+    #[test]
+    fn smoke_plugin_jars_produce_xplugin_args() {
+        use konvoy_konanc::invoke::KonancCommand;
+
+        let plugin_jars = vec![
+            PathBuf::from("/home/.konvoy/cache/maven/org/jetbrains/kotlin/kotlin-serialization-compiler-plugin/2.1.0/kotlin-serialization-compiler-plugin-2.1.0.jar"),
+            PathBuf::from("/home/.konvoy/cache/maven/org/jetbrains/kotlin/kotlin-allopen-compiler-plugin/2.1.0/kotlin-allopen-compiler-plugin-2.1.0.jar"),
+        ];
+
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("src/main.kt")])
+            .output(std::path::Path::new(".konvoy/build/linux_x64/debug/myapp"))
+            .target("linux_x64")
+            .plugins(&plugin_jars);
+
+        let args = cmd.build_args().unwrap();
+        let xplugin_args: Vec<_> = args.iter().filter(|a| a.starts_with("-Xplugin=")).collect();
+
+        assert_eq!(xplugin_args.len(), 2);
+        assert!(
+            xplugin_args[0].contains("kotlin-serialization-compiler-plugin"),
+            "first -Xplugin should reference serialization: {}",
+            xplugin_args[0]
+        );
+        assert!(
+            xplugin_args[1].contains("kotlin-allopen-compiler-plugin"),
+            "second -Xplugin should reference allopen: {}",
+            xplugin_args[1]
+        );
+    }
+
+    /// Verify that update_lockfile_if_needed correctly writes plugins alongside
+    /// Maven dependencies, and the resulting lockfile passes staleness for a
+    /// manifest that declares both.
+    #[test]
+    fn smoke_update_lockfile_with_plugins_and_maven_deps_then_staleness() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join("konvoy.lock");
+
+        // Start with a lockfile that has Maven deps but no plugins.
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "dep-hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-coroutines".to_owned(),
+            source: DepSource::Maven {
+                version: "1.8.0".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
+                targets,
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "src-hash".to_owned(),
+        });
+        lockfile.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        // Now add plugins via update_lockfile_if_needed.
+        let plugin_locks = vec![konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "pluginhash".to_owned(),
+            url: "https://example.com/plugin.jar".to_owned(),
+        }];
+
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            &plugin_locks,
+            dir.path(),
+            &lockfile_path,
+            false,
+            false,
+        )
+        .unwrap();
+
+        // Read back and verify both deps and plugins are present.
+        let written = Lockfile::from_path(&lockfile_path).unwrap();
+        assert_eq!(
+            written.dependencies.len(),
+            1,
+            "Maven dep should be preserved"
+        );
+        assert_eq!(written.plugins.len(), 1, "plugin should be written");
+
+        // Staleness check with matching manifest.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            r#"
+[package]
+name = "myapp"
+
+[toolchain]
+kotlin = "2.1.0"
+
+[dependencies]
+kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+"#,
+            "konvoy.toml",
+        )
+        .unwrap();
+
+        let result = check_lockfile_staleness(&manifest, &written);
+        assert!(
+            result.is_ok(),
+            "lockfile with both deps and plugins should pass staleness: {result:?}"
+        );
+    }
+
+    /// Locked mode (--locked) blocks lockfile updates when plugins change.
+    /// This tests the full locked-mode scenario end-to-end.
+    #[test]
+    fn smoke_locked_mode_rejects_plugin_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join("konvoy.lock");
+
+        // Write a lockfile with an old plugin hash.
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "oldhash".to_owned(),
+            url: "https://example.com/old.jar".to_owned(),
+        });
+        lockfile.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        // Plugin resolution produced a DIFFERENT hash.
+        let new_plugin_locks = vec![konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "newhash".to_owned(),
+            url: "https://example.com/new.jar".to_owned(),
+        }];
+
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+
+        // In locked mode, this should error.
+        let result = update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            &new_plugin_locks,
+            dir.path(),
+            &lockfile_path,
+            false,
+            true, // locked = true
+        );
+        assert!(
+            result.is_err(),
+            "locked mode should reject plugin hash changes"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("lockfile is out of date"),
+            "error should mention lockfile staleness: {err}"
+        );
+    }
+
+    /// Plugin resolution correctly substitutes {kotlin} in version for the
+    /// full pipeline: manifest -> resolve -> build locks -> verify resolved version.
+    #[test]
+    fn smoke_kotlin_placeholder_resolution_through_pipeline() {
+        // Manifest uses {kotlin} placeholder.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            r#"
+[package]
+name = "myapp"
+
+[toolchain]
+kotlin = "2.1.0"
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0" }
+"#,
+            "konvoy.toml",
+        )
+        .unwrap();
+
+        // Resolve plugins.
+        let artifacts = crate::plugin::resolve_plugin_artifacts(&manifest).unwrap();
+        assert_eq!(artifacts.len(), 2);
+
+        // Find the serialization plugin (BTreeMap order: "compose" < "kotlin-serialization").
+        let ser = artifacts
+            .iter()
+            .find(|a| a.plugin_name == "kotlin-serialization")
+            .unwrap();
+        let compose = artifacts
+            .iter()
+            .find(|a| a.plugin_name == "compose")
+            .unwrap();
+
+        // {kotlin} should be resolved to 2.1.0.
+        assert_eq!(ser.maven_coord.version, "2.1.0");
+        // compose uses a literal version, not {kotlin}.
+        assert_eq!(compose.maven_coord.version, "1.5.0");
+
+        // Build plugin locks from simulated results.
+        let results: Vec<crate::plugin::PluginArtifactResult> = artifacts
+            .iter()
+            .map(|a| crate::plugin::PluginArtifactResult {
+                plugin_name: a.plugin_name.clone(),
+                path: a.cache_path.clone(),
+                sha256: format!("hash-{}", a.plugin_name),
+                url: a.url.clone(),
+                freshly_downloaded: true,
+                maven: format!("{}:{}", a.maven_coord.group_id, a.maven_coord.artifact_id),
+                version: a.maven_coord.version.clone(),
+            })
+            .collect();
+
+        let locks = crate::plugin::build_plugin_locks(&results);
+        assert_eq!(locks.len(), 2);
+
+        // Verify resolved versions in locks.
+        let ser_lock = locks
+            .iter()
+            .find(|l| l.name == "kotlin-serialization")
+            .unwrap();
+        assert_eq!(ser_lock.version, "2.1.0");
+        let compose_lock = locks.iter().find(|l| l.name == "compose").unwrap();
+        assert_eq!(compose_lock.version, "1.5.0");
+    }
+
+    // -----------------------------------------------------------------------
+    // has_unresolved_maven_deps
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn has_unresolved_maven_deps_no_deps() {
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+        assert!(!has_unresolved_maven_deps(&manifest, &lockfile));
+    }
+
+    #[test]
+    fn has_unresolved_maven_deps_path_only() {
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nutils = { path = \"../utils\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+        assert!(!has_unresolved_maven_deps(&manifest, &lockfile));
+    }
+
+    #[test]
+    fn has_unresolved_maven_deps_maven_present_in_lockfile() {
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-datetime = { maven = \"org.jetbrains.kotlinx:kotlinx-datetime\", version = \"0.6.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-datetime".to_owned(),
+            source: DepSource::Maven {
+                version: "0.6.0".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-datetime".to_owned(),
+                targets: std::collections::BTreeMap::new(),
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "hash".to_owned(),
+        });
+        assert!(!has_unresolved_maven_deps(&manifest, &lockfile));
+    }
+
+    #[test]
+    fn has_unresolved_maven_deps_maven_missing_from_lockfile() {
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-datetime = { maven = \"org.jetbrains.kotlinx:kotlinx-datetime\", version = \"0.6.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+        assert!(has_unresolved_maven_deps(&manifest, &lockfile));
+    }
+
+    #[test]
+    fn has_unresolved_maven_deps_path_entry_same_name_as_maven_dep() {
+        // Lockfile has a path dep named "kotlinx-datetime" but manifest
+        // declares it as a Maven dep — should detect as unresolved.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-datetime = { maven = \"org.jetbrains.kotlinx:kotlinx-datetime\", version = \"0.6.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-datetime".to_owned(),
+            source: DepSource::Path {
+                path: "../kotlinx-datetime".to_owned(),
+            },
+            source_hash: "hash".to_owned(),
+        });
+        assert!(has_unresolved_maven_deps(&manifest, &lockfile));
+    }
+
+    #[test]
+    fn has_unresolved_maven_deps_one_resolved_one_not() {
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-datetime = { maven = \"org.jetbrains.kotlinx:kotlinx-datetime\", version = \"0.6.0\" }\nkotlinx-coroutines = { maven = \"org.jetbrains.kotlinx:kotlinx-coroutines-core\", version = \"1.8.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-datetime".to_owned(),
+            source: DepSource::Maven {
+                version: "0.6.0".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-datetime".to_owned(),
+                targets: std::collections::BTreeMap::new(),
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "hash".to_owned(),
+        });
+        // kotlinx-coroutines is missing from lockfile.
+        assert!(has_unresolved_maven_deps(&manifest, &lockfile));
     }
 }

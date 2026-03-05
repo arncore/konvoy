@@ -30,8 +30,8 @@ detekt = "1.23.7"
 [dependencies]
 mylib = { path = "../mylib" }
 
-[plugins.serialization]
-version = "2.1.0"
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
 `.trim();
 
 suite('validateManifest', () => {
@@ -264,14 +264,14 @@ name = "hello"
 [toolchain]
 kotlin = "2.1.0"
 
-[plugins.serialization]
-modules = "json"
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin" }
 `.trim();
         const diags = validateManifest(text);
-        assert.ok(hasError(diags, 'Missing required key: version'));
+        assert.ok(hasError(diags, 'must have "version" set'));
     });
 
-    test('plugin with empty version is flagged', () => {
+    test('plugin without maven key is flagged', () => {
         const text = `
 [package]
 name = "hello"
@@ -279,14 +279,14 @@ name = "hello"
 [toolchain]
 kotlin = "2.1.0"
 
-[plugins.serialization]
-version = ""
+[plugins]
+kotlin-serialization = { version = "{kotlin}" }
 `.trim();
         const diags = validateManifest(text);
-        assert.ok(hasError(diags, 'Plugin version must not be empty'));
+        assert.ok(hasError(diags, 'must have "maven" set'));
     });
 
-    test('plugin with valid version passes', () => {
+    test('plugin with valid maven and version passes', () => {
         const text = `
 [package]
 name = "hello"
@@ -294,11 +294,61 @@ name = "hello"
 [toolchain]
 kotlin = "2.1.0"
 
-[plugins.serialization]
-version = "1.8.0"
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
 `.trim();
         const diags = validateManifest(text);
         // Should not flag any plugin errors
+        assert.ok(!hasError(diags, 'maven'));
+        assert.ok(!hasError(diags, 'version'));
+    });
+
+    // ── Sub-table plugin format [plugins.name] ──────────────────────────
+
+    test('sub-table plugin without maven is flagged', () => {
+        const text = `
+[package]
+name = "hello"
+
+[toolchain]
+kotlin = "2.1.0"
+
+[plugins.kotlin-serialization]
+version = "{kotlin}"
+`.trim();
+        const diags = validateManifest(text);
+        assert.ok(hasError(diags, 'must have "maven" set'));
+    });
+
+    test('sub-table plugin without version is flagged', () => {
+        const text = `
+[package]
+name = "hello"
+
+[toolchain]
+kotlin = "2.1.0"
+
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+`.trim();
+        const diags = validateManifest(text);
+        assert.ok(hasError(diags, 'must have "version" set'));
+    });
+
+    test('sub-table plugin with maven and version passes', () => {
+        const text = `
+[package]
+name = "hello"
+
+[toolchain]
+kotlin = "2.1.0"
+
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+version = "{kotlin}"
+`.trim();
+        const diags = validateManifest(text);
+        assert.ok(!hasError(diags, 'maven'));
         assert.ok(!hasError(diags, 'version'));
     });
 
