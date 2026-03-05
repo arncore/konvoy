@@ -569,6 +569,177 @@ mod tests {
         assert_eq!(artifacts[0].maven_coord.version, "1.2.3");
     }
 
+    #[test]
+    fn resolve_plugin_artifacts_kotlin_placeholder_mid_string() {
+        // {kotlin} can appear within a larger version string, e.g. "1.0-{kotlin}-beta".
+        let manifest =
+            make_manifest_with_plugin("my-plugin", "com.example:my-plugin", "1.0-{kotlin}-beta");
+        let artifacts = resolve_plugin_artifacts(&manifest).unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].maven_coord.version, "1.0-2.1.0-beta");
+    }
+
+    #[test]
+    fn resolve_plugin_artifacts_multiple_kotlin_placeholders() {
+        // Multiple {kotlin} occurrences should all be replaced.
+        let manifest =
+            make_manifest_with_plugin("my-plugin", "com.example:my-plugin", "{kotlin}-{kotlin}");
+        let artifacts = resolve_plugin_artifacts(&manifest).unwrap();
+        assert_eq!(artifacts[0].maven_coord.version, "2.1.0-2.1.0");
+    }
+
+    #[test]
+    fn resolve_plugin_artifacts_version_no_placeholder() {
+        // A version without {kotlin} should be used as-is.
+        let manifest = make_manifest_with_plugin("my-plugin", "com.example:my-plugin", "3.5.0");
+        let artifacts = resolve_plugin_artifacts(&manifest).unwrap();
+        assert_eq!(artifacts[0].maven_coord.version, "3.5.0");
+    }
+
+    #[test]
+    fn resolve_plugin_url_contains_jar_extension() {
+        // Plugin artifacts should be JARs (default packaging).
+        let manifest = make_manifest_with_plugin(
+            "kotlin-serialization",
+            "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin",
+            "2.1.0",
+        );
+        let artifacts = resolve_plugin_artifacts(&manifest).unwrap();
+        assert!(
+            artifacts[0].url.ends_with(".jar"),
+            "plugin URL should end with .jar: {}",
+            artifacts[0].url
+        );
+    }
+
+    #[test]
+    fn build_plugin_locks_preserves_ordering() {
+        let results = vec![
+            PluginArtifactResult {
+                plugin_name: "z-plugin".to_owned(),
+                path: PathBuf::from("/cache/z.jar"),
+                sha256: "hash-z".to_owned(),
+                url: "https://example.com/z.jar".to_owned(),
+                freshly_downloaded: true,
+                maven: "com.example:z-plugin".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            PluginArtifactResult {
+                plugin_name: "a-plugin".to_owned(),
+                path: PathBuf::from("/cache/a.jar"),
+                sha256: "hash-a".to_owned(),
+                url: "https://example.com/a.jar".to_owned(),
+                freshly_downloaded: false,
+                maven: "com.example:a-plugin".to_owned(),
+                version: "2.0.0".to_owned(),
+            },
+        ];
+        let locks = build_plugin_locks(&results);
+        assert_eq!(locks.len(), 2);
+        // Order must match input order, not sorted.
+        assert_eq!(locks[0].name, "z-plugin");
+        assert_eq!(locks[1].name, "a-plugin");
+    }
+
+    #[test]
+    fn map_download_err_maps_download_error() {
+        let err = konvoy_util::error::UtilError::Download {
+            message: "connection refused".to_owned(),
+        };
+        let engine_err = map_download_err("my-plugin", err);
+        let msg = engine_err.to_string();
+        assert!(
+            msg.contains("my-plugin"),
+            "error should mention plugin name: {msg}"
+        );
+        assert!(
+            msg.contains("connection refused"),
+            "error should mention cause: {msg}"
+        );
+    }
+
+    #[test]
+    fn map_download_err_maps_hash_mismatch() {
+        let err = konvoy_util::error::UtilError::ArtifactHashMismatch {
+            path: "/cache/my-plugin.jar".to_owned(),
+            expected: "aaa".to_owned(),
+            actual: "bbb".to_owned(),
+        };
+        let engine_err = map_download_err("my-plugin", err);
+        let msg = engine_err.to_string();
+        assert!(
+            msg.contains("hash mismatch"),
+            "error should mention hash mismatch: {msg}"
+        );
+        assert!(msg.contains("aaa"), "error should mention expected: {msg}");
+        assert!(msg.contains("bbb"), "error should mention actual: {msg}");
+    }
+
+    #[test]
+    fn map_download_err_passes_through_other_errors() {
+        let err = konvoy_util::error::UtilError::NoHomeDir;
+        let engine_err = map_download_err("my-plugin", err);
+        let msg = engine_err.to_string();
+        assert!(
+            msg.contains("home directory"),
+            "other errors should pass through: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_plugin_artifacts_with_both_plugins_and_deps() {
+        // Manifest has both plugins and dependencies — plugins should resolve independently.
+        let mut plugins = BTreeMap::new();
+        plugins.insert(
+            "kotlin-serialization".to_owned(),
+            konvoy_config::manifest::DependencySpec {
+                path: None,
+                maven: Some("org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned()),
+                version: Some("{kotlin}".to_owned()),
+            },
+        );
+        let mut dependencies = BTreeMap::new();
+        dependencies.insert(
+            "kotlinx-coroutines".to_owned(),
+            konvoy_config::manifest::DependencySpec {
+                path: None,
+                maven: Some("org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned()),
+                version: Some("1.8.0".to_owned()),
+            },
+        );
+        let manifest = Manifest {
+            package: default_package(),
+            toolchain: default_toolchain(),
+            dependencies,
+            plugins,
+        };
+        let artifacts = resolve_plugin_artifacts(&manifest).unwrap();
+        // Only plugin artifacts, not dependency artifacts.
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].plugin_name, "kotlin-serialization");
+    }
+
+    #[test]
+    fn find_lockfile_hash_ignores_dependency_entries() {
+        // Lockfile has deps but no plugins — plugin lookup should return None.
+        let mut lockfile = Lockfile::default();
+        lockfile
+            .dependencies
+            .push(konvoy_config::lockfile::DependencyLock {
+                name: "kotlin-serialization".to_owned(),
+                source: konvoy_config::lockfile::DepSource::Path {
+                    path: "../serial".to_owned(),
+                },
+                source_hash: "abcdef".to_owned(),
+            });
+        // Same name as a dep but should not be found as a plugin.
+        let hash = find_lockfile_hash(&lockfile, "kotlin-serialization");
+        assert!(
+            hash.is_none(),
+            "plugin lookup should not match dependency entries"
+        );
+    }
+
     // -- Helpers ---------------------------------------------------------------
 
     fn default_package() -> konvoy_config::manifest::Package {

@@ -1024,6 +1024,94 @@ url = "https://example.com/plugin.jar"
         );
     }
 
+    #[test]
+    fn round_trip_with_both_plugins_and_deps() {
+        // A lockfile with both [[dependencies]] and [[plugins]] should round-trip correctly.
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+
+        // Add a dependency.
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "dep-hash".to_owned());
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-coroutines".to_owned(),
+            source: DepSource::Maven {
+                version: "1.8.0".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
+                targets,
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "dep-source-hash".to_owned(),
+        });
+
+        // Add a plugin.
+        lockfile.plugins.push(PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "plugin-hash".to_owned(),
+            url: "https://example.com/plugin.jar".to_owned(),
+        });
+
+        lockfile.write_to(&path).unwrap();
+        let reparsed = Lockfile::from_path(&path).unwrap();
+        assert_eq!(lockfile, reparsed);
+        assert_eq!(reparsed.dependencies.len(), 1);
+        assert_eq!(reparsed.plugins.len(), 1);
+    }
+
+    #[test]
+    fn plugin_lock_url_with_query_params_round_trips() {
+        // URLs with query parameters should round-trip correctly.
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(PluginLock {
+            name: "my-plugin".to_owned(),
+            maven: "com.example:my-plugin".to_owned(),
+            version: "1.0.0".to_owned(),
+            sha256: "abc".to_owned(),
+            url: "https://repo.example.com/artifacts/my-plugin-1.0.0.jar?token=abc&ts=123"
+                .to_owned(),
+        });
+        lockfile.write_to(&path).unwrap();
+        let reparsed = Lockfile::from_path(&path).unwrap();
+        assert_eq!(lockfile, reparsed);
+        assert_eq!(
+            reparsed.plugins[0].url,
+            "https://repo.example.com/artifacts/my-plugin-1.0.0.jar?token=abc&ts=123"
+        );
+    }
+
+    #[test]
+    fn plugin_lock_missing_required_fields_rejected() {
+        // A [[plugins]] entry missing a required field (e.g. version) should be rejected.
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        fs::write(
+            &path,
+            r#"
+[toolchain]
+konanc_version = "2.1.0"
+
+[[plugins]]
+name = "my-plugin"
+maven = "com.example:my-plugin"
+sha256 = "abc123"
+url = "https://example.com/plugin.jar"
+"#,
+        )
+        .unwrap();
+
+        let result = Lockfile::from_path(&path);
+        assert!(
+            result.is_err(),
+            "plugin lock missing version should be rejected"
+        );
+    }
+
     mod property_tests {
         use super::*;
         use proptest::prelude::*;

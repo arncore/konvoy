@@ -3025,4 +3025,204 @@ linux_x64 = "1111"
             other => panic!("expected Maven source, got: {other:?}"),
         }
     }
+
+    #[test]
+    fn check_lockfile_staleness_wrong_plugin_name_errors() {
+        // Manifest declares "kotlin-serialization" but lockfile only has "kotlin-allopen".
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-allopen".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-allopen-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "abc123".to_owned(),
+            url: "https://example.com/allopen.jar".to_owned(),
+        });
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(
+            result.is_err(),
+            "lockfile with wrong plugin name should fail staleness check"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("lockfile is out of date"),
+            "expected staleness error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn update_lockfile_locked_mode_with_plugin_changes_errors() {
+        // In --locked mode, if plugin locks differ, it should error.
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "oldhash".to_owned(),
+            url: "https://example.com/old.jar".to_owned(),
+        });
+        lockfile.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        // New plugin locks differ from what's in the lockfile.
+        let new_plugin_locks = vec![konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "newhash".to_owned(),
+            url: "https://example.com/new.jar".to_owned(),
+        }];
+
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        let result = update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            &new_plugin_locks,
+            tmp.path(),
+            &lockfile_path,
+            false,
+            true, // locked = true
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("lockfile is out of date"),
+            "expected lockfile update error in locked mode, got: {err}"
+        );
+    }
+
+    #[test]
+    fn update_lockfile_writes_both_plugins_and_deps() {
+        // When both plugins and deps change, both should be written to lockfile.
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile = Lockfile::default();
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        let dep = crate::resolve::ResolvedDep {
+            name: "my-lib".to_owned(),
+            project_root: tmp.path().join("my-lib"),
+            manifest: konvoy_config::manifest::Manifest::from_str(
+                "[package]\nname = \"my-lib\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+                "konvoy.toml",
+            )
+            .unwrap(),
+            dep_names: Vec::new(),
+            source_hash: "dephash".to_owned(),
+        };
+        let graph = crate::resolve::ResolvedGraph { order: vec![dep] };
+
+        let plugin_locks = vec![konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: "pluginhash".to_owned(),
+            url: "https://example.com/plugin.jar".to_owned(),
+        }];
+
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &graph,
+            &plugin_locks,
+            tmp.path(),
+            &lockfile_path,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let reparsed = Lockfile::from_path(&lockfile_path).unwrap();
+        assert_eq!(reparsed.dependencies.len(), 1);
+        assert_eq!(reparsed.plugins.len(), 1);
+        assert_eq!(reparsed.dependencies[0].name, "my-lib");
+        assert_eq!(reparsed.plugins[0].name, "kotlin-serialization");
+    }
+
+    #[test]
+    fn lockfile_toml_content_includes_plugins() {
+        // Adding plugins to a lockfile should change the serialized content,
+        // which means plugins affect the cache key.
+        let lockfile_no_plugins = Lockfile::with_toolchain("2.1.0");
+        let mut lockfile_with_plugins = Lockfile::with_toolchain("2.1.0");
+        lockfile_with_plugins
+            .plugins
+            .push(konvoy_config::lockfile::PluginLock {
+                name: "kotlin-serialization".to_owned(),
+                maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+                version: "2.1.0".to_owned(),
+                sha256: "abc123".to_owned(),
+                url: "https://example.com/plugin.jar".to_owned(),
+            });
+
+        let content_without = lockfile_toml_content(&lockfile_no_plugins).unwrap();
+        let content_with = lockfile_toml_content(&lockfile_with_plugins).unwrap();
+
+        assert_ne!(
+            content_without, content_with,
+            "lockfile content should differ when plugins are present"
+        );
+        assert!(
+            content_with.contains("kotlin-serialization"),
+            "lockfile content should include plugin name"
+        );
+    }
+
+    #[test]
+    fn pre_stabilization_preserves_plugins_from_disk() {
+        // When the lockfile on disk has plugins and the toolchain version changes,
+        // the pre-stabilized lockfile should preserve the plugin entries.
+        let mut on_disk = Lockfile::with_toolchain("2.0.0");
+        on_disk.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.0.0".to_owned(),
+            sha256: "oldhash".to_owned(),
+            url: "https://example.com/old.jar".to_owned(),
+        });
+
+        let new_version = "2.1.0";
+
+        // Simulate the pre-stabilization path from build().
+        let stabilized = match &on_disk.toolchain {
+            Some(tc) if tc.konanc_version == new_version => on_disk.clone(),
+            _ => {
+                let mut s = Lockfile::with_managed_toolchain(new_version, None, None);
+                s.dependencies = on_disk.dependencies.clone();
+                s.plugins = on_disk.plugins.clone();
+                s
+            }
+        };
+
+        // Plugins should be preserved.
+        assert_eq!(stabilized.plugins.len(), 1);
+        assert_eq!(stabilized.plugins[0].name, "kotlin-serialization");
+        // Toolchain should be updated.
+        assert_eq!(
+            stabilized.toolchain.as_ref().unwrap().konanc_version,
+            new_version
+        );
+    }
 }

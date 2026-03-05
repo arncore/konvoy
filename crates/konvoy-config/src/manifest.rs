@@ -1357,6 +1357,151 @@ bad-dep = {{}}
         assert!(err.contains("maven"), "error should mention maven: {err}");
     }
 
+    #[test]
+    fn reject_plugin_empty_version() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.my-plugin]
+maven = "com.example:plugin"
+version = ""
+"#
+        );
+        // Empty version is technically valid TOML — but resolve_plugin_artifacts
+        // will produce an empty version string. The manifest validation only
+        // checks for missing `version`, so empty string parses but is useless.
+        // This test documents current behavior.
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        // Empty version string is accepted at manifest parse time (not validated further).
+        assert!(
+            result.is_ok(),
+            "empty version string is accepted by manifest parser"
+        );
+    }
+
+    #[test]
+    fn reject_plugin_with_both_path_and_maven() {
+        // A plugin with both path and maven should be rejected (path check comes first).
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.my-plugin]
+path = "../plugin"
+maven = "com.example:plugin"
+version = "1.0"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("plugins must use `maven`"), "error was: {err}");
+    }
+
+    #[test]
+    fn plugins_and_dependencies_both_present() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+version = "{{kotlin}}"
+
+[dependencies]
+kotlinx-coroutines = {{ maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }}
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        assert_eq!(manifest.plugins.len(), 1);
+        assert_eq!(manifest.dependencies.len(), 1);
+        assert!(manifest.plugins.contains_key("kotlin-serialization"));
+        assert!(manifest.dependencies.contains_key("kotlinx-coroutines"));
+    }
+
+    #[test]
+    fn plugins_only_no_dependencies() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+version = "{{kotlin}}"
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        assert_eq!(manifest.plugins.len(), 1);
+        assert!(manifest.dependencies.is_empty());
+    }
+
+    #[test]
+    fn round_trip_with_both_plugins_and_deps() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[dependencies]
+kotlinx-coroutines = {{ maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }}
+
+[plugins]
+kotlin-serialization = {{ maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{{kotlin}}" }}
+"#
+        );
+        let original = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        let serialized = original.to_toml().unwrap();
+        let reparsed = Manifest::from_str(&serialized, "konvoy.toml").unwrap();
+        assert_eq!(original, reparsed);
+        assert_eq!(reparsed.plugins.len(), 1);
+        assert_eq!(reparsed.dependencies.len(), 1);
+    }
+
+    #[test]
+    fn plugin_maven_coordinate_with_dots_in_group() {
+        // Maven coordinates with deeply nested groups should be valid.
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.my-plugin]
+maven = "com.very.deep.package.name:my-artifact"
+version = "1.0.0"
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        let plugin = manifest.plugins.get("my-plugin").unwrap();
+        assert_eq!(
+            plugin.maven.as_deref(),
+            Some("com.very.deep.package.name:my-artifact")
+        );
+    }
+
+    #[test]
+    fn reject_plugin_maven_only_colon() {
+        // A maven coordinate that is just ":" should be rejected.
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[plugins.bad-plugin]
+maven = ":"
+version = "1.0"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid maven coordinate"), "error was: {err}");
+    }
+
     mod property_tests {
         use super::*;
         use proptest::prelude::*;
