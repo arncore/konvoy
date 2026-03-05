@@ -150,11 +150,7 @@ fn validate(manifest: &Manifest, path: &str) -> Result<(), ManifestError> {
                 reason: "plugin must have `version` set".to_owned(),
             });
         }
-        if spec
-            .version
-            .as_ref()
-            .is_some_and(|v| v.trim().is_empty())
-        {
+        if spec.version.as_ref().is_some_and(|v| v.trim().is_empty()) {
             return Err(ManifestError::InvalidPluginConfig {
                 path: path.to_owned(),
                 name: name.clone(),
@@ -216,11 +212,7 @@ fn validate(manifest: &Manifest, path: &str) -> Result<(), ManifestError> {
             });
         }
         // Empty or whitespace-only version is an error.
-        if spec
-            .version
-            .as_ref()
-            .is_some_and(|v| v.trim().is_empty())
-        {
+        if spec.version.as_ref().is_some_and(|v| v.trim().is_empty()) {
             return Err(ManifestError::DependencyEmptyVersion {
                 path: path.to_owned(),
                 name: name.clone(),
