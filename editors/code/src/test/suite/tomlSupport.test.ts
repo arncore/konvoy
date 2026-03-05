@@ -303,6 +303,55 @@ kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-comp
         assert.ok(!hasError(diags, 'version'));
     });
 
+    // ── Sub-table plugin format [plugins.name] ──────────────────────────
+
+    test('sub-table plugin without maven is flagged', () => {
+        const text = `
+[package]
+name = "hello"
+
+[toolchain]
+kotlin = "2.1.0"
+
+[plugins.kotlin-serialization]
+version = "{kotlin}"
+`.trim();
+        const diags = validateManifest(text);
+        assert.ok(hasError(diags, 'must have "maven" set'));
+    });
+
+    test('sub-table plugin without version is flagged', () => {
+        const text = `
+[package]
+name = "hello"
+
+[toolchain]
+kotlin = "2.1.0"
+
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+`.trim();
+        const diags = validateManifest(text);
+        assert.ok(hasError(diags, 'must have "version" set'));
+    });
+
+    test('sub-table plugin with maven and version passes', () => {
+        const text = `
+[package]
+name = "hello"
+
+[toolchain]
+kotlin = "2.1.0"
+
+[plugins.kotlin-serialization]
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+version = "{kotlin}"
+`.trim();
+        const diags = validateManifest(text);
+        assert.ok(!hasError(diags, 'maven'));
+        assert.ok(!hasError(diags, 'version'));
+    });
+
     test('default bin entrypoint without .kt extension is flagged', () => {
         const text = `
 [package]

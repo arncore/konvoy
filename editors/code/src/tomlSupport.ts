@@ -214,6 +214,33 @@ export function validateManifest(text: string): TomlDiagnostic[] {
         }
     }
 
+    // Validate [plugins.*] sub-table format
+    for (const section of sections) {
+        if (!section.name.startsWith('plugins.')) {
+            continue;
+        }
+        const pluginName = section.name.substring('plugins.'.length);
+        const pluginKvs = kvBySection.get(section.name) ?? [];
+        const pluginKeys = new Map(pluginKvs.map(kv => [kv.key, kv]));
+        const hasMaven = pluginKeys.has('maven');
+        const hasVersion = pluginKeys.has('version');
+
+        if (!hasMaven) {
+            diagnostics.push({
+                line: section.line, col: 0, endCol: lines[section.line].length,
+                message: `Plugin "${pluginName}" must have "maven" set to a groupId:artifactId coordinate.`,
+                severity: vscode.DiagnosticSeverity.Error,
+            });
+        }
+        if (!hasVersion) {
+            diagnostics.push({
+                line: section.line, col: 0, endCol: lines[section.line].length,
+                message: `Plugin "${pluginName}" must have "version" set.`,
+                severity: vscode.DiagnosticSeverity.Error,
+            });
+        }
+    }
+
     // Validate [dependencies.*]
     for (const section of sections) {
         if (!section.name.startsWith('dependencies.')) {
