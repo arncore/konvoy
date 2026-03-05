@@ -80,21 +80,22 @@
     },
     "plugins": {
       "type": "object",
-      "description": "Compiler plugins.",
+      "description": "Compiler plugins. Each entry uses { maven = \"groupId:artifactId\", version = \"...\" }.",
       "additionalProperties": {
         "type": "object",
-        "required": ["version"],
+        "required": ["maven", "version"],
         "additionalProperties": false,
         "properties": {
+          "maven": {
+            "type": "string",
+            "description": "Maven coordinate in groupId:artifactId format.",
+            "pattern": "^[^:]+:[^:]+$",
+            "minLength": 3
+          },
           "version": {
             "type": "string",
-            "description": "Plugin version.",
+            "description": "Plugin version. Use \"{kotlin}\" to match the toolchain Kotlin version.",
             "minLength": 1
-          },
-          "modules": {
-            "type": "array",
-            "items": { "type": "string" },
-            "description": "Specific modules to include."
           }
         }
       }
