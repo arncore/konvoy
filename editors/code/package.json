@@ -249,9 +249,10 @@
     "build": "esbuild --bundle src/extension.ts --outfile=out/extension.js --external:vscode --platform=node --format=cjs --minify",
     "watch": "esbuild --bundle src/extension.ts --outfile=out/extension.js --external:vscode --platform=node --format=cjs --watch",
     "lint": "eslint src --ext ts",
+    "clean": "rm -rf out",
     "compile-tests": "tsc -p tsconfig.json",
     "test": "node ./out/test/runTests.js",
-    "pretest": "npm run build && npm run compile-tests",
+    "pretest": "npm run clean && npm run build && npm run compile-tests",
     "package": "vsce package"
   },
   "devDependencies": {
