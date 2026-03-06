@@ -78,7 +78,8 @@
       },
       {
         "command": "konvoy.doctor",
-        "title": "Konvoy: Doctor"
+        "title": "Konvoy: Doctor",
+        "icon": "$(pulse)"
       },
       {
         "command": "konvoy.toolchainInstall",
@@ -201,6 +202,11 @@
           "command": "konvoy.cleanConfirm",
           "group": "navigation@3",
           "when": "resourceFilename == 'konvoy.toml' || resourceExtname == '.kt'"
+        },
+        {
+          "command": "konvoy.doctor",
+          "group": "navigation@4",
+          "when": "resourceFilename == 'konvoy.toml'"
         }
       ],
       "editor/title/run": [
