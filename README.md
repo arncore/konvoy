@@ -199,13 +199,13 @@ konvoy build     # downloads only the klib needed for your host target
 `konvoy update` performs these steps:
 
 1. Reads `[dependencies]` from `konvoy.toml`
-2. Fetches each dependency's POM from Maven Central
-3. Walks transitive dependencies via POM `<dependency>` entries (BFS)
-4. Detects version conflicts and dependency cycles with actionable errors
-5. Downloads the per-target `.klib` for each supported platform
-6. Writes SHA-256 hashes to `konvoy.lock`
+2. Fetches artifact metadata (`.module` JSON first, POM XML as fallback) from Maven Central
+3. Resolves transitive dependencies via BFS with cycle detection
+4. Detects version conflicts with actionable errors
+5. Downloads the per-target `.klib` for each supported platform and computes SHA-256 hashes (also discovers cinterop klibs from `.module` metadata)
+6. Writes the full dependency set to `konvoy.lock` with `required_by` for transitive deps
 
-At build time (`konvoy build`), only the klib for your current host target is downloaded from the Maven cache. Subsequent builds reuse cached artifacts from `~/.konvoy/cache/maven/`.
+At build time (`konvoy build`), only the klib for your current host target is needed. Subsequent builds reuse cached artifacts from `~/.konvoy/cache/maven/`.
 
 #### Lockfile
 
