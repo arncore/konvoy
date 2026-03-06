@@ -65,7 +65,7 @@
       {
         "command": "konvoy.clean",
         "title": "Konvoy: Clean",
-        "icon": "$(clear-all)"
+        "icon": "$(eraser)"
       },
       {
         "command": "konvoy.cleanAll",
@@ -74,7 +74,7 @@
       {
         "command": "konvoy.cleanConfirm",
         "title": "Konvoy: Clean (Confirm)",
-        "icon": "$(clear-all)"
+        "icon": "$(eraser)"
       },
       {
         "command": "konvoy.doctor",
