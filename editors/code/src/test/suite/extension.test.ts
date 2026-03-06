@@ -78,6 +78,8 @@ suite('extension lifecycle', () => {
             'konvoy.lint',
             'konvoy.update',
             'konvoy.clean',
+            'konvoy.cleanAll',
+            'konvoy.cleanConfirm',
             'konvoy.doctor',
             'konvoy.toolchainInstall',
             'konvoy.toolchainList',

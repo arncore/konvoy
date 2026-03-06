@@ -10,6 +10,8 @@ const EXPECTED_COMMAND_IDS = [
     'konvoy.lint',
     'konvoy.update',
     'konvoy.clean',
+    'konvoy.cleanAll',
+    'konvoy.cleanConfirm',
     'konvoy.doctor',
     'konvoy.toolchainInstall',
     'konvoy.toolchainList',
@@ -36,24 +38,24 @@ suite('Commands', () => {
         }
     });
 
-    test('registerCommands returns 11 disposables', () => {
+    test('registerCommands returns 13 disposables', () => {
         assert.strictEqual(
             disposables.length,
-            11,
-            `Expected 11 disposables, got ${disposables.length}`,
+            13,
+            `Expected 13 disposables (12 COMMANDS + 1 cleanConfirm), got ${disposables.length}`,
         );
         for (const d of disposables) {
             assert.ok(d.dispose, 'Each disposable must have a dispose method');
         }
     });
 
-    test('all 11 konvoy commands are registered', async () => {
+    test('all 13 konvoy commands are registered', async () => {
         const allCommands = await vscode.commands.getCommands(true);
         const konvoyCommands = allCommands.filter(id => id.startsWith('konvoy.'));
         assert.strictEqual(
             konvoyCommands.length,
-            11,
-            `Expected 11 konvoy commands, got ${konvoyCommands.length}: ${JSON.stringify(konvoyCommands)}`,
+            13,
+            `Expected 13 konvoy commands, got ${konvoyCommands.length}: ${JSON.stringify(konvoyCommands)}`,
         );
     });
 
@@ -154,6 +156,90 @@ suite('Commands', () => {
             detektCommands[0].id,
             'konvoy.lint',
             `Expected konvoy.lint to be the only useDetektParser command, got "${detektCommands[0].id}"`,
+        );
+    });
+
+    // --- cleanAll command tests ---
+
+    test('COMMANDS array contains konvoy.cleanAll', () => {
+        const cleanAll = COMMANDS.find(
+            (c: { id: string }) => c.id === 'konvoy.cleanAll',
+        );
+        assert.ok(cleanAll, 'konvoy.cleanAll must be in COMMANDS array');
+    });
+
+    test('konvoy.cleanAll has correct args ["clean", "--all"]', () => {
+        const cleanAll = COMMANDS.find(
+            (c: { id: string }) => c.id === 'konvoy.cleanAll',
+        );
+        assert.ok(cleanAll, 'konvoy.cleanAll must exist');
+        assert.deepStrictEqual(
+            cleanAll.args,
+            ['clean', '--all'],
+            `Expected args ["clean", "--all"], got ${JSON.stringify(cleanAll.args)}`,
+        );
+    });
+
+    test('konvoy.cleanAll does not parse diagnostics', () => {
+        const cleanAll = COMMANDS.find(
+            (c: { id: string }) => c.id === 'konvoy.cleanAll',
+        );
+        assert.ok(cleanAll, 'konvoy.cleanAll must exist');
+        assert.strictEqual(
+            cleanAll.parseDiagnostics,
+            false,
+            'konvoy.cleanAll should not parse diagnostics',
+        );
+    });
+
+    // --- cleanConfirm command tests ---
+
+    test('konvoy.cleanConfirm is registered as a VS Code command', async () => {
+        const allCommands = await vscode.commands.getCommands(true);
+        assert.ok(
+            allCommands.includes('konvoy.cleanConfirm'),
+            'konvoy.cleanConfirm must be registered',
+        );
+    });
+
+    test('konvoy.cleanConfirm is not in COMMANDS array (it is a separate registration)', () => {
+        const cleanConfirm = COMMANDS.find(
+            (c: { id: string }) => c.id === 'konvoy.cleanConfirm',
+        );
+        assert.strictEqual(
+            cleanConfirm,
+            undefined,
+            'konvoy.cleanConfirm should not be in the COMMANDS array — it is registered separately in registerCommands()',
+        );
+    });
+
+    test('executing konvoy.cleanConfirm without workspace does not throw', async () => {
+        try {
+            await vscode.commands.executeCommand('konvoy.cleanConfirm');
+        } catch (err) {
+            assert.fail(`konvoy.cleanConfirm threw an unexpected error: ${err}`);
+        }
+    });
+
+    // --- COMMANDS array completeness ---
+
+    test('COMMANDS array has exactly 12 entries', () => {
+        assert.strictEqual(
+            COMMANDS.length,
+            12,
+            `Expected 12 entries in COMMANDS array, got ${COMMANDS.length}`,
+        );
+    });
+
+    test('konvoy.clean has correct args ["clean"]', () => {
+        const clean = COMMANDS.find(
+            (c: { id: string }) => c.id === 'konvoy.clean',
+        );
+        assert.ok(clean, 'konvoy.clean must exist');
+        assert.deepStrictEqual(
+            clean.args,
+            ['clean'],
+            `Expected args ["clean"], got ${JSON.stringify(clean.args)}`,
         );
     });
 });
