@@ -202,12 +202,12 @@
           "when": "resourceFilename == 'konvoy.toml' || resourceFilename == 'konvoy.lock' || resourceExtname == '.kt'"
         },
         {
-          "command": "konvoy.lint",
+          "command": "konvoy.update",
           "group": "navigation@3",
           "when": "resourceFilename == 'konvoy.toml' || resourceFilename == 'konvoy.lock' || resourceExtname == '.kt'"
         },
         {
-          "command": "konvoy.update",
+          "command": "konvoy.lint",
           "group": "navigation@4",
           "when": "resourceFilename == 'konvoy.toml' || resourceFilename == 'konvoy.lock' || resourceExtname == '.kt'"
         },
