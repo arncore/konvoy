@@ -57,7 +57,7 @@ suite('package.json manifest validation', () => {
         'konvoy.toolchainInstall',
         'konvoy.toolchainList',
         'konvoy.cleanAll',
-        'konvoy.toggleRunProfile',
+        'konvoy.toggleRunVariant',
     ];
 
     test('all commands except toolchain and cleanAll have icons', () => {
@@ -279,14 +279,14 @@ suite('package.json manifest validation', () => {
 
     // --- Command existence and title tests ---
 
-    test('konvoy.toggleRunProfile command exists in package.json', () => {
-        const cmd = pkg.contributes.commands.find(c => c.command === 'konvoy.toggleRunProfile');
-        assert.ok(cmd, 'konvoy.toggleRunProfile must exist in package.json commands array');
+    test('konvoy.toggleRunVariant command exists in package.json', () => {
+        const cmd = pkg.contributes.commands.find(c => c.command === 'konvoy.toggleRunVariant');
+        assert.ok(cmd, 'konvoy.toggleRunVariant must exist in package.json commands array');
     });
 
-    test('konvoy.toggleRunProfile has correct title', () => {
-        const cmd = pkg.contributes.commands.find(c => c.command === 'konvoy.toggleRunProfile');
-        assert.ok(cmd, 'konvoy.toggleRunProfile must exist');
+    test('konvoy.toggleRunVariant has correct title', () => {
+        const cmd = pkg.contributes.commands.find(c => c.command === 'konvoy.toggleRunVariant');
+        assert.ok(cmd, 'konvoy.toggleRunVariant must exist');
         assert.strictEqual(
             cmd!.title,
             'Konvoy: Toggle Debug/Release',

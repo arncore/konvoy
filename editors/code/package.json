@@ -56,7 +56,7 @@
         "icon": "$(play)"
       },
       {
-        "command": "konvoy.toggleRunProfile",
+        "command": "konvoy.toggleRunVariant",
         "title": "Konvoy: Toggle Debug/Release"
       },
       {

@@ -2,11 +2,11 @@ import * as assert from 'assert';
 import * as vscode from 'vscode';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const { initProfile, _testing } = require('../../profileManager');
+const { initVariant, _testing } = require('../../variantManager');
 
 /**
  * Creates a minimal mock of vscode.ExtensionContext sufficient for
- * testing initProfile without a real extension host.
+ * testing initVariant without a real extension host.
  */
 function createMockContext(): vscode.ExtensionContext {
     const store = new Map<string, unknown>();
@@ -49,14 +49,14 @@ function createMockContext(): vscode.ExtensionContext {
     } as unknown as vscode.ExtensionContext;
 }
 
-suite('profileManager', () => {
+suite('variantManager', () => {
     let disposables: vscode.Disposable[] = [];
     let mockContext: vscode.ExtensionContext;
 
     suiteSetup(() => {
         _testing.resetState();
         mockContext = createMockContext();
-        disposables = initProfile(mockContext);
+        disposables = initVariant(mockContext);
     });
 
     suiteTeardown(() => {
@@ -73,29 +73,29 @@ suite('profileManager', () => {
         assert.strictEqual(typeof _testing.resetState, 'function', '_testing.resetState must be a function');
     });
 
-    // --- Default profile ---
+    // --- Default variant ---
 
-    test('default profile is debug', () => {
+    test('default variant is debug', () => {
         assert.strictEqual(
-            _testing.getRunProfile(),
+            _testing.getRunVariant(),
             'debug',
-            'Default run profile should be "debug"',
+            'Default run variant should be "debug"',
         );
     });
 
-    test('getRunProfile returns debug or release', () => {
-        const profile = _testing.getRunProfile();
+    test('getRunVariant returns debug or release', () => {
+        const variant = _testing.getRunVariant();
         assert.ok(
-            profile === 'debug' || profile === 'release',
-            `getRunProfile() must return "debug" or "release", got "${profile}"`,
+            variant === 'debug' || variant === 'release',
+            `getRunVariant() must return "debug" or "release", got "${variant}"`,
         );
     });
 
-    // --- initProfile ---
+    // --- initVariant ---
 
-    test('initProfile returns a disposables array', () => {
-        assert.ok(Array.isArray(disposables), 'initProfile must return an array');
-        assert.ok(disposables.length > 0, 'initProfile must return at least one disposable');
+    test('initVariant returns a disposables array', () => {
+        assert.ok(Array.isArray(disposables), 'initVariant must return an array');
+        assert.ok(disposables.length > 0, 'initVariant must return at least one disposable');
         for (const d of disposables) {
             assert.ok(typeof d.dispose === 'function', 'Each item must have a dispose method');
         }
@@ -103,9 +103,9 @@ suite('profileManager', () => {
 
     // --- Status bar item ---
 
-    test('initProfile creates a status bar item', () => {
+    test('initVariant creates a status bar item', () => {
         const item = _testing.getStatusBarItem();
-        assert.ok(item, 'Status bar item must be created after initProfile');
+        assert.ok(item, 'Status bar item must be created after initVariant');
     });
 
     test('status bar item has correct initial text "$(debug-alt) Debug"', () => {
@@ -118,13 +118,13 @@ suite('profileManager', () => {
         );
     });
 
-    test('status bar item command is konvoy.toggleRunProfile', () => {
+    test('status bar item command is konvoy.toggleRunVariant', () => {
         const item = _testing.getStatusBarItem();
         assert.ok(item, 'Status bar item must exist');
         assert.strictEqual(
             item.command,
-            'konvoy.toggleRunProfile',
-            `Expected command "konvoy.toggleRunProfile", got "${item.command}"`,
+            'konvoy.toggleRunVariant',
+            `Expected command "konvoy.toggleRunVariant", got "${item.command}"`,
         );
     });
 
@@ -139,15 +139,15 @@ suite('profileManager', () => {
 
     // --- Toggle behavior ---
 
-    test('toggle switches profile from debug to release', async () => {
-        assert.strictEqual(_testing.getRunProfile(), 'debug', 'precondition: profile is debug');
+    test('toggle switches variant from debug to release', async () => {
+        assert.strictEqual(_testing.getRunVariant(), 'debug', 'precondition: variant is debug');
 
-        await vscode.commands.executeCommand('konvoy.toggleRunProfile');
+        await vscode.commands.executeCommand('konvoy.toggleRunVariant');
 
         assert.strictEqual(
-            _testing.getRunProfile(),
+            _testing.getRunVariant(),
             'release',
-            'Profile should be "release" after toggling from debug',
+            'Variant should be "release" after toggling from debug',
         );
     });
 
@@ -161,15 +161,15 @@ suite('profileManager', () => {
         );
     });
 
-    test('toggle switches profile back from release to debug', async () => {
-        assert.strictEqual(_testing.getRunProfile(), 'release', 'precondition: profile is release');
+    test('toggle switches variant back from release to debug', async () => {
+        assert.strictEqual(_testing.getRunVariant(), 'release', 'precondition: variant is release');
 
-        await vscode.commands.executeCommand('konvoy.toggleRunProfile');
+        await vscode.commands.executeCommand('konvoy.toggleRunVariant');
 
         assert.strictEqual(
-            _testing.getRunProfile(),
+            _testing.getRunVariant(),
             'debug',
-            'Profile should be "debug" after toggling from release',
+            'Variant should be "debug" after toggling from release',
         );
     });
 
@@ -183,15 +183,15 @@ suite('profileManager', () => {
         );
     });
 
-    test('workspaceState persists the toggled profile', async () => {
-        await vscode.commands.executeCommand('konvoy.toggleRunProfile');
-        const stored = mockContext.workspaceState.get('konvoy.runProfile');
+    test('workspaceState persists the toggled variant', async () => {
+        await vscode.commands.executeCommand('konvoy.toggleRunVariant');
+        const stored = mockContext.workspaceState.get('konvoy.runVariant');
         assert.strictEqual(
             stored,
             'release',
             `Expected workspaceState to store "release", got "${stored}"`,
         );
         // Toggle back to debug for clean state
-        await vscode.commands.executeCommand('konvoy.toggleRunProfile');
+        await vscode.commands.executeCommand('konvoy.toggleRunVariant');
     });
 });

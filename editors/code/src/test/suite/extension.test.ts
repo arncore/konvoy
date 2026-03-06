@@ -75,7 +75,7 @@ suite('extension lifecycle', () => {
             'konvoy.buildPick',
             'konvoy.run',
             'konvoy.runRelease',
-            'konvoy.toggleRunProfile',
+            'konvoy.toggleRunVariant',
             'konvoy.test',
             'konvoy.lint',
             'konvoy.update',

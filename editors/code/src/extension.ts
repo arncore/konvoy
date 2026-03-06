@@ -6,7 +6,7 @@ import { registerCommands } from './commands';
 import { registerTaskProvider } from './taskProvider';
 import { registerTomlSupport } from './tomlSupport';
 import { disposeDiagnosticCollection } from './diagnostics';
-import { initProfile } from './profileManager';
+import { initVariant } from './variantManager';
 
 export function activate(context: vscode.ExtensionContext): void {
     const output = getOutputChannel();
@@ -25,9 +25,9 @@ export function activate(context: vscode.ExtensionContext): void {
         context.subscriptions.push(d);
     }
 
-    // Initialize run profile toggle (debug / release)
-    const profileDisposables = initProfile(context);
-    for (const d of profileDisposables) {
+    // Initialize run variant toggle (debug / release)
+    const variantDisposables = initVariant(context);
+    for (const d of variantDisposables) {
         context.subscriptions.push(d);
     }
 
