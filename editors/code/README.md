@@ -4,20 +4,7 @@ VS Code extension for [Konvoy](https://github.com/arncore/konvoy), a native-firs
 
 ## Install
 
-> **VS Code Marketplace listing coming soon.** For now, install manually using one of the methods below.
-
-### From GitHub Releases
-
-1. Download the latest `.vsix` from [Releases](https://github.com/arncore/konvoy/releases)
-2. Install it:
-   ```
-   code --install-extension konvoy-vscode-*.vsix
-   ```
-   Or in VS Code: `Ctrl+Shift+P` → "Extensions: Install from VSIX..." and select the file.
-
-### From CI artifacts
-
-Every push to `main` that changes the extension produces a `.vsix` artifact. Go to [Actions](https://github.com/arncore/konvoy/actions/workflows/vscode-extension.yml), open the latest run, and download the `konvoy-vscode` artifact.
+Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=konvoy.konvoy-vscode), or search "Konvoy" in the Extensions panel.
 
 ### From source
 
