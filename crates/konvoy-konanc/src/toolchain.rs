@@ -448,13 +448,12 @@ fn jre_platform_slug() -> Result<(&'static str, &'static str), KonancError> {
 
 /// Construct the download URL for a Kotlin/Native prebuilt tarball.
 ///
-/// Uses `download.jetbrains.com` which hosts prebuilt tarballs for all
-/// supported platforms (including linux-aarch64 which is not published
-/// to GitHub releases).
+/// Uses GitHub releases which hosts prebuilt tarballs for all supported
+/// platforms. The JetBrains CDN stopped publishing prebuilts after 2.1.10.
 fn download_url(version: &str) -> Result<String, KonancError> {
     let (os, arch) = platform_slug()?;
     Ok(format!(
-        "https://download.jetbrains.com/kotlin/native/builds/releases/{version}/{os}-{arch}/kotlin-native-prebuilt-{os}-{arch}-{version}.tar.gz"
+        "https://github.com/JetBrains/kotlin/releases/download/v{version}/kotlin-native-prebuilt-{os}-{arch}-{version}.tar.gz"
     ))
 }
 
@@ -646,7 +645,7 @@ mod tests {
             assert!(url.contains("kotlin-native-prebuilt"));
             assert!(url.contains(".tar.gz"));
             assert!(url.starts_with("https://"));
-            assert!(url.contains("download.jetbrains.com"));
+            assert!(url.contains("github.com/JetBrains/kotlin/releases"));
         }
     }
 
