@@ -3,6 +3,10 @@
 [![CI](https://github.com/arncore/konvoy/actions/workflows/ci.yml/badge.svg)](https://github.com/arncore/konvoy/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/arncore/konvoy/branch/main/graph/badge.svg)](https://codecov.io/gh/arncore/konvoy)
 
+<p align="center">
+  <img width="512" height="512" alt="konvoy_logo_under_2mb" src="https://github.com/user-attachments/assets/d300589e-eb0b-4655-a86e-5d936d36e9a4" />
+</p>
+
 Konvoy is a native-first Kotlin build tool focused on making Kotlin/Native compilation as easy, fast, and painless as Cargo.
 
 Konvoy avoids Gradle/Maven-style complexity by providing:
@@ -320,23 +324,13 @@ konvoy lint --verbose              # show raw detekt output
 
 ### VS Code
 
-> **VS Code Marketplace listing coming soon.** For now, install manually from [Releases](https://github.com/arncore/konvoy/releases).
-
-The [Konvoy for VS Code](editors/code) extension provides:
+Install [Konvoy for VS Code](https://marketplace.visualstudio.com/items?itemName=konvoy.konvoy-vscode) from the Marketplace, or search "Konvoy" in the Extensions panel.
 
 - **Commands** — Build, Run, Test, Lint, Clean, Doctor, Update, and Toolchain management via `Ctrl+Shift+P`
 - **Run button** — Play button in the editor title bar for `.kt` files and `konvoy.toml`
 - **`konvoy.toml` support** — Syntax highlighting, validation on save, autocomplete, and hover docs
 - **Diagnostics** — Build errors and detekt findings in the Problems panel
 - **Tasks** — Auto-detected konvoy tasks via `Ctrl+Shift+B`
-
-Install from [Releases](https://github.com/arncore/konvoy/releases):
-
-```
-code --install-extension konvoy-vscode-1.0.0.vsix
-```
-
-Or in VS Code: `Ctrl+Shift+P` → "Extensions: Install from VSIX..."
 
 See the [extension README](editors/code/README.md) for full details.
 
