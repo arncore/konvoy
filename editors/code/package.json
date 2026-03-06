@@ -188,7 +188,7 @@
     }
   },
   "scripts": {
-    "build": "esbuild --bundle src/extension.ts --outfile=out/extension.js --external:vscode --platform=node --format=cjs",
+    "build": "esbuild --bundle src/extension.ts --outfile=out/extension.js --external:vscode --platform=node --format=cjs --minify",
     "watch": "esbuild --bundle src/extension.ts --outfile=out/extension.js --external:vscode --platform=node --format=cjs --watch",
     "lint": "eslint src --ext ts",
     "compile-tests": "tsc -p tsconfig.json",
