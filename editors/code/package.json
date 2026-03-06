@@ -59,11 +59,18 @@
       },
       {
         "command": "konvoy.update",
-        "title": "Konvoy: Update"
+        "title": "Konvoy: Update",
+        "icon": "$(cloud-download)"
       },
       {
         "command": "konvoy.clean",
-        "title": "Konvoy: Clean"
+        "title": "Konvoy: Clean",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "konvoy.cleanConfirm",
+        "title": "Konvoy: Clean (Confirm)",
+        "icon": "$(trash)"
       },
       {
         "command": "konvoy.doctor",
@@ -178,7 +185,17 @@
       "editor/title": [
         {
           "command": "konvoy.build",
-          "group": "navigation",
+          "group": "navigation@1",
+          "when": "resourceFilename == 'konvoy.toml' || resourceExtname == '.kt'"
+        },
+        {
+          "command": "konvoy.update",
+          "group": "navigation@2",
+          "when": "resourceFilename == 'konvoy.toml'"
+        },
+        {
+          "command": "konvoy.cleanConfirm",
+          "group": "navigation@3",
           "when": "resourceFilename == 'konvoy.toml' || resourceExtname == '.kt'"
         }
       ],

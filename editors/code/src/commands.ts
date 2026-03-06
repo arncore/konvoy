@@ -123,9 +123,27 @@ function runCommand(config: CommandConfig): void {
 }
 
 export function registerCommands(): vscode.Disposable[] {
-    return COMMANDS.map((config) =>
+    const disposables = COMMANDS.map((config) =>
         vscode.commands.registerCommand(config.id, () => runCommand(config)),
     );
+
+    const cleanConfig = COMMANDS.find((c) => c.id === 'konvoy.clean');
+    if (cleanConfig) {
+        disposables.push(
+            vscode.commands.registerCommand('konvoy.cleanConfirm', async () => {
+                const choice = await vscode.window.showWarningMessage(
+                    'Remove all build artifacts (.konvoy/build/)?',
+                    { modal: true },
+                    'Clean',
+                );
+                if (choice === 'Clean') {
+                    runCommand(cleanConfig);
+                }
+            }),
+        );
+    }
+
+    return disposables;
 }
 
 /** @internal Exposed for testing only. */
