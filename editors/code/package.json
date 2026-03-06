@@ -58,7 +58,7 @@
       {
         "command": "konvoy.lint",
         "title": "Konvoy: Lint",
-        "icon": "$(checklist)"
+        "icon": "$(eye)"
       },
       {
         "command": "konvoy.update",
