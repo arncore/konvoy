@@ -27,6 +27,7 @@ export const COMMANDS: CommandConfig[] = [
     { id: 'konvoy.lint',             args: ['lint', '--verbose'],                parseDiagnostics: true,  useDetektParser: true  },
     { id: 'konvoy.update',           args: ['update'],                           parseDiagnostics: false, useDetektParser: false },
     { id: 'konvoy.clean',            args: ['clean'],                            parseDiagnostics: false, useDetektParser: false },
+    { id: 'konvoy.cleanAll',         args: ['clean', '--all'],                   parseDiagnostics: false, useDetektParser: false },
     { id: 'konvoy.doctor',           args: ['doctor'],                           parseDiagnostics: false, useDetektParser: false },
     { id: 'konvoy.toolchainInstall', args: ['toolchain', 'install'],             parseDiagnostics: false, useDetektParser: false },
     { id: 'konvoy.toolchainList',    args: ['toolchain', 'list'],                parseDiagnostics: false, useDetektParser: false },
@@ -128,16 +129,20 @@ export function registerCommands(): vscode.Disposable[] {
     );
 
     const cleanConfig = COMMANDS.find((c) => c.id === 'konvoy.clean');
-    if (cleanConfig) {
+    const cleanAllConfig = COMMANDS.find((c) => c.id === 'konvoy.cleanAll');
+    if (cleanConfig && cleanAllConfig) {
         disposables.push(
             vscode.commands.registerCommand('konvoy.cleanConfirm', async () => {
                 const choice = await vscode.window.showWarningMessage(
-                    'Remove all build artifacts (.konvoy/build/)?',
+                    'What do you want to clean?',
                     { modal: true },
-                    'Clean',
+                    'Clean (build only)',
+                    'Clean All (.konvoy/)',
                 );
-                if (choice === 'Clean') {
+                if (choice === 'Clean (build only)') {
                     runCommand(cleanConfig);
+                } else if (choice === 'Clean All (.konvoy/)') {
+                    runCommand(cleanAllConfig);
                 }
             }),
         );

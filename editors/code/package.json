@@ -68,6 +68,10 @@
         "icon": "$(trash)"
       },
       {
+        "command": "konvoy.cleanAll",
+        "title": "Konvoy: Clean All"
+      },
+      {
         "command": "konvoy.cleanConfirm",
         "title": "Konvoy: Clean (Confirm)",
         "icon": "$(trash)"
