@@ -32,7 +32,8 @@
     "commands": [
       {
         "command": "konvoy.build",
-        "title": "Konvoy: Build"
+        "title": "Konvoy: Build",
+        "icon": "$(tools)"
       },
       {
         "command": "konvoy.buildRelease",
@@ -174,6 +175,13 @@
       }
     ],
     "menus": {
+      "editor/title": [
+        {
+          "command": "konvoy.build",
+          "group": "navigation",
+          "when": "resourceFilename == 'konvoy.toml' || resourceExtname == '.kt'"
+        }
+      ],
       "editor/title/run": [
         {
           "command": "konvoy.run",
