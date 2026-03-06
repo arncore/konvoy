@@ -1,49 +1,9 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
+import { createMockContext } from './testHelpers';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { activate, deactivate } = require('../../extension');
-
-/**
- * Creates a minimal mock of vscode.ExtensionContext sufficient for
- * testing the activate/deactivate lifecycle without a real extension host.
- */
-function createMockContext(): vscode.ExtensionContext {
-    const subscriptions: vscode.Disposable[] = [];
-    return {
-        subscriptions,
-        extensionPath: __dirname,
-        extensionUri: vscode.Uri.file(__dirname),
-        globalState: {
-            get: () => undefined,
-            update: () => Promise.resolve(),
-            keys: () => [],
-            setKeysForSync: () => {},
-        },
-        workspaceState: {
-            get: () => undefined,
-            update: () => Promise.resolve(),
-            keys: () => [],
-        },
-        secrets: {
-            get: () => Promise.resolve(undefined),
-            store: () => Promise.resolve(),
-            delete: () => Promise.resolve(),
-            onDidChange: new vscode.EventEmitter<vscode.SecretStorageChangeEvent>().event,
-        },
-        asAbsolutePath: (relativePath: string) => relativePath,
-        environmentVariableCollection: {} as any,
-        storagePath: undefined,
-        globalStoragePath: __dirname,
-        logPath: __dirname,
-        storageUri: undefined,
-        globalStorageUri: vscode.Uri.file(__dirname),
-        logUri: vscode.Uri.file(__dirname),
-        extensionMode: vscode.ExtensionMode.Test,
-        extension: {} as any,
-        languageModelAccessInformation: {} as any,
-    } as unknown as vscode.ExtensionContext;
-}
 
 suite('extension lifecycle', () => {
     let mockContext: vscode.ExtensionContext;
@@ -72,12 +32,16 @@ suite('extension lifecycle', () => {
         const expectedCommands = [
             'konvoy.build',
             'konvoy.buildRelease',
+            'konvoy.buildPick',
             'konvoy.run',
             'konvoy.runRelease',
+            'konvoy.toggleRunVariant',
             'konvoy.test',
             'konvoy.lint',
             'konvoy.update',
             'konvoy.clean',
+            'konvoy.cleanAll',
+            'konvoy.cleanConfirm',
             'konvoy.doctor',
             'konvoy.toolchainInstall',
             'konvoy.toolchainList',

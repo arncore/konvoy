@@ -27,6 +27,7 @@ export const COMMANDS: CommandConfig[] = [
     { id: 'konvoy.lint',             args: ['lint', '--verbose'],                parseDiagnostics: true,  useDetektParser: true  },
     { id: 'konvoy.update',           args: ['update'],                           parseDiagnostics: false, useDetektParser: false },
     { id: 'konvoy.clean',            args: ['clean'],                            parseDiagnostics: false, useDetektParser: false },
+    { id: 'konvoy.cleanAll',         args: ['clean', '--all'],                   parseDiagnostics: false, useDetektParser: false },
     { id: 'konvoy.doctor',           args: ['doctor'],                           parseDiagnostics: false, useDetektParser: false },
     { id: 'konvoy.toolchainInstall', args: ['toolchain', 'install'],             parseDiagnostics: false, useDetektParser: false },
     { id: 'konvoy.toolchainList',    args: ['toolchain', 'list'],                parseDiagnostics: false, useDetektParser: false },
@@ -123,9 +124,51 @@ function runCommand(config: CommandConfig): void {
 }
 
 export function registerCommands(): vscode.Disposable[] {
-    return COMMANDS.map((config) =>
+    const disposables = COMMANDS.map((config) =>
         vscode.commands.registerCommand(config.id, () => runCommand(config)),
     );
+
+    // Build variant picker (debug / release)
+    const buildConfig = COMMANDS.find((c) => c.id === 'konvoy.build');
+    const buildReleaseConfig = COMMANDS.find((c) => c.id === 'konvoy.buildRelease');
+    if (buildConfig && buildReleaseConfig) {
+        disposables.push(
+            vscode.commands.registerCommand('konvoy.buildPick', async () => {
+                const choice = await vscode.window.showQuickPick(
+                    ['Debug', 'Release'],
+                    { placeHolder: 'Select build variant' },
+                );
+                if (choice === 'Debug') {
+                    runCommand(buildConfig);
+                } else if (choice === 'Release') {
+                    runCommand(buildReleaseConfig);
+                }
+            }),
+        );
+    }
+
+    // Clean variant picker (build only / all)
+    const cleanConfig = COMMANDS.find((c) => c.id === 'konvoy.clean');
+    const cleanAllConfig = COMMANDS.find((c) => c.id === 'konvoy.cleanAll');
+    if (cleanConfig && cleanAllConfig) {
+        disposables.push(
+            vscode.commands.registerCommand('konvoy.cleanConfirm', async () => {
+                const choice = await vscode.window.showWarningMessage(
+                    'What do you want to clean?',
+                    { modal: true },
+                    'Clean (build only)',
+                    'Clean All (.konvoy/)',
+                );
+                if (choice === 'Clean (build only)') {
+                    runCommand(cleanConfig);
+                } else if (choice === 'Clean All (.konvoy/)') {
+                    runCommand(cleanAllConfig);
+                }
+            }),
+        );
+    }
+
+    return disposables;
 }
 
 /** @internal Exposed for testing only. */

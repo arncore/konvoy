@@ -199,13 +199,13 @@ konvoy build     # downloads only the klib needed for your host target
 `konvoy update` performs these steps:
 
 1. Reads `[dependencies]` from `konvoy.toml`
-2. Fetches each dependency's POM from Maven Central
-3. Walks transitive dependencies via POM `<dependency>` entries (BFS)
-4. Detects version conflicts and dependency cycles with actionable errors
-5. Downloads the per-target `.klib` for each supported platform
-6. Writes SHA-256 hashes to `konvoy.lock`
+2. Fetches artifact metadata (`.module` JSON first, POM XML as fallback) from Maven Central
+3. Resolves transitive dependencies via BFS with cycle detection
+4. Detects version conflicts (suggests pinning an explicit version in `konvoy.toml`)
+5. Downloads the per-target `.klib` for each supported platform and computes SHA-256 hashes (also discovers cinterop klibs from `.module` metadata)
+6. Writes the full dependency set to `konvoy.lock` with `required_by` for transitive deps
 
-At build time (`konvoy build`), only the klib for your current host target is downloaded from the Maven cache. Subsequent builds reuse cached artifacts from `~/.konvoy/cache/maven/`.
+At build time (`konvoy build`), only the klib for your current host target is needed. Subsequent builds reuse cached artifacts from `~/.konvoy/cache/maven/`.
 
 #### Lockfile
 
@@ -327,7 +327,7 @@ konvoy lint --verbose              # show raw detekt output
 Install [Konvoy for VS Code](https://marketplace.visualstudio.com/items?itemName=konvoy.konvoy-vscode) from the Marketplace, or search "Konvoy" in the Extensions panel.
 
 - **Commands** — Build, Run, Test, Lint, Clean, Doctor, Update, and Toolchain management via `Ctrl+Shift+P`
-- **Run button** — Play button in the editor title bar for `.kt` files and `konvoy.toml`
+- **Title bar buttons** — Build (dropdown), Run (debug/release toggle), Test, Lint, Clean, Update, and Doctor in the editor title bar for `.kt` files, `konvoy.toml`, and `konvoy.lock`
 - **`konvoy.toml` support** — Syntax highlighting, validation on save, autocomplete, and hover docs
 - **Diagnostics** — Build errors and detekt findings in the Problems panel
 - **Tasks** — Auto-detected konvoy tasks via `Ctrl+Shift+B`
