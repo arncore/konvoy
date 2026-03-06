@@ -60,12 +60,12 @@
       {
         "command": "konvoy.update",
         "title": "Konvoy: Update",
-        "icon": "$(cloud-download)"
+        "icon": "$(sync)"
       },
       {
         "command": "konvoy.clean",
         "title": "Konvoy: Clean",
-        "icon": "$(trash)"
+        "icon": "$(clear-all)"
       },
       {
         "command": "konvoy.cleanAll",
@@ -74,7 +74,7 @@
       {
         "command": "konvoy.cleanConfirm",
         "title": "Konvoy: Clean (Confirm)",
-        "icon": "$(trash)"
+        "icon": "$(clear-all)"
       },
       {
         "command": "konvoy.doctor",
