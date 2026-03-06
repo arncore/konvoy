@@ -201,7 +201,7 @@ konvoy build     # downloads only the klib needed for your host target
 1. Reads `[dependencies]` from `konvoy.toml`
 2. Fetches artifact metadata (`.module` JSON first, POM XML as fallback) from Maven Central
 3. Resolves transitive dependencies via BFS with cycle detection
-4. Detects version conflicts with actionable errors
+4. Detects version conflicts (suggests pinning an explicit version in `konvoy.toml`)
 5. Downloads the per-target `.klib` for each supported platform and computes SHA-256 hashes (also discovers cinterop klibs from `.module` metadata)
 6. Writes the full dependency set to `konvoy.lock` with `required_by` for transitive deps
 
