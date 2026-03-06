@@ -41,14 +41,23 @@
         "icon": "$(tools)"
       },
       {
+        "command": "konvoy.buildPick",
+        "title": "Konvoy: Build...",
+        "icon": "$(tools)"
+      },
+      {
         "command": "konvoy.run",
         "title": "Konvoy: Run",
-        "icon": "$(play)"
+        "icon": "$(debug-alt)"
       },
       {
         "command": "konvoy.runRelease",
         "title": "Konvoy: Run (Release)",
         "icon": "$(play)"
+      },
+      {
+        "command": "konvoy.toggleRunProfile",
+        "title": "Konvoy: Toggle Debug/Release"
       },
       {
         "command": "konvoy.test",
@@ -192,7 +201,7 @@
     "menus": {
       "editor/title": [
         {
-          "command": "konvoy.build",
+          "command": "konvoy.buildPick",
           "group": "navigation@1",
           "when": "resourceFilename == 'konvoy.toml' || resourceFilename == 'konvoy.lock' || resourceExtname == '.kt'"
         },
@@ -226,12 +235,12 @@
         {
           "command": "konvoy.run",
           "group": "navigation@1",
-          "when": "resourceFilename == 'konvoy.toml' || resourceFilename == 'konvoy.lock' || resourceExtname == '.kt'"
+          "when": "!konvoy.releaseMode && (resourceFilename == 'konvoy.toml' || resourceFilename == 'konvoy.lock' || resourceExtname == '.kt')"
         },
         {
           "command": "konvoy.runRelease",
-          "group": "navigation@2",
-          "when": "resourceFilename == 'konvoy.toml' || resourceFilename == 'konvoy.lock' || resourceExtname == '.kt'"
+          "group": "navigation@1",
+          "when": "konvoy.releaseMode && (resourceFilename == 'konvoy.toml' || resourceFilename == 'konvoy.lock' || resourceExtname == '.kt')"
         }
       ]
     }

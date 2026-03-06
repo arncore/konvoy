@@ -6,6 +6,7 @@ import { registerCommands } from './commands';
 import { registerTaskProvider } from './taskProvider';
 import { registerTomlSupport } from './tomlSupport';
 import { disposeDiagnosticCollection } from './diagnostics';
+import { initProfile } from './profileManager';
 
 export function activate(context: vscode.ExtensionContext): void {
     const output = getOutputChannel();
@@ -21,6 +22,12 @@ export function activate(context: vscode.ExtensionContext): void {
     // Register commands
     const commandDisposables = registerCommands();
     for (const d of commandDisposables) {
+        context.subscriptions.push(d);
+    }
+
+    // Initialize run profile toggle (debug / release)
+    const profileDisposables = initProfile(context);
+    for (const d of profileDisposables) {
         context.subscriptions.push(d);
     }
 

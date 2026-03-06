@@ -128,6 +128,26 @@ export function registerCommands(): vscode.Disposable[] {
         vscode.commands.registerCommand(config.id, () => runCommand(config)),
     );
 
+    // Build variant picker (debug / release)
+    const buildConfig = COMMANDS.find((c) => c.id === 'konvoy.build');
+    const buildReleaseConfig = COMMANDS.find((c) => c.id === 'konvoy.buildRelease');
+    if (buildConfig && buildReleaseConfig) {
+        disposables.push(
+            vscode.commands.registerCommand('konvoy.buildPick', async () => {
+                const choice = await vscode.window.showQuickPick(
+                    ['Debug', 'Release'],
+                    { placeHolder: 'Select build variant' },
+                );
+                if (choice === 'Debug') {
+                    runCommand(buildConfig);
+                } else if (choice === 'Release') {
+                    runCommand(buildReleaseConfig);
+                }
+            }),
+        );
+    }
+
+    // Clean variant picker (build only / all)
     const cleanConfig = COMMANDS.find((c) => c.id === 'konvoy.clean');
     const cleanAllConfig = COMMANDS.find((c) => c.id === 'konvoy.cleanAll');
     if (cleanConfig && cleanAllConfig) {

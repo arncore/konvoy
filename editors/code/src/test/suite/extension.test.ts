@@ -72,8 +72,10 @@ suite('extension lifecycle', () => {
         const expectedCommands = [
             'konvoy.build',
             'konvoy.buildRelease',
+            'konvoy.buildPick',
             'konvoy.run',
             'konvoy.runRelease',
+            'konvoy.toggleRunProfile',
             'konvoy.test',
             'konvoy.lint',
             'konvoy.update',

@@ -57,6 +57,7 @@ suite('package.json manifest validation', () => {
         'konvoy.toolchainInstall',
         'konvoy.toolchainList',
         'konvoy.cleanAll',
+        'konvoy.toggleRunProfile',
     ];
 
     test('all commands except toolchain and cleanAll have icons', () => {
@@ -115,16 +116,22 @@ suite('package.json manifest validation', () => {
         assert.strictEqual(cmd!.icon, '$(pulse)');
     });
 
-    test('konvoy.run has $(play) icon', () => {
+    test('konvoy.run has $(debug-alt) icon', () => {
         const cmd = pkg.contributes.commands.find(c => c.command === 'konvoy.run');
         assert.ok(cmd, 'konvoy.run must exist');
-        assert.strictEqual(cmd!.icon, '$(play)');
+        assert.strictEqual(cmd!.icon, '$(debug-alt)');
     });
 
     test('konvoy.runRelease has $(play) icon', () => {
         const cmd = pkg.contributes.commands.find(c => c.command === 'konvoy.runRelease');
         assert.ok(cmd, 'konvoy.runRelease must exist');
         assert.strictEqual(cmd!.icon, '$(play)');
+    });
+
+    test('konvoy.buildPick has $(tools) icon', () => {
+        const cmd = pkg.contributes.commands.find(c => c.command === 'konvoy.buildPick');
+        assert.ok(cmd, 'konvoy.buildPick must exist');
+        assert.strictEqual(cmd!.icon, '$(tools)');
     });
 
     test('konvoy.update has $(sync) icon', () => {
@@ -204,10 +211,10 @@ suite('package.json manifest validation', () => {
         }
     });
 
-    test('editor/title button order is Build, Test, Update, Lint, CleanConfirm, Doctor', () => {
+    test('editor/title button order is BuildPick, Test, Update, Lint, CleanConfirm, Doctor', () => {
         const entries = pkg.contributes.menus['editor/title'];
         const expectedOrder = [
-            'konvoy.build',
+            'konvoy.buildPick',
             'konvoy.test',
             'konvoy.update',
             'konvoy.lint',
@@ -243,23 +250,58 @@ suite('package.json manifest validation', () => {
         }
     });
 
-    test('all editor/title/run entries have the exact expected when clause', () => {
+    test('editor/title/run entries have profile-aware when clauses', () => {
+        const entries = pkg.contributes.menus['editor/title/run'];
+        const runEntry = entries.find(e => e.command === 'konvoy.run');
+        const runReleaseEntry = entries.find(e => e.command === 'konvoy.runRelease');
+        assert.ok(runEntry, 'konvoy.run must be in editor/title/run');
+        assert.ok(runReleaseEntry, 'konvoy.runRelease must be in editor/title/run');
+        assert.ok(
+            runEntry!.when.includes('!konvoy.releaseMode'),
+            `konvoy.run when clause must include !konvoy.releaseMode, got: "${runEntry!.when}"`,
+        );
+        assert.ok(
+            runReleaseEntry!.when.includes('konvoy.releaseMode') && !runReleaseEntry!.when.includes('!konvoy.releaseMode'),
+            `konvoy.runRelease when clause must include konvoy.releaseMode (without negation), got: "${runReleaseEntry!.when}"`,
+        );
+    });
+
+    test('editor/title/run entries both use navigation@1 for swapping in place', () => {
         const entries = pkg.contributes.menus['editor/title/run'];
         for (const entry of entries) {
             assert.strictEqual(
-                entry.when,
-                EXPECTED_WHEN_CLAUSE,
-                `Run menu entry for "${entry.command}" has unexpected when clause`,
+                entry.group,
+                'navigation@1',
+                `Run menu entry "${entry.command}" should use navigation@1 for in-place toggle, got "${entry.group}"`,
             );
         }
     });
 
-    test('editor/title/run order is Run then Run (Release)', () => {
-        const entries = pkg.contributes.menus['editor/title/run'];
-        assert.strictEqual(entries[0].command, 'konvoy.run');
-        assert.strictEqual(entries[0].group, 'navigation@1');
-        assert.strictEqual(entries[1].command, 'konvoy.runRelease');
-        assert.strictEqual(entries[1].group, 'navigation@2');
+    // --- Command existence and title tests ---
+
+    test('konvoy.toggleRunProfile command exists in package.json', () => {
+        const cmd = pkg.contributes.commands.find(c => c.command === 'konvoy.toggleRunProfile');
+        assert.ok(cmd, 'konvoy.toggleRunProfile must exist in package.json commands array');
+    });
+
+    test('konvoy.toggleRunProfile has correct title', () => {
+        const cmd = pkg.contributes.commands.find(c => c.command === 'konvoy.toggleRunProfile');
+        assert.ok(cmd, 'konvoy.toggleRunProfile must exist');
+        assert.strictEqual(
+            cmd!.title,
+            'Konvoy: Toggle Debug/Release',
+            `Expected title "Konvoy: Toggle Debug/Release", got "${cmd!.title}"`,
+        );
+    });
+
+    test('konvoy.buildPick has correct title "Konvoy: Build..."', () => {
+        const cmd = pkg.contributes.commands.find(c => c.command === 'konvoy.buildPick');
+        assert.ok(cmd, 'konvoy.buildPick must exist');
+        assert.strictEqual(
+            cmd!.title,
+            'Konvoy: Build...',
+            `Expected title "Konvoy: Build...", got "${cmd!.title}"`,
+        );
     });
 
     // --- Cross-validation: editor/title commands must exist in commands array ---
