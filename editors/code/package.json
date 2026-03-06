@@ -32,16 +32,23 @@
     "commands": [
       {
         "command": "konvoy.build",
-        "title": "Konvoy: Build"
+        "title": "Konvoy: Build",
+        "icon": "$(tools)"
       },
       {
         "command": "konvoy.buildRelease",
-        "title": "Konvoy: Build (Release)"
+        "title": "Konvoy: Build (Release)",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "konvoy.buildPick",
+        "title": "Konvoy: Build...",
+        "icon": "$(tools)"
       },
       {
         "command": "konvoy.run",
         "title": "Konvoy: Run",
-        "icon": "$(play)"
+        "icon": "$(debug-alt)"
       },
       {
         "command": "konvoy.runRelease",
@@ -49,24 +56,42 @@
         "icon": "$(play)"
       },
       {
+        "command": "konvoy.toggleRunVariant",
+        "title": "Konvoy: Toggle Debug/Release"
+      },
+      {
         "command": "konvoy.test",
-        "title": "Konvoy: Test"
+        "title": "Konvoy: Test",
+        "icon": "$(beaker)"
       },
       {
         "command": "konvoy.lint",
-        "title": "Konvoy: Lint"
+        "title": "Konvoy: Lint",
+        "icon": "$(eye)"
       },
       {
         "command": "konvoy.update",
-        "title": "Konvoy: Update"
+        "title": "Konvoy: Update",
+        "icon": "$(sync)"
       },
       {
         "command": "konvoy.clean",
-        "title": "Konvoy: Clean"
+        "title": "Konvoy: Clean",
+        "icon": "$(eraser)"
+      },
+      {
+        "command": "konvoy.cleanAll",
+        "title": "Konvoy: Clean All"
+      },
+      {
+        "command": "konvoy.cleanConfirm",
+        "title": "Konvoy: Clean (Confirm)",
+        "icon": "$(eraser)"
       },
       {
         "command": "konvoy.doctor",
-        "title": "Konvoy: Doctor"
+        "title": "Konvoy: Doctor",
+        "icon": "$(pulse)"
       },
       {
         "command": "konvoy.toolchainInstall",
@@ -174,16 +199,48 @@
       }
     ],
     "menus": {
+      "editor/title": [
+        {
+          "command": "konvoy.buildPick",
+          "group": "navigation@1",
+          "when": "resourceFilename == 'konvoy.toml' || resourceFilename == 'konvoy.lock' || resourceExtname == '.kt'"
+        },
+        {
+          "command": "konvoy.test",
+          "group": "navigation@2",
+          "when": "resourceFilename == 'konvoy.toml' || resourceFilename == 'konvoy.lock' || resourceExtname == '.kt'"
+        },
+        {
+          "command": "konvoy.update",
+          "group": "navigation@3",
+          "when": "resourceFilename == 'konvoy.toml' || resourceFilename == 'konvoy.lock' || resourceExtname == '.kt'"
+        },
+        {
+          "command": "konvoy.lint",
+          "group": "navigation@4",
+          "when": "resourceFilename == 'konvoy.toml' || resourceFilename == 'konvoy.lock' || resourceExtname == '.kt'"
+        },
+        {
+          "command": "konvoy.cleanConfirm",
+          "group": "navigation@5",
+          "when": "resourceFilename == 'konvoy.toml' || resourceFilename == 'konvoy.lock' || resourceExtname == '.kt'"
+        },
+        {
+          "command": "konvoy.doctor",
+          "group": "navigation@6",
+          "when": "resourceFilename == 'konvoy.toml' || resourceFilename == 'konvoy.lock' || resourceExtname == '.kt'"
+        }
+      ],
       "editor/title/run": [
         {
           "command": "konvoy.run",
           "group": "navigation@1",
-          "when": "resourceFilename == 'konvoy.toml' || resourceExtname == '.kt'"
+          "when": "!konvoy.releaseMode && (resourceFilename == 'konvoy.toml' || resourceFilename == 'konvoy.lock' || resourceExtname == '.kt')"
         },
         {
           "command": "konvoy.runRelease",
-          "group": "navigation@2",
-          "when": "resourceFilename == 'konvoy.toml' || resourceExtname == '.kt'"
+          "group": "navigation@1",
+          "when": "konvoy.releaseMode && (resourceFilename == 'konvoy.toml' || resourceFilename == 'konvoy.lock' || resourceExtname == '.kt')"
         }
       ]
     }
@@ -192,9 +249,10 @@
     "build": "esbuild --bundle src/extension.ts --outfile=out/extension.js --external:vscode --platform=node --format=cjs --minify",
     "watch": "esbuild --bundle src/extension.ts --outfile=out/extension.js --external:vscode --platform=node --format=cjs --watch",
     "lint": "eslint src --ext ts",
+    "clean": "rm -rf out",
     "compile-tests": "tsc -p tsconfig.json",
     "test": "node ./out/test/runTests.js",
-    "pretest": "npm run build && npm run compile-tests",
+    "pretest": "npm run clean && npm run build && npm run compile-tests",
     "package": "vsce package"
   },
   "devDependencies": {

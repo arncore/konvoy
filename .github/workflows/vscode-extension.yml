@@ -11,6 +11,9 @@ on:
     paths:
       - "editors/code/**"
 
+permissions:
+  contents: read
+
 defaults:
   run:
     working-directory: editors/code
