@@ -250,7 +250,7 @@ suite('package.json manifest validation', () => {
         }
     });
 
-    test('editor/title/run entries have profile-aware when clauses', () => {
+    test('editor/title/run entries have variant-aware when clauses', () => {
         const entries = pkg.contributes.menus['editor/title/run'];
         const runEntry = entries.find(e => e.command === 'konvoy.run');
         const runReleaseEntry = entries.find(e => e.command === 'konvoy.runRelease');
