@@ -3,6 +3,10 @@
 [![CI](https://github.com/arncore/konvoy/actions/workflows/ci.yml/badge.svg)](https://github.com/arncore/konvoy/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/arncore/konvoy/branch/main/graph/badge.svg)](https://codecov.io/gh/arncore/konvoy)
 
+<p align="center">
+  <img width="512" height="512" alt="konvoy_logo_under_2mb" src="https://github.com/user-attachments/assets/d300589e-eb0b-4655-a86e-5d936d36e9a4" />
+</p>
+
 Konvoy is a native-first Kotlin build tool focused on making Kotlin/Native compilation as easy, fast, and painless as Cargo.
 
 Konvoy avoids Gradle/Maven-style complexity by providing:
