@@ -207,5 +207,9 @@
     "@typescript-eslint/eslint-plugin": "^6.0.0",
     "@typescript-eslint/parser": "^6.0.0",
     "eslint": "^8.0.0"
+  },
+  "overrides": {
+    "serialize-javascript": "^7.0.3",
+    "minimatch": "^10.0.0"
   }
 }
