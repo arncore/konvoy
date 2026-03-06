@@ -327,7 +327,7 @@ konvoy lint --verbose              # show raw detekt output
 Install [Konvoy for VS Code](https://marketplace.visualstudio.com/items?itemName=konvoy.konvoy-vscode) from the Marketplace, or search "Konvoy" in the Extensions panel.
 
 - **Commands** — Build, Run, Test, Lint, Clean, Doctor, Update, and Toolchain management via `Ctrl+Shift+P`
-- **Run button** — Play button in the editor title bar for `.kt` files and `konvoy.toml`
+- **Title bar buttons** — Build (dropdown), Run (debug/release toggle), Test, Lint, Clean, Update, and Doctor in the editor title bar for `.kt` files, `konvoy.toml`, and `konvoy.lock`
 - **`konvoy.toml` support** — Syntax highlighting, validation on save, autocomplete, and hover docs
 - **Diagnostics** — Build errors and detekt findings in the Problems panel
 - **Tasks** — Auto-detected konvoy tasks via `Ctrl+Shift+B`
