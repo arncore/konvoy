@@ -63,4 +63,3 @@ Build errors and detekt findings are parsed and shown inline in the editor and i
 ## Requirements
 
 - **[Konvoy](https://github.com/arncore/konvoy)** installed and on your `PATH` (or set `konvoy.path` in settings)
-- **[Kotlin Language](https://marketplace.visualstudio.com/items?itemName=fwcd.kotlin)** extension — installed automatically as a dependency
