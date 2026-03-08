@@ -2,8 +2,7 @@ import * as assert from 'assert';
 import * as vscode from 'vscode';
 
 suite('TaskProvider', () => {
-    // Register the task provider directly so tests don't depend on
-    // extension activation (which requires fwcd.kotlin in CI).
+    // Register the task provider directly for isolated testing.
     let providerDisposable: vscode.Disposable;
 
     suiteSetup(() => {
