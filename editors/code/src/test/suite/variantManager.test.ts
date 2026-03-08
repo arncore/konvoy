@@ -8,14 +8,22 @@ const { initVariant, _testing } = require('../../variantManager');
 suite('variantManager', () => {
     let disposables: vscode.Disposable[] = [];
     let mockContext: vscode.ExtensionContext;
+    let autoActivated = false;
 
-    suiteSetup(() => {
-        _testing.resetState();
+    suiteSetup(async () => {
         mockContext = createMockContext();
+        // The extension may have auto-activated via workspaceContains:konvoy.toml.
+        const allCommands = await vscode.commands.getCommands(true);
+        if (allCommands.includes('konvoy.toggleRunVariant')) {
+            autoActivated = true;
+            return;
+        }
+        _testing.resetState();
         disposables = initVariant(mockContext);
     });
 
     suiteTeardown(() => {
+        if (autoActivated) { return; }
         for (const d of disposables) {
             d.dispose();
         }
@@ -49,7 +57,8 @@ suite('variantManager', () => {
 
     // --- initVariant ---
 
-    test('initVariant returns a disposables array', () => {
+    test('initVariant returns a disposables array', function () {
+        if (autoActivated) { return this.skip(); }
         assert.ok(Array.isArray(disposables), 'initVariant must return an array');
         assert.ok(disposables.length > 0, 'initVariant must return at least one disposable');
         for (const d of disposables) {
@@ -139,7 +148,8 @@ suite('variantManager', () => {
         );
     });
 
-    test('workspaceState persists the toggled variant', async () => {
+    test('workspaceState persists the toggled variant', async function () {
+        if (autoActivated) { return this.skip(); }
         await vscode.commands.executeCommand('konvoy.toggleRunVariant');
         const stored = mockContext.workspaceState.get('konvoy.runVariant');
         assert.strictEqual(
