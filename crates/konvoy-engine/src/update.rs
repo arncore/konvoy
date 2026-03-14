@@ -414,11 +414,18 @@ fn resolve_transitive(
 
                     let hint_name = base_artifact_id.replace('.', "-");
 
+                    // Suggest the higher version so the hint actually resolves the conflict.
+                    let hint_version = if resolved_version > existing.version {
+                        resolved_version
+                    } else {
+                        existing.version.clone()
+                    };
+
                     return Err(EngineError::MavenVersionConflict {
                         maven: dep_key,
                         details,
                         hint_name,
-                        hint_version: resolved_version,
+                        hint_version,
                     });
                 }
                 // Same version, already resolved — skip.
