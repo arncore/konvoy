@@ -776,8 +776,7 @@ mod tests {
         );
         let artifacts = resolve_plugin_artifacts(&manifest).unwrap();
         assert_eq!(
-            artifacts[0].maven_coord.artifact_id,
-            "kotlin-serialization-compiler-plugin-embeddable",
+            artifacts[0].maven_coord.artifact_id, "kotlin-serialization-compiler-plugin-embeddable",
             "should not double-append -embeddable"
         );
     }
