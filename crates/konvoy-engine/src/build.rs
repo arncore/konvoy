@@ -380,6 +380,86 @@ pub(crate) fn resolve_target(target_opt: &Option<String>) -> Result<Target, Engi
 
 /// Invoke konanc and return the path to the compiled artifact.
 #[allow(clippy::too_many_arguments)]
+/// Check whether two-step compilation is needed.
+///
+/// konanc has a bug in one-stage compilation: compiler plugins (like
+/// serialization) are loaded but their codegen doesn't fire when compiling
+/// sources directly to a binary. Gradle works around this by always compiling
+/// sources to a klib first, then linking the klib into a binary.
+///
+/// We do the same when producing a program with plugins active.
+fn needs_two_step_compilation(produce: ProduceKind, plugin_jars: &[PathBuf]) -> bool {
+    produce == ProduceKind::Program && !plugin_jars.is_empty()
+}
+
+/// Two-step compilation: sources → klib → binary.
+///
+/// Step 1 compiles sources into a temporary klib with plugins active so that
+/// plugin codegen (e.g. serialization) is applied. Step 2 links the klib into
+/// the final binary without plugins.
+fn compile_two_step(
+    konanc: &KonancInfo,
+    jre_home: Option<&Path>,
+    sources: &[PathBuf],
+    target: &Target,
+    output_path: &Path,
+    options: &BuildOptions,
+    library_paths: &[PathBuf],
+    plugin_jars: &[PathBuf],
+) -> Result<PathBuf, EngineError> {
+    // Step 1: compile sources → temporary klib (with plugins active).
+    let klib_path = output_path.with_extension("klib");
+
+    let mut compile_cmd = KonancCommand::new()
+        .sources(sources)
+        .output(&klib_path)
+        .target(target.to_konanc_arg())
+        .produce(ProduceKind::Library)
+        .libraries(library_paths)
+        .plugins(plugin_jars);
+
+    if let Some(jh) = jre_home {
+        compile_cmd = compile_cmd.java_home(jh);
+    }
+
+    let compile_result = compile_cmd.execute(konanc)?;
+    crate::diagnostics::print_diagnostics(&compile_result, options.verbose);
+
+    if !compile_result.success {
+        return Err(EngineError::CompilationFailed {
+            error_count: compile_result.error_count(),
+        });
+    }
+
+    // Step 2: link klib → binary (no plugins needed).
+    let mut link_cmd = KonancCommand::new()
+        .include(&klib_path)
+        .output(output_path)
+        .target(target.to_konanc_arg())
+        .release(options.release)
+        .libraries(library_paths);
+
+    if let Some(jh) = jre_home {
+        link_cmd = link_cmd.java_home(jh);
+    }
+
+    let link_result = link_cmd.execute(konanc)?;
+    crate::diagnostics::print_diagnostics(&link_result, options.verbose);
+
+    if !link_result.success {
+        return Err(EngineError::CompilationFailed {
+            error_count: link_result.error_count(),
+        });
+    }
+
+    normalize_konanc_output(output_path)?;
+
+    // Clean up temporary klib.
+    let _ = std::fs::remove_file(&klib_path);
+
+    Ok(output_path.to_path_buf())
+}
+
 fn compile(
     konanc: &KonancInfo,
     jre_home: Option<&Path>,
@@ -396,6 +476,20 @@ fn compile(
         konvoy_util::fs::ensure_dir(parent)?;
     }
 
+    if needs_two_step_compilation(produce, plugin_jars) {
+        return compile_two_step(
+            konanc,
+            jre_home,
+            sources,
+            target,
+            output_path,
+            options,
+            library_paths,
+            plugin_jars,
+        );
+    }
+
+    // Standard single-step compilation (libraries, or programs without plugins).
     let mut cmd = KonancCommand::new()
         .sources(sources)
         .output(output_path)
