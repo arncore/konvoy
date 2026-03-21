@@ -101,7 +101,16 @@ pub fn resolve_plugin_artifacts(
                     reason: format!("invalid maven coordinate `{maven}`"),
                 })?;
 
-        let coord = MavenCoordinate::new(group_id, artifact_id, &resolved_version);
+        // konanc uses an embedded compiler (kotlin-native-compiler-embeddable),
+        // so compiler plugins must be their embeddable variants. Automatically
+        // map to the -embeddable artifact when the user specifies the base name.
+        let embeddable_artifact_id = if artifact_id.ends_with("-embeddable") {
+            artifact_id.to_owned()
+        } else {
+            format!("{artifact_id}-embeddable")
+        };
+
+        let coord = MavenCoordinate::new(group_id, &embeddable_artifact_id, &resolved_version);
         let url = coord.to_url(MAVEN_CENTRAL);
         let cache_path = coord.cache_path(&cache_root);
 
@@ -234,9 +243,11 @@ mod tests {
         assert_eq!(artifacts.len(), 1);
         let a = &artifacts[0];
         assert_eq!(a.plugin_name, "kotlin-serialization");
+        // konanc uses the embeddable compiler, so plugins must use the -embeddable variant.
         assert!(
-            a.url.contains("kotlin-serialization-compiler-plugin"),
-            "url was: {}",
+            a.url
+                .contains("kotlin-serialization-compiler-plugin-embeddable"),
+            "url should use embeddable variant: {}",
             a.url
         );
         assert!(
@@ -565,7 +576,7 @@ mod tests {
         assert_eq!(artifacts.len(), 1);
         assert!(artifacts[0]
             .url
-            .contains("an-extremely-long-artifact-name-for-testing"));
+            .contains("an-extremely-long-artifact-name-for-testing-embeddable"));
         assert_eq!(artifacts[0].maven_coord.version, "1.2.3");
     }
 
@@ -737,6 +748,37 @@ mod tests {
         assert!(
             hash.is_none(),
             "plugin lookup should not match dependency entries"
+        );
+    }
+
+    #[test]
+    fn resolve_plugin_maps_to_embeddable_variant() {
+        // konanc uses the embeddable compiler, so plugins must use -embeddable JARs.
+        let manifest = make_manifest_with_plugin(
+            "kotlin-serialization",
+            "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin",
+            "2.1.0",
+        );
+        let artifacts = resolve_plugin_artifacts(&manifest).unwrap();
+        assert_eq!(
+            artifacts[0].maven_coord.artifact_id,
+            "kotlin-serialization-compiler-plugin-embeddable"
+        );
+    }
+
+    #[test]
+    fn resolve_plugin_already_embeddable_no_double_suffix() {
+        // If the user already specifies the -embeddable variant, don't append it again.
+        let manifest = make_manifest_with_plugin(
+            "kotlin-serialization",
+            "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin-embeddable",
+            "2.1.0",
+        );
+        let artifacts = resolve_plugin_artifacts(&manifest).unwrap();
+        assert_eq!(
+            artifacts[0].maven_coord.artifact_id,
+            "kotlin-serialization-compiler-plugin-embeddable",
+            "should not double-append -embeddable"
         );
     }
 

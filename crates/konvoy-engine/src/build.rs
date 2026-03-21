@@ -3818,12 +3818,12 @@ url = "https://example.com/plugin.jar"
     /// plugin JARs are passed through the build pipeline. This tests the
     /// konanc invocation builder integration.
     #[test]
-    fn smoke_plugin_jars_produce_xplugin_args() {
+    fn plugin_jars_produce_xplugin_args() {
         use konvoy_konanc::invoke::KonancCommand;
 
         let plugin_jars = vec![
-            PathBuf::from("/home/.konvoy/cache/maven/org/jetbrains/kotlin/kotlin-serialization-compiler-plugin/2.1.0/kotlin-serialization-compiler-plugin-2.1.0.jar"),
-            PathBuf::from("/home/.konvoy/cache/maven/org/jetbrains/kotlin/kotlin-allopen-compiler-plugin/2.1.0/kotlin-allopen-compiler-plugin-2.1.0.jar"),
+            PathBuf::from("/home/.konvoy/cache/maven/org/jetbrains/kotlin/kotlin-serialization-compiler-plugin-embeddable/2.1.0/kotlin-serialization-compiler-plugin-embeddable-2.1.0.jar"),
+            PathBuf::from("/home/.konvoy/cache/maven/org/jetbrains/kotlin/kotlin-allopen-compiler-plugin-embeddable/2.1.0/kotlin-allopen-compiler-plugin-embeddable-2.1.0.jar"),
         ];
 
         let cmd = KonancCommand::new()
@@ -3837,13 +3837,13 @@ url = "https://example.com/plugin.jar"
 
         assert_eq!(xplugin_args.len(), 2);
         assert!(
-            xplugin_args[0].contains("kotlin-serialization-compiler-plugin"),
-            "first -Xplugin should reference serialization: {}",
+            xplugin_args[0].contains("kotlin-serialization-compiler-plugin-embeddable"),
+            "first -Xplugin should reference serialization embeddable: {}",
             xplugin_args[0]
         );
         assert!(
-            xplugin_args[1].contains("kotlin-allopen-compiler-plugin"),
-            "second -Xplugin should reference allopen: {}",
+            xplugin_args[1].contains("kotlin-allopen-compiler-plugin-embeddable"),
+            "second -Xplugin should reference allopen embeddable: {}",
             xplugin_args[1]
         );
     }
@@ -4062,6 +4062,92 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
         assert_eq!(ser_lock.version, "2.1.0");
         let compose_lock = locks.iter().find(|l| l.name == "compose").unwrap();
         assert_eq!(compose_lock.version, "1.5.0");
+    }
+
+    /// Resolved plugin artifacts must use the embeddable variant in the
+    /// `-Xplugin=` argument passed to konanc.
+    #[test]
+    fn resolved_plugin_produces_embeddable_xplugin_arg() {
+        use konvoy_konanc::invoke::KonancCommand;
+
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            r#"
+[package]
+name = "myapp"
+
+[toolchain]
+kotlin = "2.1.0"
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+"#,
+            "konvoy.toml",
+        )
+        .unwrap();
+
+        let artifacts = crate::plugin::resolve_plugin_artifacts(&manifest).unwrap();
+        let plugin_jars: Vec<PathBuf> = artifacts.iter().map(|a| a.cache_path.clone()).collect();
+
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("src/main.kt")])
+            .output(std::path::Path::new(".konvoy/build/linux_x64/debug/myapp"))
+            .target("linux_x64")
+            .plugins(&plugin_jars);
+
+        let args = cmd.build_args().unwrap();
+        let xplugin_args: Vec<_> = args.iter().filter(|a| a.starts_with("-Xplugin=")).collect();
+
+        assert_eq!(xplugin_args.len(), 1);
+        assert!(
+            xplugin_args[0].contains("-embeddable"),
+            "-Xplugin path must use embeddable variant: {}",
+            xplugin_args[0]
+        );
+    }
+
+    /// Multiple plugins should all resolve to their embeddable variants
+    /// and each produce a separate `-Xplugin=` argument.
+    #[test]
+    fn multiple_plugins_all_produce_embeddable_xplugin_args() {
+        use konvoy_konanc::invoke::KonancCommand;
+
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            r#"
+[package]
+name = "myapp"
+
+[toolchain]
+kotlin = "2.1.0"
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+kotlin-allopen = { maven = "org.jetbrains.kotlin:kotlin-allopen-compiler-plugin", version = "2.1.0" }
+"#,
+            "konvoy.toml",
+        )
+        .unwrap();
+
+        let artifacts = crate::plugin::resolve_plugin_artifacts(&manifest).unwrap();
+        assert_eq!(artifacts.len(), 2);
+
+        let plugin_jars: Vec<PathBuf> = artifacts.iter().map(|a| a.cache_path.clone()).collect();
+
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("src/main.kt")])
+            .output(std::path::Path::new(".konvoy/build/linux_x64/debug/myapp"))
+            .target("linux_x64")
+            .plugins(&plugin_jars);
+
+        let args = cmd.build_args().unwrap();
+        let xplugin_args: Vec<_> = args.iter().filter(|a| a.starts_with("-Xplugin=")).collect();
+
+        assert_eq!(xplugin_args.len(), 2);
+        for arg in &xplugin_args {
+            assert!(
+                arg.contains("-embeddable"),
+                "every -Xplugin path must use embeddable variant: {arg}",
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

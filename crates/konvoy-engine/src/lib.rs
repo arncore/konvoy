@@ -18,7 +18,7 @@ pub use build::{build, BuildOptions, BuildOutcome, BuildResult};
 pub use cache::{CacheInputs, CacheKey};
 pub use detekt::{lint, DetektDiagnostic, LintOptions, LintResult};
 pub use error::EngineError;
-pub use init::{init_project, init_project_in_place, init_project_with_kind};
+pub use init::{init_project, init_project_in_place, init_project_with_kind, DEFAULT_KOTLIN_VERSION};
 pub use plugin::{
     ensure_plugin_artifacts, resolve_plugin_artifacts, PluginArtifactResult, ResolvedPluginArtifact,
 };

@@ -6,6 +6,9 @@ use konvoy_config::manifest::{Manifest, Package, PackageKind, Toolchain};
 
 use crate::error::EngineError;
 
+/// Default Kotlin version used when scaffolding new projects.
+pub const DEFAULT_KOTLIN_VERSION: &str = "2.2.0";
+
 /// Scaffold a new Konvoy project in a new subdirectory.
 ///
 /// Creates the project directory (if it doesn't exist), a `konvoy.toml` manifest,
@@ -124,7 +127,7 @@ pub fn init_project_with_kind(
             },
         },
         toolchain: Toolchain {
-            kotlin: "2.1.0".to_owned(),
+            kotlin: DEFAULT_KOTLIN_VERSION.to_owned(),
             detekt: None,
         },
         dependencies: std::collections::BTreeMap::new(),
@@ -186,7 +189,7 @@ mod tests {
         let manifest = Manifest::from_path(&project_dir.join("konvoy.toml")).unwrap();
         assert_eq!(manifest.package.name, "test-proj");
         assert_eq!(manifest.package.entrypoint, "src/main.kt");
-        assert_eq!(manifest.toolchain.kotlin, "2.1.0");
+        assert_eq!(manifest.toolchain.kotlin, DEFAULT_KOTLIN_VERSION);
     }
 
     #[test]
