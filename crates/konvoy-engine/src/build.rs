@@ -463,9 +463,11 @@ fn compile_two_step(
     link_result
 }
 
-/// Invoke konanc and return the path to the compiled artifact.
+/// Single-step compilation: sources → artifact directly.
+///
+/// Used for library builds, or program builds without plugins.
 #[allow(clippy::too_many_arguments)]
-fn compile(
+fn compile_single_step(
     konanc: &KonancInfo,
     jre_home: Option<&Path>,
     sources: &[PathBuf],
@@ -476,25 +478,6 @@ fn compile(
     library_paths: &[PathBuf],
     plugin_jars: &[PathBuf],
 ) -> Result<PathBuf, EngineError> {
-    // Ensure the output directory exists.
-    if let Some(parent) = output_path.parent() {
-        konvoy_util::fs::ensure_dir(parent)?;
-    }
-
-    if needs_two_step_compilation(produce, plugin_jars) {
-        return compile_two_step(
-            konanc,
-            jre_home,
-            sources,
-            target,
-            output_path,
-            options,
-            library_paths,
-            plugin_jars,
-        );
-    }
-
-    // Standard single-step compilation (libraries, or programs without plugins).
     let mut cmd = KonancCommand::new()
         .sources(sources)
         .output(output_path)
@@ -525,6 +508,50 @@ fn compile(
     }
 
     Ok(output_path.to_path_buf())
+}
+
+/// Invoke konanc and return the path to the compiled artifact.
+#[allow(clippy::too_many_arguments)]
+fn compile(
+    konanc: &KonancInfo,
+    jre_home: Option<&Path>,
+    sources: &[PathBuf],
+    target: &Target,
+    output_path: &Path,
+    options: &BuildOptions,
+    produce: ProduceKind,
+    library_paths: &[PathBuf],
+    plugin_jars: &[PathBuf],
+) -> Result<PathBuf, EngineError> {
+    // Ensure the output directory exists.
+    if let Some(parent) = output_path.parent() {
+        konvoy_util::fs::ensure_dir(parent)?;
+    }
+
+    if needs_two_step_compilation(produce, plugin_jars) {
+        compile_two_step(
+            konanc,
+            jre_home,
+            sources,
+            target,
+            output_path,
+            options,
+            library_paths,
+            plugin_jars,
+        )
+    } else {
+        compile_single_step(
+            konanc,
+            jre_home,
+            sources,
+            target,
+            output_path,
+            options,
+            produce,
+            library_paths,
+            plugin_jars,
+        )
+    }
 }
 
 /// Serialize lockfile content for cache key computation.
