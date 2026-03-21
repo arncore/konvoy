@@ -378,8 +378,6 @@ pub(crate) fn resolve_target(target_opt: &Option<String>) -> Result<Target, Engi
     }
 }
 
-/// Invoke konanc and return the path to the compiled artifact.
-#[allow(clippy::too_many_arguments)]
 /// Check whether two-step compilation is needed.
 ///
 /// konanc has a bug in one-stage compilation: compiler plugins (like
@@ -397,6 +395,7 @@ fn needs_two_step_compilation(produce: ProduceKind, plugin_jars: &[PathBuf]) -> 
 /// Step 1 compiles sources into a temporary klib with plugins active so that
 /// plugin codegen (e.g. serialization) is applied. Step 2 links the klib into
 /// the final binary without plugins.
+#[allow(clippy::too_many_arguments)]
 fn compile_two_step(
     konanc: &KonancInfo,
     jre_home: Option<&Path>,
@@ -432,34 +431,40 @@ fn compile_two_step(
     }
 
     // Step 2: link klib → binary (no plugins needed).
-    let mut link_cmd = KonancCommand::new()
-        .include(&klib_path)
-        .output(output_path)
-        .target(target.to_konanc_arg())
-        .release(options.release)
-        .libraries(library_paths);
+    // Use a closure so the temp klib is cleaned up on all exit paths.
+    let link_result = (|| {
+        let mut link_cmd = KonancCommand::new()
+            .include(&klib_path)
+            .output(output_path)
+            .target(target.to_konanc_arg())
+            .release(options.release)
+            .libraries(library_paths);
 
-    if let Some(jh) = jre_home {
-        link_cmd = link_cmd.java_home(jh);
-    }
+        if let Some(jh) = jre_home {
+            link_cmd = link_cmd.java_home(jh);
+        }
 
-    let link_result = link_cmd.execute(konanc)?;
-    crate::diagnostics::print_diagnostics(&link_result, options.verbose);
+        let result = link_cmd.execute(konanc)?;
+        crate::diagnostics::print_diagnostics(&result, options.verbose);
 
-    if !link_result.success {
-        return Err(EngineError::CompilationFailed {
-            error_count: link_result.error_count(),
-        });
-    }
+        if !result.success {
+            return Err(EngineError::CompilationFailed {
+                error_count: result.error_count(),
+            });
+        }
 
-    normalize_konanc_output(output_path)?;
+        normalize_konanc_output(output_path)?;
+        Ok(output_path.to_path_buf())
+    })();
 
-    // Clean up temporary klib.
+    // Clean up temporary klib regardless of success or failure.
     let _ = std::fs::remove_file(&klib_path);
 
-    Ok(output_path.to_path_buf())
+    link_result
 }
 
+/// Invoke konanc and return the path to the compiled artifact.
+#[allow(clippy::too_many_arguments)]
 fn compile(
     konanc: &KonancInfo,
     jre_home: Option<&Path>,
@@ -4242,6 +4247,80 @@ kotlin-allopen = { maven = "org.jetbrains.kotlin:kotlin-allopen-compiler-plugin"
                 "every -Xplugin path must use embeddable variant: {arg}",
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // needs_two_step_compilation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn two_step_needed_for_program_with_plugins() {
+        let plugins = vec![PathBuf::from("/cache/plugin.jar")];
+        assert!(needs_two_step_compilation(ProduceKind::Program, &plugins));
+    }
+
+    #[test]
+    fn two_step_not_needed_for_program_without_plugins() {
+        assert!(!needs_two_step_compilation(ProduceKind::Program, &[]));
+    }
+
+    #[test]
+    fn two_step_not_needed_for_library_with_plugins() {
+        let plugins = vec![PathBuf::from("/cache/plugin.jar")];
+        assert!(!needs_two_step_compilation(ProduceKind::Library, &plugins));
+    }
+
+    #[test]
+    fn two_step_not_needed_for_library_without_plugins() {
+        assert!(!needs_two_step_compilation(ProduceKind::Library, &[]));
+    }
+
+    // -----------------------------------------------------------------------
+    // two-step compilation args
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn two_step_compile_produces_library_with_plugins() {
+        use konvoy_konanc::invoke::KonancCommand;
+
+        let plugins = vec![PathBuf::from("/cache/serialization.jar")];
+        let libs = vec![PathBuf::from("/cache/core.klib")];
+
+        // Step 1: should produce a library with plugins.
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("src/main.kt")])
+            .output(std::path::Path::new("/tmp/intermediate.klib"))
+            .target("linux_x64")
+            .produce(ProduceKind::Library)
+            .libraries(&libs)
+            .plugins(&plugins);
+
+        let args = cmd.build_args().unwrap();
+        assert!(args.contains(&"-produce".to_owned()));
+        assert!(args.contains(&"library".to_owned()));
+        assert!(args.iter().any(|a| a.starts_with("-Xplugin=")));
+        assert!(!args.iter().any(|a| a.starts_with("-Xinclude=")));
+    }
+
+    #[test]
+    fn two_step_link_uses_xinclude_without_plugins() {
+        use konvoy_konanc::invoke::KonancCommand;
+
+        let libs = vec![PathBuf::from("/cache/core.klib")];
+
+        // Step 2: should include the klib, no plugins, no sources.
+        let cmd = KonancCommand::new()
+            .include(std::path::Path::new("/tmp/intermediate.klib"))
+            .output(std::path::Path::new("/tmp/output"))
+            .target("linux_x64")
+            .libraries(&libs);
+
+        let args = cmd.build_args().unwrap();
+        assert!(args.iter().any(|a| a.starts_with("-Xinclude=")));
+        assert!(!args.iter().any(|a| a.starts_with("-Xplugin=")));
+        assert!(!args.contains(&"-produce".to_owned()));
+        // No source files in the args.
+        assert!(!args.iter().any(|a| a.ends_with(".kt")));
     }
 
     // -----------------------------------------------------------------------
