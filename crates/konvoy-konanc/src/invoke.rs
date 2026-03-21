@@ -98,6 +98,8 @@ pub struct KonancCommand {
     plugins: Vec<PathBuf>,
     java_home: Option<PathBuf>,
     generate_test_runner: bool,
+    /// Klib to include via `-Xinclude=` (used for linking a klib into a binary).
+    include: Option<PathBuf>,
 }
 
 impl KonancCommand {
@@ -160,12 +162,18 @@ impl KonancCommand {
         self
     }
 
+    /// Set a klib to include via `-Xinclude=` (for linking a klib into a binary).
+    pub fn include(mut self, path: &Path) -> Self {
+        self.include = Some(path.to_path_buf());
+        self
+    }
+
     /// Build the argument list without executing.
     ///
     /// # Errors
     /// Returns an error if sources or output path are not set.
     pub fn build_args(&self) -> Result<Vec<String>, KonancError> {
-        if self.sources.is_empty() {
+        if self.sources.is_empty() && self.include.is_none() {
             return Err(KonancError::NoSources);
         }
         let Some(output) = &self.output else {
@@ -196,6 +204,11 @@ impl KonancCommand {
                 args.push("-produce".to_owned());
                 args.push("library".to_owned());
             }
+        }
+
+        // Include klib (for linking step)
+        if let Some(include) = &self.include {
+            args.push(format!("-Xinclude={}", include.display()));
         }
 
         // Dependency libraries

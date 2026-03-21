@@ -378,9 +378,97 @@ pub(crate) fn resolve_target(target_opt: &Option<String>) -> Result<Target, Engi
     }
 }
 
-/// Invoke konanc and return the path to the compiled artifact.
+/// Check whether two-step compilation is needed.
+///
+/// konanc has a bug in one-stage compilation: compiler plugins (like
+/// serialization) are loaded but their codegen doesn't fire when compiling
+/// sources directly to a binary. Gradle works around this by always compiling
+/// sources to a klib first, then linking the klib into a binary.
+///
+/// We do the same when producing a program with plugins active.
+fn needs_two_step_compilation(produce: ProduceKind, plugin_jars: &[PathBuf]) -> bool {
+    produce == ProduceKind::Program && !plugin_jars.is_empty()
+}
+
+/// Two-step compilation: sources → klib → binary.
+///
+/// Step 1 compiles sources into a temporary klib with plugins active so that
+/// plugin codegen (e.g. serialization) is applied. Step 2 links the klib into
+/// the final binary without plugins.
 #[allow(clippy::too_many_arguments)]
-fn compile(
+fn compile_two_step(
+    konanc: &KonancInfo,
+    jre_home: Option<&Path>,
+    sources: &[PathBuf],
+    target: &Target,
+    output_path: &Path,
+    options: &BuildOptions,
+    library_paths: &[PathBuf],
+    plugin_jars: &[PathBuf],
+) -> Result<PathBuf, EngineError> {
+    // Step 1: compile sources → temporary klib (with plugins active).
+    let klib_path = output_path.with_extension("klib");
+
+    let mut compile_cmd = KonancCommand::new()
+        .sources(sources)
+        .output(&klib_path)
+        .target(target.to_konanc_arg())
+        .release(options.release)
+        .produce(ProduceKind::Library)
+        .libraries(library_paths)
+        .plugins(plugin_jars);
+
+    if let Some(jh) = jre_home {
+        compile_cmd = compile_cmd.java_home(jh);
+    }
+
+    let compile_result = compile_cmd.execute(konanc)?;
+    crate::diagnostics::print_diagnostics(&compile_result, options.verbose);
+
+    if !compile_result.success {
+        return Err(EngineError::CompilationFailed {
+            error_count: compile_result.error_count(),
+        });
+    }
+
+    // Step 2: link klib → binary (no plugins needed).
+    // Use a closure so the temp klib is cleaned up on all exit paths.
+    let link_result = (|| {
+        let mut link_cmd = KonancCommand::new()
+            .include(&klib_path)
+            .output(output_path)
+            .target(target.to_konanc_arg())
+            .release(options.release)
+            .libraries(library_paths);
+
+        if let Some(jh) = jre_home {
+            link_cmd = link_cmd.java_home(jh);
+        }
+
+        let result = link_cmd.execute(konanc)?;
+        crate::diagnostics::print_diagnostics(&result, options.verbose);
+
+        if !result.success {
+            return Err(EngineError::CompilationFailed {
+                error_count: result.error_count(),
+            });
+        }
+
+        normalize_konanc_output(output_path)?;
+        Ok(output_path.to_path_buf())
+    })();
+
+    // Clean up temporary klib regardless of success or failure.
+    let _ = std::fs::remove_file(&klib_path);
+
+    link_result
+}
+
+/// Single-step compilation: sources → artifact directly.
+///
+/// Used for library builds, or program builds without plugins.
+#[allow(clippy::too_many_arguments)]
+fn compile_single_step(
     konanc: &KonancInfo,
     jre_home: Option<&Path>,
     sources: &[PathBuf],
@@ -391,11 +479,6 @@ fn compile(
     library_paths: &[PathBuf],
     plugin_jars: &[PathBuf],
 ) -> Result<PathBuf, EngineError> {
-    // Ensure the output directory exists.
-    if let Some(parent) = output_path.parent() {
-        konvoy_util::fs::ensure_dir(parent)?;
-    }
-
     let mut cmd = KonancCommand::new()
         .sources(sources)
         .output(output_path)
@@ -426,6 +509,50 @@ fn compile(
     }
 
     Ok(output_path.to_path_buf())
+}
+
+/// Invoke konanc and return the path to the compiled artifact.
+#[allow(clippy::too_many_arguments)]
+fn compile(
+    konanc: &KonancInfo,
+    jre_home: Option<&Path>,
+    sources: &[PathBuf],
+    target: &Target,
+    output_path: &Path,
+    options: &BuildOptions,
+    produce: ProduceKind,
+    library_paths: &[PathBuf],
+    plugin_jars: &[PathBuf],
+) -> Result<PathBuf, EngineError> {
+    // Ensure the output directory exists.
+    if let Some(parent) = output_path.parent() {
+        konvoy_util::fs::ensure_dir(parent)?;
+    }
+
+    if needs_two_step_compilation(produce, plugin_jars) {
+        compile_two_step(
+            konanc,
+            jre_home,
+            sources,
+            target,
+            output_path,
+            options,
+            library_paths,
+            plugin_jars,
+        )
+    } else {
+        compile_single_step(
+            konanc,
+            jre_home,
+            sources,
+            target,
+            output_path,
+            options,
+            produce,
+            library_paths,
+            plugin_jars,
+        )
+    }
 }
 
 /// Serialize lockfile content for cache key computation.
@@ -4148,6 +4275,104 @@ kotlin-allopen = { maven = "org.jetbrains.kotlin:kotlin-allopen-compiler-plugin"
                 "every -Xplugin path must use embeddable variant: {arg}",
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // needs_two_step_compilation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn two_step_needed_for_program_with_plugins() {
+        let plugins = vec![PathBuf::from("/cache/plugin.jar")];
+        assert!(needs_two_step_compilation(ProduceKind::Program, &plugins));
+    }
+
+    #[test]
+    fn two_step_not_needed_for_program_without_plugins() {
+        assert!(!needs_two_step_compilation(ProduceKind::Program, &[]));
+    }
+
+    #[test]
+    fn two_step_not_needed_for_library_with_plugins() {
+        let plugins = vec![PathBuf::from("/cache/plugin.jar")];
+        assert!(!needs_two_step_compilation(ProduceKind::Library, &plugins));
+    }
+
+    #[test]
+    fn two_step_not_needed_for_library_without_plugins() {
+        assert!(!needs_two_step_compilation(ProduceKind::Library, &[]));
+    }
+
+    // -----------------------------------------------------------------------
+    // two-step compilation args
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn two_step_compile_produces_library_with_plugins() {
+        use konvoy_konanc::invoke::KonancCommand;
+
+        let plugins = vec![PathBuf::from("/cache/serialization.jar")];
+        let libs = vec![PathBuf::from("/cache/core.klib")];
+
+        // Step 1: should produce a library with plugins.
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("src/main.kt")])
+            .output(std::path::Path::new("/tmp/intermediate.klib"))
+            .target("linux_x64")
+            .produce(ProduceKind::Library)
+            .libraries(&libs)
+            .plugins(&plugins);
+
+        let args = cmd.build_args().unwrap();
+        assert!(args.contains(&"-produce".to_owned()));
+        assert!(args.contains(&"library".to_owned()));
+        assert!(args.iter().any(|a| a.starts_with("-Xplugin=")));
+        assert!(!args.iter().any(|a| a.starts_with("-Xinclude=")));
+    }
+
+    #[test]
+    fn two_step_link_uses_xinclude_without_plugins() {
+        use konvoy_konanc::invoke::KonancCommand;
+
+        let libs = vec![PathBuf::from("/cache/core.klib")];
+
+        // Step 2: should include the klib, no plugins, no sources.
+        let cmd = KonancCommand::new()
+            .include(std::path::Path::new("/tmp/intermediate.klib"))
+            .output(std::path::Path::new("/tmp/output"))
+            .target("linux_x64")
+            .libraries(&libs);
+
+        let args = cmd.build_args().unwrap();
+        assert!(args.iter().any(|a| a.starts_with("-Xinclude=")));
+        assert!(!args.iter().any(|a| a.starts_with("-Xplugin=")));
+        assert!(!args.contains(&"-produce".to_owned()));
+        // No source files in the args.
+        assert!(!args.iter().any(|a| a.ends_with(".kt")));
+    }
+
+    #[test]
+    fn two_step_compile_passes_release_flag() {
+        use konvoy_konanc::invoke::KonancCommand;
+
+        let plugins = vec![PathBuf::from("/cache/serialization.jar")];
+        let libs = vec![PathBuf::from("/cache/core.klib")];
+
+        // Step 1 in release mode should include -opt.
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("src/main.kt")])
+            .output(std::path::Path::new("/tmp/intermediate.klib"))
+            .target("linux_x64")
+            .release(true)
+            .produce(ProduceKind::Library)
+            .libraries(&libs)
+            .plugins(&plugins);
+
+        let args = cmd.build_args().unwrap();
+        assert!(
+            args.contains(&"-opt".to_owned()),
+            "step 1 should pass -opt in release mode: {args:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
