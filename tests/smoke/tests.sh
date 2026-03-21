@@ -294,7 +294,7 @@ test_build_release() {
 
 test_clean_no_konvoy_dir_ok() {
     mkdir -p src
-    printf '[package]\nname = "noop"\n\n[toolchain]\nkotlin = "2.1.0"\n' > konvoy.toml
+    printf '[package]\nname = "noop"\n\n[toolchain]\nkotlin = "2.2.0"\n' > konvoy.toml
     konvoy clean >/dev/null 2>&1
 }
 
@@ -329,7 +329,7 @@ test_clean_all_removes_everything() {
 
 test_clean_all_no_konvoy_dir_ok() {
     mkdir -p src
-    printf '[package]\nname = "noop"\n\n[toolchain]\nkotlin = "2.1.0"\n' > konvoy.toml
+    printf '[package]\nname = "noop"\n\n[toolchain]\nkotlin = "2.2.0"\n' > konvoy.toml
     konvoy clean --all >/dev/null 2>&1
 }
 
@@ -470,7 +470,7 @@ kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-comp
 TOML
     cd plug-locked
     # Write a valid lockfile that's missing plugin entries.
-    printf '[toolchain]\nkonanc_version = "2.1.0"\n' > konvoy.lock
+    printf '[toolchain]\nkonanc_version = "2.2.0"\n' > konvoy.lock
     local output
     if output=$(konvoy build --locked 2>&1); then
         echo "    expected --locked to fail without plugin entries in lockfile" >&2
@@ -544,6 +544,50 @@ TOML
     if [ -f konvoy.lock ]; then
         assert_file_not_contains konvoy.lock "{kotlin}"
     fi
+}
+
+test_issue_239_serialization_plugin_applied() {
+    # Issue #239: serialization compiler plugin is downloaded but not applied.
+    # Exact reproducer from the bug report. The binary must run without
+    # throwing a SerializationException.
+    mkdir -p repro/src
+    cat > repro/konvoy.toml << 'TOML'
+[package]
+name = "konvoy-serialization-repro"
+kind = "bin"
+entrypoint = "src/main.kt"
+
+[toolchain]
+kotlin = "2.2.0"
+
+[plugins]
+serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+
+[dependencies]
+kotlinx-serialization-core = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-core", version = "1.7.3" }
+kotlinx-serialization-json = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-json", version = "1.7.3" }
+TOML
+    cat > repro/src/main.kt << 'KOTLIN'
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+
+@Serializable
+data class Person(val name: String, val age: Int)
+
+fun main() {
+    val json = Json.decodeFromString<Person>("""{"name":"Alice","age":30}""")
+    println("name=${json.name} age=${json.age}")
+}
+KOTLIN
+    cd repro
+
+    konvoy update >/dev/null 2>&1
+    konvoy build 2>&1
+
+    # The binary must run cleanly — no SerializationException.
+    local run_output
+    run_output=$(.konvoy/build/linux_x64/debug/konvoy-serialization-repro 2>&1)
+    assert_contains "$run_output" "name=Alice age=30"
 }
 
 # ---------------------------------------------------------------------------
@@ -766,7 +810,7 @@ kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version =
 TOML
     cd locked-maven
     # Create a lockfile with toolchain but no Maven entries.
-    printf '[toolchain]\nkonanc_version = "2.1.0"\n' > konvoy.lock
+    printf '[toolchain]\nkonanc_version = "2.2.0"\n' > konvoy.lock
     local output
     if output=$(konvoy build --locked 2>&1); then
         echo "    expected --locked to fail without Maven entries in lockfile" >&2
@@ -885,7 +929,7 @@ kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version =
 TOML
     cd doc-missing
     # Create lockfile without Maven entries.
-    printf '[toolchain]\nkonanc_version = "2.1.0"\n' > konvoy.lock
+    printf '[toolchain]\nkonanc_version = "2.2.0"\n' > konvoy.lock
 
     local output
     output=$(konvoy doctor 2>&1)
@@ -933,7 +977,7 @@ test_run_outside_project_fails() {
 
 test_build_no_sources_fails() {
     mkdir -p src
-    printf '[package]\nname = "empty"\n\n[toolchain]\nkotlin = "2.1.0"\n' > konvoy.toml
+    printf '[package]\nname = "empty"\n\n[toolchain]\nkotlin = "2.2.0"\n' > konvoy.toml
     local output
     if output=$(konvoy build 2>&1); then
         echo "    expected build to fail with no sources" >&2
@@ -1107,8 +1151,8 @@ test_lint_without_config_fails() {
 }
 
 test_lint_no_sources_warns() {
-    printf '[package]\nname = "empty"\n\n[toolchain]\nkotlin = "2.1.0"\ndetekt = "1.23.7"\n' > konvoy.toml
-    printf '[toolchain]\nkonanc_version = "2.1.0"\n' > konvoy.lock
+    printf '[package]\nname = "empty"\n\n[toolchain]\nkotlin = "2.2.0"\ndetekt = "1.23.7"\n' > konvoy.toml
+    printf '[toolchain]\nkonanc_version = "2.2.0"\n' > konvoy.lock
     local output
     if ! output=$(konvoy lint 2>&1); then
         echo "    expected lint to succeed with no sources" >&2
@@ -1179,6 +1223,9 @@ run_test test_plugin_with_path_fails
 run_test test_plugin_locked_no_entries_error
 run_test test_plugin_build_lifecycle
 run_test test_plugin_kotlin_placeholder_resolves
+
+# Issue #239: serialization plugin must use embeddable JAR
+run_test test_issue_239_serialization_plugin_applied
 
 # Maven dependencies
 run_test test_update_help
