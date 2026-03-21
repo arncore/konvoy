@@ -413,6 +413,7 @@ fn compile_two_step(
         .sources(sources)
         .output(&klib_path)
         .target(target.to_konanc_arg())
+        .release(options.release)
         .produce(ProduceKind::Library)
         .libraries(library_paths)
         .plugins(plugin_jars);
@@ -4348,6 +4349,30 @@ kotlin-allopen = { maven = "org.jetbrains.kotlin:kotlin-allopen-compiler-plugin"
         assert!(!args.contains(&"-produce".to_owned()));
         // No source files in the args.
         assert!(!args.iter().any(|a| a.ends_with(".kt")));
+    }
+
+    #[test]
+    fn two_step_compile_passes_release_flag() {
+        use konvoy_konanc::invoke::KonancCommand;
+
+        let plugins = vec![PathBuf::from("/cache/serialization.jar")];
+        let libs = vec![PathBuf::from("/cache/core.klib")];
+
+        // Step 1 in release mode should include -opt.
+        let cmd = KonancCommand::new()
+            .sources(&[PathBuf::from("src/main.kt")])
+            .output(std::path::Path::new("/tmp/intermediate.klib"))
+            .target("linux_x64")
+            .release(true)
+            .produce(ProduceKind::Library)
+            .libraries(&libs)
+            .plugins(&plugins);
+
+        let args = cmd.build_args().unwrap();
+        assert!(
+            args.contains(&"-opt".to_owned()),
+            "step 1 should pass -opt in release mode: {args:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
