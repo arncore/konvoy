@@ -5,7 +5,7 @@ import com.intellij.openapi.application.WriteAction
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.module.Module
 import com.intellij.openapi.module.ModuleManager
-import com.intellij.openapi.module.ModuleTypeId
+import com.intellij.openapi.module.StdModuleTypes
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.roots.*
 import com.intellij.openapi.roots.libraries.LibraryTablesRegistrar
@@ -61,7 +61,7 @@ object KonvoyWorkspaceModelUpdater {
         // Create new module
         val imlPath = "$basePath/.konvoy/$name.iml"
         val model = moduleManager.getModifiableModel()
-        val module = model.newModule(imlPath, ModuleTypeId.JAVA_MODULE)
+        val module = model.newModule(imlPath, StdModuleTypes.JAVA.id)
         model.commit()
         return module
     }
@@ -258,7 +258,4 @@ object KonvoyWorkspaceModelUpdater {
         }
     }
 
-    companion object {
-        private val LOG = Logger.getInstance(KonvoyWorkspaceModelUpdater::class.java)
-    }
 }
