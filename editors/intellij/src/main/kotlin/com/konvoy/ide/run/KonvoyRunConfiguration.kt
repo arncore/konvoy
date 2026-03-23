@@ -2,7 +2,6 @@ package com.konvoy.ide.run
 
 import com.intellij.execution.Executor
 import com.intellij.execution.configurations.*
-import com.intellij.execution.process.OSProcessHandler
 import com.intellij.execution.process.ProcessHandler
 import com.intellij.execution.process.ProcessHandlerFactory
 import com.intellij.execution.runners.ExecutionEnvironment
@@ -18,18 +17,10 @@ class KonvoyRunConfiguration(
     project: Project,
     factory: ConfigurationFactory,
     name: String,
-) : RunConfigurationBase<KonvoyRunConfigurationOptions>(project, factory, name) {
+) : RunConfigurationBase<RunConfigurationOptions>(project, factory, name) {
 
-    var command: KonvoyCommand
-        get() = options.command
-        set(value) { options.command = value }
-
-    var extraArgs: String
-        get() = options.extraArgs
-        set(value) { options.extraArgs = value }
-
-    override fun getOptions(): KonvoyRunConfigurationOptions =
-        super.getOptions() as KonvoyRunConfigurationOptions
+    var command: KonvoyCommand = KonvoyCommand.RUN
+    var extraArgs: String = ""
 
     override fun getConfigurationEditor(): SettingsEditor<out RunConfiguration> =
         KonvoySettingsEditor()
@@ -61,11 +52,6 @@ class KonvoyRunConfiguration(
             ?: KonvoyCommand.RUN
         extraArgs = element.getAttributeValue("konvoy-extra-args") ?: ""
     }
-}
-
-class KonvoyRunConfigurationOptions : RunConfigurationOptions() {
-    var command: KonvoyCommand = KonvoyCommand.RUN
-    var extraArgs: String = ""
 }
 
 enum class KonvoyCommand(val displayName: String, val subcommand: String) {

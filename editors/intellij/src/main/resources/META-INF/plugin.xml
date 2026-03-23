@@ -13,6 +13,10 @@
     <depends>org.jetbrains.kotlin</depends>
     <depends optional="true" config-file="konvoy-withToml.xml">org.toml.lang</depends>
 
+    <extensions defaultExtensionNs="org.jetbrains.kotlin">
+        <supportsKotlinPluginMode supportsK2="true"/>
+    </extensions>
+
     <extensions defaultExtensionNs="com.intellij">
         <!-- SDK type for Konvoy toolchains -->
         <sdkType implementation="com.konvoy.ide.sdk.KonvoySdkType"/>

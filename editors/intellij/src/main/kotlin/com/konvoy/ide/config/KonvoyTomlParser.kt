@@ -16,22 +16,33 @@ object KonvoyTomlParser {
     private val LOG = Logger.getInstance(KonvoyTomlParser::class.java)
 
     fun parseManifest(project: Project, file: VirtualFile): KonvoyManifest? {
+        val text = file.contentsToByteArray().decodeToString()
         return try {
-            val psi = PsiManager.getInstance(project).findFile(file) as? TomlFile ?: return null
-            parseManifestFromPsi(psi)
+            val psi = PsiManager.getInstance(project).findFile(file) as? TomlFile
+            val result = psi?.let { parseManifestFromPsi(it) }
+            if (result != null) {
+                LOG.info("Parsed konvoy.toml via PSI: ${result.`package`.name}")
+                return result
+            }
+            LOG.info("PSI parsing returned null, falling back to text")
+            parseManifestFromText(text)
         } catch (e: Exception) {
             LOG.warn("Failed to parse konvoy.toml via PSI, falling back to text", e)
-            parseManifestFromText(file.contentsToByteArray().decodeToString())
+            parseManifestFromText(text)
         }
     }
 
     fun parseLockfile(project: Project, file: VirtualFile): KonvoyLockfile? {
+        val text = file.contentsToByteArray().decodeToString()
         return try {
-            val psi = PsiManager.getInstance(project).findFile(file) as? TomlFile ?: return null
-            parseLockfileFromPsi(psi)
+            val psi = PsiManager.getInstance(project).findFile(file) as? TomlFile
+            val result = psi?.let { parseLockfileFromPsi(it) }
+            if (result != null) return result
+            LOG.info("PSI lockfile parsing returned null, falling back to text")
+            parseLockfileFromText(text)
         } catch (e: Exception) {
             LOG.warn("Failed to parse konvoy.lock via PSI, falling back to text", e)
-            parseLockfileFromText(file.contentsToByteArray().decodeToString())
+            parseLockfileFromText(text)
         }
     }
 

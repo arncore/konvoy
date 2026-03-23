@@ -33,9 +33,15 @@ object KonvoyWorkspaceModelUpdater {
     private val LOG = Logger.getInstance(KonvoyWorkspaceModelUpdater::class.java)
 
     fun updateProjectModel(project: Project, manifest: KonvoyManifest, lockfile: KonvoyLockfile?) {
+        LOG.info("Scheduling workspace model update for '${manifest.`package`.name}'")
         ApplicationManager.getApplication().invokeLater {
+            if (project.isDisposed) return@invokeLater
             WriteAction.run<Throwable> {
-                doUpdate(project, manifest, lockfile)
+                try {
+                    doUpdate(project, manifest, lockfile)
+                } catch (e: Exception) {
+                    LOG.error("Failed to update workspace model", e)
+                }
             }
         }
     }
@@ -44,10 +50,17 @@ object KonvoyWorkspaceModelUpdater {
         val basePath = project.basePath ?: return
         val moduleName = manifest.`package`.name
 
+        LOG.info("Updating workspace model for '$moduleName' (kotlin ${manifest.toolchain.kotlin})")
+
         val module = getOrCreateModule(project, moduleName, basePath)
         configureSourceRoots(module, basePath)
         configureLibraries(project, module, manifest, lockfile)
-        configureKotlinFacet(module, manifest, lockfile)
+
+        try {
+            configureKotlinFacet(module, manifest, lockfile)
+        } catch (e: Exception) {
+            LOG.warn("Failed to configure Kotlin facet, language intelligence may be limited", e)
+        }
 
         LOG.info("Workspace model updated for module '$moduleName'")
     }
@@ -128,6 +141,16 @@ object KonvoyWorkspaceModelUpdater {
 
         val tableModel = libraryTable.modifiableModel
 
+        // Add Kotlin/Native stdlib from the managed toolchain
+        val kotlinVersion = manifest.toolchain.kotlin
+        val stdlibPath = findStdlibKlib(konvoyHome, kotlinVersion)
+        if (stdlibPath != null) {
+            addKlibLibrary(tableModel, moduleModel, "konvoy:kotlin-stdlib", stdlibPath)
+            LOG.info("Added Kotlin/Native stdlib from $stdlibPath")
+        } else {
+            LOG.warn("Kotlin/Native stdlib not found for version $kotlinVersion in $konvoyHome/toolchains/")
+        }
+
         // Add Maven dependencies as libraries
         if (lockfile != null) {
             for (dep in lockfile.dependencies) {
@@ -176,6 +199,23 @@ object KonvoyWorkspaceModelUpdater {
 
         val path = "$konvoyHome/cache/maven/$groupPath/$artifactId/$version/$fileName"
         return if (File(path).exists()) path else null
+    }
+
+    /**
+     * Find the Kotlin/Native stdlib klib in the managed toolchain.
+     * Tries the exact version first, then falls back to the closest available version.
+     */
+    private fun findStdlibKlib(konvoyHome: String, kotlinVersion: String): String? {
+        val exactPath = "$konvoyHome/toolchains/$kotlinVersion/klib/common/stdlib"
+        if (File(exactPath).isDirectory) return exactPath
+
+        // Fallback: find any installed toolchain with a stdlib
+        val toolchainsDir = File("$konvoyHome/toolchains")
+        if (!toolchainsDir.isDirectory) return null
+        return toolchainsDir.listFiles()
+            ?.filter { it.isDirectory && File(it, "klib/common/stdlib").isDirectory }
+            ?.maxByOrNull { it.name } // prefer latest version
+            ?.let { "${it.absolutePath}/klib/common/stdlib" }
     }
 
     private fun addKlibLibrary(

@@ -1,5 +1,6 @@
 package com.konvoy.ide.sync
 
+import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
@@ -46,14 +47,20 @@ class KonvoyProjectService(private val project: Project) {
             return
         }
 
-        manifest = KonvoyTomlParser.parseManifest(project, manifestFile)
+        manifest = ReadAction.compute<KonvoyManifest?, Throwable> {
+            KonvoyTomlParser.parseManifest(project, manifestFile)
+        }
         if (manifest == null) {
             LOG.warn("Failed to parse konvoy.toml")
             return
         }
 
         val lockfileFile = findLockfile()
-        lockfile = lockfileFile?.let { KonvoyTomlParser.parseLockfile(project, it) }
+        lockfile = lockfileFile?.let {
+            ReadAction.compute<KonvoyLockfile?, Throwable> {
+                KonvoyTomlParser.parseLockfile(project, it)
+            }
+        }
 
         LOG.info("Konvoy project synced: ${manifest?.`package`?.name} (kotlin ${manifest?.toolchain?.kotlin})")
 
