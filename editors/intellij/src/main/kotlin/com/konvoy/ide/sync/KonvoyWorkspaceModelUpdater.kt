@@ -58,8 +58,9 @@ object KonvoyWorkspaceModelUpdater {
 
         try {
             configureKotlinFacet(module, manifest, lockfile)
+            LOG.info("Kotlin facet configured successfully")
         } catch (e: Exception) {
-            LOG.warn("Failed to configure Kotlin facet, language intelligence may be limited", e)
+            LOG.error("Failed to configure Kotlin facet, language intelligence may be limited", e)
         }
 
         LOG.info("Workspace model updated for module '$moduleName'")
@@ -226,7 +227,14 @@ object KonvoyWorkspaceModelUpdater {
     ) {
         val lib = tableModel.createLibrary(name)
         val libModel = lib.modifiableModel
-        val url = VfsUtil.getUrlForLibraryRoot(File(klibPath))
+        val file = File(klibPath)
+        val url = if (file.isDirectory) {
+            // klib directories need file:// URL, not jar://
+            com.intellij.openapi.vfs.VfsUtilCore.pathToUrl(file.absolutePath)
+        } else {
+            VfsUtil.getUrlForLibraryRoot(file)
+        }
+        LOG.info("Adding library '$name' with URL: $url")
         libModel.addRoot(url, OrderRootType.CLASSES)
         libModel.commit()
         moduleModel.addLibraryEntry(lib)
