@@ -17,8 +17,9 @@ Download the latest `konvoy-intellij-*.zip` from [Releases](https://github.com/a
 ```bash
 cd editors/intellij
 ./gradlew buildPlugin
-# Plugin zip: build/distributions/konvoy-intellij-<version>.zip
 ```
+
+Then install the built plugin: go to **Settings → Plugins → ⚙️ → Install Plugin from Disk...** and select `build/distributions/konvoy-intellij-<version>.zip`.
 
 ## Requirements
 
