@@ -336,7 +336,7 @@ See the [extension README](editors/code/README.md) for full details.
 
 ### IntelliJ IDEA
 
-Install [Konvoy for IntelliJ](https://plugins.jetbrains.com/plugin/com.konvoy.intellij) from the JetBrains Marketplace, or search for "Konvoy" in **Settings → Plugins → Marketplace**.
+Install [Konvoy for IntelliJ](https://plugins.jetbrains.com/plugin/30878-konvoy/) from the JetBrains Marketplace, or search for "Konvoy" in **Settings → Plugins → Marketplace**.
 
 The plugin provides full Kotlin/Native language intelligence by teaching IntelliJ how to read `konvoy.toml`. Once installed, IntelliJ's built-in Kotlin plugin handles completion, navigation, refactoring, and diagnostics automatically.
 

@@ -6,7 +6,7 @@ Kotlin/Native project support for [Konvoy](https://github.com/arncore/konvoy) bu
 
 **From JetBrains Marketplace:**
 
-Search for "Konvoy" in **Settings → Plugins → Marketplace**, or install from the [plugin page](https://plugins.jetbrains.com/plugin/com.konvoy.intellij).
+Search for "Konvoy" in **Settings → Plugins → Marketplace**, or install from the [plugin page](https://plugins.jetbrains.com/plugin/30878-konvoy/).
 
 **From GitHub Release:**
 
