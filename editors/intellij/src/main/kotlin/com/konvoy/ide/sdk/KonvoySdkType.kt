@@ -19,8 +19,8 @@ class KonvoySdkType : SdkType("KonvoyToolchain") {
     override fun suggestHomePath(): String? {
         val toolchainsDir = toolchainsBaseDir()
         return toolchainsDir.listFiles()
-            ?.filter { it.isDirectory }
-            ?.maxByOrNull { it.name } // latest version
+            ?.filter { it.isDirectory && hasKonanc(it) }
+            ?.maxByOrNull { it.name }
             ?.absolutePath
     }
 
