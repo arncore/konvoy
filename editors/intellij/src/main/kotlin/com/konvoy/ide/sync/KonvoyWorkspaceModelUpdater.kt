@@ -163,7 +163,8 @@ object KonvoyWorkspaceModelUpdater {
                     "The Kotlin version specified in konvoy.toml requires toolchain $kotlinVersion, " +
                         "but it is not installed at <code>~/.konvoy/toolchains/$kotlinVersion/</code>. " +
                         "Code intelligence will be limited until the toolchain is available.<br/><br/>" +
-                        "Run <code>konvoy toolchain install</code> to download it.",
+                        "Run <code>konvoy toolchain install</code> to download it, or run " +
+                        "<code>konvoy build</code> or <code>konvoy run</code> which will download it automatically.",
                     NotificationType.WARNING,
                 )
                 .notify(project)
