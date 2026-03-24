@@ -1,5 +1,7 @@
 package com.konvoy.ide.sdk
 
+import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.WriteAction
 import com.intellij.openapi.projectRoots.*
 import com.intellij.openapi.roots.OrderRootType
 import com.intellij.openapi.vfs.VfsUtil
@@ -61,7 +63,11 @@ class KonvoySdkType : SdkType("KonvoyToolchain") {
             modificator.addRoot(url, OrderRootType.CLASSES)
         }
 
-        modificator.commitChanges()
+        ApplicationManager.getApplication().invokeAndWait {
+            WriteAction.run<Throwable> {
+                modificator.commitChanges()
+            }
+        }
     }
 
     private fun hasKonanc(dir: File): Boolean {

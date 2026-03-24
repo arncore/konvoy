@@ -8,15 +8,20 @@ import com.intellij.openapi.module.ModuleManager
 import com.intellij.openapi.module.StdModuleTypes
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.roots.*
+import com.intellij.openapi.roots.impl.libraries.LibraryEx
 import com.intellij.openapi.roots.libraries.LibraryTablesRegistrar
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VfsUtil
 import com.konvoy.ide.config.*
-import org.jetbrains.kotlin.config.KotlinFacetSettingsProvider
+import org.jetbrains.kotlin.cli.common.arguments.K2NativeCompilerArguments
+import org.jetbrains.kotlin.config.CompilerSettings
+import org.jetbrains.kotlin.idea.base.platforms.KotlinNativeLibraryKind
 import org.jetbrains.kotlin.idea.facet.KotlinFacet
 import org.jetbrains.kotlin.idea.facet.KotlinFacetType
 import org.jetbrains.kotlin.platform.konan.NativePlatforms
 import com.intellij.facet.FacetManager
+import com.intellij.notification.NotificationGroupManager
+import com.intellij.notification.NotificationType
 import java.io.File
 
 /**
@@ -39,7 +44,7 @@ object KonvoyWorkspaceModelUpdater {
             WriteAction.run<Throwable> {
                 try {
                     doUpdate(project, manifest, lockfile)
-                } catch (e: Exception) {
+                } catch (e: Throwable) {
                     LOG.error("Failed to update workspace model", e)
                 }
             }
@@ -54,7 +59,7 @@ object KonvoyWorkspaceModelUpdater {
 
         val module = getOrCreateModule(project, moduleName, basePath)
         configureSourceRoots(module, basePath)
-        configureLibraries(project, module, manifest, lockfile)
+        configureLibraries(project, module, manifest, lockfile, basePath)
 
         try {
             configureKotlinFacet(module, manifest, lockfile)
@@ -119,6 +124,7 @@ object KonvoyWorkspaceModelUpdater {
         module: Module,
         manifest: KonvoyManifest,
         lockfile: KonvoyLockfile?,
+        basePath: String,
     ) {
         val libraryTable = LibraryTablesRegistrar.getInstance().getLibraryTable(project)
         val moduleModel = ModuleRootManager.getInstance(module).modifiableModel
@@ -149,7 +155,18 @@ object KonvoyWorkspaceModelUpdater {
             addKlibLibrary(tableModel, moduleModel, "konvoy:kotlin-stdlib", stdlibPath)
             LOG.info("Added Kotlin/Native stdlib from $stdlibPath")
         } else {
-            LOG.warn("Kotlin/Native stdlib not found for version $kotlinVersion in $konvoyHome/toolchains/")
+            LOG.warn("Kotlin $kotlinVersion toolchain not installed at $konvoyHome/toolchains/$kotlinVersion")
+            NotificationGroupManager.getInstance()
+                .getNotificationGroup("Konvoy")
+                .createNotification(
+                    "Konvoy: Kotlin $kotlinVersion toolchain not found",
+                    "The Kotlin version specified in konvoy.toml requires toolchain $kotlinVersion, " +
+                        "but it is not installed at <code>~/.konvoy/toolchains/$kotlinVersion/</code>. " +
+                        "Code intelligence will be limited until the toolchain is available.<br/><br/>" +
+                        "Run <code>konvoy toolchain install</code> to download it.",
+                    NotificationType.WARNING,
+                )
+                .notify(project)
         }
 
         // Add Maven dependencies as libraries
@@ -164,7 +181,7 @@ object KonvoyWorkspaceModelUpdater {
                         }
                     }
                     is DepSource.Path -> {
-                        val depPath = File(project.basePath!!, source.path).canonicalPath
+                        val depPath = File(basePath, source.path).canonicalPath
                         addPathDependency(tableModel, moduleModel, "konvoy:${dep.name}", depPath)
                     }
                 }
@@ -203,20 +220,13 @@ object KonvoyWorkspaceModelUpdater {
     }
 
     /**
-     * Find the Kotlin/Native stdlib klib in the managed toolchain.
-     * Tries the exact version first, then falls back to the closest available version.
+     * Find the Kotlin/Native stdlib klib for the exact requested version.
+     * Returns the path or null if the toolchain isn't installed.
      */
     private fun findStdlibKlib(konvoyHome: String, kotlinVersion: String): String? {
-        val exactPath = "$konvoyHome/toolchains/$kotlinVersion/klib/common/stdlib"
-        if (File(exactPath).isDirectory) return exactPath
-
-        // Fallback: find any installed toolchain with a stdlib
-        val toolchainsDir = File("$konvoyHome/toolchains")
-        if (!toolchainsDir.isDirectory) return null
-        return toolchainsDir.listFiles()
-            ?.filter { it.isDirectory && File(it, "klib/common/stdlib").isDirectory }
-            ?.maxByOrNull { it.name } // prefer latest version
-            ?.let { "${it.absolutePath}/klib/common/stdlib" }
+        val path = "$konvoyHome/toolchains/$kotlinVersion/klib/common/stdlib"
+        if (File(path, "default/manifest").exists()) return path
+        return null
     }
 
     private fun addKlibLibrary(
@@ -228,14 +238,29 @@ object KonvoyWorkspaceModelUpdater {
         val lib = tableModel.createLibrary(name)
         val libModel = lib.modifiableModel
         val file = File(klibPath)
+
+        // Refresh VFS so K2 analyzer can discover the klib files.
+        // Without this, getRootProvider().getFiles(CLASSES) returns empty
+        // and KaLibraryModuleImpl.resolvedKotlinLibraries finds nothing.
+        val vFile = LocalFileSystem.getInstance().refreshAndFindFileByPath(file.absolutePath)
+        if (vFile != null) {
+            VfsUtil.markDirtyAndRefresh(false, true, true, vFile)
+        }
+
         val url = if (file.isDirectory) {
-            // klib directories need file:// URL, not jar://
             com.intellij.openapi.vfs.VfsUtilCore.pathToUrl(file.absolutePath)
         } else {
             VfsUtil.getUrlForLibraryRoot(file)
         }
-        LOG.info("Adding library '$name' with URL: $url")
+        LOG.info("Adding library '$name' with URL: $url (vfs=${vFile != null})")
         libModel.addRoot(url, OrderRootType.CLASSES)
+
+        // Mark as Kotlin/Native library so the Kotlin plugin recognizes it
+        if (libModel is LibraryEx.ModifiableModelEx) {
+            libModel.kind = KotlinNativeLibraryKind
+            LOG.info("Set library kind to KotlinNativeLibraryKind for '$name'")
+        }
+
         libModel.commit()
         moduleModel.addLibraryEntry(lib)
     }
@@ -275,14 +300,12 @@ object KonvoyWorkspaceModelUpdater {
 
         val settings = facet.configuration.settings
 
-        // Set Kotlin/Native target platform
-        val konanTarget = KonvoyTargets.hostTarget()
-        settings.targetPlatform = NativePlatforms.nativePlatformBySingleTarget(konanTarget)
-
-        // Set language and API version from toolchain
+        // Set Kotlin/Native compiler arguments — this is what the targetPlatform getter
+        // uses to derive the platform in K2 mode (setting targetPlatform directly is ignored)
+        val nativeArgs = K2NativeCompilerArguments()
         val kotlinVersion = manifest.toolchain.kotlin
-        settings.languageLevel = org.jetbrains.kotlin.config.LanguageVersion.fromVersionString(kotlinVersion)
-        settings.apiLevel = org.jetbrains.kotlin.config.LanguageVersion.fromVersionString(kotlinVersion)
+        nativeArgs.languageVersion = kotlinVersion
+        nativeArgs.apiVersion = kotlinVersion
 
         // Configure compiler plugins
         if (lockfile != null && lockfile.plugins.isNotEmpty()) {
@@ -293,17 +316,30 @@ object KonvoyWorkspaceModelUpdater {
                 val groupPath = groupId.replace('.', '/')
                 val path = "$konvoyHome/cache/maven/$groupPath/$artifactId/${plugin.version}/$artifactId-${plugin.version}.jar"
                 if (File(path).exists()) path else {
-                    // Plugins may also be at the download URL path structure
                     val altPath = "$konvoyHome/tools/plugins/${plugin.name}/${plugin.version}/$artifactId-${plugin.version}.jar"
                     if (File(altPath).exists()) altPath else null
                 }
             }
-
-            val args = settings.compilerArguments
-            if (args != null) {
-                args.pluginClasspaths = pluginPaths.toTypedArray()
-            }
+            nativeArgs.pluginClasspaths = pluginPaths.toTypedArray()
         }
+
+        settings.compilerArguments = nativeArgs
+
+        // Set compilerSettings — this is what hasKotlinPluginEnabled() checks
+        // for non-JPS build systems (which we report via KonvoyBuildSystemTypeDetector)
+        if (settings.compilerSettings == null) {
+            settings.compilerSettings = CompilerSettings()
+        }
+
+        // Set target platform explicitly (backed by compiler arguments above)
+        val konanTarget = KonvoyTargets.hostTarget()
+        settings.targetPlatform = NativePlatforms.nativePlatformBySingleTarget(konanTarget)
+
+        // Set language and API version from toolchain
+        settings.languageLevel = org.jetbrains.kotlin.config.LanguageVersion.fromVersionString(kotlinVersion)
+        settings.apiLevel = org.jetbrains.kotlin.config.LanguageVersion.fromVersionString(kotlinVersion)
+
+        LOG.info("Configured Kotlin facet: platform=Native, kotlin=$kotlinVersion, compilerSettings=present")
     }
 
 }
