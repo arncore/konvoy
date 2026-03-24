@@ -1,5 +1,5 @@
 <idea-plugin>
-    <id>com.konvoy.intellij</id>
+    <id>com.konvoy.ide</id>
     <name>Konvoy</name>
     <vendor url="https://github.com/arncore/konvoy">Konvoy</vendor>
     <description><![CDATA[
@@ -10,6 +10,7 @@
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.java</depends>
     <depends>org.jetbrains.kotlin</depends>
     <depends optional="true" config-file="konvoy-withToml.xml">org.toml.lang</depends>
 
