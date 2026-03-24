@@ -336,7 +336,9 @@ See the [extension README](editors/code/README.md) for full details.
 
 ### IntelliJ IDEA
 
-The Konvoy IntelliJ plugin provides full Kotlin/Native language intelligence by teaching IntelliJ how to read `konvoy.toml`. Once installed, IntelliJ's built-in Kotlin plugin handles completion, navigation, refactoring, and diagnostics automatically.
+Install [Konvoy for IntelliJ](https://plugins.jetbrains.com/plugin/com.konvoy.intellij) from the JetBrains Marketplace, or search for "Konvoy" in **Settings → Plugins → Marketplace**.
+
+The plugin provides full Kotlin/Native language intelligence by teaching IntelliJ how to read `konvoy.toml`. Once installed, IntelliJ's built-in Kotlin plugin handles completion, navigation, refactoring, and diagnostics automatically.
 
 **Features:**
 
@@ -356,4 +358,6 @@ cd editors/intellij
 The plugin zip will be at `build/distributions/konvoy-intellij-<version>.zip`. Install it in IntelliJ via **Settings → Plugins → ⚙️ → Install Plugin from Disk...** and select the zip file.
 
 **Requirements:** IntelliJ IDEA 2024.2+ (Community or Ultimate) with the Kotlin plugin installed.
+
+See the [plugin README](editors/intellij/README.md) for full details.
 
