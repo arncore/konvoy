@@ -72,7 +72,7 @@ Once the project model is configured, all Kotlin intelligence comes from Intelli
 
 ## Known limitations
 
-- **K2 mode symbol resolution** — In IntelliJ 2025.3 with K2 mode enabled, stdlib symbols like `println` may show as unresolved. This is due to an upstream bug in the Kotlin plugin's `LibraryEffectiveKindProvider` which ignores `LibraryEntity.typeId` for non-Gradle libraries. A fix has been identified and reported to JetBrains. The "Kotlin is not configured" banner and all other plugin features work correctly.
+- **K2 mode symbol resolution** — In IntelliJ 2025.3 with K2 mode enabled, stdlib symbols like `println` may show as unresolved. This is due to an upstream bug in the Kotlin plugin's `LibraryEffectiveKindProvider` which ignores `LibraryEntity.typeId` for non-Gradle libraries. A [fix has been submitted](https://github.com/JetBrains/intellij-community/pull/3469) upstream. The "Kotlin is not configured" banner and all other plugin features work correctly.
 
 ## Development
 
