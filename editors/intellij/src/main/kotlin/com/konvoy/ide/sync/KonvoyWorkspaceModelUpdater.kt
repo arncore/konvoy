@@ -64,7 +64,7 @@ object KonvoyWorkspaceModelUpdater {
         try {
             configureKotlinFacet(module, manifest, lockfile)
             LOG.info("Kotlin facet configured successfully")
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             LOG.error("Failed to configure Kotlin facet, language intelligence may be limited", e)
         }
 

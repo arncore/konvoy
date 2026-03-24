@@ -72,7 +72,7 @@ class KonvoyCommandLineState(
     override fun startProcess(): ProcessHandler {
         val cmd = GeneralCommandLine("konvoy", config.command.subcommand)
         if (config.extraArgs.isNotBlank()) {
-            cmd.addParameters(config.extraArgs.split(" ").filter { it.isNotBlank() })
+            cmd.addParameters(com.intellij.execution.configurations.ParametersList.parse(config.extraArgs).toList())
         }
         cmd.workDirectory = File(config.project.basePath!!)
         cmd.withParentEnvironmentType(GeneralCommandLine.ParentEnvironmentType.CONSOLE)
