@@ -334,3 +334,26 @@ Install [Konvoy for VS Code](https://marketplace.visualstudio.com/items?itemName
 
 See the [extension README](editors/code/README.md) for full details.
 
+### IntelliJ IDEA
+
+The Konvoy IntelliJ plugin provides full Kotlin/Native language intelligence by teaching IntelliJ how to read `konvoy.toml`. Once installed, IntelliJ's built-in Kotlin plugin handles completion, navigation, refactoring, and diagnostics automatically.
+
+**Features:**
+
+- **Project sync** — Parses `konvoy.toml` and `konvoy.lock` to configure modules, source roots, klib dependencies, and Kotlin/Native target platform
+- **Auto re-sync** — Watches `konvoy.toml` and `konvoy.lock` for changes
+- **Run configurations** — Build, Run, Test, and Lint via the standard run menu
+- **Toolchain SDK** — Discovers managed toolchains from `~/.konvoy/toolchains/`
+- **Full Kotlin intelligence** — Completion, go-to-definition, find usages, rename, diagnostics, and refactoring (provided by IntelliJ's Kotlin plugin)
+
+**Install from source:**
+
+```bash
+cd editors/intellij
+./gradlew buildPlugin
+```
+
+The plugin zip will be at `build/distributions/konvoy-intellij-<version>.zip`. Install it in IntelliJ via **Settings → Plugins → ⚙️ → Install Plugin from Disk...** and select the zip file.
+
+**Requirements:** IntelliJ IDEA 2024.2+ (Community or Ultimate) with the Kotlin plugin installed.
+

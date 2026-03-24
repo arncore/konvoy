@@ -1,0 +1,6 @@
+<idea-plugin>
+    <!-- Extensions that require the TOML plugin -->
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Future: konvoy.toml schema completion, validation, navigation -->
+    </extensions>
+</idea-plugin>

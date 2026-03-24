@@ -1,0 +1,58 @@
+<idea-plugin>
+    <id>com.konvoy.intellij</id>
+    <name>Konvoy</name>
+    <vendor url="https://github.com/arncore/konvoy">Konvoy</vendor>
+    <description><![CDATA[
+        Kotlin/Native project support for <a href="https://github.com/arncore/konvoy">Konvoy</a> build tool.
+        <br/>
+        Provides project model integration, run configurations, and toolchain management
+        for projects using <code>konvoy.toml</code>.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>org.jetbrains.kotlin</depends>
+    <depends optional="true" config-file="konvoy-withToml.xml">org.toml.lang</depends>
+
+    <extensions defaultExtensionNs="org.jetbrains.kotlin">
+        <supportsKotlinPluginMode supportsK2="true"/>
+        <projectConfigurator implementation="com.konvoy.ide.sync.KonvoyKotlinProjectConfigurator"/>
+        <buildSystemTypeDetector implementation="com.konvoy.ide.sync.KonvoyBuildSystemTypeDetector"/>
+    </extensions>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- SDK type for Konvoy toolchains -->
+        <sdkType implementation="com.konvoy.ide.sdk.KonvoySdkType"/>
+
+        <!-- Run configurations -->
+        <configurationType implementation="com.konvoy.ide.run.KonvoyConfigurationType"/>
+        <runConfigurationProducer
+                implementation="com.konvoy.ide.run.KonvoyRunConfigurationProducer"
+                order="first"/>
+
+        <!-- Project service -->
+        <projectService
+                serviceImplementation="com.konvoy.ide.sync.KonvoyProjectService"/>
+
+        <!-- Startup activity to detect konvoy.toml on project open -->
+        <postStartupActivity
+                implementation="com.konvoy.ide.sync.KonvoyStartupActivity"/>
+
+        <!-- Notification group -->
+        <notificationGroup id="Konvoy" displayType="BALLOON"/>
+    </extensions>
+
+    <projectListeners>
+        <listener class="com.konvoy.ide.sync.KonvoyFileListener"
+                  topic="com.intellij.openapi.vfs.newvfs.BulkFileListener"/>
+    </projectListeners>
+
+    <actions>
+        <action id="Konvoy.SyncProject"
+                class="com.konvoy.ide.sync.KonvoySyncAction"
+                text="Sync Konvoy Project"
+                description="Re-sync project model from konvoy.toml"
+                icon="AllIcons.Actions.Refresh">
+            <add-to-group group-id="BuildMenu" anchor="first"/>
+        </action>
+    </actions>
+</idea-plugin>
