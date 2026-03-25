@@ -30,6 +30,14 @@
                 implementation="com.konvoy.ide.run.KonvoyRunConfigurationProducer"
                 order="first"/>
 
+        <!-- Gutter run icons -->
+        <runLineMarkerContributor
+                language="kotlin"
+                implementation="com.konvoy.ide.run.KonvoyRunLineMarkerContributor"/>
+        <runLineMarkerContributor
+                language="kotlin"
+                implementation="com.konvoy.ide.run.KonvoyTestLineMarkerContributor"/>
+
         <!-- Project service -->
         <projectService
                 serviceImplementation="com.konvoy.ide.sync.KonvoyProjectService"/>
