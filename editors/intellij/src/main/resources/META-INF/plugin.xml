@@ -12,7 +12,7 @@
     <depends>com.intellij.modules.platform</depends>
     <depends>com.intellij.modules.java</depends>
     <depends>org.jetbrains.kotlin</depends>
-    <depends optional="true" config-file="konvoy-withToml.xml">org.toml.lang</depends>
+    <depends>org.toml.lang</depends>
 
     <extensions defaultExtensionNs="org.jetbrains.kotlin">
         <supportsKotlinPluginMode supportsK2="true"/>
@@ -38,9 +38,30 @@
                 language="kotlin"
                 implementation="com.konvoy.ide.run.KonvoyTestLineMarkerContributor"/>
 
+        <!-- Clickable file:line:col links in build output -->
+        <consoleFilterProvider
+                implementation="com.konvoy.ide.run.KonvoyConsoleFilterProvider"/>
+
         <!-- Project service -->
         <projectService
                 serviceImplementation="com.konvoy.ide.sync.KonvoyProjectService"/>
+
+        <!-- konvoy.toml editing support -->
+        <completion.contributor
+                language="TOML"
+                implementationClass="com.konvoy.ide.toml.KonvoyTomlCompletionContributor"/>
+        <annotator
+                language="TOML"
+                implementationClass="com.konvoy.ide.toml.KonvoyTomlAnnotator"/>
+        <lang.documentationProvider
+                language="TOML"
+                implementationClass="com.konvoy.ide.toml.KonvoyTomlDocumentationProvider"/>
+        <psi.referenceContributor
+                language="TOML"
+                implementation="com.konvoy.ide.toml.KonvoyTomlReferenceContributor"/>
+        <codeInsight.lineMarkerProvider
+                language="TOML"
+                implementationClass="com.konvoy.ide.toml.KonvoyTomlLineMarkerProvider"/>
 
         <!-- Startup activity to detect konvoy.toml on project open -->
         <postStartupActivity
