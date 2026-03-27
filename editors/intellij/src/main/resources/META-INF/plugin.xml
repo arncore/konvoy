@@ -42,9 +42,28 @@
         <consoleFilterProvider
                 implementation="com.konvoy.ide.run.KonvoyConsoleFilterProvider"/>
 
-        <!-- Project service -->
+        <!-- Project services -->
         <projectService
                 serviceImplementation="com.konvoy.ide.sync.KonvoyProjectService"/>
+        <projectService
+                serviceImplementation="com.konvoy.ide.build.KonvoyExternalAnnotatorService"/>
+        <projectService
+                serviceImplementation="com.konvoy.ide.build.KonvoyBuildSettings"/>
+        <projectService
+                serviceImplementation="com.konvoy.ide.build.KonvoyBuildStatusService"/>
+
+        <!-- Build on save -->
+        <statusBarWidgetFactory
+                implementation="com.konvoy.ide.build.KonvoyBuildStatusWidgetFactory"
+                id="KonvoyBuildStatus"/>
+        <externalAnnotator
+                language="kotlin"
+                implementationClass="com.konvoy.ide.build.KonvoyExternalAnnotator"/>
+        <projectConfigurable
+                parentId="build"
+                instance="com.konvoy.ide.build.KonvoyBuildConfigurable"
+                displayName="Konvoy"
+                id="konvoy.settings"/>
 
         <!-- konvoy.toml editing support -->
         <completion.contributor
