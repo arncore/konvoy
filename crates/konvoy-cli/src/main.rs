@@ -439,24 +439,24 @@ fn check_toolchain(manifest: &konvoy_config::Manifest) -> u32 {
                 Ok(path) => eprintln!("  [ok] konanc: {version} ({})", path.display()),
                 Err(e) => {
                     eprintln!("  [!!] konanc: {e}");
-                    issues += 1;
+                    issues = issues.saturating_add(1);
                 }
             }
             match konvoy_konanc::toolchain::jre_home_path(version) {
                 Ok(path) => eprintln!("  [ok] JRE: {}", path.display()),
                 Err(e) => {
                     eprintln!("  [!!] JRE: {e}");
-                    issues += 1;
+                    issues = issues.saturating_add(1);
                 }
             }
         }
         Ok(false) => {
             eprintln!("  [!!] konanc: Kotlin/Native {version} not installed — run `konvoy toolchain install` or `konvoy build`");
-            issues += 1;
+            issues = issues.saturating_add(1);
         }
         Err(e) => {
             eprintln!("  [!!] konanc: {e}");
-            issues += 1;
+            issues = issues.saturating_add(1);
         }
     }
     issues
@@ -512,7 +512,7 @@ fn check_maven_deps(manifest: &konvoy_config::Manifest, cwd: &std::path::Path) -
         eprintln!(
             "  [!!] No konvoy.lock found — run 'konvoy update' to resolve Maven dependencies"
         );
-        return issues.saturating_add(1);
+        return 1;
     }
 
     match konvoy_config::lockfile::Lockfile::from_path(&lockfile_path) {
