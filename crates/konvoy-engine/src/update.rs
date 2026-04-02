@@ -203,7 +203,7 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
         let mut targets_map: BTreeMap<String, String> = BTreeMap::new();
         for result in target_results {
             let (target_name, sha256) = result?;
-            let display_hash = truncate_hash(&sha256, 16);
+            let display_hash = crate::build::truncate_hash(&sha256, 16);
             eprintln!("    {target_name}: {display_hash}...");
             targets_map.insert(target_name, sha256);
         }
@@ -601,7 +601,7 @@ fn fetch_metadata_cached(
 /// # Errors
 ///
 /// Returns an error if the string does not contain exactly one colon.
-fn split_maven_coordinate(maven: &str) -> Result<(&str, &str), EngineError> {
+pub(crate) fn split_maven_coordinate(maven: &str) -> Result<(&str, &str), EngineError> {
     maven.split_once(':').ok_or_else(|| EngineError::Metadata {
         message: format!("invalid maven coordinate `{maven}` — expected `groupId:artifactId`"),
     })
@@ -634,11 +634,6 @@ fn is_filtered_dependency(group_id: &str, artifact_id: &str) -> bool {
 /// - `"atomicfu"` → `"atomicfu"`
 fn derive_dep_name(artifact_id: &str) -> String {
     artifact_id.to_owned()
-}
-
-/// Truncate a hash string to the given length for display.
-fn truncate_hash(hash: &str, max_len: usize) -> &str {
-    hash.get(..max_len).unwrap_or(hash)
 }
 
 /// Extract the Maven classifier from a cinterop file URL.
@@ -904,19 +899,6 @@ kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", 
             "kotlinx-coroutines-core"
         );
         assert_eq!(derive_dep_name("atomicfu"), "atomicfu");
-    }
-
-    #[test]
-    fn truncate_hash_short() {
-        assert_eq!(
-            truncate_hash("abcdef1234567890abcdef", 16),
-            "abcdef1234567890"
-        );
-    }
-
-    #[test]
-    fn truncate_hash_shorter_than_limit() {
-        assert_eq!(truncate_hash("abc", 16), "abc");
     }
 
     #[test]

@@ -8,12 +8,19 @@ use std::process::Command;
 
 use crate::error::EngineError;
 
-/// Map a `UtilError::Download` to `EngineError::DetektDownload`.
+/// Map a `UtilError` from artifact operations to the corresponding `EngineError`.
 fn map_download_err(version: &str, e: konvoy_util::error::UtilError) -> EngineError {
     match e {
         konvoy_util::error::UtilError::Download { message } => EngineError::DetektDownload {
             version: version.to_owned(),
             message,
+        },
+        konvoy_util::error::UtilError::ArtifactHashMismatch {
+            expected, actual, ..
+        } => EngineError::DetektHashMismatch {
+            version: version.to_owned(),
+            expected,
+            actual,
         },
         other => EngineError::Util(other),
     }
@@ -101,97 +108,21 @@ pub fn ensure_detekt(
     version: &str,
     expected_sha256: Option<&str>,
 ) -> Result<(PathBuf, String), EngineError> {
-    validate_version(version)?;
+    konvoy_util::artifact::validate_version(version).map_err(|_| EngineError::DetektDownload {
+        version: version.to_owned(),
+        message: format!(
+            "invalid detekt version \"{version}\" — only alphanumeric characters, dots, hyphens, and underscores are allowed"
+        ),
+    })?;
+
     let jar = detekt_jar_path(version)?;
-
-    if jar.exists() {
-        // Verify hash of existing JAR.
-        let actual_hash = konvoy_util::hash::sha256_file(&jar)?;
-        if let Some(expected) = expected_sha256 {
-            if actual_hash != expected {
-                return Err(EngineError::DetektHashMismatch {
-                    version: version.to_owned(),
-                    expected: expected.to_owned(),
-                    actual: actual_hash,
-                });
-            }
-        }
-        return Ok((jar, actual_hash));
-    }
-
-    let dir = detekt_dir(version)?;
-    konvoy_util::fs::ensure_dir(&dir)?;
-
     let url = detekt_download_url(version);
 
-    // Download to a temp file, then rename atomically.
-    let pid = std::process::id();
-    let tmp_path = dir.join(format!(".tmp-detekt-{pid}.jar"));
-
-    let download_hash =
-        konvoy_util::download::download_with_progress(&url, &tmp_path, "detekt", version)
+    let result =
+        konvoy_util::artifact::ensure_artifact(&url, &jar, expected_sha256, "detekt", version)
             .map_err(|e| map_download_err(version, e))?;
 
-    // Verify hash before placing the file.
-    if let Some(expected) = expected_sha256 {
-        if download_hash != expected {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(EngineError::DetektHashMismatch {
-                version: version.to_owned(),
-                expected: expected.to_owned(),
-                actual: download_hash,
-            });
-        }
-    }
-
-    // Atomic rename.
-    match std::fs::rename(&tmp_path, &jar) {
-        Ok(()) => {}
-        Err(_) if jar.exists() => {
-            // Another process downloaded it concurrently — verify its hash.
-            let _ = std::fs::remove_file(&tmp_path);
-            if let Some(expected) = expected_sha256 {
-                let placed_hash = konvoy_util::hash::sha256_file(&jar)?;
-                if placed_hash != expected {
-                    return Err(EngineError::DetektHashMismatch {
-                        version: version.to_owned(),
-                        expected: expected.to_owned(),
-                        actual: placed_hash,
-                    });
-                }
-            }
-        }
-        Err(source) => {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(konvoy_util::error::UtilError::Io {
-                path: jar.display().to_string(),
-                source,
-            }
-            .into());
-        }
-    }
-
-    Ok((jar, download_hash))
-}
-
-/// Validate that a version string is safe for use in filesystem paths.
-/// Only allows alphanumeric characters, dots, hyphens, and underscores.
-/// Notably excludes `+` (semver build metadata) since detekt releases don't
-/// use it, and `+` can be problematic in URLs and filesystem paths.
-fn validate_version(version: &str) -> Result<(), EngineError> {
-    if version.is_empty()
-        || !version
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
-    {
-        return Err(EngineError::DetektDownload {
-            version: version.to_owned(),
-            message: format!(
-                "invalid detekt version \"{version}\" — only alphanumeric characters, dots, hyphens, and underscores are allowed"
-            ),
-        });
-    }
-    Ok(())
+    Ok((result.path, result.sha256))
 }
 
 /// Resolve the expected detekt hash from the lockfile.
@@ -558,9 +489,7 @@ fn parse_detekt_line(line: &str) -> Option<DetektDiagnostic> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{
-        detekt_download_url, detekt_jar_path, parse_detekt_output, resolve_config, validate_version,
-    };
+    use super::{detekt_download_url, detekt_jar_path, parse_detekt_output, resolve_config};
 
     #[test]
     fn detekt_download_url_format() {
@@ -667,47 +596,6 @@ src/main.kt:3:5: Magic number. [MagicNumber]
             diags.first().map(|d| d.message.as_str()),
             Some("Unused import detected.")
         );
-    }
-
-    #[test]
-    fn validate_version_accepts_valid() {
-        assert!(validate_version("1.23.7").is_ok());
-        assert!(validate_version("2.0.0-RC1").is_ok());
-        assert!(validate_version("1.0.0_beta").is_ok());
-    }
-
-    #[test]
-    fn validate_version_rejects_path_traversal() {
-        assert!(validate_version("../../etc").is_err());
-        assert!(validate_version("../foo").is_err());
-        assert!(validate_version("1.0/../../etc").is_err());
-    }
-
-    #[test]
-    fn validate_version_rejects_empty() {
-        assert!(validate_version("").is_err());
-    }
-
-    #[test]
-    fn validate_version_rejects_special_chars() {
-        assert!(validate_version("1.0; rm -rf /").is_err());
-        assert!(validate_version("ver\0sion").is_err());
-    }
-
-    #[test]
-    fn ensure_detekt_rejects_invalid_version() {
-        let result = super::ensure_detekt("../../etc", None);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("invalid detekt version"), "error was: {err}");
-    }
-
-    #[test]
-    fn ensure_detekt_rejects_empty_version() {
-        let result = super::ensure_detekt("", None);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("invalid detekt version"), "error was: {err}");
     }
 
     #[test]

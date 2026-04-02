@@ -1,11 +1,16 @@
 //! Test build orchestration: compile and run Kotlin/Native tests using konanc's
 //! built-in test runner (`-generate-test-runner` flag with `kotlin.test`).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+
 use crate::artifact::{ArtifactStore, BuildMetadata};
-use crate::build::{lockfile_toml_content, now_epoch_secs, resolve_target, BuildOutcome};
+use crate::build::{
+    lockfile_toml_content, now_epoch_secs, resolve_target, BuildOptions, BuildOutcome,
+};
 use crate::cache::{CacheInputs, CacheKey};
 use crate::error::EngineError;
 use crate::resolve::resolve_dependencies;
@@ -13,21 +18,6 @@ use konvoy_config::lockfile::Lockfile;
 use konvoy_config::manifest::Manifest;
 use konvoy_konanc::detect::resolve_konanc;
 use konvoy_konanc::invoke::{KonancCommand, ProduceKind};
-
-/// Options controlling a test build invocation.
-#[derive(Debug, Clone)]
-pub struct TestOptions {
-    /// Explicit target triple, or `None` for host.
-    pub target: Option<String>,
-    /// Whether to build tests in release mode.
-    pub release: bool,
-    /// Whether to show raw compiler output.
-    pub verbose: bool,
-    /// Force a rebuild, bypassing the cache.
-    pub force: bool,
-    /// Require the lockfile to be up-to-date; error on any mismatch.
-    pub locked: bool,
-}
 
 /// Result of a successful test build.
 #[derive(Debug)]
@@ -46,54 +36,126 @@ pub struct TestBuildResult {
 /// sources (`src/test/**/*.kt`), then invokes konanc with `-generate-test-runner`
 /// to produce a test binary.
 ///
+/// The build pipeline mirrors `build()`: auto-resolve Maven deps, staleness
+/// checks, lockfile pre-stabilization, parallel dependency builds, plugin and
+/// Maven klib resolution.
+///
 /// # Errors
 /// Returns an error if test sources are missing, compilation fails, or any
 /// filesystem operation fails.
 pub fn build_tests(
     project_root: &Path,
-    options: &TestOptions,
+    options: &BuildOptions,
 ) -> Result<TestBuildResult, EngineError> {
     let start = Instant::now();
 
+    // 1. Read konvoy.toml.
     let manifest_path = project_root.join("konvoy.toml");
     let manifest = Manifest::from_path(&manifest_path)?;
 
+    // 2. Read konvoy.lock (or default).
     let lockfile_path = project_root.join("konvoy.lock");
     let lockfile = Lockfile::from_path(&lockfile_path)?;
 
+    // 3. Auto-resolve Maven deps if needed (unless --locked).
+    let lockfile =
+        if !options.locked && crate::build::has_unresolved_maven_deps(&manifest, &lockfile) {
+            eprintln!("  Maven dependencies not resolved \u{2014} running update automatically...");
+            crate::update::update(project_root)?;
+            Lockfile::from_path(&lockfile_path)?
+        } else {
+            lockfile
+        };
+
+    // In --locked mode, verify the lockfile is complete and consistent.
+    if options.locked {
+        crate::build::check_lockfile_staleness(&manifest, &lockfile)?;
+    }
+
+    // 4. Resolve target.
     let target = resolve_target(&options.target)?;
     let profile = if options.release { "release" } else { "debug" };
 
+    // 5. Resolve managed konanc toolchain.
     let resolved = resolve_konanc(&manifest.toolchain.kotlin)?;
-    let jre_home = resolved.jre_home;
+    let jre_home = resolved.jre_home.clone();
     let konanc = resolved.info;
 
-    // Build dependencies first (same as regular build).
-    let dep_graph = resolve_dependencies(project_root, &manifest)?;
-    let mut library_paths: Vec<PathBuf> = Vec::new();
-    let lockfile_content = lockfile_toml_content(&lockfile)?;
+    // 6. Pre-stabilize the lockfile for cache key consistency.
+    let effective_lockfile = if options.locked {
+        lockfile
+    } else {
+        match &lockfile.toolchain {
+            Some(tc) if tc.konanc_version == konanc.version => lockfile.clone(),
+            _ => {
+                let mut stabilized = Lockfile::with_managed_toolchain(
+                    &konanc.version,
+                    resolved.konanc_tarball_sha256.as_deref(),
+                    resolved.jre_tarball_sha256.as_deref(),
+                );
+                stabilized.dependencies = lockfile.dependencies.clone();
+                stabilized.plugins = lockfile.plugins.clone();
+                stabilized
+            }
+        }
+    };
 
-    for dep in &dep_graph.order {
-        let (dep_output, _) = crate::build::build_single(
-            &dep.project_root,
-            &dep.manifest,
-            &konanc,
-            jre_home.as_deref(),
-            &target,
-            profile,
-            &crate::build::BuildOptions {
-                target: options.target.clone(),
-                release: options.release,
-                verbose: options.verbose,
-                force: options.force,
-                locked: options.locked,
-            },
-            &library_paths,
-            &[],
-            &lockfile_content,
-        )?;
-        library_paths.push(dep_output);
+    // 7. Resolve dependencies and build them in parallel (topological levels).
+    let dep_graph = resolve_dependencies(project_root, &manifest)?;
+    let lockfile_content = lockfile_toml_content(&effective_lockfile)?;
+    let levels = crate::resolve::parallel_levels(&dep_graph);
+    let mut completed: HashMap<String, PathBuf> = HashMap::new();
+
+    for level in &levels {
+        let lib_paths: Vec<PathBuf> = completed.values().cloned().collect();
+
+        let results: Vec<Result<(String, PathBuf, BuildOutcome), EngineError>> = level
+            .par_iter()
+            .map(|dep| {
+                let (output, outcome) = crate::build::build_single(
+                    &dep.project_root,
+                    &dep.manifest,
+                    &konanc,
+                    jre_home.as_deref(),
+                    &target,
+                    profile,
+                    options,
+                    &lib_paths,
+                    &[],
+                    &lockfile_content,
+                )?;
+                Ok((dep.name.clone(), output, outcome))
+            })
+            .collect();
+
+        for result in results {
+            let (name, output, _) = result?;
+            completed.insert(name, output);
+        }
     }
+
+    let mut library_paths: Vec<PathBuf> = dep_graph
+        .order
+        .iter()
+        .filter_map(|dep| completed.get(&dep.name).cloned())
+        .collect();
+
+    // 7a. Resolve and download plugin artifacts.
+    let plugin_jars = if !manifest.plugins.is_empty() {
+        let resolved_artifacts = crate::plugin::resolve_plugin_artifacts(&manifest)?;
+        let results = crate::plugin::ensure_plugin_artifacts(
+            &resolved_artifacts,
+            &effective_lockfile,
+            options.locked,
+        )?;
+        results.iter().map(|r| r.path.clone()).collect()
+    } else {
+        Vec::new()
+    };
+
+    // 7b. Resolve and download Maven dependency klibs for the current target.
+    let maven_klibs = crate::build::resolve_maven_deps(&effective_lockfile, &target)?;
+    library_paths.extend(maven_klibs);
 
     // Collect project sources (excluding src/test/) and test sources.
     let src_dir = project_root.join("src");
@@ -151,8 +213,8 @@ pub fn build_tests(
 
     let store = ArtifactStore::new(project_root);
 
-    // Check cache.
-    if store.has(&cache_key) {
+    // Check cache (respecting --force).
+    if !options.force && store.has(&cache_key) {
         eprintln!("    Fresh {} (cached)", output_name);
         store.materialize(&cache_key, &output_name, &output_path)?;
         return Ok(TestBuildResult {
@@ -180,7 +242,8 @@ pub fn build_tests(
         .release(options.release)
         .produce(ProduceKind::Program)
         .generate_test_runner(true)
-        .libraries(&library_paths);
+        .libraries(&library_paths)
+        .plugins(&plugin_jars);
 
     if let Some(jh) = jre_home.as_deref() {
         cmd = cmd.java_home(jh);
@@ -233,7 +296,7 @@ mod tests {
         )
         .unwrap();
 
-        let options = TestOptions {
+        let options = BuildOptions {
             target: None,
             release: false,
             verbose: false,
@@ -262,7 +325,7 @@ mod tests {
         )
         .unwrap();
 
-        let options = TestOptions {
+        let options = BuildOptions {
             target: None,
             release: false,
             verbose: false,
@@ -282,7 +345,7 @@ mod tests {
     #[test]
     fn build_tests_fails_without_manifest() {
         let tmp = tempfile::tempdir().unwrap();
-        let options = TestOptions {
+        let options = BuildOptions {
             target: None,
             release: false,
             verbose: false,
@@ -292,21 +355,5 @@ mod tests {
 
         let result = build_tests(tmp.path(), &options);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_options_defaults() {
-        let opts = TestOptions {
-            target: None,
-            release: false,
-            verbose: false,
-            force: false,
-            locked: false,
-        };
-        assert!(opts.target.is_none());
-        assert!(!opts.release);
-        assert!(!opts.verbose);
-        assert!(!opts.force);
-        assert!(!opts.locked);
     }
 }

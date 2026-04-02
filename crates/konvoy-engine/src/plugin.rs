@@ -52,7 +52,7 @@ pub struct PluginArtifactResult {
 ///
 /// # Errors
 /// Returns an error if the home directory cannot be determined.
-fn maven_cache_root() -> Result<PathBuf, EngineError> {
+pub(crate) fn maven_cache_root() -> Result<PathBuf, EngineError> {
     Ok(konvoy_util::fs::konvoy_home()?.join("cache").join("maven"))
 }
 
