@@ -310,6 +310,75 @@ mod tests {
         assert_ne!(key1, key2);
     }
 
+    #[test]
+    fn dependency_hashes_change_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_sources(tmp.path());
+
+        let key1 = CacheKey::compute(&make_inputs(tmp.path())).unwrap();
+
+        let mut inputs = make_inputs(tmp.path());
+        inputs.dependency_hashes = vec!["abc123".to_owned()];
+        let key2 = CacheKey::compute(&inputs).unwrap();
+
+        assert_ne!(key1, key2, "adding a dependency hash must change the key");
+    }
+
+    #[test]
+    fn different_dependency_hashes_produce_different_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_sources(tmp.path());
+
+        let mut inputs1 = make_inputs(tmp.path());
+        inputs1.dependency_hashes = vec!["hash_a".to_owned()];
+        let key1 = CacheKey::compute(&inputs1).unwrap();
+
+        let mut inputs2 = make_inputs(tmp.path());
+        inputs2.dependency_hashes = vec!["hash_b".to_owned()];
+        let key2 = CacheKey::compute(&inputs2).unwrap();
+
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn multiple_dependency_hashes_order_matters() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_sources(tmp.path());
+
+        let mut inputs1 = make_inputs(tmp.path());
+        inputs1.dependency_hashes = vec!["aaa".to_owned(), "bbb".to_owned()];
+        let key1 = CacheKey::compute(&inputs1).unwrap();
+
+        let mut inputs2 = make_inputs(tmp.path());
+        inputs2.dependency_hashes = vec!["bbb".to_owned(), "aaa".to_owned()];
+        let key2 = CacheKey::compute(&inputs2).unwrap();
+
+        assert_ne!(key1, key2, "dependency hash order should affect the key");
+    }
+
+    #[test]
+    fn empty_source_dir_produces_valid_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create the dir but don't put any .kt files in it.
+        let empty_src = tmp.path().join("empty-src");
+        fs::create_dir_all(&empty_src).unwrap();
+
+        let mut inputs = make_inputs(tmp.path());
+        inputs.source_dir = empty_src;
+        let key = CacheKey::compute(&inputs).unwrap();
+        assert_eq!(key.as_hex().len(), 64);
+    }
+
+    #[test]
+    fn as_ref_path_matches_hex() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_sources(tmp.path());
+
+        let key = CacheKey::compute(&make_inputs(tmp.path())).unwrap();
+        let path: &Path = key.as_ref();
+        assert_eq!(path.to_str().unwrap(), key.as_hex());
+    }
+
     mod property_tests {
         use super::*;
         use proptest::prelude::*;

@@ -4406,4 +4406,221 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
     fn truncate_hash_shorter_than_limit() {
         assert_eq!(truncate_hash("abc", 16), "abc");
     }
+
+    // ── normalize_konanc_output ─────────────────────────────────────────
+
+    #[test]
+    fn normalize_renames_kexe_to_expected_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("my-app");
+        let kexe_path = tmp.path().join("my-app.kexe");
+        fs::write(&kexe_path, b"binary").unwrap();
+
+        normalize_konanc_output(&output_path).unwrap();
+
+        assert!(output_path.exists());
+        assert!(!kexe_path.exists());
+        assert_eq!(fs::read(&output_path).unwrap(), b"binary");
+    }
+
+    #[test]
+    fn normalize_noop_when_no_kexe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("my-app");
+        // No .kexe file exists — should be a no-op.
+        normalize_konanc_output(&output_path).unwrap();
+        assert!(!output_path.exists());
+    }
+
+    #[test]
+    fn normalize_overwrites_existing_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("my-app");
+        let kexe_path = tmp.path().join("my-app.kexe");
+        fs::write(&output_path, b"stale").unwrap();
+        fs::write(&kexe_path, b"fresh").unwrap();
+
+        normalize_konanc_output(&output_path).unwrap();
+
+        assert_eq!(fs::read(&output_path).unwrap(), b"fresh");
+        assert!(!kexe_path.exists());
+    }
+
+    // ── now_epoch_secs ──────────────────────────────────────────────────
+
+    #[test]
+    fn now_epoch_secs_format() {
+        let ts = now_epoch_secs();
+        assert!(
+            ts.ends_with("s-since-epoch"),
+            "expected format '<digits>s-since-epoch', got: {ts}"
+        );
+        let digits = ts.strip_suffix("s-since-epoch").unwrap();
+        assert!(
+            digits.parse::<u64>().is_ok(),
+            "expected numeric prefix, got: {digits}"
+        );
+    }
+
+    #[test]
+    fn now_epoch_secs_is_reasonable() {
+        let ts = now_epoch_secs();
+        let secs: u64 = ts.strip_suffix("s-since-epoch").unwrap().parse().unwrap();
+        // Should be after 2024-01-01 (1704067200) and before 2040-01-01 (2208988800).
+        assert!(secs > 1_704_067_200, "timestamp too old: {secs}");
+        assert!(secs < 2_208_988_800, "timestamp too far in future: {secs}");
+    }
+
+    // ── check_lockfile_staleness ────────────────────────────────────────
+
+    fn make_manifest(kotlin: &str) -> Manifest {
+        Manifest::from_str(
+            &format!("[package]\nname = \"test\"\n\n[toolchain]\nkotlin = \"{kotlin}\"\n"),
+            "konvoy.toml",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn staleness_ok_when_versions_match() {
+        let manifest = make_manifest("2.1.0");
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+        assert!(check_lockfile_staleness(&manifest, &lockfile).is_ok());
+    }
+
+    #[test]
+    fn staleness_err_when_versions_differ() {
+        let manifest = make_manifest("2.2.0");
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+        assert!(check_lockfile_staleness(&manifest, &lockfile).is_err());
+    }
+
+    #[test]
+    fn staleness_err_when_no_toolchain_in_lockfile() {
+        let manifest = make_manifest("2.1.0");
+        let lockfile = Lockfile::default();
+        assert!(check_lockfile_staleness(&manifest, &lockfile).is_err());
+    }
+
+    #[test]
+    fn staleness_err_when_detekt_in_manifest_but_not_lockfile() {
+        let manifest = Manifest::from_str(
+            "[package]\nname = \"test\"\n\n[toolchain]\nkotlin = \"2.1.0\"\ndetekt = \"1.23.0\"\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+        assert!(check_lockfile_staleness(&manifest, &lockfile).is_err());
+    }
+
+    #[test]
+    fn staleness_err_when_plugin_missing_from_lockfile() {
+        let manifest = Manifest::from_str(
+            "[package]\nname = \"test\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nserialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"2.1.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+        assert!(check_lockfile_staleness(&manifest, &lockfile).is_err());
+    }
+
+    #[test]
+    fn staleness_err_when_maven_dep_missing_from_lockfile() {
+        let manifest = Manifest::from_str(
+            "[package]\nname = \"test\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\ncoroutines = { maven = \"org.jetbrains.kotlinx:kotlinx-coroutines-core\", version = \"1.8.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+        assert!(check_lockfile_staleness(&manifest, &lockfile).is_err());
+    }
+
+    // ── update_lockfile: locked mode and hash tamper ────────────────────
+
+    #[test]
+    fn update_lockfile_locked_mode_errors_on_version_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile = Lockfile::with_toolchain("2.0.0");
+        lockfile.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        let result = update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            &[],
+            tmp.path(),
+            &lockfile_path,
+            false,
+            true, // locked
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_lockfile_detects_tampered_konanc_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile = Lockfile::with_managed_toolchain("2.1.0", Some("original-hash"), None);
+        lockfile.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        let result = update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            Some("different-hash"),
+            None,
+            &empty_graph,
+            &[],
+            tmp.path(),
+            &lockfile_path,
+            false, // not force
+            false,
+        );
+        assert!(result.is_err(), "should detect tampered konanc hash");
+    }
+
+    #[test]
+    fn update_lockfile_force_allows_tampered_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile = Lockfile::with_managed_toolchain("2.1.0", Some("original-hash"), None);
+        lockfile.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        let result = update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            Some("different-hash"),
+            None,
+            &empty_graph,
+            &[],
+            tmp.path(),
+            &lockfile_path,
+            true, // force
+            false,
+        );
+        assert!(result.is_ok(), "force should bypass hash mismatch");
+    }
 }
