@@ -320,7 +320,7 @@ fn cmd_test(
     filter: &Option<String>,
 ) -> CliResult {
     let root = project_root()?;
-    let options = konvoy_engine::TestOptions {
+    let options = konvoy_engine::BuildOptions {
         target,
         release,
         verbose,
@@ -417,124 +417,162 @@ fn clean_project(root: &std::path::Path, all: bool) -> CliResult {
     Ok(())
 }
 
-fn cmd_doctor() -> CliResult {
-    eprintln!("Checking environment...");
-    eprintln!();
+fn check_host_target() -> u32 {
+    match konvoy_targets::host_target() {
+        Ok(target) => {
+            eprintln!("  [ok] Host target: {target}");
+            0
+        }
+        Err(e) => {
+            eprintln!("  [!!] Host target: {e}");
+            1
+        }
+    }
+}
+
+fn check_toolchain(manifest: &konvoy_config::Manifest) -> u32 {
+    let mut issues = 0u32;
+    let version = &manifest.toolchain.kotlin;
+    match konvoy_konanc::toolchain::is_installed(version) {
+        Ok(true) => {
+            match konvoy_konanc::toolchain::managed_konanc_path(version) {
+                Ok(path) => eprintln!("  [ok] konanc: {version} ({})", path.display()),
+                Err(e) => {
+                    eprintln!("  [!!] konanc: {e}");
+                    issues += 1;
+                }
+            }
+            match konvoy_konanc::toolchain::jre_home_path(version) {
+                Ok(path) => eprintln!("  [ok] JRE: {}", path.display()),
+                Err(e) => {
+                    eprintln!("  [!!] JRE: {e}");
+                    issues += 1;
+                }
+            }
+        }
+        Ok(false) => {
+            eprintln!("  [!!] konanc: Kotlin/Native {version} not installed — run `konvoy toolchain install` or `konvoy build`");
+            issues += 1;
+        }
+        Err(e) => {
+            eprintln!("  [!!] konanc: {e}");
+            issues += 1;
+        }
+    }
+    issues
+}
+
+fn check_detekt(manifest: &konvoy_config::Manifest) -> u32 {
+    let Some(ref detekt_version) = manifest.toolchain.detekt else {
+        return 0;
+    };
+    match konvoy_engine::detekt::is_installed(detekt_version) {
+        Ok(true) => match konvoy_engine::detekt::detekt_jar_path(detekt_version) {
+            Ok(path) => {
+                eprintln!("  [ok] detekt: {detekt_version} ({})", path.display());
+                0
+            }
+            Err(e) => {
+                eprintln!("  [!!] detekt: {e}");
+                1
+            }
+        },
+        Ok(false) => {
+            eprintln!("  [--] detekt: {detekt_version} not downloaded — will download on first `konvoy lint`");
+            0
+        }
+        Err(e) => {
+            eprintln!("  [!!] detekt: {e}");
+            1
+        }
+    }
+}
+
+fn check_maven_deps(manifest: &konvoy_config::Manifest, cwd: &std::path::Path) -> u32 {
+    let maven_deps: Vec<_> = manifest
+        .dependencies
+        .iter()
+        .filter(|(_, spec)| spec.maven.is_some() && spec.version.is_some())
+        .collect();
+
+    if maven_deps.is_empty() {
+        return 0;
+    }
 
     let mut issues = 0u32;
 
-    // Check host target.
-    match konvoy_targets::host_target() {
-        Ok(target) => eprintln!("  [ok] Host target: {target}"),
+    for (dep_name, dep_spec) in &maven_deps {
+        if let (Some(ref maven), Some(ref dep_version)) = (&dep_spec.maven, &dep_spec.version) {
+            eprintln!("  [ok] Maven dep: {} {} ({})", dep_name, dep_version, maven);
+        }
+    }
+
+    let lockfile_path = cwd.join("konvoy.lock");
+    if !lockfile_path.exists() {
+        eprintln!(
+            "  [!!] No konvoy.lock found — run 'konvoy update' to resolve Maven dependencies"
+        );
+        return issues.saturating_add(1);
+    }
+
+    match konvoy_config::lockfile::Lockfile::from_path(&lockfile_path) {
+        Ok(lockfile) => {
+            for (dep_name, _) in &maven_deps {
+                let has_entry = lockfile.dependencies.iter().any(|d| {
+                    d.name == **dep_name
+                        && matches!(&d.source, konvoy_config::lockfile::DepSource::Maven { .. })
+                });
+                if has_entry {
+                    eprintln!("  [ok] Lockfile entry: {}", dep_name);
+                } else {
+                    eprintln!(
+                        "  [!!] Lockfile entry: '{}' not found — run 'konvoy update'",
+                        dep_name
+                    );
+                    issues = issues.saturating_add(1);
+                }
+            }
+        }
         Err(e) => {
-            eprintln!("  [!!] Host target: {e}");
+            eprintln!("  [!!] Lockfile: {}", e);
             issues = issues.saturating_add(1);
         }
     }
 
-    // Check for konvoy.toml in current directory and report managed toolchain status.
+    issues
+}
+
+fn check_standalone_toolchains() -> u32 {
+    match konvoy_konanc::toolchain::list_installed() {
+        Ok(versions) if versions.is_empty() => {
+            eprintln!("  [--] No managed toolchains installed");
+            0
+        }
+        Ok(versions) => {
+            eprintln!("  [ok] Managed toolchains: {}", versions.join(", "));
+            0
+        }
+        Err(e) => {
+            eprintln!("  [!!] Managed toolchains: {e}");
+            1
+        }
+    }
+}
+
+fn cmd_doctor() -> CliResult {
+    eprintln!("Checking environment...");
+    eprintln!();
+
+    let mut issues = check_host_target();
+
     let cwd = std::env::current_dir()?;
     if cwd.join("konvoy.toml").exists() {
         match konvoy_config::Manifest::from_path(&cwd.join("konvoy.toml")) {
             Ok(manifest) => {
                 eprintln!("  [ok] Project: {}", manifest.package.name);
-                let version = &manifest.toolchain.kotlin;
-                match konvoy_konanc::toolchain::is_installed(version) {
-                    Ok(true) => {
-                        match konvoy_konanc::toolchain::managed_konanc_path(version) {
-                            Ok(path) => eprintln!("  [ok] konanc: {version} ({})", path.display()),
-                            Err(e) => {
-                                eprintln!("  [!!] konanc: {e}");
-                                issues = issues.saturating_add(1);
-                            }
-                        }
-                        match konvoy_konanc::toolchain::jre_home_path(version) {
-                            Ok(path) => eprintln!("  [ok] JRE: {}", path.display()),
-                            Err(e) => {
-                                eprintln!("  [!!] JRE: {e}");
-                                issues = issues.saturating_add(1);
-                            }
-                        }
-                    }
-                    Ok(false) => {
-                        eprintln!("  [!!] konanc: Kotlin/Native {version} not installed — run `konvoy toolchain install` or `konvoy build`");
-                        issues = issues.saturating_add(1);
-                    }
-                    Err(e) => {
-                        eprintln!("  [!!] konanc: {e}");
-                        issues = issues.saturating_add(1);
-                    }
-                }
-
-                // Check detekt availability if detekt is configured in [toolchain].
-                if let Some(ref detekt_version) = manifest.toolchain.detekt {
-                    match konvoy_engine::detekt::is_installed(detekt_version) {
-                        Ok(true) => match konvoy_engine::detekt::detekt_jar_path(detekt_version) {
-                            Ok(path) => {
-                                eprintln!("  [ok] detekt: {detekt_version} ({})", path.display());
-                            }
-                            Err(e) => {
-                                eprintln!("  [!!] detekt: {e}");
-                                issues = issues.saturating_add(1);
-                            }
-                        },
-                        Ok(false) => {
-                            eprintln!("  [--] detekt: {detekt_version} not downloaded — will download on first `konvoy lint`");
-                        }
-                        Err(e) => {
-                            eprintln!("  [!!] detekt: {e}");
-                            issues = issues.saturating_add(1);
-                        }
-                    }
-                }
-
-                // Check Maven dependencies and lockfile entries.
-                let maven_deps: Vec<_> = manifest
-                    .dependencies
-                    .iter()
-                    .filter(|(_, spec)| spec.maven.is_some() && spec.version.is_some())
-                    .collect();
-
-                if !maven_deps.is_empty() {
-                    for (dep_name, dep_spec) in &maven_deps {
-                        if let (Some(ref maven), Some(ref dep_version)) =
-                            (&dep_spec.maven, &dep_spec.version)
-                        {
-                            eprintln!("  [ok] Maven dep: {} {} ({})", dep_name, dep_version, maven);
-                        }
-                    }
-
-                    // Check lockfile entries for Maven deps.
-                    let lockfile_path = cwd.join("konvoy.lock");
-                    if lockfile_path.exists() {
-                        match konvoy_config::lockfile::Lockfile::from_path(&lockfile_path) {
-                            Ok(lockfile) => {
-                                for (dep_name, _) in &maven_deps {
-                                    let has_entry = lockfile.dependencies.iter().any(|d| {
-                                        d.name == **dep_name
-                                            && matches!(
-                                                &d.source,
-                                                konvoy_config::lockfile::DepSource::Maven { .. }
-                                            )
-                                    });
-                                    if has_entry {
-                                        eprintln!("  [ok] Lockfile entry: {}", dep_name);
-                                    } else {
-                                        eprintln!("  [!!] Lockfile entry: '{}' not found — run 'konvoy update'", dep_name);
-                                        issues = issues.saturating_add(1);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("  [!!] Lockfile: {}", e);
-                                issues = issues.saturating_add(1);
-                            }
-                        }
-                    } else {
-                        eprintln!("  [!!] No konvoy.lock found — run 'konvoy update' to resolve Maven dependencies");
-                        issues = issues.saturating_add(1);
-                    }
-                }
+                issues = issues.saturating_add(check_toolchain(&manifest));
+                issues = issues.saturating_add(check_detekt(&manifest));
+                issues = issues.saturating_add(check_maven_deps(&manifest, &cwd));
             }
             Err(e) => {
                 eprintln!("  [!!] konvoy.toml: {e}");
@@ -543,19 +581,7 @@ fn cmd_doctor() -> CliResult {
         }
     } else {
         eprintln!("  [--] No konvoy.toml in current directory");
-        // Check if any managed toolchains are installed.
-        match konvoy_konanc::toolchain::list_installed() {
-            Ok(versions) if versions.is_empty() => {
-                eprintln!("  [--] No managed toolchains installed");
-            }
-            Ok(versions) => {
-                eprintln!("  [ok] Managed toolchains: {}", versions.join(", "));
-            }
-            Err(e) => {
-                eprintln!("  [!!] Managed toolchains: {e}");
-                issues = issues.saturating_add(1);
-            }
-        }
+        issues = issues.saturating_add(check_standalone_toolchains());
     }
 
     eprintln!();

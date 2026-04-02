@@ -25,5 +25,5 @@ pub use plugin::{
     ensure_plugin_artifacts, resolve_plugin_artifacts, PluginArtifactResult, ResolvedPluginArtifact,
 };
 pub use resolve::{resolve_dependencies, ResolvedGraph};
-pub use test_build::{build_tests, TestBuildResult, TestOptions};
+pub use test_build::{build_tests, TestBuildResult};
 pub use update::{update, UpdateResult};

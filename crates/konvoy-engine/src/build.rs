@@ -573,7 +573,10 @@ pub(crate) fn lockfile_toml_content(lockfile: &Lockfile) -> Result<String, Engin
 /// # Errors
 /// Returns an error if a Maven dependency is missing from the lockfile, the
 /// target hash is not present, or the download/hash verification fails.
-fn resolve_maven_deps(lockfile: &Lockfile, target: &Target) -> Result<Vec<PathBuf>, EngineError> {
+pub(crate) fn resolve_maven_deps(
+    lockfile: &Lockfile,
+    target: &Target,
+) -> Result<Vec<PathBuf>, EngineError> {
     // Collect all Maven dependency entries from the lockfile (direct + transitive).
     let maven_locks: Vec<&DependencyLock> = lockfile
         .dependencies
@@ -585,7 +588,7 @@ fn resolve_maven_deps(lockfile: &Lockfile, target: &Target) -> Result<Vec<PathBu
         return Ok(Vec::new());
     }
 
-    let cache_root = konvoy_util::fs::konvoy_home()?.join("cache").join("maven");
+    let cache_root = crate::plugin::maven_cache_root()?;
     let target_str = target.to_string();
     let maven_suffix = target.to_maven_suffix();
 
@@ -608,14 +611,7 @@ fn resolve_maven_deps(lockfile: &Lockfile, target: &Target) -> Result<Vec<PathBu
             };
 
             // Split "groupId:artifactId" into parts.
-            let (group_id, artifact_id) =
-                maven_coord
-                    .split_once(':')
-                    .ok_or_else(|| EngineError::Metadata {
-                        message: format!(
-                            "invalid maven coordinate `{maven_coord}` for dependency `{dep_name}`"
-                        ),
-                    })?;
+            let (group_id, artifact_id) = crate::update::split_maven_coordinate(maven_coord)?;
 
             // Build the per-target artifact ID (e.g. "kotlinx-coroutines-core-linuxx64").
             let per_target_artifact_id = format!("{artifact_id}-{maven_suffix}");
@@ -675,7 +671,7 @@ fn resolve_maven_deps(lockfile: &Lockfile, target: &Target) -> Result<Vec<PathBu
 
 /// Returns `true` if the manifest declares Maven deps that have no matching
 /// lockfile entry. Used to trigger automatic `konvoy update` during build.
-fn has_unresolved_maven_deps(manifest: &Manifest, lockfile: &Lockfile) -> bool {
+pub(crate) fn has_unresolved_maven_deps(manifest: &Manifest, lockfile: &Lockfile) -> bool {
     for (dep_name, dep_spec) in &manifest.dependencies {
         if dep_spec.maven.is_some() && dep_spec.version.is_some() {
             let has_entry = lockfile
@@ -700,7 +696,10 @@ fn has_unresolved_maven_deps(manifest: &Manifest, lockfile: &Lockfile) -> bool {
 /// - Missing Maven dependency entries
 ///
 /// Runs before any build work so users get fast, clear feedback.
-fn check_lockfile_staleness(manifest: &Manifest, lockfile: &Lockfile) -> Result<(), EngineError> {
+pub(crate) fn check_lockfile_staleness(
+    manifest: &Manifest,
+    lockfile: &Lockfile,
+) -> Result<(), EngineError> {
     match &lockfile.toolchain {
         Some(tc) => {
             // Toolchain version must match.
@@ -786,8 +785,8 @@ fn update_lockfile_if_needed(
                 eprintln!(
                     "warning: dependency `{}` source has changed (locked: {}, current: {})",
                     dep.name,
-                    truncate_hash(&locked_dep.source_hash),
-                    truncate_hash(&dep.source_hash),
+                    truncate_hash(&locked_dep.source_hash, 8),
+                    truncate_hash(&dep.source_hash, 8),
                 );
             }
         }
@@ -937,9 +936,9 @@ pub(crate) fn normalize_konanc_output(output_path: &Path) -> Result<(), EngineEr
     Ok(())
 }
 
-/// Truncate a hash string for display (first 8 chars).
-fn truncate_hash(hash: &str) -> &str {
-    hash.get(..8).unwrap_or(hash)
+/// Truncate a hash string to the given length for display.
+pub(crate) fn truncate_hash(hash: &str, len: usize) -> &str {
+    hash.get(..len).unwrap_or(hash)
 }
 
 /// Return the current UTC time as epoch seconds (e.g. "1708646400s-since-epoch").
@@ -4389,5 +4388,18 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
         });
         // kotlinx-coroutines is missing from lockfile.
         assert!(has_unresolved_maven_deps(&manifest, &lockfile));
+    }
+
+    #[test]
+    fn truncate_hash_short() {
+        assert_eq!(
+            truncate_hash("abcdef1234567890abcdef", 16),
+            "abcdef1234567890"
+        );
+    }
+
+    #[test]
+    fn truncate_hash_shorter_than_limit() {
+        assert_eq!(truncate_hash("abc", 16), "abc");
     }
 }
