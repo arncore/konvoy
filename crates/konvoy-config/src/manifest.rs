@@ -100,12 +100,8 @@ fn is_valid_maven_coordinate(coord: &str) -> bool {
 /// Validate plugin entries: must use Maven coordinates with a version, not path dependencies.
 fn validate_plugins(
     plugins: &BTreeMap<String, DependencySpec>,
-    kotlin_version: &str,
     path: &str,
 ) -> Result<(), ManifestError> {
-    // Suppress unused-variable warning — `kotlin_version` is accepted for future
-    // template-expansion validation but not needed by the current checks.
-    let _ = kotlin_version;
     for (name, spec) in plugins {
         // Plugins must use Maven coordinates, not path dependencies.
         if spec.path.is_some() {
@@ -260,7 +256,7 @@ fn validate(manifest: &Manifest, path: &str) -> Result<(), ManifestError> {
             message: "detekt version must not be empty".to_owned(),
         });
     }
-    validate_plugins(&manifest.plugins, &manifest.toolchain.kotlin, path)?;
+    validate_plugins(&manifest.plugins, path)?;
     validate_dependencies(&manifest.dependencies, &manifest.package.name, path)?;
     Ok(())
 }

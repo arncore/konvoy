@@ -107,7 +107,7 @@ pub fn download_with_progress(
     } else {
         let kb = downloaded / 1024;
         if kb >= 1024 {
-            let mb = kb / 1024;
+            let mb = (kb + 512) / 1024;
             eprintln!("    Downloaded {label} {version} ({mb} MB)");
         } else {
             eprintln!("    Downloaded {label} {version} ({kb} KB)");

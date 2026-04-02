@@ -111,7 +111,11 @@ pub fn parallel_levels(graph: &ResolvedGraph) -> Vec<Vec<&ResolvedDep>> {
             .partition(|dep| dep.dep_names.iter().all(|d| assigned.contains(d.as_str())));
 
         if level.is_empty() {
-            break; // All remaining deps have unresolvable dependencies — avoid infinite loop
+            // Remaining deps reference names that were never resolved (e.g. Maven
+            // deps filtered out of dep_names). Log for diagnostics and stop.
+            let stuck: Vec<&str> = rest.iter().map(|d| d.name.as_str()).collect();
+            eprintln!("  warning: skipping unresolvable deps in parallel scheduling: {stuck:?}");
+            break;
         }
 
         for dep in &level {
