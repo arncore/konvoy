@@ -696,6 +696,10 @@ pub(crate) fn has_unresolved_maven_deps(manifest: &Manifest, lockfile: &Lockfile
 /// - Missing Maven dependency entries
 ///
 /// Runs before any build work so users get fast, clear feedback.
+///
+/// # Errors
+/// Returns `EngineError::LockfileUpdateRequired` when the lockfile is missing
+/// or has mismatched toolchain, detekt, plugin, or Maven dependency entries.
 pub(crate) fn check_lockfile_staleness(
     manifest: &Manifest,
     lockfile: &Lockfile,
