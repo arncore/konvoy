@@ -76,7 +76,7 @@ pub enum KonancError {
     CorruptToolchain { path: PathBuf, version: String },
 
     /// Failed to install or locate the bundled JRE.
-    #[error("JRE installation failed: {message}")]
+    #[error("jre installation failed: {message}")]
     JreInstall { message: String },
 
     /// A filesystem operation failed during toolchain management.

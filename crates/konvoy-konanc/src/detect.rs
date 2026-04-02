@@ -139,7 +139,7 @@ fn check_executable(path: &Path) -> Result<(), KonancError> {
     Ok(())
 }
 
-fn query_version(path: &PathBuf, java_home: Option<&Path>) -> Result<String, KonancError> {
+fn query_version(path: &Path, java_home: Option<&Path>) -> Result<String, KonancError> {
     let mut cmd = Command::new(path);
     cmd.arg("-version");
     if let Some(jh) = java_home {
@@ -159,9 +159,7 @@ fn query_version(path: &PathBuf, java_home: Option<&Path>) -> Result<String, Kon
         stdout.trim().to_owned()
     };
 
-    parse_version(&raw).ok_or_else(|| KonancError::VersionParse {
-        output: raw.clone(),
-    })
+    parse_version(&raw).ok_or(KonancError::VersionParse { output: raw })
 }
 
 fn compute_fingerprint(path: &Path) -> Result<String, KonancError> {

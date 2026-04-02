@@ -22,6 +22,18 @@ fn pct_u8(downloaded: u64, total: u64) -> u8 {
     u8::try_from((downloaded * 100) / total).unwrap_or(100)
 }
 
+/// Create an HTTP agent with the given global timeout.
+///
+/// Uses a 30-second connect timeout for all requests.
+pub fn http_agent(global_timeout_secs: u64) -> ureq::Agent {
+    ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .timeout_connect(Some(std::time::Duration::from_secs(30)))
+            .timeout_global(Some(std::time::Duration::from_secs(global_timeout_secs)))
+            .build(),
+    )
+}
+
 /// Download a URL to a file, showing progress on stderr and computing SHA-256.
 ///
 /// Returns the hex-encoded SHA-256 hash of the downloaded content.
@@ -35,12 +47,7 @@ pub fn download_with_progress(
     label: &str,
     version: &str,
 ) -> Result<String, UtilError> {
-    let agent = ureq::Agent::new_with_config(
-        ureq::config::Config::builder()
-            .timeout_connect(Some(std::time::Duration::from_secs(30)))
-            .timeout_global(Some(std::time::Duration::from_secs(600)))
-            .build(),
-    );
+    let agent = http_agent(600);
 
     let response = agent.get(url).call().map_err(|e| UtilError::Download {
         message: e.to_string(),
@@ -98,8 +105,13 @@ pub fn download_with_progress(
     if content_length.is_some() {
         eprintln!("\r    Downloading {label} {version}... done   ");
     } else {
-        let mb = downloaded / (1024 * 1024);
-        eprintln!("    Downloaded {label} {version} ({mb} MB)");
+        let kb = downloaded / 1024;
+        if kb >= 1024 {
+            let mb = kb / 1024;
+            eprintln!("    Downloaded {label} {version} ({mb} MB)");
+        } else {
+            eprintln!("    Downloaded {label} {version} ({kb} KB)");
+        }
     }
 
     Ok(finalize_hex(hasher))

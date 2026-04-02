@@ -29,6 +29,7 @@ pub struct PluginLock {
     pub url: String,
 }
 
+/// Pinned toolchain versions and integrity hashes from `konvoy.lock`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolchainLock {
@@ -156,6 +157,7 @@ impl Lockfile {
     }
 }
 
+/// Errors produced when reading, parsing, or writing a `konvoy.lock` lockfile.
 #[derive(Debug, thiserror::Error)]
 pub enum LockfileError {
     #[error("cannot read {path}: {source}")]
