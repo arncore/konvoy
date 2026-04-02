@@ -9,9 +9,7 @@ on:
     tags:
       - "intellij-v*"
   pull_request:
-    paths:
-      - "editors/intellij/**"
-      - ".github/workflows/intellij-plugin.yml"
+    branches: [main]
 
 permissions:
   contents: read
@@ -21,8 +19,25 @@ defaults:
     working-directory: editors/intellij
 
 jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      plugin: ${{ steps.filter.outputs.plugin }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            plugin:
+              - 'editors/intellij/**'
+              - '.github/workflows/intellij-plugin.yml'
+
   build:
     name: Build & Test
+    needs: [changes]
+    if: needs.changes.outputs.plugin == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -83,3 +98,21 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: "*.zip"
+
+  # Single gate job for branch protection. Passes when build succeeds or
+  # is skipped (no IntelliJ changes). Use this as the required check
+  # instead of "Build & Test" directly.
+  intellij-pass:
+    name: IntelliJ Pass
+    if: always()
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify build passed or was skipped
+        run: |
+          result="${{ needs.build.result }}"
+          if [[ "$result" != "success" && "$result" != "skipped" ]]; then
+            echo "Build & Test failed with result: $result"
+            exit 1
+          fi
+          echo "IntelliJ Plugin check passed or was skipped."
