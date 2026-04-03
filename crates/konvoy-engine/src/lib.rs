@@ -4,6 +4,7 @@
 pub mod artifact;
 pub mod build;
 pub mod cache;
+mod common;
 pub mod detekt;
 mod diagnostics;
 pub mod error;

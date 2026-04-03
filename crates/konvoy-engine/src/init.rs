@@ -52,38 +52,15 @@ pub fn init_project_in_place(dir: &Path, kind: PackageKind) -> Result<String, En
 
 /// Validate that a project name is well-formed.
 ///
-/// A valid project name:
-/// - Is not empty
-/// - Contains only ASCII alphanumeric characters, hyphens (`-`), or underscores (`_`)
-/// - Starts with a letter or underscore (not a digit or hyphen)
+/// Delegates to [`konvoy_config::manifest::validate_name`] for the actual rules
+/// and failure reason — single source of truth for name validation.
 fn validate_project_name(name: &str) -> Result<(), EngineError> {
-    let Some(first) = name.chars().next() else {
-        return Err(EngineError::InvalidProjectName {
+    konvoy_config::manifest::validate_name(name).map_err(|reason| {
+        EngineError::InvalidProjectName {
             name: name.to_owned(),
-            reason: "name must not be empty".to_owned(),
-        });
-    };
-
-    if !first.is_ascii_alphabetic() && first != '_' {
-        return Err(EngineError::InvalidProjectName {
-            name: name.to_owned(),
-            reason: format!("must start with a letter or underscore, found '{first}'"),
-        });
-    }
-
-    if let Some(bad) = name
-        .chars()
-        .find(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_')
-    {
-        return Err(EngineError::InvalidProjectName {
-            name: name.to_owned(),
-            reason: format!(
-                "contains invalid character '{bad}' — only ASCII letters, digits, hyphens, and underscores are allowed"
-            ),
-        });
-    }
-
-    Ok(())
+            reason,
+        }
+    })
 }
 
 /// Scaffold a new Konvoy project with a specific package kind.

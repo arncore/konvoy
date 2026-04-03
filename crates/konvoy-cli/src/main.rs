@@ -225,6 +225,22 @@ fn cmd_init(name: Option<String>, lib: bool) -> CliResult {
     Ok(())
 }
 
+fn build_options(
+    target: Option<String>,
+    release: bool,
+    verbose: bool,
+    force: bool,
+    locked: bool,
+) -> konvoy_engine::BuildOptions {
+    konvoy_engine::BuildOptions {
+        target,
+        release,
+        verbose,
+        force,
+        locked,
+    }
+}
+
 fn cmd_build(
     target: Option<String>,
     release: bool,
@@ -233,13 +249,7 @@ fn cmd_build(
     locked: bool,
 ) -> CliResult {
     let root = project_root()?;
-    let options = konvoy_engine::BuildOptions {
-        target,
-        release,
-        verbose,
-        force,
-        locked,
-    };
+    let options = build_options(target, release, verbose, force, locked);
 
     let result = konvoy_engine::build(&root, &options)?;
 
@@ -281,13 +291,7 @@ fn cmd_run(
         );
     }
 
-    let options = konvoy_engine::BuildOptions {
-        target,
-        release,
-        verbose,
-        force,
-        locked,
-    };
+    let options = build_options(target, release, verbose, force, locked);
 
     let result = konvoy_engine::build(&root, &options)?;
 
@@ -320,13 +324,7 @@ fn cmd_test(
     filter: &Option<String>,
 ) -> CliResult {
     let root = project_root()?;
-    let options = konvoy_engine::BuildOptions {
-        target,
-        release,
-        verbose,
-        force,
-        locked,
-    };
+    let options = build_options(target, release, verbose, force, locked);
 
     let result = konvoy_engine::build_tests(&root, &options)?;
 

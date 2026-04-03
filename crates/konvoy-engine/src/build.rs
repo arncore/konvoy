@@ -52,26 +52,46 @@ pub struct BuildResult {
     pub duration: std::time::Duration,
 }
 
-/// Run the full build pipeline.
+/// Common state resolved during steps 1–7b of the build pipeline.
 ///
-/// Steps:
-/// 1. Read `konvoy.toml` from project root
-/// 2. Read `konvoy.lock` (or create default)
-/// 3. Check lockfile staleness (in --locked mode)
-/// 4. Detect host target (or resolve `--target` flag)
-/// 5. Detect `konanc` and get version + fingerprint
-/// 6. Pre-stabilize lockfile for cache key consistency (issue #133)
-/// 7. Resolve dependencies and build them in topological order
-/// 8. Build the root project (collect sources, compute cache key,
-///    check cache, invoke compiler, store artifact)
-/// 9. Update `konvoy.lock` if toolchain version changed
-///
-/// # Errors
-/// Returns an error if any step fails (config parsing, compiler detection,
-/// compilation failure, filesystem errors, etc.).
-pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult, EngineError> {
-    let start = Instant::now();
+/// Shared between `build()` and `build_tests()` to avoid duplicating the
+/// manifest, lockfile, toolchain, and dependency resolution logic.
+pub(crate) struct ResolvedBuildContext {
+    pub manifest: Manifest,
+    /// Original lockfile read from disk (before pre-stabilization).
+    pub lockfile: Lockfile,
+    pub lockfile_path: PathBuf,
+    /// Serialized effective (pre-stabilized) lockfile content for cache key computation.
+    pub lockfile_content: String,
+    pub target: Target,
+    pub profile: String,
+    pub konanc: KonancInfo,
+    pub jre_home: Option<PathBuf>,
+    pub konanc_tarball_sha256: Option<String>,
+    pub jre_tarball_sha256: Option<String>,
+    /// Library paths from built path-deps + Maven klibs.
+    pub library_paths: Vec<PathBuf>,
+    pub plugin_jars: Vec<PathBuf>,
+    pub plugin_locks: Vec<konvoy_config::lockfile::PluginLock>,
+    pub dep_graph: ResolvedGraph,
+    pub store: ArtifactStore,
+}
 
+/// Resolve the common build pipeline state (steps 1–7b).
+///
+/// This is the shared core of both `build()` and `build_tests()`:
+/// 1. Read `konvoy.toml` and `konvoy.lock`
+/// 2. Auto-resolve Maven deps if needed
+/// 3. Check lockfile staleness in `--locked` mode
+/// 4. Resolve target and profile
+/// 5. Resolve managed konanc toolchain
+/// 6. Pre-stabilize lockfile for cache key consistency
+/// 7. Resolve + build path dependencies in topological order,
+///    resolve plugin artifacts, and download Maven dependency klibs
+pub(crate) fn resolve_build_context(
+    project_root: &Path,
+    options: &BuildOptions,
+) -> Result<ResolvedBuildContext, EngineError> {
     // 1. Read konvoy.toml.
     let manifest_path = project_root.join("konvoy.toml");
     let manifest = Manifest::from_path(&manifest_path)?;
@@ -84,7 +104,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     //    When the manifest declares Maven deps that aren't in the lockfile,
     //    run `konvoy update` automatically so users don't have to.
     let lockfile = if !options.locked && has_unresolved_maven_deps(&manifest, &lockfile) {
-        eprintln!("  Maven dependencies not resolved — running update automatically...");
+        eprintln!("  Maven dependencies not resolved \u{2014} running update automatically...");
         crate::update::update(project_root)?;
         // Re-read the lockfile after update wrote it.
         Lockfile::from_path(&lockfile_path)?
@@ -105,40 +125,38 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     // 5. Resolve managed konanc toolchain.
     let resolved = resolve_konanc(&manifest.toolchain.kotlin)?;
     let konanc = resolved.info;
-    let jre_home = resolved.jre_home.clone();
+    let jre_home = resolved.jre_home;
+    let konanc_tarball_sha256 = resolved.konanc_tarball_sha256;
+    let jre_tarball_sha256 = resolved.jre_tarball_sha256;
 
-    // 6. Pre-stabilize the lockfile for cache key consistency.
+    // 6. Pre-stabilize the lockfile for cache key consistency (issue #133).
     //
     // When `konvoy.lock` does not exist (first build) or the toolchain version
     // has changed, the lockfile read at step 2 will differ from what
-    // `update_lockfile_if_needed` writes at step 9. Without pre-stabilization
-    // the first build computes a cache key using the stale/empty lockfile,
-    // then the lockfile is updated on disk, and the second build sees
-    // different content and misses the cache (issue #133).
+    // `update_lockfile_if_needed` writes after the build. Without
+    // pre-stabilization the first build computes a cache key using the
+    // stale/empty lockfile, then the lockfile is updated on disk, and the
+    // second build sees different content and misses the cache.
     //
-    // We predict the lockfile content that `update_lockfile_if_needed` will
-    // eventually write, so the cache key is the same in the first and second
-    // builds. In `--locked` mode we must use the lockfile as-is because the
-    // user explicitly forbids changes.
+    // We predict the lockfile content that will eventually be written, so the
+    // cache key is the same in the first and second builds. In `--locked` mode
+    // we must use the lockfile as-is because the user explicitly forbids changes.
     let effective_lockfile = if options.locked {
         lockfile.clone()
     } else {
         match &lockfile.toolchain {
-            Some(tc) if tc.konanc_version == konanc.version => {
-                // Lockfile already has the correct version — use as-is
-                // (preserves any existing tarball hashes and detekt info).
-                lockfile.clone()
-            }
+            // Lockfile already has the correct version — use as-is
+            // (preserves any existing tarball hashes and detekt info).
+            Some(tc) if tc.konanc_version == konanc.version => lockfile.clone(),
+            // Lockfile is missing or has a different version. Build the same
+            // lockfile that will eventually be written so the cache key is
+            // stable from the first build. Preserve existing dependencies and
+            // plugins (e.g. Maven deps written by `konvoy update`).
             _ => {
-                // Lockfile is missing or has a different version. Build
-                // the same lockfile that `update_lockfile_if_needed` would
-                // write so the cache key is stable from the first build.
-                // Preserve existing dependencies and plugins from the
-                // on-disk lockfile (e.g. Maven deps written by `konvoy update`).
                 let mut stabilized = Lockfile::with_managed_toolchain(
                     &konanc.version,
-                    resolved.konanc_tarball_sha256.as_deref(),
-                    resolved.jre_tarball_sha256.as_deref(),
+                    konanc_tarball_sha256.as_deref(),
+                    jre_tarball_sha256.as_deref(),
                 );
                 stabilized.dependencies = lockfile.dependencies.clone();
                 stabilized.plugins = lockfile.plugins.clone();
@@ -155,44 +173,42 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     let mut completed: HashMap<String, PathBuf> = HashMap::new();
 
     for level in &levels {
-        // Collect library paths from all previously completed deps.
         let lib_paths: Vec<PathBuf> = completed.values().cloned().collect();
-
-        // Build all deps in this level in parallel.
         let results: Vec<Result<(String, PathBuf, BuildOutcome), EngineError>> = level
             .par_iter()
             .map(|dep| {
+                let dep_cc = CompileContext {
+                    konanc: &konanc,
+                    jre_home: jre_home.as_deref(),
+                    target: &target,
+                    options,
+                    library_paths: &lib_paths,
+                    plugin_jars: &[],
+                };
                 let (output, outcome) = build_single(
                     &dep.project_root,
                     &dep.manifest,
-                    &konanc,
-                    jre_home.as_deref(),
-                    &target,
+                    &dep_cc,
                     profile,
-                    options,
-                    &lib_paths,
-                    &[],
                     &lockfile_content,
                 )?;
                 Ok((dep.name.clone(), output, outcome))
             })
             .collect();
 
-        // Collect outputs, propagating the first error.
         for result in results {
             let (name, output, _) = result?;
             completed.insert(name, output);
         }
     }
 
-    // Collect all dep outputs for root project (preserve topological order).
-    let library_paths: Vec<PathBuf> = dep_graph
+    let mut library_paths: Vec<PathBuf> = dep_graph
         .order
         .iter()
         .filter_map(|dep| completed.get(&dep.name).cloned())
         .collect();
 
-    // 7a. Resolve and download plugin artifacts (all plugins are compiler-plugin JARs).
+    // 7a. Resolve and download plugin artifacts.
     let (plugin_jars, plugin_locks) = if !manifest.plugins.is_empty() {
         let resolved_artifacts = crate::plugin::resolve_plugin_artifacts(&manifest)?;
         let results = crate::plugin::ensure_plugin_artifacts(
@@ -207,36 +223,79 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         (Vec::new(), Vec::new())
     };
 
-    let mut all_library_paths = library_paths;
-
     // 7b. Resolve and download Maven dependency klibs for the current target.
     let maven_klibs = resolve_maven_deps(&effective_lockfile, &target)?;
-    all_library_paths.extend(maven_klibs);
+    library_paths.extend(maven_klibs);
+
+    let store = ArtifactStore::new(project_root);
+
+    Ok(ResolvedBuildContext {
+        manifest,
+        lockfile,
+        lockfile_path,
+        lockfile_content,
+        target,
+        profile: profile.to_owned(),
+        konanc,
+        jre_home,
+        konanc_tarball_sha256,
+        jre_tarball_sha256,
+        library_paths,
+        plugin_jars,
+        plugin_locks,
+        dep_graph,
+        store,
+    })
+}
+
+/// Run the full build pipeline.
+///
+/// Steps:
+/// 1. Read `konvoy.toml` from project root
+/// 2. Read `konvoy.lock` (or create default)
+/// 3. Check lockfile staleness (in --locked mode)
+/// 4. Detect host target (or resolve `--target` flag)
+/// 5. Detect `konanc` and get version + fingerprint
+/// 6. Pre-stabilize lockfile for cache key consistency (issue #133)
+/// 7. Resolve dependencies and build them in topological order
+/// 8. Build the root project (collect sources, compute cache key,
+///    check cache, invoke compiler, store artifact)
+/// 9. Update `konvoy.lock` if toolchain version changed
+///
+/// # Errors
+/// Returns an error if any step fails (config parsing, compiler detection,
+/// compilation failure, filesystem errors, etc.).
+pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult, EngineError> {
+    let start = Instant::now();
+    let ctx = resolve_build_context(project_root, options)?;
 
     // 8. Build the root project.
+    let cc = CompileContext {
+        konanc: &ctx.konanc,
+        jre_home: ctx.jre_home.as_deref(),
+        target: &ctx.target,
+        options,
+        library_paths: &ctx.library_paths,
+        plugin_jars: &ctx.plugin_jars,
+    };
     let (output_path, outcome) = build_single(
         project_root,
-        &manifest,
-        &konanc,
-        jre_home.as_deref(),
-        &target,
-        profile,
-        options,
-        &all_library_paths,
-        &plugin_jars,
-        &lockfile_content,
+        &ctx.manifest,
+        &cc,
+        &ctx.profile,
+        &ctx.lockfile_content,
     )?;
 
     // 9. Update lockfile if toolchain, dependencies, or plugins changed.
     update_lockfile_if_needed(
-        &lockfile,
-        &konanc,
-        resolved.konanc_tarball_sha256.as_deref(),
-        resolved.jre_tarball_sha256.as_deref(),
-        &dep_graph,
-        &plugin_locks,
+        &ctx.lockfile,
+        &ctx.konanc,
+        ctx.konanc_tarball_sha256.as_deref(),
+        ctx.jre_tarball_sha256.as_deref(),
+        &ctx.dep_graph,
+        &ctx.plugin_locks,
         project_root,
-        &lockfile_path,
+        &ctx.lockfile_path,
         options.force,
         options.locked,
     )?;
@@ -248,20 +307,27 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
     })
 }
 
+/// Compiler invocation context shared across compilation functions.
+///
+/// Bundles the common parameters that flow through `build_single`, `compile`,
+/// and the two-step/single-step compilation helpers.
+pub(crate) struct CompileContext<'a> {
+    pub konanc: &'a KonancInfo,
+    pub jre_home: Option<&'a Path>,
+    pub target: &'a Target,
+    pub options: &'a BuildOptions,
+    pub library_paths: &'a [PathBuf],
+    pub plugin_jars: &'a [PathBuf],
+}
+
 /// Build a single project (either root or a dependency).
 ///
 /// Returns the path to the output artifact and whether the build was cached.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_single(
     project_root: &Path,
     manifest: &Manifest,
-    konanc: &KonancInfo,
-    jre_home: Option<&Path>,
-    target: &Target,
+    cc: &CompileContext<'_>,
     profile: &str,
-    options: &BuildOptions,
-    library_paths: &[PathBuf],
-    plugin_jars: &[PathBuf],
     lockfile_content: &str,
 ) -> Result<(PathBuf, BuildOutcome), EngineError> {
     // Collect source files, excluding test sources (src/test/).
@@ -285,15 +351,16 @@ pub(crate) fn build_single(
     let cache_inputs = CacheInputs {
         manifest_content,
         lockfile_content: lockfile_content.to_owned(),
-        konanc_version: konanc.version.clone(),
-        konanc_fingerprint: konanc.fingerprint.clone(),
-        target: target.to_string(),
+        konanc_version: cc.konanc.version.clone(),
+        konanc_fingerprint: cc.konanc.fingerprint.clone(),
+        target: cc.target.to_string(),
         profile: profile.to_owned(),
         source_dir: project_root.join("src"),
         source_glob: "**/*.kt".to_owned(),
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
-        dependency_hashes: library_paths
+        dependency_hashes: cc
+            .library_paths
             .iter()
             .map(|p| konvoy_util::hash::sha256_file(p).map_err(EngineError::from))
             .collect::<Result<Vec<_>, _>>()?,
@@ -309,14 +376,14 @@ pub(crate) fn build_single(
     let output_path = project_root
         .join(".konvoy")
         .join("build")
-        .join(target.to_konanc_arg())
+        .join(cc.target.to_konanc_arg())
         .join(profile)
         .join(&output_name);
 
     let store = ArtifactStore::new(project_root);
 
     // Check cache (skip when --force is used to force a rebuild).
-    if !options.force && store.has(&cache_key) {
+    if !cc.options.force && store.has(&cache_key) {
         eprintln!("    Fresh {} (cached)", manifest.package.name);
         store.materialize(&cache_key, &output_name, &output_path)?;
         return Ok((output_path, BuildOutcome::Cached));
@@ -329,27 +396,18 @@ pub(crate) fn build_single(
         output_path.display()
     );
 
-    let compile_output = compile(
-        konanc,
-        jre_home,
-        &sources,
-        target,
-        &output_path,
-        options,
-        if is_lib {
-            ProduceKind::Library
-        } else {
-            ProduceKind::Program
-        },
-        library_paths,
-        plugin_jars,
-    )?;
+    let produce = if is_lib {
+        ProduceKind::Library
+    } else {
+        ProduceKind::Program
+    };
+    let compile_output = compile(cc, &sources, &output_path, produce)?;
 
     // Store artifact in cache.
     let metadata = BuildMetadata {
-        target: target.to_string(),
+        target: cc.target.to_string(),
         profile: profile.to_owned(),
-        konanc_version: konanc.version.clone(),
+        konanc_version: cc.konanc.version.clone(),
         built_at: now_epoch_secs(),
     };
     store.store(&cache_key, &compile_output, &metadata)?;
@@ -395,16 +453,10 @@ fn needs_two_step_compilation(produce: ProduceKind, plugin_jars: &[PathBuf]) -> 
 /// Step 1 compiles sources into a temporary klib with plugins active so that
 /// plugin codegen (e.g. serialization) is applied. Step 2 links the klib into
 /// the final binary without plugins.
-#[allow(clippy::too_many_arguments)]
 fn compile_two_step(
-    konanc: &KonancInfo,
-    jre_home: Option<&Path>,
+    cc: &CompileContext<'_>,
     sources: &[PathBuf],
-    target: &Target,
     output_path: &Path,
-    options: &BuildOptions,
-    library_paths: &[PathBuf],
-    plugin_jars: &[PathBuf],
 ) -> Result<PathBuf, EngineError> {
     // Step 1: compile sources → temporary klib (with plugins active).
     let klib_path = output_path.with_extension("klib");
@@ -412,18 +464,18 @@ fn compile_two_step(
     let mut compile_cmd = KonancCommand::new()
         .sources(sources)
         .output(&klib_path)
-        .target(target.to_konanc_arg())
-        .release(options.release)
+        .target(cc.target.to_konanc_arg())
+        .release(cc.options.release)
         .produce(ProduceKind::Library)
-        .libraries(library_paths)
-        .plugins(plugin_jars);
+        .libraries(cc.library_paths)
+        .plugins(cc.plugin_jars);
 
-    if let Some(jh) = jre_home {
+    if let Some(jh) = cc.jre_home {
         compile_cmd = compile_cmd.java_home(jh);
     }
 
-    let compile_result = compile_cmd.execute(konanc)?;
-    crate::diagnostics::print_diagnostics(&compile_result, options.verbose);
+    let compile_result = compile_cmd.execute(cc.konanc)?;
+    crate::diagnostics::print_diagnostics(&compile_result, cc.options.verbose);
 
     if !compile_result.success {
         return Err(EngineError::CompilationFailed {
@@ -437,16 +489,16 @@ fn compile_two_step(
         let mut link_cmd = KonancCommand::new()
             .include(&klib_path)
             .output(output_path)
-            .target(target.to_konanc_arg())
-            .release(options.release)
-            .libraries(library_paths);
+            .target(cc.target.to_konanc_arg())
+            .release(cc.options.release)
+            .libraries(cc.library_paths);
 
-        if let Some(jh) = jre_home {
+        if let Some(jh) = cc.jre_home {
             link_cmd = link_cmd.java_home(jh);
         }
 
-        let result = link_cmd.execute(konanc)?;
-        crate::diagnostics::print_diagnostics(&result, options.verbose);
+        let result = link_cmd.execute(cc.konanc)?;
+        crate::diagnostics::print_diagnostics(&result, cc.options.verbose);
 
         if !result.success {
             return Err(EngineError::CompilationFailed {
@@ -467,34 +519,28 @@ fn compile_two_step(
 /// Single-step compilation: sources → artifact directly.
 ///
 /// Used for library builds, or program builds without plugins.
-#[allow(clippy::too_many_arguments)]
 fn compile_single_step(
-    konanc: &KonancInfo,
-    jre_home: Option<&Path>,
+    cc: &CompileContext<'_>,
     sources: &[PathBuf],
-    target: &Target,
     output_path: &Path,
-    options: &BuildOptions,
     produce: ProduceKind,
-    library_paths: &[PathBuf],
-    plugin_jars: &[PathBuf],
 ) -> Result<PathBuf, EngineError> {
     let mut cmd = KonancCommand::new()
         .sources(sources)
         .output(output_path)
-        .target(target.to_konanc_arg())
-        .release(options.release)
+        .target(cc.target.to_konanc_arg())
+        .release(cc.options.release)
         .produce(produce)
-        .libraries(library_paths)
-        .plugins(plugin_jars);
+        .libraries(cc.library_paths)
+        .plugins(cc.plugin_jars);
 
-    if let Some(jh) = jre_home {
+    if let Some(jh) = cc.jre_home {
         cmd = cmd.java_home(jh);
     }
 
-    let result = cmd.execute(konanc)?;
+    let result = cmd.execute(cc.konanc)?;
 
-    crate::diagnostics::print_diagnostics(&result, options.verbose);
+    crate::diagnostics::print_diagnostics(&result, cc.options.verbose);
 
     if !result.success {
         return Err(EngineError::CompilationFailed {
@@ -512,46 +558,21 @@ fn compile_single_step(
 }
 
 /// Invoke konanc and return the path to the compiled artifact.
-#[allow(clippy::too_many_arguments)]
 fn compile(
-    konanc: &KonancInfo,
-    jre_home: Option<&Path>,
+    cc: &CompileContext<'_>,
     sources: &[PathBuf],
-    target: &Target,
     output_path: &Path,
-    options: &BuildOptions,
     produce: ProduceKind,
-    library_paths: &[PathBuf],
-    plugin_jars: &[PathBuf],
 ) -> Result<PathBuf, EngineError> {
     // Ensure the output directory exists.
     if let Some(parent) = output_path.parent() {
         konvoy_util::fs::ensure_dir(parent)?;
     }
 
-    if needs_two_step_compilation(produce, plugin_jars) {
-        compile_two_step(
-            konanc,
-            jre_home,
-            sources,
-            target,
-            output_path,
-            options,
-            library_paths,
-            plugin_jars,
-        )
+    if needs_two_step_compilation(produce, cc.plugin_jars) {
+        compile_two_step(cc, sources, output_path)
     } else {
-        compile_single_step(
-            konanc,
-            jre_home,
-            sources,
-            target,
-            output_path,
-            options,
-            produce,
-            library_paths,
-            plugin_jars,
-        )
+        compile_single_step(cc, sources, output_path, produce)
     }
 }
 
@@ -611,7 +632,7 @@ pub(crate) fn resolve_maven_deps(
             };
 
             // Split "groupId:artifactId" into parts.
-            let (group_id, artifact_id) = crate::update::split_maven_coordinate(maven_coord)?;
+            let (group_id, artifact_id) = crate::common::split_maven_coordinate(maven_coord)?;
 
             // Build the per-target artifact ID (e.g. "kotlinx-coroutines-core-linuxx64").
             let per_target_artifact_id = format!("{artifact_id}-{maven_suffix}");
@@ -1380,16 +1401,19 @@ mod tests {
         assert!(store.has(&cache_key));
 
         // Call build_single — it should hit cache and return Cached.
+        let cc = CompileContext {
+            konanc: &konanc,
+            jre_home: None,
+            target: &target,
+            options: &options,
+            library_paths: &[],
+            plugin_jars: &[],
+        };
         let (output_path, outcome) = build_single(
             &project,
             &manifest,
-            &konanc,
-            None,
-            &target,
+            &cc,
             profile,
-            &options,
-            &[],
-            &[],
             &lockfile_content,
         )
         .unwrap();
@@ -1470,16 +1494,19 @@ mod tests {
 
         // build_single should hit cache because test sources are excluded,
         // producing the same cache key we computed above.
+        let cc = CompileContext {
+            konanc: &konanc,
+            jre_home: None,
+            target: &target,
+            options: &options,
+            library_paths: &[],
+            plugin_jars: &[],
+        };
         let (output_path, outcome) = build_single(
             &project,
             &manifest,
-            &konanc,
-            None,
-            &target,
+            &cc,
             profile,
-            &options,
-            &[],
-            &[],
             &lockfile_content,
         )
         .unwrap();
@@ -1585,16 +1612,19 @@ mod tests {
         );
 
         // build_single should still hit cache because it uses src/ as source_dir.
+        let cc = CompileContext {
+            konanc: &konanc,
+            jre_home: None,
+            target: &target,
+            options: &options,
+            library_paths: &[],
+            plugin_jars: &[],
+        };
         let (output_path, outcome) = build_single(
             &project,
             &manifest,
-            &konanc,
-            None,
-            &target,
+            &cc,
             profile,
-            &options,
-            &[],
-            &[],
             &lockfile_content,
         )
         .unwrap();
@@ -2184,16 +2214,19 @@ mod tests {
             force: false,
             locked: false,
         };
+        let cc_no_force = CompileContext {
+            konanc: &konanc,
+            jre_home: None,
+            target: &target,
+            options: &options_no_force,
+            library_paths: &[],
+            plugin_jars: &[],
+        };
         let (_, outcome) = build_single(
             &project,
             &manifest,
-            &konanc,
-            None,
-            &target,
+            &cc_no_force,
             profile,
-            &options_no_force,
-            &[],
-            &[],
             &lockfile_content,
         )
         .unwrap();
@@ -2209,16 +2242,19 @@ mod tests {
             force: true,
             locked: false,
         };
+        let cc_force = CompileContext {
+            konanc: &konanc,
+            jre_home: None,
+            target: &target,
+            options: &options_force,
+            library_paths: &[],
+            plugin_jars: &[],
+        };
         let result = build_single(
             &project,
             &manifest,
-            &konanc,
-            None,
-            &target,
+            &cc_force,
             profile,
-            &options_force,
-            &[],
-            &[],
             &lockfile_content,
         );
 

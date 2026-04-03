@@ -621,13 +621,9 @@ fn fetch_metadata_cached(
 
 /// Split a `groupId:artifactId` string into its two parts.
 ///
-/// # Errors
-///
-/// Returns an error if the string does not contain exactly one colon.
+/// Re-export of [`crate::common::split_maven_coordinate`] for backward compatibility.
 pub(crate) fn split_maven_coordinate(maven: &str) -> Result<(&str, &str), EngineError> {
-    maven.split_once(':').ok_or_else(|| EngineError::Metadata {
-        message: format!("invalid maven coordinate `{maven}` — expected `groupId:artifactId`"),
-    })
+    crate::common::split_maven_coordinate(maven)
 }
 
 /// Return `true` if this dependency should be filtered from transitive resolution.
