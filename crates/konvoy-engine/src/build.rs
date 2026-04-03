@@ -57,23 +57,35 @@ pub struct BuildResult {
 /// Shared between `build()` and `build_tests()` to avoid duplicating the
 /// manifest, lockfile, toolchain, and dependency resolution logic.
 pub(crate) struct ResolvedBuildContext {
+    /// Parsed `konvoy.toml` manifest.
     pub manifest: Manifest,
     /// Original lockfile read from disk (before pre-stabilization).
     pub lockfile: Lockfile,
+    /// Path to `konvoy.lock` on disk.
     pub lockfile_path: PathBuf,
     /// Serialized effective (pre-stabilized) lockfile content for cache key computation.
     pub lockfile_content: String,
+    /// Resolved build target (host or explicit `--target`).
     pub target: Target,
+    /// Build profile (`"debug"` or `"release"`).
     pub profile: String,
+    /// Detected konanc compiler info (path, version, fingerprint).
     pub konanc: KonancInfo,
+    /// JRE home directory from the managed toolchain, if available.
     pub jre_home: Option<PathBuf>,
+    /// SHA-256 of the konanc tarball (from a fresh download, or `None` if already installed).
     pub konanc_tarball_sha256: Option<String>,
+    /// SHA-256 of the JRE tarball (from a fresh download, or `None` if already installed).
     pub jre_tarball_sha256: Option<String>,
-    /// Library paths from built path-deps + Maven klibs.
+    /// Library paths from built path-deps and downloaded Maven klibs.
     pub library_paths: Vec<PathBuf>,
+    /// Paths to downloaded compiler plugin JARs.
     pub plugin_jars: Vec<PathBuf>,
+    /// Lockfile entries for resolved plugins (used by `update_lockfile_if_needed`).
     pub plugin_locks: Vec<konvoy_config::lockfile::PluginLock>,
+    /// Resolved path-dependency graph in topological order.
     pub dep_graph: ResolvedGraph,
+    /// Content-addressed artifact store for this project.
     pub store: ArtifactStore,
 }
 
@@ -312,11 +324,17 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
 /// Bundles the common parameters that flow through `build_single`, `compile`,
 /// and the two-step/single-step compilation helpers.
 pub(crate) struct CompileContext<'a> {
+    /// Konanc compiler info (path, version, fingerprint).
     pub konanc: &'a KonancInfo,
+    /// JRE home for `JAVA_HOME`, if using a managed toolchain.
     pub jre_home: Option<&'a Path>,
+    /// Kotlin/Native compilation target.
     pub target: &'a Target,
+    /// Build options (release, verbose, force, locked).
     pub options: &'a BuildOptions,
+    /// Dependency `.klib` paths to pass as `-library` args.
     pub library_paths: &'a [PathBuf],
+    /// Compiler plugin JAR paths to pass as `-Xplugin` args.
     pub plugin_jars: &'a [PathBuf],
 }
 
