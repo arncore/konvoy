@@ -11,7 +11,6 @@
 //! - Property placeholders beyond `${project.version}` / `${project.groupId}`
 
 use crate::error::UtilError;
-use crate::maven::MAVEN_CENTRAL;
 use crate::metadata::{ArtifactMetadata, MetadataDep};
 
 /// A parsed Maven POM, containing identity and compile-scope dependencies.
@@ -302,8 +301,7 @@ pub fn parse_pom(
 ///
 /// where `group_path` replaces dots in `group_id` with `/`.
 pub fn pom_url(group_id: &str, artifact_id: &str, version: &str) -> String {
-    let group_path = group_id.replace('.', "/");
-    format!("{MAVEN_CENTRAL}/{group_path}/{artifact_id}/{version}/{artifact_id}-{version}.pom")
+    crate::maven::maven_artifact_url(group_id, artifact_id, version, "pom")
 }
 
 /// Fetch a POM file from Maven Central and return its contents as a string.
