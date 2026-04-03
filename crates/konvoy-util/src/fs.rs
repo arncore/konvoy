@@ -4,15 +4,23 @@ use std::path::{Path, PathBuf};
 
 use crate::error::UtilError;
 
+/// Build a `UtilError::Io` mapping closure for the given path.
+///
+/// Avoids repeating `map_err(|source| UtilError::Io { path: ..., source })`
+/// across every filesystem wrapper.
+fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> UtilError + '_ {
+    move |source| UtilError::Io {
+        path: path.display().to_string(),
+        source,
+    }
+}
+
 /// Create a directory and all parent directories if they do not exist.
 ///
 /// # Errors
 /// Returns an error if the directory cannot be created.
 pub fn ensure_dir(path: &Path) -> Result<(), UtilError> {
-    std::fs::create_dir_all(path).map_err(|source| UtilError::Io {
-        path: path.display().to_string(),
-        source,
-    })
+    std::fs::create_dir_all(path).map_err(io_err(path))
 }
 
 /// Copy `src` to `dest`, preferring a hard link for speed.
@@ -22,27 +30,15 @@ pub fn ensure_dir(path: &Path) -> Result<(), UtilError> {
 /// # Errors
 /// Returns an error if both hard linking and copying fail.
 pub fn materialize(src: &Path, dest: &Path) -> Result<(), UtilError> {
-    // Ensure the parent directory exists.
     if let Some(parent) = dest.parent() {
         ensure_dir(parent)?;
     }
-
-    // Remove existing destination if present, so hard_link doesn't fail.
     if dest.exists() {
-        std::fs::remove_file(dest).map_err(|source| UtilError::Io {
-            path: dest.display().to_string(),
-            source,
-        })?;
+        std::fs::remove_file(dest).map_err(io_err(dest))?;
     }
-
-    // Try hard link first, fall back to copy.
     if std::fs::hard_link(src, dest).is_err() {
-        std::fs::copy(src, dest).map_err(|source| UtilError::Io {
-            path: dest.display().to_string(),
-            source,
-        })?;
+        std::fs::copy(src, dest).map_err(io_err(dest))?;
     }
-
     Ok(())
 }
 
@@ -51,10 +47,7 @@ pub fn materialize(src: &Path, dest: &Path) -> Result<(), UtilError> {
 /// # Errors
 /// Returns an error if the file cannot be written.
 pub fn write_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), UtilError> {
-    std::fs::write(path, contents).map_err(|source| UtilError::Io {
-        path: path.display().to_string(),
-        source,
-    })
+    std::fs::write(path, contents).map_err(io_err(path))
 }
 
 /// Read the entire contents of a file into a byte vector.
@@ -62,10 +55,7 @@ pub fn write_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), UtilErr
 /// # Errors
 /// Returns an error if the file cannot be read.
 pub fn read_file(path: &Path) -> Result<Vec<u8>, UtilError> {
-    std::fs::read(path).map_err(|source| UtilError::Io {
-        path: path.display().to_string(),
-        source,
-    })
+    std::fs::read(path).map_err(io_err(path))
 }
 
 /// Copy a file from `src` to `dest`.
@@ -73,10 +63,7 @@ pub fn read_file(path: &Path) -> Result<Vec<u8>, UtilError> {
 /// # Errors
 /// Returns an error if the copy fails.
 pub fn copy_file(src: &Path, dest: &Path) -> Result<u64, UtilError> {
-    std::fs::copy(src, dest).map_err(|source| UtilError::Io {
-        path: dest.display().to_string(),
-        source,
-    })
+    std::fs::copy(src, dest).map_err(io_err(dest))
 }
 
 /// Rename (move) a file or directory from `from` to `to`.
@@ -84,10 +71,7 @@ pub fn copy_file(src: &Path, dest: &Path) -> Result<u64, UtilError> {
 /// # Errors
 /// Returns an error if the rename fails.
 pub fn rename(from: &Path, to: &Path) -> Result<(), UtilError> {
-    std::fs::rename(from, to).map_err(|source| UtilError::Io {
-        path: to.display().to_string(),
-        source,
-    })
+    std::fs::rename(from, to).map_err(io_err(to))
 }
 
 /// Remove a directory and all its contents. No error if the directory is absent.
@@ -98,10 +82,7 @@ pub fn remove_dir_all_if_exists(path: &Path) -> Result<(), UtilError> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(UtilError::Io {
-            path: path.display().to_string(),
-            source,
-        }),
+        Err(source) => Err(io_err(path)(source)),
     }
 }
 
@@ -130,29 +111,27 @@ pub fn collect_files(dir: &Path, extension: &str) -> Result<Vec<PathBuf>, UtilEr
     Ok(files)
 }
 
+/// Check whether a path has the given file extension (case-sensitive).
+fn has_extension(path: &Path, ext: &str) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e == ext)
+}
+
 fn collect_files_recursive(
     dir: &Path,
     extension: &str,
     out: &mut Vec<PathBuf>,
 ) -> Result<(), UtilError> {
-    let entries = std::fs::read_dir(dir).map_err(|source| UtilError::Io {
-        path: dir.display().to_string(),
-        source,
-    })?;
+    let entries = std::fs::read_dir(dir).map_err(io_err(dir))?;
 
     for entry in entries {
-        let entry = entry.map_err(|source| UtilError::Io {
-            path: dir.display().to_string(),
-            source,
-        })?;
+        let entry = entry.map_err(io_err(dir))?;
 
         // Use entry.file_type() which does NOT follow symlinks, unlike
         // path.is_dir()/path.metadata(). This prevents infinite recursion
         // when symlink cycles exist (e.g. a -> b, b -> a).
-        let file_type = entry.file_type().map_err(|source| UtilError::Io {
-            path: entry.path().display().to_string(),
-            source,
-        })?;
+        let file_type = entry.file_type().map_err(io_err(&entry.path()))?;
 
         if file_type.is_symlink() {
             // Follow the symlink to determine what it points to.
@@ -165,12 +144,7 @@ fn collect_files_recursive(
 
             // Only include symlinked regular files; skip directory symlinks
             // to prevent infinite recursion from symlink cycles.
-            if target_meta.is_file()
-                && path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| e == extension)
-            {
+            if target_meta.is_file() && has_extension(&path, extension) {
                 out.push(path);
             }
             continue;
@@ -180,11 +154,7 @@ fn collect_files_recursive(
 
         if file_type.is_dir() {
             collect_files_recursive(&path, extension, out)?;
-        } else if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e == extension)
-        {
+        } else if has_extension(&path, extension) {
             out.push(path);
         }
     }

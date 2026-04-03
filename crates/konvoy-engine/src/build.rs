@@ -735,31 +735,25 @@ pub(crate) fn check_lockfile_staleness(
     manifest: &Manifest,
     lockfile: &Lockfile,
 ) -> Result<(), EngineError> {
-    match &lockfile.toolchain {
-        Some(tc) => {
-            // Toolchain version must match.
-            if tc.konanc_version != manifest.toolchain.kotlin {
-                return Err(EngineError::LockfileUpdateRequired);
-            }
+    let Some(tc) = &lockfile.toolchain else {
+        // Lockfile has no toolchain section at all — it's stale.
+        return Err(EngineError::LockfileUpdateRequired);
+    };
 
-            // If detekt is configured in manifest, lockfile must have matching detekt version.
-            if let Some(manifest_detekt) = &manifest.toolchain.detekt {
-                if tc.detekt_version.as_deref() != Some(manifest_detekt.as_str()) {
-                    return Err(EngineError::LockfileUpdateRequired);
-                }
-            }
-        }
-        None => {
-            // Lockfile has no toolchain section at all — it's stale.
+    if tc.konanc_version != manifest.toolchain.kotlin {
+        return Err(EngineError::LockfileUpdateRequired);
+    }
+
+    // If detekt is configured in manifest, lockfile must have matching detekt version.
+    if let Some(manifest_detekt) = &manifest.toolchain.detekt {
+        if tc.detekt_version.as_deref() != Some(manifest_detekt.as_str()) {
             return Err(EngineError::LockfileUpdateRequired);
         }
     }
 
-    // If the manifest has plugins, the lockfile must have at least one plugin entry
-    // for each declared plugin name.
+    // Each declared plugin must have a matching lockfile entry.
     for plugin_name in manifest.plugins.keys() {
-        let has_plugin = lockfile.plugins.iter().any(|p| p.name == *plugin_name);
-        if !has_plugin {
+        if !lockfile.plugins.iter().any(|p| p.name == *plugin_name) {
             return Err(EngineError::LockfileUpdateRequired);
         }
     }

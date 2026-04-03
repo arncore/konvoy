@@ -131,46 +131,35 @@ fn validate_plugins(
     path: &str,
 ) -> Result<(), ManifestError> {
     for (name, spec) in plugins {
-        // Plugins must use Maven coordinates, not path dependencies.
+        let err = |reason: String| ManifestError::InvalidPluginConfig {
+            path: path.to_owned(),
+            name: name.clone(),
+            reason,
+        };
+
         if spec.path.is_some() {
-            return Err(ManifestError::InvalidPluginConfig {
-                path: path.to_owned(),
-                name: name.clone(),
-                reason: "plugins must use `maven` coordinates, not `path`".to_owned(),
-            });
+            return Err(err(
+                "plugins must use `maven` coordinates, not `path`".to_owned()
+            ));
         }
         if spec.maven.is_none() {
-            return Err(ManifestError::InvalidPluginConfig {
-                path: path.to_owned(),
-                name: name.clone(),
-                reason: "plugin must have `maven` set to a `groupId:artifactId` coordinate"
-                    .to_owned(),
-            });
+            return Err(err(
+                "plugin must have `maven` set to a `groupId:artifactId` coordinate".to_owned(),
+            ));
         }
         if spec.version.is_none() {
-            return Err(ManifestError::InvalidPluginConfig {
-                path: path.to_owned(),
-                name: name.clone(),
-                reason: "plugin must have `version` set".to_owned(),
-            });
+            return Err(err("plugin must have `version` set".to_owned()));
         }
         if spec.version.as_ref().is_some_and(|v| v.trim().is_empty()) {
-            return Err(ManifestError::InvalidPluginConfig {
-                path: path.to_owned(),
-                name: name.clone(),
-                reason: "plugin `version` must not be empty or whitespace".to_owned(),
-            });
+            return Err(err(
+                "plugin `version` must not be empty or whitespace".to_owned()
+            ));
         }
-        // Validate maven coordinate format (reuse same colon-check as deps).
         if let Some(ref maven) = spec.maven {
             if !is_valid_maven_coordinate(maven) {
-                return Err(ManifestError::InvalidPluginConfig {
-                    path: path.to_owned(),
-                    name: name.clone(),
-                    reason: format!(
-                        "invalid maven coordinate `{maven}` — expected `groupId:artifactId`"
-                    ),
-                });
+                return Err(err(format!(
+                    "invalid maven coordinate `{maven}` — expected `groupId:artifactId`"
+                )));
             }
         }
     }

@@ -369,15 +369,10 @@ fn cmd_lint(verbose: bool, config: Option<PathBuf>, locked: bool) -> CliResult {
 
     if !verbose {
         for diag in &result.diagnostics {
-            let location = match (&diag.file, diag.line) {
-                (Some(f), Some(l)) => format!("{f}:{l}"),
-                (Some(f), None) => f.clone(),
-                _ => String::new(),
-            };
-            if location.is_empty() {
-                eprintln!("  {}: {}", diag.rule, diag.message);
-            } else {
-                eprintln!("  {location}: {}: {}", diag.rule, diag.message);
+            match (&diag.file, diag.line) {
+                (Some(f), Some(l)) => eprintln!("  {f}:{l}: {}: {}", diag.rule, diag.message),
+                (Some(f), None) => eprintln!("  {f}: {}: {}", diag.rule, diag.message),
+                _ => eprintln!("  {}: {}", diag.rule, diag.message),
             }
         }
     }
