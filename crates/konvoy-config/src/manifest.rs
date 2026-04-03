@@ -37,6 +37,7 @@ pub enum PackageKind {
     Lib,
 }
 
+/// Package metadata from the `[package]` section of `konvoy.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Package {
@@ -86,6 +87,136 @@ fn is_valid_entrypoint(entrypoint: &str) -> bool {
     entrypoint.ends_with(".kt")
 }
 
+/// Return `true` if `coord` is a valid `groupId:artifactId` Maven coordinate.
+fn is_valid_maven_coordinate(coord: &str) -> bool {
+    match coord.split_once(':') {
+        Some((group, artifact)) => {
+            !group.is_empty() && !artifact.is_empty() && !artifact.contains(':')
+        }
+        None => false,
+    }
+}
+
+/// Validate plugin entries: must use Maven coordinates with a version, not path dependencies.
+fn validate_plugins(
+    plugins: &BTreeMap<String, DependencySpec>,
+    path: &str,
+) -> Result<(), ManifestError> {
+    for (name, spec) in plugins {
+        // Plugins must use Maven coordinates, not path dependencies.
+        if spec.path.is_some() {
+            return Err(ManifestError::InvalidPluginConfig {
+                path: path.to_owned(),
+                name: name.clone(),
+                reason: "plugins must use `maven` coordinates, not `path`".to_owned(),
+            });
+        }
+        if spec.maven.is_none() {
+            return Err(ManifestError::InvalidPluginConfig {
+                path: path.to_owned(),
+                name: name.clone(),
+                reason: "plugin must have `maven` set to a `groupId:artifactId` coordinate"
+                    .to_owned(),
+            });
+        }
+        if spec.version.is_none() {
+            return Err(ManifestError::InvalidPluginConfig {
+                path: path.to_owned(),
+                name: name.clone(),
+                reason: "plugin must have `version` set".to_owned(),
+            });
+        }
+        if spec.version.as_ref().is_some_and(|v| v.trim().is_empty()) {
+            return Err(ManifestError::InvalidPluginConfig {
+                path: path.to_owned(),
+                name: name.clone(),
+                reason: "plugin `version` must not be empty or whitespace".to_owned(),
+            });
+        }
+        // Validate maven coordinate format (reuse same colon-check as deps).
+        if let Some(ref maven) = spec.maven {
+            if !is_valid_maven_coordinate(maven) {
+                return Err(ManifestError::InvalidPluginConfig {
+                    path: path.to_owned(),
+                    name: name.clone(),
+                    reason: format!(
+                        "invalid maven coordinate `{maven}` — expected `groupId:artifactId`"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate dependency entries: names, source types, Maven coordinates, and versions.
+fn validate_dependencies(
+    dependencies: &BTreeMap<String, DependencySpec>,
+    package_name: &str,
+    path: &str,
+) -> Result<(), ManifestError> {
+    for (name, spec) in dependencies {
+        if !is_valid_name(name) {
+            return Err(ManifestError::DependencyInvalidName {
+                path: path.to_owned(),
+                name: name.clone(),
+            });
+        }
+        if name == package_name {
+            return Err(ManifestError::DependencySelfReference {
+                path: path.to_owned(),
+                name: name.clone(),
+            });
+        }
+        // maven + path is an error — pick one source type.
+        if spec.maven.is_some() && spec.path.is_some() {
+            return Err(ManifestError::DependencyMavenWithPath {
+                path: path.to_owned(),
+                name: name.clone(),
+            });
+        }
+        // version without maven is an error — needs a coordinate.
+        if spec.version.is_some() && spec.maven.is_none() {
+            return Err(ManifestError::DependencyVersionWithoutMaven {
+                path: path.to_owned(),
+                name: name.clone(),
+            });
+        }
+        // maven without version is an error — needs a pinned version.
+        if spec.maven.is_some() && spec.version.is_none() {
+            return Err(ManifestError::DependencyMavenWithoutVersion {
+                path: path.to_owned(),
+                name: name.clone(),
+            });
+        }
+        // Empty or whitespace-only version is an error.
+        if spec.version.as_ref().is_some_and(|v| v.trim().is_empty()) {
+            return Err(ManifestError::DependencyEmptyVersion {
+                path: path.to_owned(),
+                name: name.clone(),
+            });
+        }
+        // Validate maven coordinate format: exactly one colon, non-empty parts.
+        if let Some(ref maven) = spec.maven {
+            if !is_valid_maven_coordinate(maven) {
+                return Err(ManifestError::DependencyInvalidMaven {
+                    path: path.to_owned(),
+                    name: name.clone(),
+                    maven: maven.clone(),
+                });
+            }
+        }
+        // No source at all — need path or maven+version.
+        if spec.path.is_none() && spec.maven.is_none() && spec.version.is_none() {
+            return Err(ManifestError::DependencyNoSource {
+                path: path.to_owned(),
+                name: name.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Validate a parsed manifest and return validation errors.
 fn validate(manifest: &Manifest, path: &str) -> Result<(), ManifestError> {
     if manifest.package.name.is_empty() {
@@ -125,123 +256,8 @@ fn validate(manifest: &Manifest, path: &str) -> Result<(), ManifestError> {
             message: "detekt version must not be empty".to_owned(),
         });
     }
-    // Validate plugins.
-    for (name, spec) in &manifest.plugins {
-        // Plugins must use Maven coordinates, not path dependencies.
-        if spec.path.is_some() {
-            return Err(ManifestError::InvalidPluginConfig {
-                path: path.to_owned(),
-                name: name.clone(),
-                reason: "plugins must use `maven` coordinates, not `path`".to_owned(),
-            });
-        }
-        if spec.maven.is_none() {
-            return Err(ManifestError::InvalidPluginConfig {
-                path: path.to_owned(),
-                name: name.clone(),
-                reason: "plugin must have `maven` set to a `groupId:artifactId` coordinate"
-                    .to_owned(),
-            });
-        }
-        if spec.version.is_none() {
-            return Err(ManifestError::InvalidPluginConfig {
-                path: path.to_owned(),
-                name: name.clone(),
-                reason: "plugin must have `version` set".to_owned(),
-            });
-        }
-        if spec.version.as_ref().is_some_and(|v| v.trim().is_empty()) {
-            return Err(ManifestError::InvalidPluginConfig {
-                path: path.to_owned(),
-                name: name.clone(),
-                reason: "plugin `version` must not be empty or whitespace".to_owned(),
-            });
-        }
-        // Validate maven coordinate format (reuse same colon-check as deps).
-        if let Some(ref maven) = spec.maven {
-            let valid = match maven.split_once(':') {
-                Some((group, artifact)) => {
-                    !group.is_empty() && !artifact.is_empty() && !artifact.contains(':')
-                }
-                None => false,
-            };
-            if !valid {
-                return Err(ManifestError::InvalidPluginConfig {
-                    path: path.to_owned(),
-                    name: name.clone(),
-                    reason: format!(
-                        "invalid maven coordinate `{maven}` — expected `groupId:artifactId`"
-                    ),
-                });
-            }
-        }
-    }
-    // Validate dependencies.
-    for (name, spec) in &manifest.dependencies {
-        if !is_valid_name(name) {
-            return Err(ManifestError::DependencyInvalidName {
-                path: path.to_owned(),
-                name: name.clone(),
-            });
-        }
-        if name == &manifest.package.name {
-            return Err(ManifestError::DependencySelfReference {
-                path: path.to_owned(),
-                name: name.clone(),
-            });
-        }
-        // maven + path is an error — pick one source type.
-        if spec.maven.is_some() && spec.path.is_some() {
-            return Err(ManifestError::DependencyMavenWithPath {
-                path: path.to_owned(),
-                name: name.clone(),
-            });
-        }
-        // version without maven is an error — needs a coordinate.
-        if spec.version.is_some() && spec.maven.is_none() {
-            return Err(ManifestError::DependencyVersionWithoutMaven {
-                path: path.to_owned(),
-                name: name.clone(),
-            });
-        }
-        // maven without version is an error — needs a pinned version.
-        if spec.maven.is_some() && spec.version.is_none() {
-            return Err(ManifestError::DependencyMavenWithoutVersion {
-                path: path.to_owned(),
-                name: name.clone(),
-            });
-        }
-        // Empty or whitespace-only version is an error.
-        if spec.version.as_ref().is_some_and(|v| v.trim().is_empty()) {
-            return Err(ManifestError::DependencyEmptyVersion {
-                path: path.to_owned(),
-                name: name.clone(),
-            });
-        }
-        // Validate maven coordinate format: exactly one colon, non-empty parts.
-        if let Some(ref maven) = spec.maven {
-            let valid = match maven.split_once(':') {
-                Some((group, artifact)) => {
-                    !group.is_empty() && !artifact.is_empty() && !artifact.contains(':')
-                }
-                None => false,
-            };
-            if !valid {
-                return Err(ManifestError::DependencyInvalidMaven {
-                    path: path.to_owned(),
-                    name: name.clone(),
-                    maven: maven.clone(),
-                });
-            }
-        }
-        // No source at all — need path or maven+version.
-        if spec.path.is_none() && spec.maven.is_none() && spec.version.is_none() {
-            return Err(ManifestError::DependencyNoSource {
-                path: path.to_owned(),
-                name: name.clone(),
-            });
-        }
-    }
+    validate_plugins(&manifest.plugins, path)?;
+    validate_dependencies(&manifest.dependencies, &manifest.package.name, path)?;
     Ok(())
 }
 
@@ -283,6 +299,7 @@ impl Manifest {
     }
 }
 
+/// Errors produced when reading, parsing, or validating a `konvoy.toml` manifest.
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
     #[error("cannot read {path}: {source}")]

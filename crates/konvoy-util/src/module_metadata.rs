@@ -145,12 +145,7 @@ pub fn fetch_module_metadata(
 ) -> Result<Option<String>, UtilError> {
     let url = module_metadata_url(group_id, artifact_id, version);
 
-    let agent = ureq::Agent::new_with_config(
-        ureq::config::Config::builder()
-            .timeout_connect(Some(std::time::Duration::from_secs(30)))
-            .timeout_global(Some(std::time::Duration::from_secs(60)))
-            .build(),
-    );
+    let agent = crate::download::http_agent(60);
 
     match agent.get(&url).call() {
         Ok(response) => {

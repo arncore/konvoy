@@ -7,6 +7,17 @@ use konvoy_config::manifest::{Manifest, PackageKind};
 
 use crate::error::EngineError;
 
+/// Three-color marking for DFS cycle detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DfsColor {
+    /// Not yet visited.
+    White,
+    /// Currently on the DFS stack (in progress).
+    Gray,
+    /// Fully processed.
+    Black,
+}
+
 /// A single resolved dependency in the build graph.
 #[derive(Debug, Clone)]
 pub struct ResolvedDep {
@@ -55,8 +66,8 @@ pub fn resolve_dependencies(
 
     // Collect all dependencies by canonical path to deduplicate diamonds.
     let mut visited: HashMap<PathBuf, ResolvedDep> = HashMap::new();
-    // Three-color marking: 0=white, 1=gray(in-stack), 2=black(done).
-    let mut color: HashMap<PathBuf, u8> = HashMap::new();
+    // Three-color marking for cycle detection.
+    let mut color: HashMap<PathBuf, DfsColor> = HashMap::new();
     // Topological order (post-order DFS).
     let mut topo: Vec<PathBuf> = Vec::new();
 
@@ -99,6 +110,14 @@ pub fn parallel_levels(graph: &ResolvedGraph) -> Vec<Vec<&ResolvedDep>> {
             .into_iter()
             .partition(|dep| dep.dep_names.iter().all(|d| assigned.contains(d.as_str())));
 
+        if level.is_empty() {
+            // Remaining deps reference names that were never resolved (e.g. Maven
+            // deps filtered out of dep_names). Log for diagnostics and stop.
+            let stuck: Vec<&str> = rest.iter().map(|d| d.name.as_str()).collect();
+            eprintln!("  warning: skipping unresolvable deps in parallel scheduling: {stuck:?}");
+            break;
+        }
+
         for dep in &level {
             assigned.insert(&dep.name);
         }
@@ -115,19 +134,22 @@ fn dfs(
     canonical_path: &Path,
     root_kotlin: &str,
     visited: &mut HashMap<PathBuf, ResolvedDep>,
-    color: &mut HashMap<PathBuf, u8>,
+    color: &mut HashMap<PathBuf, DfsColor>,
     topo: &mut Vec<PathBuf>,
     stack: &mut Vec<String>,
 ) -> Result<(), EngineError> {
-    let current_color = color.get(canonical_path).copied().unwrap_or(0);
+    let current_color = color
+        .get(canonical_path)
+        .copied()
+        .unwrap_or(DfsColor::White);
 
-    if current_color == 2 {
-        // Already fully processed (black).
+    if current_color == DfsColor::Black {
+        // Already fully processed.
         return Ok(());
     }
 
-    if current_color == 1 {
-        // Gray — cycle detected.
+    if current_color == DfsColor::Gray {
+        // Currently on the stack — cycle detected.
         stack.push(name.to_owned());
         let cycle_start = stack.iter().position(|n| n == name).unwrap_or(0);
         let cycle = stack
@@ -138,7 +160,7 @@ fn dfs(
     }
 
     // Mark gray (in-stack).
-    color.insert(canonical_path.to_path_buf(), 1);
+    color.insert(canonical_path.to_path_buf(), DfsColor::Gray);
     stack.push(name.to_owned());
 
     // Read the dependency manifest.
@@ -169,7 +191,12 @@ fn dfs(
     }
 
     // Recurse into this dep's own dependencies (skip Maven deps).
-    let dep_names: Vec<String> = dep_manifest.dependencies.keys().cloned().collect();
+    let dep_names: Vec<String> = dep_manifest
+        .dependencies
+        .iter()
+        .filter(|(_, spec)| spec.version.is_none())
+        .map(|(dep_key, _)| dep_key.clone())
+        .collect();
     for (sub_name, sub_spec) in &dep_manifest.dependencies {
         if sub_spec.version.is_some() {
             continue; // Maven deps are resolved separately
@@ -187,7 +214,7 @@ fn dfs(
     }
 
     // Mark black (done) and add to topo order.
-    color.insert(canonical_path.to_path_buf(), 2);
+    color.insert(canonical_path.to_path_buf(), DfsColor::Black);
     stack.pop();
 
     // Compute source hash for integrity verification.

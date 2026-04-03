@@ -317,12 +317,7 @@ pub fn pom_url(group_id: &str, artifact_id: &str, version: &str) -> String {
 pub fn fetch_pom(group_id: &str, artifact_id: &str, version: &str) -> Result<String, UtilError> {
     let url = pom_url(group_id, artifact_id, version);
 
-    let agent = ureq::Agent::new_with_config(
-        ureq::config::Config::builder()
-            .timeout_connect(Some(std::time::Duration::from_secs(30)))
-            .timeout_global(Some(std::time::Duration::from_secs(60)))
-            .build(),
-    );
+    let agent = crate::download::http_agent(60);
 
     let response = agent.get(&url).call().map_err(|e| UtilError::Download {
         message: format!("failed to fetch POM from {url}: {e}"),

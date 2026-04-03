@@ -79,7 +79,10 @@ pub fn jre_home_path(version: &str) -> Result<PathBuf, KonancError> {
     let jre_root = jre_dir(version)?;
     if !jre_root.exists() {
         return Err(KonancError::JreInstall {
-            message: format!("JRE not found at {}", jre_root.display()),
+            message: format!(
+                "jre not found at {} — run `konvoy toolchain install` to reinstall",
+                jre_root.display()
+            ),
         });
     }
 
@@ -351,7 +354,10 @@ fn install_jre(version: &str) -> Result<(PathBuf, Option<String>), KonancError> 
     let java_bin = home.join("bin").join("java");
     if !java_bin.exists() {
         return Err(KonancError::JreInstall {
-            message: format!("java binary not found at {}", java_bin.display()),
+            message: format!(
+                "java binary not found at {} — run `konvoy toolchain install` to reinstall",
+                java_bin.display()
+            ),
         });
     }
 
@@ -556,7 +562,12 @@ fn find_extracted_root(extract_dir: &Path, version: &str) -> Result<PathBuf, Kon
             path: extract_dir.display().to_string(),
             source,
         })?
-        .filter_map(Result::ok)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| KonancError::Io {
+            path: extract_dir.display().to_string(),
+            source: e,
+        })?
+        .into_iter()
         .filter(|e| e.path().is_dir())
         .collect();
 
