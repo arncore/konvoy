@@ -297,6 +297,124 @@ struct ResolvedMavenDep {
 /// A BFS queue entry: (group_id, artifact_id, version, requirer_name, ancestor_path).
 type BfsEntry = (String, String, String, Option<String>, Vec<String>);
 
+/// State accumulated during the BFS traversal of Maven transitive dependencies.
+struct BfsState {
+    user_versions: HashMap<String, String>,
+    resolved: HashMap<String, ResolvedMavenDep>,
+    metadata_cache: HashMap<String, ArtifactMetadata>,
+    required_by_map: HashMap<String, BTreeSet<String>>,
+    queue: VecDeque<BfsEntry>,
+}
+
+/// Check for a version conflict between a newly resolved dep and one already seen.
+///
+/// Returns an error describing the conflict with an actionable hint, or `Ok(())`
+/// if the versions match (already resolved — caller should skip).
+fn check_version_conflict(
+    existing: &ResolvedMavenDep,
+    resolved_version: &str,
+    dep_key: &str,
+    base_artifact_id: &str,
+    requirer: Option<&str>,
+) -> Result<(), EngineError> {
+    if existing.version == resolved_version {
+        return Ok(());
+    }
+
+    let existing_requirer = if existing.required_by.is_empty() {
+        "konvoy.toml (direct)"
+    } else {
+        existing
+            .required_by
+            .first()
+            .map(String::as_str)
+            .unwrap_or("unknown")
+    };
+    let current_requirer = requirer.unwrap_or("konvoy.toml (direct)");
+
+    let details = format!(
+        "  {existing_requirer} requires {}\n  {current_requirer} requires {resolved_version}",
+        existing.version
+    );
+    let hint_name = base_artifact_id.replace('.', "-");
+    let hint_version = if resolved_version > existing.version.as_str() {
+        resolved_version.to_owned()
+    } else {
+        existing.version.clone()
+    };
+
+    Err(EngineError::MavenVersionConflict {
+        maven: dep_key.to_owned(),
+        details,
+        hint_name,
+        hint_version,
+    })
+}
+
+/// Discover cinterop klibs from cached metadata and return them as separate deps.
+fn discover_cinterop_deps(
+    resolved: &HashMap<String, ResolvedMavenDep>,
+    metadata_cache: &HashMap<String, ArtifactMetadata>,
+    maven_suffix: &str,
+) -> Vec<ResolvedMavenDep> {
+    let mut cinterop_deps = Vec::new();
+
+    for dep in resolved.values() {
+        let metadata_key = format!(
+            "{}:{}-{}:{}",
+            dep.group_id, dep.artifact_id, maven_suffix, dep.version
+        );
+        let Some(metadata) = metadata_cache.get(&metadata_key) else {
+            continue;
+        };
+        for file in &metadata.files {
+            if !file.name.contains("cinterop-") {
+                continue;
+            }
+            let Some(cls) = extract_classifier_from_url(&file.url, &dep.version) else {
+                continue;
+            };
+            let cinterop_name = file
+                .name
+                .strip_suffix(".klib")
+                .unwrap_or(&file.name)
+                .to_owned();
+
+            cinterop_deps.push(ResolvedMavenDep {
+                name: cinterop_name,
+                group_id: dep.group_id.clone(),
+                artifact_id: dep.artifact_id.clone(),
+                version: dep.version.clone(),
+                required_by: vec![dep.name.clone()],
+                classifier: Some(cls),
+            });
+        }
+    }
+
+    cinterop_deps
+}
+
+/// Finalize the `required_by` fields: direct deps get empty, transitive deps
+/// get the accumulated requirer set.
+fn finalize_required_by(
+    resolved: &mut HashMap<String, ResolvedMavenDep>,
+    required_by_map: &HashMap<String, BTreeSet<String>>,
+    direct_deps: &[ResolvedMavenDep],
+) {
+    for (key, dep) in resolved.iter_mut() {
+        if let Some(requirers) = required_by_map.get(key) {
+            let is_direct = direct_deps
+                .iter()
+                .any(|d| format!("{}:{}", d.group_id, d.artifact_id) == *key);
+            if is_direct {
+                dep.required_by = Vec::new();
+            } else {
+                dep.required_by = requirers.iter().cloned().collect();
+            }
+        }
+    }
+}
+
 fn resolve_transitive(
     direct_deps: &[ResolvedMavenDep],
 ) -> Result<Vec<ResolvedMavenDep>, EngineError> {
@@ -314,28 +432,20 @@ fn resolve_transitive(
         .map_err(EngineError::Target)?;
     let maven_suffix = probe_target_parsed.to_maven_suffix();
 
-    // Build a map of user-specified versions: `groupId:artifactId` -> version.
-    // These always win over transitive versions.
-    let mut user_versions: HashMap<String, String> = HashMap::new();
+    let mut state = BfsState {
+        user_versions: HashMap::new(),
+        resolved: HashMap::new(),
+        metadata_cache: HashMap::new(),
+        required_by_map: HashMap::new(),
+        queue: VecDeque::new(),
+    };
+
+    // Build user-specified version map and seed the BFS queue.
     for dep in direct_deps {
         let key = format!("{}:{}", dep.group_id, dep.artifact_id);
-        user_versions.insert(key, dep.version.clone());
-    }
-
-    // Resolved set: `groupId:artifactId` -> ResolvedMavenDep.
-    let mut resolved: HashMap<String, ResolvedMavenDep> = HashMap::new();
-    // Cache of fetched metadata: `groupId:artifactId:version` -> ArtifactMetadata.
-    let mut metadata_cache: HashMap<String, ArtifactMetadata> = HashMap::new();
-    // Track who requires each dep: `groupId:artifactId` -> set of requirer names.
-    let mut required_by_map: HashMap<String, BTreeSet<String>> = HashMap::new();
-    // BFS queue: (group_id, artifact_id, version, requirer_name, ancestor_path).
-    let mut queue: VecDeque<BfsEntry> = VecDeque::new();
-
-    // Seed the queue with direct deps.
-    for dep in direct_deps {
-        let key = format!("{}:{}", dep.group_id, dep.artifact_id);
-        resolved.insert(key.clone(), dep.clone());
-        queue.push_back((
+        state.user_versions.insert(key.clone(), dep.version.clone());
+        state.resolved.insert(key.clone(), dep.clone());
+        state.queue.push_back((
             dep.group_id.clone(),
             dep.artifact_id.clone(),
             dep.version.clone(),
@@ -345,92 +455,55 @@ fn resolve_transitive(
     }
 
     // BFS loop.
-    while let Some((group_id, artifact_id, version, requirer, path)) = queue.pop_front() {
+    while let Some((group_id, artifact_id, version, requirer, path)) = state.queue.pop_front() {
         let key = format!("{group_id}:{artifact_id}");
 
-        // Record who required this dep.
         if let Some(req) = &requirer {
-            required_by_map
+            state
+                .required_by_map
                 .entry(key.clone())
                 .or_default()
                 .insert(req.clone());
         }
 
-        // Construct the per-target artifact ID for metadata fetching.
         let per_target_artifact_id = format!("{artifact_id}-{maven_suffix}");
-
-        // Fetch and cache metadata (tries .module first, falls back to POM).
         let metadata = fetch_metadata_cached(
             &group_id,
             &per_target_artifact_id,
             &version,
             &maven_suffix,
-            &mut metadata_cache,
+            &mut state.metadata_cache,
         )?;
 
-        // Process each dependency from the metadata.
         for meta_dep in &metadata.dependencies {
-            // Filter out kotlin-stdlib and similar JVM-only dependencies.
             if is_filtered_dependency(&meta_dep.group_id, &meta_dep.artifact_id) {
                 continue;
             }
-
-            // Skip dependencies with empty versions (managed deps we can't resolve).
             if meta_dep.version.is_empty() {
                 continue;
             }
 
-            // Metadata from .module files already provides base names (no target
-            // suffix), but POM fallback may still have suffixed names. Strip just
-            // in case — it's a no-op if the suffix isn't present.
             let base_artifact_id = strip_target_suffix(&meta_dep.artifact_id, &maven_suffix);
-
             let dep_key = format!("{}:{}", meta_dep.group_id, base_artifact_id);
 
-            // Determine the version to use: user-specified wins.
-            let resolved_version = user_versions
+            let resolved_version = state
+                .user_versions
                 .get(&dep_key)
                 .cloned()
                 .unwrap_or_else(|| meta_dep.version.clone());
 
-            // Check for version conflicts.
-            if let Some(existing) = resolved.get(&dep_key) {
-                if existing.version != resolved_version {
-                    let existing_requirer = if existing.required_by.is_empty() {
-                        "konvoy.toml (direct)"
-                    } else {
-                        existing
-                            .required_by
-                            .first()
-                            .map(String::as_str)
-                            .unwrap_or("unknown")
-                    };
-                    let current_requirer = requirer.as_deref().unwrap_or("konvoy.toml (direct)");
-
-                    let details = format!(
-                        "  {existing_requirer} requires {}\n  {current_requirer} requires {resolved_version}",
-                        existing.version
-                    );
-
-                    let hint_name = base_artifact_id.replace('.', "-");
-
-                    // Suggest the higher version so the hint actually resolves the conflict.
-                    let hint_version = if resolved_version > existing.version {
-                        resolved_version
-                    } else {
-                        existing.version.clone()
-                    };
-
-                    return Err(EngineError::MavenVersionConflict {
-                        maven: dep_key,
-                        details,
-                        hint_name,
-                        hint_version,
-                    });
-                }
-                // Same version, already resolved — skip.
+            // Already resolved — check for version conflict, then skip.
+            if let Some(existing) = state.resolved.get(&dep_key) {
+                check_version_conflict(
+                    existing,
+                    &resolved_version,
+                    &dep_key,
+                    &base_artifact_id,
+                    requirer.as_deref(),
+                )?;
                 if let Some(req) = &requirer {
-                    required_by_map
+                    state
+                        .required_by_map
                         .entry(dep_key)
                         .or_default()
                         .insert(req.clone());
@@ -439,22 +512,21 @@ fn resolve_transitive(
             }
 
             let dep_name = derive_dep_name(&base_artifact_id);
-
             let parent_name = requirer
                 .clone()
                 .or_else(|| {
-                    resolved
+                    state
+                        .resolved
                         .get(&format!("{group_id}:{artifact_id}"))
                         .map(|d| d.name.clone())
                 })
                 .unwrap_or_else(|| "unknown".to_owned());
 
-            let req_by = vec![parent_name.clone()];
-
-            required_by_map
+            state
+                .required_by_map
                 .entry(dep_key.clone())
                 .or_default()
-                .insert(parent_name);
+                .insert(parent_name.clone());
 
             // Check for cycles.
             if path.contains(&dep_key) {
@@ -467,15 +539,15 @@ fn resolve_transitive(
                 group_id: meta_dep.group_id.clone(),
                 artifact_id: base_artifact_id.clone(),
                 version: resolved_version.clone(),
-                required_by: req_by,
+                required_by: vec![parent_name],
                 classifier: None,
             };
 
             let mut child_path = path.clone();
             child_path.push(dep_key.clone());
 
-            resolved.insert(dep_key, new_dep);
-            queue.push_back((
+            state.resolved.insert(dep_key, new_dep);
+            state.queue.push_back((
                 meta_dep.group_id.clone(),
                 base_artifact_id,
                 resolved_version,
@@ -485,62 +557,13 @@ fn resolve_transitive(
         }
     }
 
-    // Build the final list, updating required_by from the accumulated map.
-    let mut result: Vec<ResolvedMavenDep> = Vec::with_capacity(resolved.len());
-    for (key, dep) in &mut resolved {
-        if let Some(requirers) = required_by_map.get(key) {
-            let is_direct = direct_deps
-                .iter()
-                .any(|d| format!("{}:{}", d.group_id, d.artifact_id) == *key);
-            if is_direct {
-                dep.required_by = Vec::new();
-            } else {
-                dep.required_by = requirers.iter().cloned().collect();
-            }
-        }
-    }
+    finalize_required_by(&mut state.resolved, &state.required_by_map, direct_deps);
 
-    // Discover cinterop klibs from cached metadata and add as separate entries.
-    let mut cinterop_deps: Vec<ResolvedMavenDep> = Vec::new();
-    for dep in resolved.values() {
-        let metadata_key = format!(
-            "{}:{}-{}:{}",
-            dep.group_id, dep.artifact_id, maven_suffix, dep.version
-        );
-        if let Some(metadata) = metadata_cache.get(&metadata_key) {
-            for file in &metadata.files {
-                // Cinterop klibs have "cinterop-" in their name.
-                if !file.name.contains("cinterop-") {
-                    continue;
-                }
+    let cinterop_deps =
+        discover_cinterop_deps(&state.resolved, &state.metadata_cache, &maven_suffix);
 
-                // Extract the classifier from the URL: the part between
-                // "{version}-" and ".klib" in the filename.
-                let classifier = extract_classifier_from_url(&file.url, &dep.version);
-                let Some(cls) = classifier else {
-                    continue;
-                };
-
-                let cinterop_name = file
-                    .name
-                    .strip_suffix(".klib")
-                    .unwrap_or(&file.name)
-                    .to_owned();
-
-                cinterop_deps.push(ResolvedMavenDep {
-                    name: cinterop_name,
-                    group_id: dep.group_id.clone(),
-                    artifact_id: dep.artifact_id.clone(),
-                    version: dep.version.clone(),
-                    required_by: vec![dep.name.clone()],
-                    classifier: Some(cls),
-                });
-            }
-        }
-    }
-
-    // Collect into result, adding cinterop deps.
-    result.extend(resolved.into_values());
+    let mut result: Vec<ResolvedMavenDep> = Vec::with_capacity(state.resolved.len());
+    result.extend(state.resolved.into_values());
     result.extend(cinterop_deps);
 
     // Sort for deterministic ordering.

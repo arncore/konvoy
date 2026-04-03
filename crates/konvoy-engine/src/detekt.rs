@@ -376,50 +376,55 @@ pub fn parse_detekt_output(output: &str) -> Vec<DetektDiagnostic> {
     diagnostics
 }
 
-/// Parse a single line of detekt output into a diagnostic.
-///
-/// Handles two formats:
-/// - Real detekt 1.23.x: `path/file.kt:line:col: message text [RuleName]`
-/// - Legacy format:      `path/file.kt:line:col: RuleName - message [detekt.RuleSet]`
-fn parse_detekt_line(line: &str) -> Option<DetektDiagnostic> {
-    // Find the pattern: ":<digits>:" which indicates file:line:
-    // We need at least one colon after a file path.
+/// Parsed file location from a detekt output line.
+struct DetektLocation {
+    file: Option<String>,
+    line: Option<u32>,
+    rest_start: usize,
+}
 
-    // Strategy: find the first occurrence of ":<digits>:" pattern.
-    let chars = line.char_indices();
+/// Extract file path, line number, and the rest-of-line offset from a detekt line.
+///
+/// Scans for the first `:<digits>:` pattern (file:line:col: or file:line:).
+fn parse_detekt_location(line: &str) -> Option<DetektLocation> {
     let mut file_end = None;
     let mut line_num = None;
     let mut rest_start = 0;
 
-    for (i, ch) in chars {
-        if ch == ':' {
-            // Check if followed by digits then colon
-            let remaining = line.get(i + 1..)?;
-            if let Some(end) = remaining.find(':') {
-                let potential_num = remaining.get(..end)?;
-                if let Ok(num) = potential_num.parse::<u32>() {
-                    if file_end.is_none() {
-                        file_end = Some(i);
-                        line_num = Some(num);
-                        // Skip past the line number and colon.
-                        // Check if there's another number (column) after.
-                        let after_line = remaining.get(end + 1..)?;
-                        if let Some(col_end) = after_line.find(':') {
-                            let potential_col = after_line.get(..col_end)?;
-                            if potential_col.parse::<u32>().is_ok() {
-                                // Skip column number too.
-                                rest_start = i + 1 + end + 1 + col_end + 1;
-                            } else {
-                                rest_start = i + 1 + end + 1;
-                            }
-                        } else {
-                            rest_start = i + 1 + end + 1;
-                        }
-                        break;
-                    }
-                }
-            }
+    for (i, ch) in line.char_indices() {
+        if ch != ':' || file_end.is_some() {
+            continue;
         }
+        let remaining = line.get(i + 1..)?;
+        let Some(end) = remaining.find(':') else {
+            continue;
+        };
+        let Ok(num) = remaining.get(..end)?.parse::<u32>() else {
+            continue;
+        };
+
+        file_end = Some(i);
+        line_num = Some(num);
+
+        // Skip optional column number after line.
+        let after_line = remaining.get(end + 1..)?;
+        rest_start = if after_line
+            .find(':')
+            .and_then(|col_end| {
+                after_line
+                    .get(..col_end)?
+                    .parse::<u32>()
+                    .ok()
+                    .map(|_| col_end)
+            })
+            .is_some()
+        {
+            let col_end = after_line.find(':').unwrap_or(0);
+            i + 1 + end + 1 + col_end + 1
+        } else {
+            i + 1 + end + 1
+        };
+        break;
     }
 
     let file = file_end.and_then(|end| {
@@ -431,39 +436,32 @@ fn parse_detekt_line(line: &str) -> Option<DetektDiagnostic> {
         }
     });
 
-    let rest = line.get(rest_start..)?.trim();
-    if rest.is_empty() {
+    Some(DetektLocation {
+        file,
+        line: line_num,
+        rest_start,
+    })
+}
+
+/// Try to parse legacy detekt format: `RuleName - message [detekt.RuleSet]`.
+fn try_parse_legacy_format(rest: &str) -> Option<(String, String)> {
+    let dash_pos = rest.find(" - ")?;
+    let candidate_rule = rest.get(..dash_pos)?.trim();
+    // Legacy rule names are single PascalCase identifiers (no spaces, no dots).
+    if candidate_rule.is_empty() || candidate_rule.contains(' ') || candidate_rule.contains('.') {
         return None;
     }
+    let msg = rest.get(dash_pos + 3..)?;
+    // Strip trailing [detekt.RuleSet] if present.
+    let msg = match msg.rfind('[') {
+        Some(bracket_pos) => msg.get(..bracket_pos)?.trim(),
+        None => msg.trim(),
+    };
+    Some((candidate_rule.to_owned(), msg.to_owned()))
+}
 
-    // Try legacy format first: "RuleName - message [detekt.RuleSet]"
-    // The legacy format has " - " separating a single-word rule from the message,
-    // and the bracket contains a dotted category like "detekt.style".
-    if let Some(dash_pos) = rest.find(" - ") {
-        let candidate_rule = rest.get(..dash_pos)?.trim();
-        // Legacy rule names are single PascalCase identifiers (no spaces, no dots).
-        let is_legacy_rule = !candidate_rule.is_empty()
-            && !candidate_rule.contains(' ')
-            && !candidate_rule.contains('.');
-        if is_legacy_rule {
-            let msg = rest.get(dash_pos + 3..)?;
-            // Strip trailing [detekt.RuleSet] if present.
-            let msg = if let Some(bracket_pos) = msg.rfind('[') {
-                msg.get(..bracket_pos)?.trim()
-            } else {
-                msg.trim()
-            };
-            return Some(DetektDiagnostic {
-                rule: candidate_rule.to_owned(),
-                message: msg.to_owned(),
-                file,
-                line: line_num,
-            });
-        }
-    }
-
-    // Real detekt format: "message text [RuleName]"
-    // The rule name is inside square brackets at the end of the line.
+/// Try to parse modern detekt format: `message text [RuleName]`.
+fn try_parse_modern_format(rest: &str) -> Option<(String, String)> {
     let bracket_open = rest.rfind('[')?;
     let bracket_close = rest.rfind(']')?;
     if bracket_close <= bracket_open {
@@ -477,12 +475,30 @@ fn parse_detekt_line(line: &str) -> Option<DetektDiagnostic> {
     if message.is_empty() {
         return None;
     }
+    Some((rule.to_owned(), message.to_owned()))
+}
+
+/// Parse a single line of detekt output into a diagnostic.
+///
+/// Handles two formats:
+/// - Real detekt 1.23.x: `path/file.kt:line:col: message text [RuleName]`
+/// - Legacy format:      `path/file.kt:line:col: RuleName - message [detekt.RuleSet]`
+fn parse_detekt_line(line: &str) -> Option<DetektDiagnostic> {
+    let loc = parse_detekt_location(line)?;
+
+    let rest = line.get(loc.rest_start..)?.trim();
+    if rest.is_empty() {
+        return None;
+    }
+
+    let (rule, message) =
+        try_parse_legacy_format(rest).or_else(|| try_parse_modern_format(rest))?;
 
     Some(DetektDiagnostic {
-        rule: rule.to_owned(),
-        message: message.to_owned(),
-        file,
-        line: line_num,
+        rule,
+        message,
+        file: loc.file,
+        line: loc.line,
     })
 }
 
