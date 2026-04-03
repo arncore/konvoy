@@ -241,6 +241,15 @@ fn build_options(
     }
 }
 
+/// Return `"release"` or `"debug"` for display in build output.
+fn profile_label(release: bool) -> &'static str {
+    if release {
+        "release"
+    } else {
+        "debug"
+    }
+}
+
 fn cmd_build(
     target: Option<String>,
     release: bool,
@@ -253,7 +262,7 @@ fn cmd_build(
 
     let result = konvoy_engine::build(&root, &options)?;
 
-    let profile = if release { "release" } else { "debug" };
+    let profile = profile_label(release);
     match result.outcome {
         konvoy_engine::BuildOutcome::Cached => {
             eprintln!(
@@ -295,7 +304,7 @@ fn cmd_run(
 
     let result = konvoy_engine::build(&root, &options)?;
 
-    let profile = if release { "release" } else { "debug" };
+    let profile = profile_label(release);
     eprintln!(
         "    Finished `{profile}` target in {:.2}s",
         result.duration.as_secs_f64()
@@ -328,7 +337,7 @@ fn cmd_test(
 
     let result = konvoy_engine::build_tests(&root, &options)?;
 
-    let profile = if release { "release" } else { "debug" };
+    let profile = profile_label(release);
     eprintln!(
         "    Finished `{profile}` test target in {:.2}s",
         result.compile_duration.as_secs_f64()
@@ -369,15 +378,10 @@ fn cmd_lint(verbose: bool, config: Option<PathBuf>, locked: bool) -> CliResult {
 
     if !verbose {
         for diag in &result.diagnostics {
-            let location = match (&diag.file, diag.line) {
-                (Some(f), Some(l)) => format!("{f}:{l}"),
-                (Some(f), None) => f.clone(),
-                _ => String::new(),
-            };
-            if location.is_empty() {
-                eprintln!("  {}: {}", diag.rule, diag.message);
-            } else {
-                eprintln!("  {location}: {}: {}", diag.rule, diag.message);
+            match (&diag.file, diag.line) {
+                (Some(f), Some(l)) => eprintln!("  {f}:{l}: {}: {}", diag.rule, diag.message),
+                (Some(f), None) => eprintln!("  {f}: {}: {}", diag.rule, diag.message),
+                _ => eprintln!("  {}: {}", diag.rule, diag.message),
             }
         }
     }
