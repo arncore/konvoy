@@ -183,22 +183,11 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
     } else {
         let url = download_url(version)?;
         let toolchains_root = toolchains_dir()?;
-
-        // Ensure the toolchains directory exists.
         konvoy_util::fs::ensure_dir(&toolchains_root)?;
 
-        // Create secure temp file and directory for download and extraction.
-        let tmp_tarball_handle = tempfile::Builder::new()
-            .prefix(&format!(".tmp-{version}-"))
-            .suffix(".tar.gz")
-            .tempfile_in(&toolchains_root)
-            .map_err(|source| KonancError::Io {
-                path: toolchains_root.display().to_string(),
-                source,
-            })?;
-        let tmp_tarball = tmp_tarball_handle.path().to_path_buf();
+        let prefix = format!(".tmp-{version}-");
+        let (_tarball_guard, tmp_tarball) = temp_tarball(&toolchains_root, &prefix)?;
 
-        // Download to the temp file, computing SHA-256 as we go.
         let sha256 = konvoy_util::download::download_with_progress(
             &url,
             &tmp_tarball,
@@ -207,45 +196,13 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
         )
         .map_err(|e| map_download_err(version, e))?;
 
-        // Extract to a temp directory, then rename atomically.
-        let tmp_extract_handle = tempfile::Builder::new()
-            .prefix(&format!(".tmp-{version}-"))
-            .suffix("-extract")
-            .tempdir_in(&toolchains_root)
-            .map_err(|source| KonancError::Io {
-                path: toolchains_root.display().to_string(),
-                source,
-            })?;
-        let tmp_extract = tmp_extract_handle.path().to_path_buf();
-
+        let (_extract_guard, tmp_extract) = temp_extract_dir(&toolchains_root, &prefix)?;
         extract_tarball(&tmp_tarball, &tmp_extract, "Kotlin/Native", version)?;
-
-        // Clean up tarball.
         let _ = std::fs::remove_file(&tmp_tarball);
 
-        // The tarball extracts to a subdirectory like `kotlin-native-prebuilt-linux-x86_64-2.1.0/`.
         let extracted_root = find_extracted_root(&tmp_extract, version)?;
+        atomic_rename_into(&extracted_root, &dest, &tmp_extract)?;
 
-        // Atomically move into place. If another process raced us, rename
-        // will fail and we verify the existing installation instead.
-        match std::fs::rename(&extracted_root, &dest) {
-            Ok(()) => {
-                let _ = std::fs::remove_dir_all(&tmp_extract);
-            }
-            Err(_) if dest.exists() => {
-                // Another process installed while we were downloading.
-                let _ = std::fs::remove_dir_all(&tmp_extract);
-            }
-            Err(source) => {
-                let _ = std::fs::remove_dir_all(&tmp_extract);
-                return Err(KonancError::Io {
-                    path: dest.display().to_string(),
-                    source,
-                });
-            }
-        }
-
-        // Verify the installation.
         let final_konanc = dest.join("bin").join("konanc");
         if !final_konanc.exists() {
             return Err(KonancError::CorruptToolchain {
@@ -253,23 +210,7 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
                 version: version.to_owned(),
             });
         }
-
-        // Ensure konanc is executable on Unix.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let metadata = std::fs::metadata(&final_konanc).map_err(|source| KonancError::Io {
-                path: final_konanc.display().to_string(),
-                source,
-            })?;
-            let mut perms = metadata.permissions();
-            let mode = perms.mode() | 0o755;
-            perms.set_mode(mode);
-            std::fs::set_permissions(&final_konanc, perms).map_err(|source| KonancError::Io {
-                path: final_konanc.display().to_string(),
-                source,
-            })?;
-        }
+        ensure_executable(&final_konanc)?;
 
         Some(sha256)
     };
@@ -301,55 +242,18 @@ fn install_jre(version: &str) -> Result<(PathBuf, Option<String>), KonancError> 
     let url = jre_download_url()?;
     let toolchains_root = toolchains_dir()?;
 
-    // Create secure temp file and directory for download and extraction.
-    let tmp_tarball_handle = tempfile::Builder::new()
-        .prefix(&format!(".tmp-{version}-jre-"))
-        .suffix(".tar.gz")
-        .tempfile_in(&toolchains_root)
-        .map_err(|source| KonancError::Io {
-            path: toolchains_root.display().to_string(),
-            source,
-        })?;
-    let tmp_tarball = tmp_tarball_handle.path().to_path_buf();
+    let prefix = format!(".tmp-{version}-jre-");
+    let (_tarball_guard, tmp_tarball) = temp_tarball(&toolchains_root, &prefix)?;
 
-    // Download JRE tarball.
     let sha256 = konvoy_util::download::download_with_progress(&url, &tmp_tarball, "JRE", version)
         .map_err(|e| map_download_err(version, e))?;
 
-    // Extract to temp directory.
-    let tmp_extract_handle = tempfile::Builder::new()
-        .prefix(&format!(".tmp-{version}-jre-"))
-        .suffix("-extract")
-        .tempdir_in(&toolchains_root)
-        .map_err(|source| KonancError::Io {
-            path: toolchains_root.display().to_string(),
-            source,
-        })?;
-    let tmp_extract = tmp_extract_handle.path().to_path_buf();
-
+    let (_extract_guard, tmp_extract) = temp_extract_dir(&toolchains_root, &prefix)?;
     extract_tarball(&tmp_tarball, &tmp_extract, "JRE", version)?;
-
-    // Clean up tarball.
     let _ = std::fs::remove_file(&tmp_tarball);
 
-    // Atomically move into place. If another process raced us, rename
-    // will fail and we verify the existing installation instead.
-    match std::fs::rename(&tmp_extract, &jre_root) {
-        Ok(()) => {}
-        Err(_) if jre_root.exists() => {
-            // Another process installed while we were downloading.
-            let _ = std::fs::remove_dir_all(&tmp_extract);
-        }
-        Err(source) => {
-            let _ = std::fs::remove_dir_all(&tmp_extract);
-            return Err(KonancError::Io {
-                path: jre_root.display().to_string(),
-                source,
-            });
-        }
-    }
+    atomic_rename_into(&tmp_extract, &jre_root, &tmp_extract)?;
 
-    // Verify java binary exists.
     let home = jre_home_path(version)?;
     let java_bin = home.join("bin").join("java");
     if !java_bin.exists() {
@@ -360,25 +264,86 @@ fn install_jre(version: &str) -> Result<(PathBuf, Option<String>), KonancError> 
             ),
         });
     }
-
-    // Ensure java is executable on Unix.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = std::fs::metadata(&java_bin).map_err(|source| KonancError::Io {
-            path: java_bin.display().to_string(),
-            source,
-        })?;
-        let mut perms = metadata.permissions();
-        let mode = perms.mode() | 0o755;
-        perms.set_mode(mode);
-        std::fs::set_permissions(&java_bin, perms).map_err(|source| KonancError::Io {
-            path: java_bin.display().to_string(),
-            source,
-        })?;
-    }
+    ensure_executable(&java_bin)?;
 
     Ok((home, Some(sha256)))
+}
+
+/// Atomically move `src` to `dest`, handling the race where another process
+/// may have already placed the target. Cleans up `cleanup_dir` on all paths.
+fn atomic_rename_into(src: &Path, dest: &Path, cleanup_dir: &Path) -> Result<(), KonancError> {
+    match std::fs::rename(src, dest) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(cleanup_dir);
+            Ok(())
+        }
+        Err(_) if dest.exists() => {
+            let _ = std::fs::remove_dir_all(cleanup_dir);
+            Ok(())
+        }
+        Err(source) => {
+            let _ = std::fs::remove_dir_all(cleanup_dir);
+            Err(KonancError::Io {
+                path: dest.display().to_string(),
+                source,
+            })
+        }
+    }
+}
+
+/// Ensure a binary is executable on Unix (no-op on other platforms).
+#[cfg(unix)]
+fn ensure_executable(path: &Path) -> Result<(), KonancError> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::metadata(path).map_err(|source| KonancError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let mut perms = metadata.permissions();
+    perms.set_mode(perms.mode() | 0o755);
+    std::fs::set_permissions(path, perms).map_err(|source| KonancError::Io {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+#[cfg(not(unix))]
+fn ensure_executable(_path: &Path) -> Result<(), KonancError> {
+    Ok(())
+}
+
+/// Create a secure temp file in the given directory.
+fn temp_tarball(
+    toolchains_root: &Path,
+    prefix: &str,
+) -> Result<(tempfile::TempPath, PathBuf), KonancError> {
+    let handle = tempfile::Builder::new()
+        .prefix(prefix)
+        .suffix(".tar.gz")
+        .tempfile_in(toolchains_root)
+        .map_err(|source| KonancError::Io {
+            path: toolchains_root.display().to_string(),
+            source,
+        })?;
+    let path = handle.path().to_path_buf();
+    Ok((handle.into_temp_path(), path))
+}
+
+/// Create a secure temp directory in the given directory.
+fn temp_extract_dir(
+    toolchains_root: &Path,
+    prefix: &str,
+) -> Result<(tempfile::TempDir, PathBuf), KonancError> {
+    let handle = tempfile::Builder::new()
+        .prefix(prefix)
+        .suffix("-extract")
+        .tempdir_in(toolchains_root)
+        .map_err(|source| KonancError::Io {
+            path: toolchains_root.display().to_string(),
+            source,
+        })?;
+    let path = handle.path().to_path_buf();
+    Ok((handle, path))
 }
 
 /// Find the extracted JRE root directory inside the jre/ directory.

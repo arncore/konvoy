@@ -341,14 +341,8 @@ fn parse_file_and_line(s: &str) -> Option<FileLocation> {
     parts.reverse();
 
     match parts.len() {
-        3 => {
-            // file:line:col
-            let file = (*parts.first()?).to_owned();
-            let line: u32 = parts.get(1)?.parse().ok()?;
-            Some(FileLocation { file, line })
-        }
-        2 => {
-            // file:line
+        // file:line or file:line:col (column is ignored)
+        2 | 3 => {
             let file = (*parts.first()?).to_owned();
             let line: u32 = parts.get(1)?.parse().ok()?;
             Some(FileLocation { file, line })
