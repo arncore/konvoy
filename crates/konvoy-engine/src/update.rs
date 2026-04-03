@@ -104,7 +104,7 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
                 message: format!("dependency `{dep_name}` is missing `version` field"),
             })?;
 
-        let (group_id, artifact_id) = split_maven_coordinate(maven)?;
+        let (group_id, artifact_id) = crate::common::split_maven_coordinate(maven)?;
 
         direct_deps.push(ResolvedMavenDep {
             name: (*dep_name).clone(),
@@ -511,7 +511,7 @@ fn resolve_transitive(
                 continue;
             }
 
-            let dep_name = derive_dep_name(&base_artifact_id);
+            let dep_name = base_artifact_id.clone();
             let parent_name = requirer
                 .clone()
                 .or_else(|| {
@@ -619,13 +619,6 @@ fn fetch_metadata_cached(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Split a `groupId:artifactId` string into its two parts.
-///
-/// Re-export of [`crate::common::split_maven_coordinate`] for backward compatibility.
-pub(crate) fn split_maven_coordinate(maven: &str) -> Result<(&str, &str), EngineError> {
-    crate::common::split_maven_coordinate(maven)
-}
-
 /// Return `true` if this dependency should be filtered from transitive resolution.
 ///
 /// Filters `kotlin-stdlib` and `kotlin-stdlib-common` which are JVM artifacts.
@@ -644,15 +637,6 @@ fn is_filtered_dependency(group_id: &str, artifact_id: &str) -> bool {
         }
     }
     false
-}
-
-/// Derive a user-friendly dependency name from a Maven artifact ID.
-///
-/// Examples:
-/// - `"kotlinx-coroutines-core"` → `"kotlinx-coroutines-core"`
-/// - `"atomicfu"` → `"atomicfu"`
-fn derive_dep_name(artifact_id: &str) -> String {
-    artifact_id.to_owned()
 }
 
 /// Extract the Maven classifier from a cinterop file URL.
@@ -867,22 +851,6 @@ kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", 
     }
 
     #[test]
-    fn split_maven_coordinate_valid() {
-        let (g, a) =
-            split_maven_coordinate("org.jetbrains.kotlinx:kotlinx-coroutines-core").unwrap();
-        assert_eq!(g, "org.jetbrains.kotlinx");
-        assert_eq!(a, "kotlinx-coroutines-core");
-    }
-
-    #[test]
-    fn split_maven_coordinate_invalid() {
-        let result = split_maven_coordinate("no-colon-here");
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("invalid maven coordinate"), "error was: {err}");
-    }
-
-    #[test]
     fn is_filtered_kotlin_stdlib() {
         assert!(is_filtered_dependency(
             "org.jetbrains.kotlin",
@@ -909,15 +877,6 @@ kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", 
             "kotlinx-coroutines-core"
         ));
         assert!(!is_filtered_dependency("org.jetbrains.kotlinx", "atomicfu"));
-    }
-
-    #[test]
-    fn derive_dep_name_from_artifact_id() {
-        assert_eq!(
-            derive_dep_name("kotlinx-coroutines-core"),
-            "kotlinx-coroutines-core"
-        );
-        assert_eq!(derive_dep_name("atomicfu"), "atomicfu");
     }
 
     #[test]

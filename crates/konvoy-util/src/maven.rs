@@ -7,6 +7,14 @@ use crate::error::UtilError;
 /// Maven Central repository URL.
 pub const MAVEN_CENTRAL: &str = "https://repo1.maven.org/maven2";
 
+/// Build a Maven Central URL for an artifact file with the given extension.
+///
+/// Pattern: `{MAVEN_CENTRAL}/{group_path}/{artifact_id}/{version}/{artifact_id}-{version}.{ext}`
+pub fn maven_artifact_url(group_id: &str, artifact_id: &str, version: &str, ext: &str) -> String {
+    let group_path = group_id.replace('.', "/");
+    format!("{MAVEN_CENTRAL}/{group_path}/{artifact_id}/{version}/{artifact_id}-{version}.{ext}")
+}
+
 /// A parsed Maven coordinate identifying a single artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MavenCoordinate {
@@ -157,14 +165,9 @@ impl MavenCoordinate {
 
     /// Return the local cache path for this artifact, rooted at `cache_root`.
     ///
-    /// Uses the same directory layout as `repository_path` but as a `PathBuf`.
+    /// Uses the same directory layout as [`Self::repository_path`].
     pub fn cache_path(&self, cache_root: &Path) -> PathBuf {
-        let group_path = self.group_id.replace('.', "/");
-        cache_root
-            .join(group_path)
-            .join(&self.artifact_id)
-            .join(&self.version)
-            .join(self.filename())
+        cache_root.join(self.repository_path())
     }
 }
 

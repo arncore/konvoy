@@ -9,7 +9,6 @@
 use serde::Deserialize;
 
 use crate::error::UtilError;
-use crate::maven::MAVEN_CENTRAL;
 use crate::metadata::{ArtifactMetadata, MetadataDep, MetadataFile};
 
 // ---------------------------------------------------------------------------
@@ -124,8 +123,7 @@ pub fn parse_module_metadata(json: &str) -> Result<ArtifactMetadata, UtilError> 
 /// The URL pattern is:
 /// `{MAVEN_CENTRAL}/{group_path}/{artifact_id}/{version}/{artifact_id}-{version}.module`
 pub fn module_metadata_url(group_id: &str, artifact_id: &str, version: &str) -> String {
-    let group_path = group_id.replace('.', "/");
-    format!("{MAVEN_CENTRAL}/{group_path}/{artifact_id}/{version}/{artifact_id}-{version}.module")
+    crate::maven::maven_artifact_url(group_id, artifact_id, version, "module")
 }
 
 /// Fetch a Gradle Module Metadata file from Maven Central.
