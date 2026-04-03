@@ -1409,14 +1409,8 @@ mod tests {
             library_paths: &[],
             plugin_jars: &[],
         };
-        let (output_path, outcome) = build_single(
-            &project,
-            &manifest,
-            &cc,
-            profile,
-            &lockfile_content,
-        )
-        .unwrap();
+        let (output_path, outcome) =
+            build_single(&project, &manifest, &cc, profile, &lockfile_content).unwrap();
 
         assert_eq!(outcome, BuildOutcome::Cached);
         assert!(output_path.exists());
@@ -1502,14 +1496,8 @@ mod tests {
             library_paths: &[],
             plugin_jars: &[],
         };
-        let (output_path, outcome) = build_single(
-            &project,
-            &manifest,
-            &cc,
-            profile,
-            &lockfile_content,
-        )
-        .unwrap();
+        let (output_path, outcome) =
+            build_single(&project, &manifest, &cc, profile, &lockfile_content).unwrap();
 
         assert_eq!(outcome, BuildOutcome::Cached);
         assert!(output_path.exists());
@@ -1620,14 +1608,8 @@ mod tests {
             library_paths: &[],
             plugin_jars: &[],
         };
-        let (output_path, outcome) = build_single(
-            &project,
-            &manifest,
-            &cc,
-            profile,
-            &lockfile_content,
-        )
-        .unwrap();
+        let (output_path, outcome) =
+            build_single(&project, &manifest, &cc, profile, &lockfile_content).unwrap();
 
         assert_eq!(outcome, BuildOutcome::Cached);
         assert!(output_path.exists());
@@ -2250,13 +2232,7 @@ mod tests {
             library_paths: &[],
             plugin_jars: &[],
         };
-        let result = build_single(
-            &project,
-            &manifest,
-            &cc_force,
-            profile,
-            &lockfile_content,
-        );
+        let result = build_single(&project, &manifest, &cc_force, profile, &lockfile_content);
 
         // The build should fail (konanc doesn't exist), NOT return Cached.
         assert!(

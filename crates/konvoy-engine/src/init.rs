@@ -55,11 +55,9 @@ pub fn init_project_in_place(dir: &Path, kind: PackageKind) -> Result<String, En
 /// Delegates to [`konvoy_config::manifest::validate_name`] for the actual rules
 /// and failure reason — single source of truth for name validation.
 fn validate_project_name(name: &str) -> Result<(), EngineError> {
-    konvoy_config::manifest::validate_name(name).map_err(|reason| {
-        EngineError::InvalidProjectName {
-            name: name.to_owned(),
-            reason,
-        }
+    konvoy_config::manifest::validate_name(name).map_err(|reason| EngineError::InvalidProjectName {
+        name: name.to_owned(),
+        reason,
     })
 }
 
