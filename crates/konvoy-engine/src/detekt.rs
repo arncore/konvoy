@@ -408,22 +408,14 @@ fn parse_detekt_location(line: &str) -> Option<DetektLocation> {
 
         // Skip optional column number after line.
         let after_line = remaining.get(end + 1..)?;
-        rest_start = if after_line
-            .find(':')
-            .and_then(|col_end| {
-                after_line
-                    .get(..col_end)?
-                    .parse::<u32>()
-                    .ok()
-                    .map(|_| col_end)
-            })
-            .is_some()
-        {
-            let col_end = after_line.find(':').unwrap_or(0);
-            i + 1 + end + 1 + col_end + 1
-        } else {
-            i + 1 + end + 1
-        };
+        let col_len = after_line.find(':').and_then(|col_end| {
+            after_line
+                .get(..col_end)?
+                .parse::<u32>()
+                .ok()
+                .map(|_| col_end + 1)
+        });
+        rest_start = i + 1 + end + 1 + col_len.unwrap_or(0);
         break;
     }
 
