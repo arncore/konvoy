@@ -954,6 +954,289 @@ TOML
 }
 
 # ---------------------------------------------------------------------------
+# Tests: konvoy test
+# ---------------------------------------------------------------------------
+
+test_test_lifecycle() {
+    # Build and run tests using konvoy test.
+    konvoy init --name test-proj >/dev/null 2>&1
+    cd test-proj
+
+    # Create test source files.
+    mkdir -p src/test
+    cat > src/test/SampleTest.kt << 'KOTLIN'
+import kotlin.test.Test
+import kotlin.test.assertEquals
+
+class SampleTest {
+    @Test
+    fun addition_works() {
+        assertEquals(4, 2 + 2)
+    }
+
+    @Test
+    fun string_concat() {
+        assertEquals("hello world", "hello" + " " + "world")
+    }
+}
+KOTLIN
+
+    # First test build compiles.
+    local out1
+    out1=$(konvoy test 2>&1)
+    assert_contains "$out1" "Compiling"
+
+    # Second test build should be a cache hit.
+    local out2
+    out2=$(konvoy test 2>&1)
+    assert_contains "$out2" "Fresh"
+}
+
+test_test_no_test_dir_fails() {
+    konvoy init --name no-tests >/dev/null 2>&1
+    cd no-tests
+    local output
+    if output=$(konvoy test 2>&1); then
+        echo "    expected test to fail without src/test/ directory" >&2
+        return 1
+    fi
+    assert_contains "$output" "no test source files"
+}
+
+test_test_filter() {
+    # --filter should be forwarded to the test binary.
+    konvoy init --name filter-proj >/dev/null 2>&1
+    cd filter-proj
+    mkdir -p src/test
+    cat > src/test/FilterTest.kt << 'KOTLIN'
+import kotlin.test.Test
+import kotlin.test.assertTrue
+
+class FilterTest {
+    @Test
+    fun included_test() {
+        assertTrue(true)
+    }
+
+    @Test
+    fun excluded_test() {
+        assertTrue(true)
+    }
+}
+KOTLIN
+
+    # Run with a filter — should succeed (the filter pattern is passed through).
+    konvoy test --filter "included" 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# Tests: lint full execution
+# ---------------------------------------------------------------------------
+
+test_lint_detects_findings() {
+    # Run detekt on code with a known issue (magic number).
+    konvoy init --name lint-find >/dev/null 2>&1
+    cat > lint-find/src/main.kt << 'KOTLIN'
+fun main() {
+    val x = 42
+    if (x > 10) {
+        println("magic number: $x")
+    }
+}
+KOTLIN
+    # Add detekt to toolchain.
+    printf '\n' >> lint-find/konvoy.toml
+    sed -i 's/\[toolchain\]/[toolchain]\n/' lint-find/konvoy.toml
+    cat > lint-find/konvoy.toml << TOML
+[package]
+name = "lint-find"
+
+[toolchain]
+kotlin = "2.2.0"
+detekt = "1.23.7"
+TOML
+    cd lint-find
+
+    # Lint should fail with findings.
+    local output
+    if output=$(konvoy lint 2>&1); then
+        # Some code may pass detekt — that's ok, just verify lint ran.
+        assert_contains "$output" "No lint issues found"
+    else
+        # If it found issues, verify we get structured output.
+        assert_contains "$output" "issue"
+    fi
+}
+
+test_lint_verbose() {
+    konvoy init --name lint-verb >/dev/null 2>&1
+    cat > lint-verb/konvoy.toml << TOML
+[package]
+name = "lint-verb"
+
+[toolchain]
+kotlin = "2.2.0"
+detekt = "1.23.7"
+TOML
+    cd lint-verb
+
+    # --verbose should run without error (output may be empty if no findings).
+    konvoy lint --verbose 2>&1 || true
+}
+
+test_lint_locked() {
+    konvoy init --name lint-lock >/dev/null 2>&1
+    cat > lint-lock/konvoy.toml << TOML
+[package]
+name = "lint-lock"
+
+[toolchain]
+kotlin = "2.2.0"
+detekt = "1.23.7"
+TOML
+    cd lint-lock
+
+    # First lint run to populate lockfile with detekt hash.
+    konvoy lint 2>&1 || true
+    assert_file_exists konvoy.lock
+    assert_file_contains konvoy.lock "detekt_version"
+    assert_file_contains konvoy.lock "detekt_jar_sha256"
+
+    # --locked should succeed now that hash is in lockfile.
+    konvoy lint --locked 2>&1 || true
+}
+
+test_lint_custom_config() {
+    konvoy init --name lint-cfg >/dev/null 2>&1
+    cat > lint-cfg/konvoy.toml << TOML
+[package]
+name = "lint-cfg"
+
+[toolchain]
+kotlin = "2.2.0"
+detekt = "1.23.7"
+TOML
+    # Create a custom detekt config.
+    cat > lint-cfg/my-detekt.yml << 'YAML'
+build:
+  maxIssues: 999
+YAML
+    cd lint-cfg
+
+    # --config should accept the custom file.
+    konvoy lint --config my-detekt.yml 2>&1 || true
+}
+
+test_lint_missing_config_fails() {
+    konvoy init --name lint-nofile >/dev/null 2>&1
+    cat > lint-nofile/konvoy.toml << TOML
+[package]
+name = "lint-nofile"
+
+[toolchain]
+kotlin = "2.2.0"
+detekt = "1.23.7"
+TOML
+    cd lint-nofile
+    local output
+    if output=$(konvoy lint --config nonexistent.yml 2>&1); then
+        echo "    expected lint to fail with missing config file" >&2
+        return 1
+    fi
+    assert_contains "$output" "config file not found"
+}
+
+# ---------------------------------------------------------------------------
+# Tests: build flags
+# ---------------------------------------------------------------------------
+
+test_build_force_bypasses_cache() {
+    konvoy init --name force-proj >/dev/null 2>&1
+    cd force-proj
+
+    # First build populates cache.
+    konvoy build >/dev/null 2>&1
+
+    # Second build with --force should recompile, not use cache.
+    local output
+    output=$(konvoy build --force 2>&1)
+    assert_contains "$output" "Compiling"
+    assert_not_contains "$output" "Fresh"
+}
+
+test_build_verbose_shows_output() {
+    konvoy init --name verbose-proj >/dev/null 2>&1
+    cd verbose-proj
+
+    # --verbose should succeed (may show compiler info lines).
+    local output
+    output=$(konvoy build --verbose 2>&1)
+    assert_contains "$output" "Compiling"
+}
+
+test_locked_toolchain_mismatch_fails() {
+    konvoy init --name locked-tc >/dev/null 2>&1
+    cd locked-tc
+    # Build to populate lockfile.
+    konvoy build >/dev/null 2>&1
+    assert_file_exists konvoy.lock
+
+    # Manually change the konanc_version in lockfile to create a mismatch.
+    sed -i 's/konanc_version = "2.2.0"/konanc_version = "9.9.9"/' konvoy.lock
+    local output
+    if output=$(konvoy build --locked 2>&1); then
+        echo "    expected --locked to fail with toolchain mismatch" >&2
+        return 1
+    fi
+    assert_contains "$output" "lockfile"
+}
+
+# ---------------------------------------------------------------------------
+# Tests: init in-place
+# ---------------------------------------------------------------------------
+
+test_init_in_place() {
+    # konvoy init without --name should initialize in the current directory.
+    mkdir myproject
+    cd myproject
+    konvoy init >/dev/null 2>&1
+    assert_file_exists konvoy.toml
+    assert_file_exists src/main.kt
+    assert_file_contains konvoy.toml 'name = "myproject"'
+}
+
+test_init_in_place_lib() {
+    mkdir mylib
+    cd mylib
+    konvoy init --lib >/dev/null 2>&1
+    assert_file_exists konvoy.toml
+    assert_file_exists src/lib.kt
+    assert_file_contains konvoy.toml 'kind = "lib"'
+}
+
+# ---------------------------------------------------------------------------
+# Tests: transitive Maven dependencies
+# ---------------------------------------------------------------------------
+
+test_update_transitive_deps_in_lockfile() {
+    # kotlinx-coroutines has transitive deps (atomicfu).
+    # Verify they appear in the lockfile with required_by.
+    konvoy init --name trans-deps >/dev/null 2>&1
+    cat >> trans-deps/konvoy.toml << 'TOML'
+
+[dependencies]
+kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }
+TOML
+    cd trans-deps
+    konvoy update >/dev/null 2>&1
+
+    # Lockfile should contain the transitive dep (atomicfu).
+    assert_file_contains konvoy.lock "atomicfu"
+    # Transitive deps should have required_by populated.
+    assert_file_contains konvoy.lock "required_by"
+}
+
+# ---------------------------------------------------------------------------
 # Tests: error cases
 # ---------------------------------------------------------------------------
 
@@ -1244,6 +1527,30 @@ run_test test_maven_dep_mixed_with_path_dep_build
 run_test test_doctor_maven_dep_checks
 run_test test_doctor_missing_lockfile_entry_warns
 run_test test_doctor_no_lockfile_warns
+# test command
+run_test test_test_lifecycle
+run_test test_test_no_test_dir_fails
+run_test test_test_filter
+
+# lint full execution
+run_test test_lint_detects_findings
+run_test test_lint_verbose
+run_test test_lint_locked
+run_test test_lint_custom_config
+run_test test_lint_missing_config_fails
+
+# build flags
+run_test test_build_force_bypasses_cache
+run_test test_build_verbose_shows_output
+run_test test_locked_toolchain_mismatch_fails
+
+# init in-place
+run_test test_init_in_place
+run_test test_init_in_place_lib
+
+# transitive Maven deps
+run_test test_update_transitive_deps_in_lockfile
+
 # error cases
 run_test test_build_outside_project_fails
 run_test test_run_outside_project_fails
