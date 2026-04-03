@@ -385,4 +385,65 @@ mod tests {
             "new() should default classifier to None"
         );
     }
+
+    #[test]
+    fn parse_rejects_empty_group_id() {
+        let result = MavenCoordinate::parse(":artifact:1.0.0");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("group_id is empty"), "error was: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_empty_artifact_id() {
+        let result = MavenCoordinate::parse("group::1.0.0");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("artifact_id is empty"), "error was: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_empty_version() {
+        let result = MavenCoordinate::parse("group:artifact:");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("version is empty"), "error was: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_empty_packaging() {
+        let result = MavenCoordinate::parse("group:artifact:1.0.0:");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("packaging is empty"), "error was: {err}");
+    }
+
+    #[test]
+    fn maven_artifact_url_format() {
+        let url = super::maven_artifact_url(
+            "org.jetbrains.kotlinx",
+            "kotlinx-coroutines-core",
+            "1.8.0",
+            "pom",
+        );
+        assert_eq!(
+            url,
+            "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/kotlinx-coroutines-core/1.8.0/kotlinx-coroutines-core-1.8.0.pom"
+        );
+    }
+
+    #[test]
+    fn maven_artifact_url_module_extension() {
+        let url = super::maven_artifact_url("org.example", "lib", "2.0.0", "module");
+        assert!(url.ends_with("lib-2.0.0.module"), "url was: {url}");
+    }
+
+    #[test]
+    fn cache_path_matches_repository_path() {
+        let coord = MavenCoordinate::new("org.example", "lib", "1.0.0");
+        let cache_root = Path::new("/cache");
+        let cache_path = coord.cache_path(cache_root);
+        let expected = cache_root.join(coord.repository_path());
+        assert_eq!(cache_path, expected);
+    }
 }

@@ -1167,4 +1167,35 @@ url = "https://example.com/plugin.jar"
             }
         }
     }
+
+    #[test]
+    fn has_maven_entry_finds_maven_dep() {
+        let mut lockfile = Lockfile::default();
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-coroutines".to_owned(),
+            source: DepSource::Maven {
+                version: "1.8.0".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
+                targets: std::collections::BTreeMap::new(),
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "abc".to_owned(),
+        });
+        assert!(lockfile.has_maven_entry("kotlinx-coroutines"));
+        assert!(!lockfile.has_maven_entry("nonexistent"));
+    }
+
+    #[test]
+    fn has_maven_entry_ignores_path_deps() {
+        let mut lockfile = Lockfile::default();
+        lockfile.dependencies.push(DependencyLock {
+            name: "my-lib".to_owned(),
+            source: DepSource::Path {
+                path: "../my-lib".to_owned(),
+            },
+            source_hash: "abc".to_owned(),
+        });
+        assert!(!lockfile.has_maven_entry("my-lib"));
+    }
 }
