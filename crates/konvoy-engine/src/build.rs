@@ -711,18 +711,10 @@ pub(crate) fn resolve_maven_deps(
 /// Returns `true` if the manifest declares Maven deps that have no matching
 /// lockfile entry. Used to trigger automatic `konvoy update` during build.
 pub(crate) fn has_unresolved_maven_deps(manifest: &Manifest, lockfile: &Lockfile) -> bool {
-    for (dep_name, dep_spec) in &manifest.dependencies {
-        if dep_spec.maven.is_some() && dep_spec.version.is_some() {
-            let has_entry = lockfile
-                .dependencies
-                .iter()
-                .any(|d| d.name == *dep_name && matches!(&d.source, DepSource::Maven { .. }));
-            if !has_entry {
-                return true;
-            }
-        }
-    }
-    false
+    manifest
+        .dependencies
+        .iter()
+        .any(|(name, spec)| spec.is_maven() && !lockfile.has_maven_entry(name))
 }
 
 /// Check that the lockfile is complete and consistent with the manifest.
@@ -750,17 +742,10 @@ pub(crate) fn check_lockfile_staleness(
                 return Err(EngineError::LockfileUpdateRequired);
             }
 
-            // If detekt is configured in manifest, lockfile must have matching detekt entries.
+            // If detekt is configured in manifest, lockfile must have matching detekt version.
             if let Some(manifest_detekt) = &manifest.toolchain.detekt {
-                match &tc.detekt_version {
-                    Some(locked_detekt) => {
-                        if locked_detekt != manifest_detekt {
-                            return Err(EngineError::LockfileUpdateRequired);
-                        }
-                    }
-                    None => {
-                        return Err(EngineError::LockfileUpdateRequired);
-                    }
+                if tc.detekt_version.as_deref() != Some(manifest_detekt.as_str()) {
+                    return Err(EngineError::LockfileUpdateRequired);
                 }
             }
         }
@@ -782,14 +767,8 @@ pub(crate) fn check_lockfile_staleness(
     // If the manifest has Maven dependencies (maven + version set), the lockfile must
     // have matching Maven entries for each.
     for (dep_name, dep_spec) in &manifest.dependencies {
-        if dep_spec.maven.is_some() && dep_spec.version.is_some() {
-            let has_maven_entry = lockfile
-                .dependencies
-                .iter()
-                .any(|d| d.name == *dep_name && matches!(&d.source, DepSource::Maven { .. }));
-            if !has_maven_entry {
-                return Err(EngineError::LockfileUpdateRequired);
-            }
+        if dep_spec.is_maven() && !lockfile.has_maven_entry(dep_name) {
+            return Err(EngineError::LockfileUpdateRequired);
         }
     }
 
@@ -882,38 +861,13 @@ fn update_lockfile_if_needed(
     // different hashes are expected, so skip the check.
     if !toolchain_changed {
         if let Some(tc) = &lockfile.toolchain {
-            if let (Some(existing), Some(actual)) =
-                (&tc.konanc_tarball_sha256, konanc_tarball_sha256)
-            {
-                if !existing.is_empty() && existing != actual {
-                    if force {
-                        eprintln!(
-                        "warning: konanc tarball hash changed — expected {existing}, got {actual}; lockfile updated (--force)"
-                    );
-                    } else {
-                        return Err(EngineError::TarballHashMismatch {
-                            kind: "konanc".to_owned(),
-                            expected: existing.clone(),
-                            actual: actual.to_owned(),
-                        });
-                    }
-                }
-            }
-            if let (Some(existing), Some(actual)) = (&tc.jre_tarball_sha256, jre_tarball_sha256) {
-                if !existing.is_empty() && existing != actual {
-                    if force {
-                        eprintln!(
-                        "warning: jre tarball hash changed — expected {existing}, got {actual}; lockfile updated (--force)"
-                    );
-                    } else {
-                        return Err(EngineError::TarballHashMismatch {
-                            kind: "jre".to_owned(),
-                            expected: existing.clone(),
-                            actual: actual.to_owned(),
-                        });
-                    }
-                }
-            }
+            verify_tarball_hash(
+                "konanc",
+                &tc.konanc_tarball_sha256,
+                konanc_tarball_sha256,
+                force,
+            )?;
+            verify_tarball_hash("jre", &tc.jre_tarball_sha256, jre_tarball_sha256, force)?;
         }
     }
 
@@ -959,6 +913,35 @@ fn update_lockfile_if_needed(
     updated.plugins = plugin_locks.to_vec();
     updated.write_to(lockfile_path)?;
 
+    Ok(())
+}
+
+/// Check that a tarball hash from the lockfile matches a freshly downloaded hash.
+///
+/// If both are present, non-empty, and differ: emit a warning when `--force` is
+/// active, or return a hard error otherwise. This detects tampered or rotated
+/// upstream tarballs.
+fn verify_tarball_hash(
+    kind: &str,
+    existing: &Option<String>,
+    actual: Option<&str>,
+    force: bool,
+) -> Result<(), EngineError> {
+    if let (Some(existing), Some(actual)) = (existing, actual) {
+        if !existing.is_empty() && existing != actual {
+            if force {
+                eprintln!(
+                    "warning: {kind} tarball hash changed — expected {existing}, got {actual}; lockfile updated (--force)"
+                );
+            } else {
+                return Err(EngineError::TarballHashMismatch {
+                    kind: kind.to_owned(),
+                    expected: existing.clone(),
+                    actual: actual.to_owned(),
+                });
+            }
+        }
+    }
     Ok(())
 }
 

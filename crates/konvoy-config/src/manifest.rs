@@ -65,6 +65,13 @@ pub struct DependencySpec {
     pub maven: Option<String>,
 }
 
+impl DependencySpec {
+    /// Returns `true` if this is a Maven dependency (has both `maven` and `version` set).
+    pub fn is_maven(&self) -> bool {
+        self.maven.is_some() && self.version.is_some()
+    }
+}
+
 fn default_entrypoint() -> String {
     "src/main.kt".to_owned()
 }
