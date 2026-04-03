@@ -382,49 +382,66 @@ fn install_jre(version: &str) -> Result<(PathBuf, Option<String>), KonancError> 
 }
 
 /// Find the extracted JRE root directory inside the jre/ directory.
-fn find_jre_root(jre_dir: &Path) -> Result<PathBuf, KonancError> {
-    let entries: Vec<_> = std::fs::read_dir(jre_dir)
+/// List subdirectories of `dir`, propagating I/O errors.
+fn list_subdirs(dir: &Path) -> Result<Vec<std::fs::DirEntry>, KonancError> {
+    let entries = std::fs::read_dir(dir)
         .map_err(|source| KonancError::Io {
-            path: jre_dir.display().to_string(),
+            path: dir.display().to_string(),
             source,
         })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| KonancError::Io {
-            path: jre_dir.display().to_string(),
+            path: dir.display().to_string(),
             source,
         })?
         .into_iter()
         .filter(|e| e.path().is_dir())
         .collect();
+    Ok(entries)
+}
+
+/// Find a single expected root directory inside `dir`.
+///
+/// If exactly one subdirectory exists, returns it. Otherwise falls back to
+/// `name_matcher` to pick the right entry by name. Returns `not_found_err`
+/// if no entry matches.
+fn find_single_root(
+    dir: &Path,
+    name_matcher: impl Fn(&str) -> bool,
+    not_found_err: impl FnOnce(usize) -> KonancError,
+) -> Result<PathBuf, KonancError> {
+    let entries = list_subdirs(dir)?;
 
     if entries.len() == 1 {
-        // The `unwrap_or_else` fallback is unreachable: we just confirmed
-        // `entries.len() == 1`, so `.next()` always yields `Some`. The
-        // fallback exists only to satisfy the type system without panicking.
         return Ok(entries
             .into_iter()
             .next()
             .map(|e| e.path())
-            .unwrap_or_else(|| jre_dir.to_path_buf()));
+            .unwrap_or_else(|| dir.to_path_buf()));
     }
 
-    // Look for a directory matching the JDK naming pattern.
     for entry in &entries {
-        let name = entry.file_name();
-        if let Some(s) = name.to_str() {
-            if s.starts_with("jdk-") {
+        if let Some(s) = entry.file_name().to_str() {
+            if name_matcher(s) {
                 return Ok(entry.path());
             }
         }
     }
 
-    Err(KonancError::JreInstall {
-        message: format!(
-            "expected a single JRE directory in {}, found {} entries",
-            jre_dir.display(),
-            entries.len()
-        ),
-    })
+    Err(not_found_err(entries.len()))
+}
+
+fn find_jre_root(jre_dir: &Path) -> Result<PathBuf, KonancError> {
+    find_single_root(
+        jre_dir,
+        |name| name.starts_with("jdk-"),
+        |count| KonancError::JreInstall {
+            message: format!(
+                "expected a single JRE directory in {}, found {count} entries",
+                jre_dir.display(),
+            ),
+        },
+    )
 }
 
 /// Construct the download URL for an Adoptium Temurin JRE.
@@ -557,48 +574,16 @@ fn extract_tarball(
 
 /// Find the single extracted root directory inside a temp extraction dir.
 fn find_extracted_root(extract_dir: &Path, version: &str) -> Result<PathBuf, KonancError> {
-    let entries: Vec<_> = std::fs::read_dir(extract_dir)
-        .map_err(|source| KonancError::Io {
-            path: extract_dir.display().to_string(),
-            source,
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| KonancError::Io {
-            path: extract_dir.display().to_string(),
-            source: e,
-        })?
-        .into_iter()
-        .filter(|e| e.path().is_dir())
-        .collect();
-
-    if entries.len() == 1 {
-        // The `unwrap_or_else` fallback is unreachable: we just confirmed
-        // `entries.len() == 1`, so `.next()` always yields `Some`. The
-        // fallback exists only to satisfy the type system without panicking.
-        return Ok(entries
-            .into_iter()
-            .next()
-            .map(|e| e.path())
-            .unwrap_or_else(|| extract_dir.to_path_buf()));
-    }
-
-    // Fall back: look for a directory matching the expected pattern.
-    for entry in &entries {
-        let name = entry.file_name();
-        if let Some(s) = name.to_str() {
-            if s.contains("kotlin-native") && s.contains(version) {
-                return Ok(entry.path());
-            }
-        }
-    }
-
-    Err(KonancError::Extract {
-        version: version.to_owned(),
-        message: format!(
-            "expected a single directory in extracted tarball, found {} entries",
-            entries.len()
-        ),
-    })
+    find_single_root(
+        extract_dir,
+        |name| name.contains("kotlin-native") && name.contains(version),
+        |count| KonancError::Extract {
+            version: version.to_owned(),
+            message: format!(
+                "expected a single directory in extracted tarball, found {count} entries",
+            ),
+        },
+    )
 }
 
 #[cfg(test)]
