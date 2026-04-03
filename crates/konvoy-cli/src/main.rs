@@ -490,7 +490,7 @@ fn check_maven_deps(manifest: &konvoy_config::Manifest, cwd: &std::path::Path) -
     let maven_deps: Vec<_> = manifest
         .dependencies
         .iter()
-        .filter(|(_, spec)| spec.maven.is_some() && spec.version.is_some())
+        .filter(|(_, spec)| spec.is_maven())
         .collect();
 
     if maven_deps.is_empty() {
@@ -516,11 +516,7 @@ fn check_maven_deps(manifest: &konvoy_config::Manifest, cwd: &std::path::Path) -
     match konvoy_config::lockfile::Lockfile::from_path(&lockfile_path) {
         Ok(lockfile) => {
             for (dep_name, _) in &maven_deps {
-                let has_entry = lockfile.dependencies.iter().any(|d| {
-                    d.name == **dep_name
-                        && matches!(&d.source, konvoy_config::lockfile::DepSource::Maven { .. })
-                });
-                if has_entry {
+                if lockfile.has_maven_entry(dep_name) {
                     eprintln!("  [ok] Lockfile entry: {}", dep_name);
                 } else {
                     eprintln!(

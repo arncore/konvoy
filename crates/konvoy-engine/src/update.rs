@@ -80,7 +80,7 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
     let maven_deps: Vec<_> = manifest
         .dependencies
         .iter()
-        .filter(|(_, spec)| spec.maven.is_some() && spec.version.is_some())
+        .filter(|(_, spec)| spec.is_maven())
         .collect();
 
     if maven_deps.is_empty() {

@@ -155,6 +155,13 @@ impl Lockfile {
         })?;
         Ok(())
     }
+
+    /// Returns `true` if the lockfile contains a Maven dependency entry with the given name.
+    pub fn has_maven_entry(&self, dep_name: &str) -> bool {
+        self.dependencies
+            .iter()
+            .any(|d| d.name == dep_name && matches!(&d.source, DepSource::Maven { .. }))
+    }
 }
 
 /// Errors produced when reading, parsing, or writing a `konvoy.lock` lockfile.
