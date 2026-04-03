@@ -94,12 +94,12 @@ pub fn resolve_plugin_artifacts(
         let resolved_version = version_template.replace("{kotlin}", kotlin_version);
 
         let (group_id, artifact_id) =
-            maven
-                .split_once(':')
-                .ok_or_else(|| EngineError::InvalidPluginConfig {
+            crate::common::split_maven_coordinate(maven).map_err(|_| {
+                EngineError::InvalidPluginConfig {
                     name: plugin_name.clone(),
                     reason: format!("invalid maven coordinate `{maven}`"),
-                })?;
+                }
+            })?;
 
         let coord = MavenCoordinate::new(group_id, artifact_id, &resolved_version);
         let url = coord.to_url(MAVEN_CENTRAL);
@@ -131,20 +131,16 @@ fn find_lockfile_hash<'a>(lockfile: &'a Lockfile, plugin_name: &str) -> Option<&
 
 /// Map a `UtilError::Download` to `EngineError::PluginDownload`.
 fn map_download_err(name: &str, e: konvoy_util::error::UtilError) -> EngineError {
-    match e {
-        konvoy_util::error::UtilError::Download { message } => EngineError::PluginDownload {
-            name: name.to_owned(),
-            message,
-        },
-        konvoy_util::error::UtilError::ArtifactHashMismatch {
-            expected, actual, ..
-        } => EngineError::PluginHashMismatch {
-            name: name.to_owned(),
+    crate::error::map_artifact_download_err(
+        name,
+        e,
+        |name, message| EngineError::PluginDownload { name, message },
+        |name, expected, actual| EngineError::PluginHashMismatch {
+            name,
             expected,
             actual,
         },
-        other => EngineError::Util(other),
-    }
+    )
 }
 
 /// Ensure all plugin artifacts are downloaded, hash-verified, and return results.

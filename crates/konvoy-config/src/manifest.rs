@@ -69,17 +69,38 @@ fn default_entrypoint() -> String {
     "src/main.kt".to_owned()
 }
 
-/// Check whether a package name is valid: non-empty, starts with a letter or underscore,
-/// and contains only ASCII alphanumeric characters, hyphens, or underscores.
-fn is_valid_name(name: &str) -> bool {
-    let Some(first) = name.chars().next() else {
-        return false;
-    };
+/// Validate a package/project name, returning the failure reason on error.
+///
+/// A valid name is non-empty, starts with a letter or underscore, and contains
+/// only ASCII alphanumeric characters, hyphens, or underscores.
+///
+/// # Errors
+///
+/// Returns a human-readable reason string if the name is invalid.
+pub fn validate_name(name: &str) -> Result<(), String> {
+    match name.chars().next() {
+        None => return Err("name must not be empty".to_owned()),
+        Some(first) if !first.is_ascii_alphabetic() && first != '_' => {
+            return Err(format!(
+                "must start with a letter or underscore, found '{first}'"
+            ));
+        }
+        _ => {}
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_')
+    {
+        return Err(format!(
+            "contains invalid character '{bad}' — only ASCII letters, digits, hyphens, and underscores are allowed"
+        ));
+    }
+    Ok(())
+}
 
-    (first.is_ascii_alphabetic() || first == '_')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+/// Check whether a package name is valid (convenience wrapper around [`validate_name`]).
+pub fn is_valid_name(name: &str) -> bool {
+    validate_name(name).is_ok()
 }
 
 /// Check whether an entrypoint path ends with `.kt`.

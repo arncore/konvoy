@@ -10,20 +10,16 @@ use crate::error::EngineError;
 
 /// Map a `UtilError` from artifact operations to the corresponding `EngineError`.
 fn map_download_err(version: &str, e: konvoy_util::error::UtilError) -> EngineError {
-    match e {
-        konvoy_util::error::UtilError::Download { message } => EngineError::DetektDownload {
-            version: version.to_owned(),
-            message,
-        },
-        konvoy_util::error::UtilError::ArtifactHashMismatch {
-            expected, actual, ..
-        } => EngineError::DetektHashMismatch {
-            version: version.to_owned(),
+    crate::error::map_artifact_download_err(
+        version,
+        e,
+        |version, message| EngineError::DetektDownload { version, message },
+        |version, expected, actual| EngineError::DetektHashMismatch {
+            version,
             expected,
             actual,
         },
-        other => EngineError::Util(other),
-    }
+    )
 }
 
 /// Options for the `lint` command.

@@ -178,3 +178,26 @@ pub enum EngineError {
     #[error("maven dependency cycle detected: {cycle} — remove one of these dependencies from konvoy.toml or file an issue upstream")]
     MavenDependencyCycle { cycle: String },
 }
+
+/// Map a `UtilError` from artifact download/verify to an `EngineError`.
+///
+/// Shared helper used by detekt, plugin, and library artifact pipelines.
+/// `make_download` builds the download-failure variant from `(label, message)`;
+/// `make_hash` builds the hash-mismatch variant from `(label, expected, actual)`.
+/// Other `UtilError` variants pass through as `EngineError::Util`.
+pub(crate) fn map_artifact_download_err(
+    label: &str,
+    util_err: konvoy_util::error::UtilError,
+    make_download: impl FnOnce(String, String) -> EngineError,
+    make_hash: impl FnOnce(String, String, String) -> EngineError,
+) -> EngineError {
+    match util_err {
+        konvoy_util::error::UtilError::Download { message } => {
+            make_download(label.to_owned(), message)
+        }
+        konvoy_util::error::UtilError::ArtifactHashMismatch {
+            expected, actual, ..
+        } => make_hash(label.to_owned(), expected, actual),
+        other => EngineError::Util(other),
+    }
+}
