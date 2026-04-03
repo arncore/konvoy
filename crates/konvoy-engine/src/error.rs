@@ -201,3 +201,24 @@ pub(crate) fn map_artifact_download_err(
         other => EngineError::Util(other),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_artifact_download_err_passes_through_other_errors() {
+        let err = konvoy_util::error::UtilError::NoHomeDir;
+        let result = map_artifact_download_err(
+            "test",
+            err,
+            |_, _| panic!("download_err should not be called"),
+            |_, _, _| panic!("hash_err should not be called"),
+        );
+        let msg = result.to_string();
+        assert!(
+            msg.contains("home directory"),
+            "other errors should pass through: {msg}"
+        );
+    }
+}

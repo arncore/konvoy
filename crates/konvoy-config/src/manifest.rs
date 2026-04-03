@@ -1667,4 +1667,44 @@ version = "1.0"
             }
         }
     }
+
+    #[test]
+    fn is_maven_true_when_both_set() {
+        let spec = DependencySpec {
+            path: None,
+            maven: Some("org.example:lib".to_owned()),
+            version: Some("1.0.0".to_owned()),
+        };
+        assert!(spec.is_maven());
+    }
+
+    #[test]
+    fn is_maven_false_when_maven_only() {
+        let spec = DependencySpec {
+            path: None,
+            maven: Some("org.example:lib".to_owned()),
+            version: None,
+        };
+        assert!(!spec.is_maven());
+    }
+
+    #[test]
+    fn is_maven_false_when_version_only() {
+        let spec = DependencySpec {
+            path: None,
+            maven: None,
+            version: Some("1.0.0".to_owned()),
+        };
+        assert!(!spec.is_maven());
+    }
+
+    #[test]
+    fn is_maven_false_for_path_dep() {
+        let spec = DependencySpec {
+            path: Some("../lib".to_owned()),
+            maven: None,
+            version: None,
+        };
+        assert!(!spec.is_maven());
+    }
 }

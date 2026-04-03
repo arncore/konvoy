@@ -333,4 +333,42 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn is_host_returns_true_for_host_target() {
+        // host_target() succeeds on all supported CI platforms.
+        if let Ok(host) = host_target() {
+            assert!(
+                host.is_host().unwrap_or(false),
+                "host target should match itself"
+            );
+        }
+    }
+
+    #[test]
+    fn is_host_returns_false_for_other_target() {
+        // Pick a target that's not the current host.
+        let host = match host_target() {
+            Ok(h) => h,
+            Err(_) => return, // skip on unsupported platforms
+        };
+        let other_name = if host.to_konanc_arg() == "linux_x64" {
+            "macos_arm64"
+        } else {
+            "linux_x64"
+        };
+        let other: Target = other_name.parse().unwrap();
+        assert!(
+            !other.is_host().unwrap_or(true),
+            "non-host target should not match host"
+        );
+    }
+
+    #[test]
+    fn display_matches_konanc_arg() {
+        for &name in KNOWN_TARGETS {
+            let target: Target = name.parse().unwrap();
+            assert_eq!(target.to_string(), target.to_konanc_arg());
+        }
+    }
 }

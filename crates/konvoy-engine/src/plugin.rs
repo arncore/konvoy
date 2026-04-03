@@ -771,4 +771,24 @@ mod tests {
             plugins,
         }
     }
+
+    #[test]
+    fn ensure_plugin_artifacts_locked_mode_requires_hash() {
+        // In --locked mode, a plugin without a lockfile hash should fail.
+        let manifest = make_manifest_with_plugin(
+            "kotlin-serialization",
+            "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin",
+            "2.1.0",
+        );
+        let artifacts = resolve_plugin_artifacts(&manifest).unwrap();
+        let lockfile = Lockfile::default(); // no plugin hashes
+
+        let result = ensure_plugin_artifacts(&artifacts, &lockfile, true);
+        assert!(
+            result.is_err(),
+            "expected error in locked mode without hash"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("lockfile is out of date"), "error was: {err}");
+    }
 }
