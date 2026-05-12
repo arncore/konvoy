@@ -722,4 +722,44 @@ mod tests {
             .join("cache");
         assert_eq!(root, expected);
     }
+
+    #[test]
+    fn resolve_cache_root_memoizes_per_project_root() {
+        // First call resolves and caches; second call must return the same
+        // path. We then break the underlying state (rename project root) and
+        // confirm we still get the cached value — proves the second call
+        // hit the memo instead of re-running `git rev-parse`.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        fs::create_dir_all(&project).unwrap();
+
+        let first = resolve_cache_root(&project);
+
+        // Remove the project directory; an uncached resolve would now return
+        // the fallback path computed from a non-existent directory.
+        fs::remove_dir_all(&project).unwrap();
+
+        let second = resolve_cache_root(&project);
+        assert_eq!(
+            first, second,
+            "second call must hit memo and return cached path"
+        );
+    }
+
+    #[test]
+    fn resolve_cache_root_memo_keys_by_project_root() {
+        // Distinct project roots must not share memoized entries.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_a = tmp.path().join("a");
+        let project_b = tmp.path().join("b");
+        fs::create_dir_all(&project_a).unwrap();
+        fs::create_dir_all(&project_b).unwrap();
+
+        let root_a = resolve_cache_root(&project_a);
+        let root_b = resolve_cache_root(&project_b);
+
+        assert_ne!(root_a, root_b, "different projects, different cache roots");
+        assert!(root_a.starts_with(&project_a));
+        assert!(root_b.starts_with(&project_b));
+    }
 }

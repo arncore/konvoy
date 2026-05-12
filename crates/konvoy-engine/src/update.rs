@@ -1130,6 +1130,39 @@ kotlin = "2.1.0"
     }
 
     #[test]
+    fn resolved_maven_dep_key_is_group_colon_artifact() {
+        let dep = ResolvedMavenDep {
+            name: "kotlinx-coroutines".to_owned(),
+            group_id: "org.jetbrains.kotlinx".to_owned(),
+            artifact_id: "kotlinx-coroutines-core".to_owned(),
+            version: "1.8.0".to_owned(),
+            required_by: Vec::new(),
+            classifier: None,
+        };
+        assert_eq!(dep.key(), "org.jetbrains.kotlinx:kotlinx-coroutines-core");
+    }
+
+    #[test]
+    fn resolved_maven_dep_key_ignores_version_and_classifier() {
+        // `key()` is a group:artifact identity — version and classifier must
+        // not influence it (they're separate fields in lockfile entries).
+        let a = ResolvedMavenDep {
+            name: "atomicfu".to_owned(),
+            group_id: "org.jetbrains.kotlinx".to_owned(),
+            artifact_id: "atomicfu".to_owned(),
+            version: "0.23.1".to_owned(),
+            required_by: Vec::new(),
+            classifier: None,
+        };
+        let b = ResolvedMavenDep {
+            version: "0.24.0".to_owned(),
+            classifier: Some("cinterop-interop".to_owned()),
+            ..a.clone()
+        };
+        assert_eq!(a.key(), b.key());
+    }
+
+    #[test]
     fn update_preserves_already_locked_classifier_dep() {
         // When a dep with a specific classifier is already locked at the
         // same version, it should be preserved (not re-downloaded). The
