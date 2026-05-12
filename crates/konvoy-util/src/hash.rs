@@ -58,6 +58,8 @@ pub fn sha256_file(path: &Path) -> Result<String, UtilError> {
 /// Returns an error if the glob pattern is invalid, `dir` cannot be read, or any
 /// matched file cannot be read.
 pub fn sha256_dir(dir: &Path, pattern: &str) -> Result<String, UtilError> {
+    use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+
     let full_pattern = dir.join(pattern);
     let full_pattern_str = full_pattern.display().to_string();
 
@@ -72,17 +74,24 @@ pub fn sha256_dir(dir: &Path, pattern: &str) -> Result<String, UtilError> {
 
     paths.sort();
 
+    // Read files in parallel; preserve sorted order when feeding the hasher so
+    // the digest is bit-identical to the sequential implementation (cache keys
+    // must remain stable across releases).
+    let contents: Vec<Vec<u8>> = paths
+        .par_iter()
+        .map(|path| {
+            std::fs::read(path).map_err(|source| UtilError::Io {
+                path: path.display().to_string(),
+                source,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
     let mut hasher = Sha256::new();
-    for path in &paths {
-        // Include the relative path in the hash so renames are detected.
+    for (path, data) in paths.iter().zip(contents.iter()) {
         let relative = path.strip_prefix(dir).unwrap_or(path);
         hasher.update(relative.display().to_string().as_bytes());
-
-        let data = std::fs::read(path).map_err(|source| UtilError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
-        hasher.update(&data);
+        hasher.update(data);
     }
 
     Ok(finalize_hex(hasher))

@@ -1,7 +1,9 @@
 //! Content-addressed artifact store for build outputs.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -142,19 +144,15 @@ impl ArtifactStore {
                 // Another process beat us; guard will clean up the temp dir.
                 Ok(())
             }
-            Err(e) => {
-                // On Linux, rename(2) on directories returns ENOTEMPTY (not
-                // EEXIST) when the target directory already exists and is
-                // non-empty. Map this to the same "lost the race" semantics.
-                if is_directory_not_empty_error(&e) {
-                    return Ok(());
-                }
-                Err(konvoy_util::error::UtilError::Io {
-                    path: entry_dir.display().to_string(),
-                    source: e,
-                }
-                .into())
+            // On Linux/macOS, rename(2) on directories returns ENOTEMPTY (not
+            // EEXIST) when the target directory already exists and is
+            // non-empty. Map this to the same "lost the race" semantics.
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
+            Err(e) => Err(konvoy_util::error::UtilError::Io {
+                path: entry_dir.display().to_string(),
+                source: e,
             }
+            .into()),
         }
     }
 
@@ -208,6 +206,15 @@ fn path_contains_symlink(path: &Path) -> bool {
     false
 }
 
+/// Per-process memoization of `resolve_cache_root` results.
+///
+/// `ArtifactStore::new` may be called once per dependency during a build; without
+/// memoization we would fork `git rev-parse` N+1 times per build.
+fn cache_root_memo() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
+    static MEMO: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Resolve the cache root directory, sharing cache across git worktrees.
 ///
 /// In a git worktree, `git rev-parse --git-common-dir` returns the `.git`
@@ -218,6 +225,22 @@ fn path_contains_symlink(path: &Path) -> bool {
 /// and the local fallback path is used instead (to avoid symlink-based
 /// redirection of cache reads/writes).
 fn resolve_cache_root(project_root: &Path) -> PathBuf {
+    if let Ok(memo) = cache_root_memo().lock() {
+        if let Some(cached) = memo.get(project_root) {
+            return cached.clone();
+        }
+    }
+
+    let resolved = resolve_cache_root_uncached(project_root);
+
+    if let Ok(mut memo) = cache_root_memo().lock() {
+        memo.insert(project_root.to_path_buf(), resolved.clone());
+    }
+
+    resolved
+}
+
+fn resolve_cache_root_uncached(project_root: &Path) -> PathBuf {
     let fallback = project_root.join(".konvoy").join("cache");
 
     let output = Command::new("git")
@@ -299,17 +322,6 @@ fn make_temp_dir(parent: &Path) -> Result<PathBuf, EngineError> {
     })?;
 
     Ok(tmp_path)
-}
-
-/// Check whether an I/O error indicates that a directory rename target already
-/// exists and is non-empty.
-///
-/// On Linux, `rename(2)` on directories returns `ENOTEMPTY` (mapped to
-/// `DirectoryNotEmpty`) rather than `EEXIST` when the target is a non-empty
-/// directory. On macOS, it returns `ENOTEMPTY` as well.
-fn is_directory_not_empty_error(err: &std::io::Error) -> bool {
-    // Stable variant available since Rust 1.64.
-    err.kind() == std::io::ErrorKind::DirectoryNotEmpty
 }
 
 #[cfg(test)]

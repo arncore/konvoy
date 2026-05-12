@@ -126,6 +126,11 @@ impl MavenCoordinate {
         Ok(parsed)
     }
 
+    /// Render the `"groupId:artifactId"` coordinate (without version or packaging).
+    pub fn group_artifact(&self) -> String {
+        format!("{}:{}", self.group_id, self.artifact_id)
+    }
+
     /// The filename for this artifact.
     ///
     /// Without classifier: `"{artifact_id}-{version}.{packaging}"`

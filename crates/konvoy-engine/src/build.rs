@@ -426,7 +426,7 @@ pub(crate) fn build_single(
         target: cc.target.to_string(),
         profile: profile.to_owned(),
         konanc_version: cc.konanc.version.clone(),
-        built_at: now_epoch_secs(),
+        built_at: crate::common::now_epoch_secs(),
     };
     store.store(&cache_key, &compile_output, &metadata)?;
 
@@ -801,8 +801,8 @@ fn update_lockfile_if_needed(
                 eprintln!(
                     "warning: dependency `{}` source has changed (locked: {}, current: {})",
                     dep.name,
-                    truncate_hash(&locked_dep.source_hash, 8),
-                    truncate_hash(&dep.source_hash, 8),
+                    crate::common::truncate_hash(&locked_dep.source_hash, 8),
+                    crate::common::truncate_hash(&dep.source_hash, 8),
                 );
             }
         }
@@ -954,20 +954,6 @@ pub(crate) fn normalize_konanc_output(output_path: &Path) -> Result<(), EngineEr
         konvoy_util::fs::rename(&kexe_path, output_path)?;
     }
     Ok(())
-}
-
-/// Truncate a hash string to the given length for display.
-pub(crate) fn truncate_hash(hash: &str, len: usize) -> &str {
-    hash.get(..len).unwrap_or(hash)
-}
-
-/// Return the current UTC time as epoch seconds (e.g. "1708646400s-since-epoch").
-pub(crate) fn now_epoch_secs() -> String {
-    // Use a simple approach without pulling in chrono.
-    let duration = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}s-since-epoch", duration.as_secs())
 }
 
 #[cfg(test)]
@@ -1390,7 +1376,7 @@ mod tests {
             target: target.to_string(),
             profile: profile.to_owned(),
             konanc_version: konanc.version.clone(),
-            built_at: now_epoch_secs(),
+            built_at: crate::common::now_epoch_secs(),
         };
         store.store(&cache_key, &fake_artifact, &metadata).unwrap();
         assert!(store.has(&cache_key));
@@ -1477,7 +1463,7 @@ mod tests {
             target: target.to_string(),
             profile: profile.to_owned(),
             konanc_version: konanc.version.clone(),
-            built_at: now_epoch_secs(),
+            built_at: crate::common::now_epoch_secs(),
         };
         store.store(&cache_key, &fake_artifact, &metadata).unwrap();
 
@@ -1559,7 +1545,7 @@ mod tests {
             target: target.to_string(),
             profile: profile.to_owned(),
             konanc_version: konanc.version.clone(),
-            built_at: now_epoch_secs(),
+            built_at: crate::common::now_epoch_secs(),
         };
         store.store(&key_before, &fake_artifact, &metadata).unwrap();
 
@@ -1608,13 +1594,6 @@ mod tests {
 
         assert_eq!(outcome, BuildOutcome::Cached);
         assert!(output_path.exists());
-    }
-
-    #[test]
-    fn now_epoch_secs_not_empty() {
-        let ts = now_epoch_secs();
-        assert!(!ts.is_empty());
-        assert!(ts.contains("since-epoch"));
     }
 
     #[test]
@@ -2178,7 +2157,7 @@ mod tests {
             target: target.to_string(),
             profile: profile.to_owned(),
             konanc_version: konanc.version.clone(),
-            built_at: now_epoch_secs(),
+            built_at: crate::common::now_epoch_secs(),
         };
         store.store(&cache_key, &fake_artifact, &metadata).unwrap();
         assert!(store.has(&cache_key));
@@ -4183,7 +4162,7 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
                 sha256: format!("hash-{}", a.plugin_name),
                 url: a.url.clone(),
                 freshly_downloaded: true,
-                maven: format!("{}:{}", a.maven_coord.group_id, a.maven_coord.artifact_id),
+                maven: a.maven_coord.group_artifact(),
                 version: a.maven_coord.version.clone(),
             })
             .collect();
@@ -4401,19 +4380,6 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
         assert!(has_unresolved_maven_deps(&manifest, &lockfile));
     }
 
-    #[test]
-    fn truncate_hash_short() {
-        assert_eq!(
-            truncate_hash("abcdef1234567890abcdef", 16),
-            "abcdef1234567890"
-        );
-    }
-
-    #[test]
-    fn truncate_hash_shorter_than_limit() {
-        assert_eq!(truncate_hash("abc", 16), "abc");
-    }
-
     // ── normalize_konanc_output ─────────────────────────────────────────
 
     #[test]
@@ -4451,31 +4417,6 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
 
         assert_eq!(fs::read(&output_path).unwrap(), b"fresh");
         assert!(!kexe_path.exists());
-    }
-
-    // ── now_epoch_secs ──────────────────────────────────────────────────
-
-    #[test]
-    fn now_epoch_secs_format() {
-        let ts = now_epoch_secs();
-        assert!(
-            ts.ends_with("s-since-epoch"),
-            "expected format '<digits>s-since-epoch', got: {ts}"
-        );
-        let digits = ts.strip_suffix("s-since-epoch").unwrap();
-        assert!(
-            digits.parse::<u64>().is_ok(),
-            "expected numeric prefix, got: {digits}"
-        );
-    }
-
-    #[test]
-    fn now_epoch_secs_is_reasonable() {
-        let ts = now_epoch_secs();
-        let secs: u64 = ts.strip_suffix("s-since-epoch").unwrap().parse().unwrap();
-        // Should be after 2024-01-01 (1704067200) and before 2040-01-01 (2208988800).
-        assert!(secs > 1_704_067_200, "timestamp too old: {secs}");
-        assert!(secs < 2_208_988_800, "timestamp too far in future: {secs}");
     }
 
     // ── check_lockfile_staleness ────────────────────────────────────────

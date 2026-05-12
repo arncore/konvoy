@@ -130,7 +130,7 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
     let mut new_dep_locks = Vec::new();
 
     for dep in &all_deps {
-        let maven_coord = format!("{}:{}", dep.group_id, dep.artifact_id);
+        let maven_coord = dep.key();
         eprintln!("  Resolving {} {}...", dep.name, dep.version);
 
         // Check if lockfile already has this dep at this version and classifier.
@@ -203,12 +203,12 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
         let mut targets_map: BTreeMap<String, String> = BTreeMap::new();
         for result in target_results {
             let (target_name, sha256) = result?;
-            let display_hash = crate::build::truncate_hash(&sha256, 16);
+            let display_hash = crate::common::truncate_hash(&sha256, 16);
             eprintln!("    {target_name}: {display_hash}...");
             targets_map.insert(target_name, sha256);
         }
 
-        let _ = std::fs::remove_dir_all(&tmp_base);
+        konvoy_util::fs::remove_dir_all_if_exists(&tmp_base)?;
 
         let hash_input: String = targets_map
             .iter()
@@ -274,6 +274,13 @@ struct ResolvedMavenDep {
     /// Maven classifier for non-primary artifacts (e.g. "cinterop-interop").
     /// `None` for the main klib.
     classifier: Option<String>,
+}
+
+impl ResolvedMavenDep {
+    /// Render the `"groupId:artifactId"` key used in lockfile entries and BFS maps.
+    fn key(&self) -> String {
+        format!("{}:{}", self.group_id, self.artifact_id)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -403,9 +410,7 @@ fn finalize_required_by(
 ) {
     for (key, dep) in resolved.iter_mut() {
         if let Some(requirers) = required_by_map.get(key) {
-            let is_direct = direct_deps
-                .iter()
-                .any(|d| format!("{}:{}", d.group_id, d.artifact_id) == *key);
+            let is_direct = direct_deps.iter().any(|d| d.key() == *key);
             if is_direct {
                 dep.required_by = Vec::new();
             } else {
@@ -442,7 +447,7 @@ fn resolve_transitive(
 
     // Build user-specified version map and seed the BFS queue.
     for dep in direct_deps {
-        let key = format!("{}:{}", dep.group_id, dep.artifact_id);
+        let key = dep.key();
         state.user_versions.insert(key.clone(), dep.version.clone());
         state.resolved.insert(key.clone(), dep.clone());
         state.queue.push_back((

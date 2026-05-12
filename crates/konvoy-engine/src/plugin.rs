@@ -155,43 +155,42 @@ pub fn ensure_plugin_artifacts(
     lockfile: &Lockfile,
     locked: bool,
 ) -> Result<Vec<PluginArtifactResult>, EngineError> {
-    let mut results = Vec::with_capacity(artifacts.len());
+    use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
-    for artifact in artifacts {
-        let expected_hash = find_lockfile_hash(lockfile, &artifact.plugin_name);
-
-        // In --locked mode, the hash must be present in the lockfile.
-        if locked && expected_hash.is_none() {
-            return Err(EngineError::LockfileUpdateRequired);
+    // Fail fast in --locked mode before spawning any downloads.
+    if locked {
+        for artifact in artifacts {
+            if find_lockfile_hash(lockfile, &artifact.plugin_name).is_none() {
+                return Err(EngineError::LockfileUpdateRequired);
+            }
         }
-
-        let util_result = konvoy_util::artifact::ensure_artifact(
-            &artifact.url,
-            &artifact.cache_path,
-            expected_hash,
-            &artifact.plugin_name,
-            &artifact.maven_coord.version,
-        )
-        .map_err(|e| map_download_err(&artifact.plugin_name, e))?;
-
-        // Reconstruct the groupId:artifactId for the lockfile.
-        let maven = format!(
-            "{}:{}",
-            artifact.maven_coord.group_id, artifact.maven_coord.artifact_id
-        );
-
-        results.push(PluginArtifactResult {
-            plugin_name: artifact.plugin_name.clone(),
-            path: util_result.path,
-            sha256: util_result.sha256,
-            url: artifact.url.clone(),
-            freshly_downloaded: util_result.freshly_downloaded,
-            maven,
-            version: artifact.maven_coord.version.clone(),
-        });
     }
 
-    Ok(results)
+    artifacts
+        .par_iter()
+        .map(|artifact| {
+            let expected_hash = find_lockfile_hash(lockfile, &artifact.plugin_name);
+
+            let util_result = konvoy_util::artifact::ensure_artifact(
+                &artifact.url,
+                &artifact.cache_path,
+                expected_hash,
+                &artifact.plugin_name,
+                &artifact.maven_coord.version,
+            )
+            .map_err(|e| map_download_err(&artifact.plugin_name, e))?;
+
+            Ok(PluginArtifactResult {
+                plugin_name: artifact.plugin_name.clone(),
+                path: util_result.path,
+                sha256: util_result.sha256,
+                url: artifact.url.clone(),
+                freshly_downloaded: util_result.freshly_downloaded,
+                maven: artifact.maven_coord.group_artifact(),
+                version: artifact.maven_coord.version.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Build `PluginLock` entries from download results.

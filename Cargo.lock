@@ -487,6 +487,7 @@ name = "konvoy-util"
 version = "1.2.0"
 dependencies = [
  "glob",
+ "rayon",
  "roxmltree",
  "serde",
  "serde_json",
