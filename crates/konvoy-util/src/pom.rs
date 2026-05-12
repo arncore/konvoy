@@ -70,10 +70,7 @@ fn interpolate_property(
     let mut result = value.to_owned();
 
     // Process all ${...} placeholders.
-    loop {
-        let Some(start) = result.find("${") else {
-            break;
-        };
+    while let Some(start) = result.find("${") {
         let Some(rel_end) = result.get(start..).and_then(|s| s.find('}')) else {
             break;
         };
