@@ -7,6 +7,9 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
+use konvoy_config::Profile;
+use konvoy_targets::Target;
+
 use crate::cache::CacheKey;
 use crate::error::EngineError;
 
@@ -35,12 +38,16 @@ impl Drop for TempDirGuard {
 }
 
 /// Metadata stored alongside a cached artifact.
+///
+/// `target` and `profile` are serialized as their canonical wire strings
+/// (e.g. `"linux_x64"`, `"debug"`) to preserve on-disk format compatibility
+/// with existing `metadata.toml` files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildMetadata {
-    /// Kotlin/Native target (e.g. "linux_x64").
-    pub target: String,
-    /// Build profile ("debug" or "release").
-    pub profile: String,
+    /// Kotlin/Native target.
+    pub target: Target,
+    /// Build profile.
+    pub profile: Profile,
     /// konanc version used for the build.
     pub konanc_version: String,
     /// Epoch seconds timestamp of when the build was produced (e.g. "1708646400s-since-epoch").
@@ -126,8 +133,9 @@ impl ArtifactStore {
         // Write metadata alongside the artifact.
         let metadata_path = tmp_dir.join("metadata.toml");
         let metadata_toml =
-            toml::to_string_pretty(metadata).map_err(|e| EngineError::Metadata {
-                message: e.to_string(),
+            toml::to_string_pretty(metadata).map_err(|source| EngineError::TomlSerialize {
+                what: "metadata.toml",
+                source,
             })?;
         konvoy_util::fs::write_file(&metadata_path, metadata_toml)?;
 
@@ -333,8 +341,8 @@ mod tests {
 
     fn test_metadata() -> BuildMetadata {
         BuildMetadata {
-            target: "linux_x64".to_owned(),
-            profile: "debug".to_owned(),
+            target: Target::LinuxX64,
+            profile: Profile::Debug,
             konanc_version: "2.1.0".to_owned(),
             built_at: "2026-02-21T00:00:00Z".to_owned(),
         }
@@ -352,8 +360,8 @@ mod tests {
             lockfile_content: "".to_owned(),
             konanc_version: "2.1.0".to_owned(),
             konanc_fingerprint: "abc123".to_owned(),
-            target: "linux_x64".to_owned(),
-            profile: "debug".to_owned(),
+            target: Target::LinuxX64,
+            profile: Profile::Debug,
             source_dir: tmp.path().to_path_buf(),
             source_glob: "**/*.kt".to_owned(),
             os: "linux".to_owned(),
@@ -394,6 +402,40 @@ mod tests {
         let content = fs::read_to_string(metadata_path).unwrap();
         assert!(content.contains("linux_x64"));
         assert!(content.contains("2.1.0"));
+    }
+
+    /// Verifies that metadata.toml on disk uses the canonical
+    /// `target = "linux_x64"` / `profile = "debug"` strings — and that
+    /// pre-typed-enum metadata files still deserialize cleanly. Guards the
+    /// on-disk format contract called out in issue #268.
+    #[test]
+    fn metadata_round_trips_with_canonical_strings() {
+        let meta = BuildMetadata {
+            target: Target::MacOsArm64,
+            profile: Profile::Release,
+            konanc_version: "2.1.0".to_owned(),
+            built_at: "12345s-since-epoch".to_owned(),
+        };
+        let serialized = toml::to_string_pretty(&meta).unwrap();
+        assert!(
+            serialized.contains("target = \"macos_arm64\""),
+            "expected canonical target wire string, got: {serialized}"
+        );
+        assert!(
+            serialized.contains("profile = \"release\""),
+            "expected canonical profile wire string, got: {serialized}"
+        );
+
+        // Old-style raw-string TOML must round-trip into the typed struct.
+        let legacy = r#"
+target = "linux_x64"
+profile = "debug"
+konanc_version = "2.1.0"
+built_at = "1s-since-epoch"
+"#;
+        let back: BuildMetadata = toml::from_str(legacy).unwrap();
+        assert_eq!(back.target, Target::LinuxX64);
+        assert_eq!(back.profile, Profile::Debug);
     }
 
     #[test]

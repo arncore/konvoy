@@ -68,7 +68,15 @@ pub struct DependencySpec {
 impl DependencySpec {
     /// Returns `true` if this is a Maven dependency (has both `maven` and `version` set).
     pub fn is_maven(&self) -> bool {
-        self.maven.is_some() && self.version.is_some()
+        self.as_maven_coord().is_some()
+    }
+
+    /// Return `(maven_coord, version)` if this spec is a complete Maven dependency.
+    pub fn as_maven_coord(&self) -> Option<(&str, &str)> {
+        match (&self.maven, &self.version) {
+            (Some(maven), Some(version)) => Some((maven.as_str(), version.as_str())),
+            _ => None,
+        }
     }
 }
 
@@ -1706,5 +1714,37 @@ version = "1.0"
             version: None,
         };
         assert!(!spec.is_maven());
+    }
+
+    #[test]
+    fn as_maven_coord_returns_pair_when_complete() {
+        let spec = DependencySpec {
+            path: None,
+            maven: Some("org.example:lib".to_owned()),
+            version: Some("1.0.0".to_owned()),
+        };
+        assert_eq!(spec.as_maven_coord(), Some(("org.example:lib", "1.0.0")));
+    }
+
+    #[test]
+    fn as_maven_coord_none_when_partial() {
+        let maven_only = DependencySpec {
+            path: None,
+            maven: Some("org.example:lib".to_owned()),
+            version: None,
+        };
+        let version_only = DependencySpec {
+            path: None,
+            maven: None,
+            version: Some("1.0.0".to_owned()),
+        };
+        let neither = DependencySpec {
+            path: None,
+            maven: None,
+            version: None,
+        };
+        assert_eq!(maven_only.as_maven_coord(), None);
+        assert_eq!(version_only.as_maven_coord(), None);
+        assert_eq!(neither.as_maven_coord(), None);
     }
 }

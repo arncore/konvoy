@@ -8,9 +8,12 @@ use crate::error::EngineError;
 ///
 /// Returns an error if the string does not contain exactly one colon.
 pub(crate) fn split_maven_coordinate(maven: &str) -> Result<(&str, &str), EngineError> {
-    maven.split_once(':').ok_or_else(|| EngineError::Metadata {
-        message: format!("invalid maven coordinate `{maven}` — expected `groupId:artifactId`"),
-    })
+    maven
+        .split_once(':')
+        .ok_or_else(|| EngineError::InvalidMavenCoordinate {
+            coordinate: maven.to_owned(),
+            reason: "expected `groupId:artifactId`".to_owned(),
+        })
 }
 
 /// Truncate a hex hash string to `len` characters for display.
