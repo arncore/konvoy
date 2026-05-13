@@ -1143,6 +1143,91 @@ kotlin = "2.1.0"
     }
 
     #[test]
+    fn finalize_required_by_clears_direct_deps_and_fills_transitive() {
+        // Build a minimal graph: one direct dep `kotlinx-coroutines-core`
+        // that pulls in transitive `atomicfu`. `finalize_required_by` should
+        // clear required_by on the direct dep and populate it on the
+        // transitive one.
+        let direct = ResolvedMavenDep {
+            name: "kotlinx-coroutines".to_owned(),
+            group_id: "org.jetbrains.kotlinx".to_owned(),
+            artifact_id: "kotlinx-coroutines-core".to_owned(),
+            version: "1.8.0".to_owned(),
+            required_by: vec!["leftover".to_owned()], // must be cleared
+            classifier: None,
+        };
+        let transitive = ResolvedMavenDep {
+            name: "atomicfu".to_owned(),
+            group_id: "org.jetbrains.kotlinx".to_owned(),
+            artifact_id: "atomicfu".to_owned(),
+            version: "0.23.1".to_owned(),
+            required_by: Vec::new(),
+            classifier: None,
+        };
+
+        let mut resolved = HashMap::new();
+        resolved.insert(direct.key(), direct.clone());
+        resolved.insert(transitive.key(), transitive.clone());
+
+        let mut required_by_map: HashMap<String, BTreeSet<String>> = HashMap::new();
+        required_by_map.insert(
+            direct.key(),
+            BTreeSet::from(["self-ref-ignored".to_owned()]),
+        );
+        required_by_map.insert(
+            transitive.key(),
+            BTreeSet::from(["kotlinx-coroutines-core".to_owned()]),
+        );
+
+        finalize_required_by(&mut resolved, &required_by_map, &[direct.clone()]);
+
+        // Direct dep: required_by must be cleared even though the map has an entry.
+        assert!(
+            resolved
+                .get(&direct.key())
+                .expect("direct still present")
+                .required_by
+                .is_empty(),
+            "direct dep should have empty required_by"
+        );
+        // Transitive dep: required_by must reflect the map.
+        assert_eq!(
+            resolved
+                .get(&transitive.key())
+                .expect("transitive still present")
+                .required_by,
+            vec!["kotlinx-coroutines-core".to_owned()]
+        );
+    }
+
+    #[test]
+    fn finalize_required_by_skips_deps_with_no_map_entry() {
+        // A dep absent from `required_by_map` is left untouched.
+        let dep = ResolvedMavenDep {
+            name: "isolated".to_owned(),
+            group_id: "org.example".to_owned(),
+            artifact_id: "isolated".to_owned(),
+            version: "1.0.0".to_owned(),
+            required_by: vec!["pre-existing".to_owned()],
+            classifier: None,
+        };
+        let mut resolved = HashMap::new();
+        resolved.insert(dep.key(), dep.clone());
+        let required_by_map: HashMap<String, BTreeSet<String>> = HashMap::new();
+
+        finalize_required_by(&mut resolved, &required_by_map, &[]);
+
+        assert_eq!(
+            resolved
+                .get(&dep.key())
+                .expect("dep still present")
+                .required_by,
+            vec!["pre-existing".to_owned()],
+            "dep with no map entry should be untouched"
+        );
+    }
+
+    #[test]
     fn resolved_maven_dep_key_ignores_version_and_classifier() {
         // `key()` is a group:artifact identity — version and classifier must
         // not influence it (they're separate fields in lockfile entries).

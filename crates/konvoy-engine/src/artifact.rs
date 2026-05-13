@@ -747,6 +747,34 @@ mod tests {
     }
 
     #[test]
+    fn store_rename_failure_surfaces_as_engine_error() {
+        // Pre-create the would-be cache entry as a regular file. `is_dir()`
+        // returns false so `store` falls through to the rename branch; rename
+        // of a directory onto an existing file fails with NotADirectory,
+        // which is neither AlreadyExists nor DirectoryNotEmpty — so the
+        // final `Err(e)` arm fires.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let store = ArtifactStore::new(project);
+        let key = test_key();
+
+        // Non-git tempdir → cache root is project/.konvoy/cache.
+        let cache_root = project.join(".konvoy").join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+        let blocker = cache_root.join(key.as_hex());
+        fs::write(&blocker, b"not a directory").unwrap();
+
+        let artifact = tmp.path().join("artifact.bin");
+        fs::write(&artifact, b"content").unwrap();
+
+        let result = store.store(&key, &artifact, &test_metadata());
+        assert!(
+            result.is_err(),
+            "rename onto an existing file should surface as error"
+        );
+    }
+
+    #[test]
     fn resolve_cache_root_memo_keys_by_project_root() {
         // Distinct project roots must not share memoized entries.
         let tmp = tempfile::tempdir().unwrap();
