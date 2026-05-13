@@ -64,11 +64,14 @@ impl DownloadBar {
     /// Run a download function with this bar attached and finalise based on
     /// the result.
     ///
-    /// The closure receives a `&ProgressBar` it can hand to lower-level
-    /// download primitives (e.g. [`crate::artifact::ensure_artifact`] or
-    /// [`crate::download::download_with_progress`]). When the closure
-    /// returns, this bar's state flips to ✅ on `Ok` or ❌ on `Err`, and
-    /// the bar is abandoned so its final frame stays on screen.
+    /// The closure receives a `&ProgressBar`. Most callers won't use this
+    /// directly — prefer the higher-level helpers [`fetch`] and
+    /// [`stream_with_bar`] in this module, which adapt the lower-level
+    /// callback-based primitives ([`crate::artifact::download_artifact`]
+    /// and [`crate::download::stream_download`]) to a bar internally.
+    /// When the closure returns, this bar's state flips to ✅ on `Ok` or
+    /// ❌ on `Err`, and the bar is abandoned so its final frame stays on
+    /// screen.
     ///
     /// This is the recommended way to use a `DownloadBar` — callers should
     /// not need to touch the inner `ProgressBar` directly.
@@ -114,34 +117,19 @@ impl DownloadBar {
     }
 }
 
-/// Run a download function with an optional bar attached.
-///
-/// Mirrors [`DownloadBar::run`] but lets the caller pass `None` for the
-/// cache-hit path where no UI should appear. When `bar` is `None`, the
-/// closure receives a hidden `ProgressBar` and no state flip happens.
-///
-/// # Errors
-/// Returns whatever `Err` the closure produced, unchanged.
-pub fn run_with_optional_bar<F, T, E>(bar: Option<&DownloadBar>, f: F) -> Result<T, E>
-where
-    F: FnOnce(&ProgressBar) -> Result<T, E>,
-{
-    if let Some(b) = bar {
-        b.run(f)
-    } else {
-        f(&hidden_bar())
-    }
-}
-
 /// Build a progress callback that drives a [`ProgressBar`] from the
 /// `(downloaded, total)` events emitted by network primitives.
 ///
-/// The callback sets the bar's length from the first `Some(total)` it
-/// receives and updates its position on every chunk.
+/// `set_length` only fires on the first `Some(total)` we see — repeated
+/// calls each chunk would take indicatif's state lock unnecessarily.
 fn bar_progress(pb: &ProgressBar) -> impl FnMut(u64, Option<u64>) + '_ {
+    let mut length_set = false;
     move |downloaded, total| {
-        if let Some(t) = total {
-            pb.set_length(t);
+        if !length_set {
+            if let Some(t) = total {
+                pb.set_length(t);
+                length_set = true;
+            }
         }
         pb.set_position(downloaded);
     }
@@ -186,12 +174,14 @@ pub fn fetch(
 /// Stream a URL to `dest` with an optional bar; returns the SHA-256.
 ///
 /// Thin UI-aware wrapper over [`crate::download::stream_download`] for
-/// callers (toolchain tarballs, JRE tarballs) that don't need
-/// hash-verified atomic placement.
+/// callers (toolchain tarballs, JRE tarballs) that just need to drop
+/// bytes onto disk and get a hash back — no `expected_sha256`, no
+/// atomic-rename dance, no `freshly_downloaded` flag. The bar is wired
+/// up internally; pass `None` to suppress UI.
 ///
 /// # Errors
 /// Returns whatever [`crate::download::stream_download`] returns.
-pub fn stream_download(
+pub fn stream_with_bar(
     url: &str,
     dest: &std::path::Path,
     bar: Option<&DownloadBar>,

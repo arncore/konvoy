@@ -189,7 +189,7 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
         let (_tarball_guard, tmp_tarball) = temp_tarball(&toolchains_root, &prefix)?;
 
         let progress = konvoy_util::progress::new_download_bar(format!("Kotlin/Native {version}"));
-        let sha256 = konvoy_util::progress::stream_download(&url, &tmp_tarball, Some(&progress))
+        let sha256 = konvoy_util::progress::stream_with_bar(&url, &tmp_tarball, Some(&progress))
             .map_err(|e| map_download_err(version, e))?;
         eprintln!();
 
@@ -243,7 +243,7 @@ fn install_jre(version: &str) -> Result<(PathBuf, Option<String>), KonancError> 
     let (_tarball_guard, tmp_tarball) = temp_tarball(&toolchains_root, &prefix)?;
 
     let progress = konvoy_util::progress::new_download_bar(format!("JRE {version}"));
-    let sha256 = konvoy_util::progress::stream_download(&url, &tmp_tarball, Some(&progress))
+    let sha256 = konvoy_util::progress::stream_with_bar(&url, &tmp_tarball, Some(&progress))
         .map_err(|e| map_download_err(version, e))?;
     eprintln!();
 

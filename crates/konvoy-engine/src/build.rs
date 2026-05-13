@@ -67,7 +67,7 @@ pub struct BuildResult {
 /// hash instead of re-hashing the file. The pre-computed value MUST match
 /// what `konvoy_util::hash::sha256_file` would return for the same file —
 /// i.e. it must be a SHA-256 over the file contents. Maven dependency klibs
-/// satisfy this because `ensure_artifact` hashes the file bytes.
+/// satisfy this because `download_artifact` hashes the file bytes.
 ///
 /// Path-deps and plugin jars use `None` because their hash is computed at
 /// a different layer (path-dep source hash) or not at all (plugins are pinned
@@ -93,7 +93,7 @@ impl LibraryInput {
 
     /// Construct a library input with a pre-computed SHA-256 hash.
     ///
-    /// Used by Maven klib downloads where `ensure_artifact` already hashed
+    /// Used by Maven klib downloads where `download_artifact` already hashed
     /// the file bytes, so the cache-key code can reuse that value instead
     /// of re-reading the file.
     pub(crate) fn with_hash(path: PathBuf, sha256: String) -> Self {
@@ -307,7 +307,7 @@ pub(crate) fn resolve_build_context(
 
     // 7b. Resolve and download Maven dependency klibs for the current target.
     //     Each Maven klib comes back with a precomputed sha256 from
-    //     `ensure_artifact`, which the cache-key code reuses to skip rehashing.
+    //     `download_artifact`, which the cache-key code reuses to skip rehashing.
     let maven_klibs = resolve_maven_deps(&effective_lockfile, &target)?;
     library_inputs.extend(maven_klibs);
 
@@ -458,7 +458,7 @@ pub(crate) fn build_single(
             .library_inputs
             .iter()
             .map(|lib| match &lib.precomputed_sha256 {
-                // Reuse the hash that `ensure_artifact` already computed for
+                // Reuse the hash that `download_artifact` already computed for
                 // this file's bytes — it's value-equivalent to sha256_file.
                 Some(h) => Ok(h.clone()),
                 None => konvoy_util::hash::sha256_file(&lib.path).map_err(EngineError::from),
@@ -696,7 +696,7 @@ pub(crate) fn lockfile_toml_content(lockfile: &Lockfile) -> Result<String, Engin
 /// SHA-256 hash, and returns the list of klib inputs to pass to the build.
 ///
 /// Each returned [`LibraryInput`] carries the file path plus the SHA-256 of
-/// its contents (produced by `ensure_artifact`), so the cache-key code does
+/// its contents (produced by `download_artifact`), so the cache-key code does
 /// not rehash the file.
 ///
 /// Only the klib for the current build target is downloaded (lazy download).
@@ -839,7 +839,7 @@ pub(crate) fn resolve_maven_deps(
     klib_inputs.into_iter().collect()
 }
 
-/// Run `ensure_artifact` for a single prepared klib. Uses the supplied
+/// Run `download_artifact` for a single prepared klib. Uses the supplied
 /// progress bar when present (download path); silently uses a hidden bar
 /// when absent (cache-hit path that needs only a hash re-verify).
 fn download_one_klib(
@@ -855,19 +855,14 @@ fn download_one_klib(
         maybe_bar,
     )
     .map_err(|e| EngineError::LibraryDownloadFailed {
-        name: dep_name.clone(),
+        name: dep_name,
         url: p.url.clone(),
         message: e.to_string(),
     })?;
-    if result.sha256 != *p.expected_sha256 {
-        return Err(EngineError::LibraryHashMismatch {
-            name: dep_name,
-            expected: p.expected_sha256.to_owned(),
-            actual: result.sha256,
-        });
-    }
-    // Carry the freshly-verified hash through so `build_single` can reuse
-    // it for the cache key without re-reading the file.
+    // `progress::fetch` already enforces `expected_sha256` (via
+    // `check_cached` on hit, `download_artifact` on miss), so `result.sha256`
+    // is guaranteed to match. Carry the freshly-verified hash through so
+    // `build_single` can reuse it for the cache key without re-reading.
     Ok(LibraryInput::with_hash(result.path, result.sha256))
 }
 
@@ -4755,7 +4750,7 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
 
     #[test]
     fn library_input_with_hash_carries_both_path_and_hash() {
-        // `with_hash` is used by Maven downloads where `ensure_artifact`
+        // `with_hash` is used by Maven downloads where `download_artifact`
         // already hashed the file — the cache-key code reuses that value.
         let p = PathBuf::from("/tmp/dep.klib");
         let h = "deadbeef".to_owned();
