@@ -22,12 +22,12 @@ const DEFAULT_PREFIX_WIDTH: usize = 36;
 /// position is a 2-column emoji).
 const BAR_LOGICAL_WIDTH: usize = 20;
 
-/// State indicator emoji shown in the `{msg}` slot at the start of each row.
+/// State indicator emoji rendered by the `{indicator}` template key.
 const IN_PROGRESS_MARKER: &str = "\u{2699}\u{FE0F}"; // ⚙️ (gear)
 const SUCCESS_MARKER: &str = "\u{2705}"; // ✅
 const FAILURE_MARKER: &str = "\u{274C}"; // ❌
 
-/// State values driving the bar's trail-character rendering.
+/// State values driving the indicator + trail-glyph rendering.
 const STATE_IN_PROGRESS: u8 = 0;
 const STATE_SUCCESS: u8 = 1;
 const STATE_FAILURE: u8 = 2;
@@ -39,24 +39,47 @@ const CRASH: &str = "\u{1F4A5}"; // 💥 crash glyph drawn over the truck on fai
 const DUST_TRAIL: &str = "\u{1F4A8}"; // 💨 dust while the truck is moving
 const DELIVERED_CARGO: &str = "\u{1F7E9}"; // 🟩 green block left after delivery
 
-/// Handle bundling a bar with the atomic flag that drives its trail glyph.
+/// Tick interval driving the indicator's redraw cadence. 250ms is half the
+/// 500ms blink period (computed inside [`write_indicator`]) so each on/off
+/// boundary is hit at least once even with indicatif's 20Hz draw throttle.
+const BLINK_TICK: Duration = Duration::from_millis(250);
+
+/// Handle bundling a bar with the atomic flag that drives its glyph state.
 ///
 /// Returned by [`add_download_bar`] / [`new_download_bar`]. The engine layer
-/// keeps the handle alive for the bar's lifetime and flips state via
-/// [`DownloadBar::mark_success`] / [`DownloadBar::mark_failure`] once the
-/// download result is known. The custom bar renderer reads the flag on each
-/// redraw to decide whether to draw dust (in progress / failure) or cargo
-/// (success) behind the truck.
+/// finalises each bar via [`DownloadBar::finish`] (or the lower-level
+/// [`DownloadBar::mark_success`] / [`DownloadBar::mark_failure`]) once the
+/// download result is known.
 pub struct DownloadBar {
-    /// The underlying indicatif bar — pass `&bar.bar` to functions that
-    /// expect `&ProgressBar` (like [`crate::download::download_with_progress`]).
-    pub bar: ProgressBar,
+    bar: ProgressBar,
     state: Arc<AtomicU8>,
 }
 
 impl DownloadBar {
+    /// Access the underlying `ProgressBar` for functions that take
+    /// `&ProgressBar` (e.g. [`crate::download::download_with_progress`] and
+    /// [`crate::artifact::ensure_artifact`]).
+    #[must_use]
+    pub fn inner(&self) -> &ProgressBar {
+        &self.bar
+    }
+
+    /// Finalise the bar based on a download result: success on `Ok`,
+    /// failure on `Err`. Returns the result unchanged so callers can chain
+    /// `?` on it.
+    ///
+    /// # Errors
+    /// Returns whatever `Err` was passed in, unchanged.
+    pub fn finish<T, E>(&self, result: Result<T, E>) -> Result<T, E> {
+        match &result {
+            Ok(_) => self.mark_success(),
+            Err(_) => self.mark_failure(),
+        }
+        result
+    }
+
     /// Flip state to success (✅ + 🟩 cargo) AND stop the bar so its final
-    /// frame is preserved. Order matters: the state has to be set before
+    /// frame is preserved. Order matters: state must be set before
     /// `abandon` halts further redraws.
     pub fn mark_success(&self) {
         self.state.store(STATE_SUCCESS, Ordering::Relaxed);
@@ -70,9 +93,6 @@ impl DownloadBar {
         self.bar.abandon();
     }
 }
-
-/// Interval at which bars redraw to drive the blinking-gear indicator.
-const BLINK_TICK: Duration = Duration::from_millis(250);
 
 /// Build a styled standalone [`DownloadBar`] for an HTTP download.
 ///
@@ -111,13 +131,6 @@ pub fn add_download_bar(
 #[must_use]
 pub fn hidden_bar() -> ProgressBar {
     ProgressBar::hidden()
-}
-
-/// Switch a bar to spinner mode (no known total).
-///
-/// Call from the downloader when the response has no `Content-Length`.
-pub fn switch_to_spinner(pb: &ProgressBar) {
-    pb.set_style(spinner_style(DEFAULT_PREFIX_WIDTH));
 }
 
 /// Custom `{elapsed_ms}` formatter — millisecond-precision elapsed time.
@@ -258,15 +271,6 @@ fn write_indicator(state: &ProgressState, w: &mut dyn Write, current_state: u8) 
     let _ = write!(w, "{glyph}");
 }
 
-fn spinner_style(prefix_width: usize) -> ProgressStyle {
-    let template = format!(
-        "  {{msg}}  {{prefix:<{prefix_width}.bold}} {{bytes:>10.cyan}} {{bytes_per_sec:>12.yellow}} {{elapsed_ms:>7.dim}}"
-    );
-    ProgressStyle::with_template(&template)
-        .unwrap_or_else(|_| ProgressStyle::default_spinner())
-        .with_key("elapsed_ms", write_elapsed_ms)
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -275,7 +279,7 @@ mod tests {
     #[test]
     fn new_download_bar_sets_prefix() {
         let bar = new_download_bar("test-prefix");
-        assert_eq!(bar.bar.prefix(), "test-prefix");
+        assert_eq!(bar.inner().prefix(), "test-prefix");
     }
 
     #[test]
@@ -295,7 +299,7 @@ mod tests {
     fn add_download_bar_attaches_to_multiprogress() {
         let mp = MultiProgress::new();
         let bar = add_download_bar(&mp, "child", 32);
-        assert_eq!(bar.bar.prefix(), "child");
+        assert_eq!(bar.inner().prefix(), "child");
         assert_eq!(bar.state.load(Ordering::Relaxed), STATE_IN_PROGRESS);
     }
 
@@ -314,9 +318,18 @@ mod tests {
     }
 
     #[test]
-    fn switch_to_spinner_changes_style() {
-        let bar = new_download_bar("a");
-        switch_to_spinner(&bar.bar);
-        bar.bar.set_position(100);
+    fn finish_ok_flips_to_success_and_returns_result() {
+        let bar = new_download_bar("x");
+        let result: Result<u32, &str> = bar.finish(Ok(42));
+        assert_eq!(result, Ok(42));
+        assert_eq!(bar.state.load(Ordering::Relaxed), STATE_SUCCESS);
+    }
+
+    #[test]
+    fn finish_err_flips_to_failure_and_returns_result() {
+        let bar = new_download_bar("x");
+        let result: Result<u32, &str> = bar.finish(Err("boom"));
+        assert_eq!(result, Err("boom"));
+        assert_eq!(bar.state.load(Ordering::Relaxed), STATE_FAILURE);
     }
 }

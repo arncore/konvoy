@@ -42,15 +42,9 @@ pub fn download_with_progress(
     dest: &Path,
     progress: &ProgressBar,
 ) -> Result<String, UtilError> {
-    download_inner(url, dest, progress)
     // Caller (engine layer holding a `DownloadBar`) finalises the bar via
-    // `DownloadBar::mark_success` / `mark_failure`, which flips state THEN
-    // calls `abandon()` — order matters so the final frame reflects state.
-}
-
-/// Inner download routine. Drives the byte stream and bar position; wrapper
-/// above flips the state indicator (✅/❌) once the result is known.
-fn download_inner(url: &str, dest: &Path, progress: &ProgressBar) -> Result<String, UtilError> {
+    // `DownloadBar::finish` after this returns — state must flip BEFORE
+    // `abandon()` halts redraws so the final frame reflects success/failure.
     let agent = http_agent(600);
 
     let response = agent.get(url).call().map_err(|e| UtilError::Download {
@@ -65,12 +59,13 @@ fn download_inner(url: &str, dest: &Path, progress: &ProgressBar) -> Result<Stri
 
     // The bar's `position` tracks the actual downloaded byte count so the
     // template's `{bytes}` and `{bytes_per_sec}` fields read correctly. The
-    // right-to-left fill effect is handled by the custom `{kbar}` renderer
-    // in `progress.rs`, which computes its edge index from `(len - pos)`.
+    // right-to-left fill is handled inside the custom `{kbar}` renderer
+    // (`progress.rs::render_truck_bar`), which computes its edge from
+    // `(len - pos)`. If `Content-Length` is missing, `set_length` is never
+    // called and the renderer's `len == 0` branch shows an all-road bar
+    // with the truck (or crash glyph on failure) at the right edge.
     if let Some(total) = content_length.filter(|t| *t > 0) {
         progress.set_length(total);
-    } else {
-        crate::progress::switch_to_spinner(progress);
     }
 
     let mut body = response.into_body();

@@ -772,22 +772,19 @@ pub(crate) fn resolve_maven_deps(
 
             // Download (or use cached) and verify hash.
             let progress = konvoy_util::progress::new_download_bar(format!("{dep_name} {version}"));
-            let ensure_result = konvoy_util::artifact::ensure_artifact(
-                &url,
-                &dest,
-                Some(expected_sha256),
-                &dep_name,
-                &progress.bar,
-            );
-            match &ensure_result {
-                Ok(_) => progress.mark_success(),
-                Err(_) => progress.mark_failure(),
-            }
-            let result = ensure_result.map_err(|e| EngineError::LibraryDownloadFailed {
-                name: dep_name.clone(),
-                url: url.clone(),
-                message: e.to_string(),
-            })?;
+            let result = progress
+                .finish(konvoy_util::artifact::ensure_artifact(
+                    &url,
+                    &dest,
+                    Some(expected_sha256),
+                    &dep_name,
+                    progress.inner(),
+                ))
+                .map_err(|e| EngineError::LibraryDownloadFailed {
+                    name: dep_name.clone(),
+                    url: url.clone(),
+                    message: e.to_string(),
+                })?;
 
             // Double-check the hash matches the lockfile expectation.
             if result.sha256 != *expected_sha256 {

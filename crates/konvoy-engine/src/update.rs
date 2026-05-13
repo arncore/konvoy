@@ -139,20 +139,24 @@ fn download_target_klib(
     let dest = coord.cache_path(cache_root);
     let label = format!("{}:{}", dep.name, target);
 
-    let ensure_result =
-        konvoy_util::artifact::ensure_artifact(&url, &dest, None, &label, &progress.bar);
-    match &ensure_result {
-        Ok(_) => progress.mark_success(),
-        Err(_) => progress.mark_failure(),
-    }
-    let result = ensure_result.map_err(|e| match e {
-        konvoy_util::error::UtilError::Download { message } => EngineError::LibraryDownloadFailed {
-            name: dep.name.clone(),
-            url: url.clone(),
-            message,
-        },
-        other => EngineError::Util(other),
-    })?;
+    let result = progress
+        .finish(konvoy_util::artifact::ensure_artifact(
+            &url,
+            &dest,
+            None,
+            &label,
+            progress.inner(),
+        ))
+        .map_err(|e| match e {
+            konvoy_util::error::UtilError::Download { message } => {
+                EngineError::LibraryDownloadFailed {
+                    name: dep.name.clone(),
+                    url: url.clone(),
+                    message,
+                }
+            }
+            other => EngineError::Util(other),
+        })?;
 
     Ok((target, result.sha256))
 }

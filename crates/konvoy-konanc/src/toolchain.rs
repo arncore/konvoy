@@ -189,13 +189,13 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
         let (_tarball_guard, tmp_tarball) = temp_tarball(&toolchains_root, &prefix)?;
 
         let progress = konvoy_util::progress::new_download_bar(format!("Kotlin/Native {version}"));
-        let download_result =
-            konvoy_util::download::download_with_progress(&url, &tmp_tarball, &progress.bar);
-        match &download_result {
-            Ok(_) => progress.mark_success(),
-            Err(_) => progress.mark_failure(),
-        }
-        let sha256 = download_result.map_err(|e| map_download_err(version, e))?;
+        let sha256 = progress
+            .finish(konvoy_util::download::download_with_progress(
+                &url,
+                &tmp_tarball,
+                progress.inner(),
+            ))
+            .map_err(|e| map_download_err(version, e))?;
 
         let (_extract_guard, tmp_extract) = temp_extract_dir(&toolchains_root, &prefix)?;
         extract_tarball(&tmp_tarball, &tmp_extract, "Kotlin/Native", version)?;
@@ -247,13 +247,13 @@ fn install_jre(version: &str) -> Result<(PathBuf, Option<String>), KonancError> 
     let (_tarball_guard, tmp_tarball) = temp_tarball(&toolchains_root, &prefix)?;
 
     let progress = konvoy_util::progress::new_download_bar(format!("JRE {version}"));
-    let download_result =
-        konvoy_util::download::download_with_progress(&url, &tmp_tarball, &progress.bar);
-    match &download_result {
-        Ok(_) => progress.mark_success(),
-        Err(_) => progress.mark_failure(),
-    }
-    let sha256 = download_result.map_err(|e| map_download_err(version, e))?;
+    let sha256 = progress
+        .finish(konvoy_util::download::download_with_progress(
+            &url,
+            &tmp_tarball,
+            progress.inner(),
+        ))
+        .map_err(|e| map_download_err(version, e))?;
 
     let (_extract_guard, tmp_extract) = temp_extract_dir(&toolchains_root, &prefix)?;
     extract_tarball(&tmp_tarball, &tmp_extract, "JRE", version)?;

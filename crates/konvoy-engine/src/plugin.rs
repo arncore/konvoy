@@ -175,19 +175,15 @@ pub fn ensure_plugin_artifacts(
                 "{} {}",
                 artifact.plugin_name, artifact.maven_coord.version
             ));
-            let ensure_result = konvoy_util::artifact::ensure_artifact(
-                &artifact.url,
-                &artifact.cache_path,
-                expected_hash,
-                &artifact.plugin_name,
-                &progress.bar,
-            );
-            match &ensure_result {
-                Ok(_) => progress.mark_success(),
-                Err(_) => progress.mark_failure(),
-            }
-            let util_result =
-                ensure_result.map_err(|e| map_download_err(&artifact.plugin_name, e))?;
+            let util_result = progress
+                .finish(konvoy_util::artifact::ensure_artifact(
+                    &artifact.url,
+                    &artifact.cache_path,
+                    expected_hash,
+                    &artifact.plugin_name,
+                    progress.inner(),
+                ))
+                .map_err(|e| map_download_err(&artifact.plugin_name, e))?;
 
             Ok(PluginArtifactResult {
                 plugin_name: artifact.plugin_name.clone(),
