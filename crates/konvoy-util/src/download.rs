@@ -55,7 +55,14 @@ pub fn download_with_progress(
         .and_then(|s| s.parse().ok());
 
     match content_length {
-        Some(total) if total > 0 => progress.set_length(total),
+        Some(total) if total > 0 => {
+            progress.set_length(total);
+            // Force the bar to redraw with the new length before the download
+            // races to completion. `set_length` alone does not trigger a redraw
+            // on `MultiProgress` children at indicatif's 20Hz throttle, so a
+            // sub-50ms download can finish before the length ever renders.
+            progress.set_position(0);
+        }
         _ => crate::progress::switch_to_spinner(progress),
     }
 
