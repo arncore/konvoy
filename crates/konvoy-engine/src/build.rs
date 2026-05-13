@@ -771,12 +771,13 @@ pub(crate) fn resolve_maven_deps(
             let url = coord.to_url(konvoy_util::maven::MAVEN_CENTRAL);
 
             // Download (or use cached) and verify hash.
+            let progress = konvoy_util::progress::new_download_bar(format!("{dep_name} {version}"));
             let result = konvoy_util::artifact::ensure_artifact(
                 &url,
                 &dest,
                 Some(expected_sha256),
                 &dep_name,
-                version,
+                &progress,
             )
             .map_err(|e| EngineError::LibraryDownloadFailed {
                 name: dep_name.clone(),

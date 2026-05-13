@@ -171,12 +171,16 @@ pub fn ensure_plugin_artifacts(
         .map(|artifact| {
             let expected_hash = find_lockfile_hash(lockfile, &artifact.plugin_name);
 
+            let progress = konvoy_util::progress::new_download_bar(format!(
+                "{} {}",
+                artifact.plugin_name, artifact.maven_coord.version
+            ));
             let util_result = konvoy_util::artifact::ensure_artifact(
                 &artifact.url,
                 &artifact.cache_path,
                 expected_hash,
                 &artifact.plugin_name,
-                &artifact.maven_coord.version,
+                &progress,
             )
             .map_err(|e| map_download_err(&artifact.plugin_name, e))?;
 

@@ -17,6 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
+use indicatif::MultiProgress;
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile};
@@ -60,37 +61,29 @@ fn placeholder_lock(dep: &ResolvedMavenDep, maven_coord: &str) -> DependencyLock
     }
 }
 
-/// Result of downloading one dep across all known targets.
-struct DownloadedDep {
-    lock: DependencyLock,
-    /// Pre-formatted multi-line summary; printed sequentially in dep order
-    /// after parallel work completes so the user sees deterministic output.
-    summary: String,
-}
-
 /// Download a Maven dep's klib for every known target and produce its lock entry.
 ///
 /// Klibs are written directly into the shared Maven cache at
 /// `~/.konvoy/cache/maven/.../<artifact>-<version>.klib` so subsequent
 /// `konvoy build` runs reuse the verified file. Per-target downloads run in
-/// parallel via rayon; logging is deferred — the caller prints `summary` in
-/// dep order so concurrent downloads do not reshuffle stderr between runs.
-fn download_dep(dep: &ResolvedMavenDep, cache_root: &Path) -> Result<DownloadedDep, EngineError> {
+/// parallel via rayon and each renders its own progress bar under `multi` so
+/// the user sees a live vertical stack of bars updating concurrently.
+fn download_dep(
+    dep: &ResolvedMavenDep,
+    cache_root: &Path,
+    multi: &MultiProgress,
+) -> Result<DependencyLock, EngineError> {
     let known_targets = konvoy_targets::KNOWN_TARGETS;
     let maven_coord = dep.key();
 
     let target_results: Vec<Result<(konvoy_targets::Target, String), EngineError>> = known_targets
         .par_iter()
-        .map(|&target| download_target_klib(dep, target, cache_root))
+        .map(|&target| download_target_klib(dep, target, cache_root, multi))
         .collect();
 
     let mut targets_map: BTreeMap<String, String> = BTreeMap::new();
-    let mut summary_lines: Vec<String> = Vec::with_capacity(known_targets.len() + 1);
-    summary_lines.push(format!("  Resolving {} {}...", dep.name, dep.version));
     for result in target_results {
         let (target, sha256) = result?;
-        let display_hash = crate::common::truncate_hash(&sha256, 16);
-        summary_lines.push(format!("    {target}: {display_hash}..."));
         targets_map.insert(target.to_string(), sha256);
     }
 
@@ -101,30 +94,28 @@ fn download_dep(dep: &ResolvedMavenDep, cache_root: &Path) -> Result<DownloadedD
         .join("\n");
     let source_hash = konvoy_util::hash::sha256_bytes(hash_input.as_bytes());
 
-    Ok(DownloadedDep {
-        lock: DependencyLock {
-            name: dep.name.clone(),
-            source: DepSource::Maven {
-                version: dep.version.clone(),
-                maven: maven_coord,
-                targets: targets_map,
-                required_by: dep.required_by.clone(),
-                classifier: dep.classifier.clone(),
-            },
-            source_hash,
+    Ok(DependencyLock {
+        name: dep.name.clone(),
+        source: DepSource::Maven {
+            version: dep.version.clone(),
+            maven: maven_coord,
+            targets: targets_map,
+            required_by: dep.required_by.clone(),
+            classifier: dep.classifier.clone(),
         },
-        summary: summary_lines.join("\n"),
+        source_hash,
     })
 }
 
 /// Download a single dep's klib for one target and return `(target, sha256)`.
 ///
 /// Writes the klib to the shared Maven cache so `konvoy build` can reuse it
-/// without re-downloading.
+/// without re-downloading. Renders its own bar in `multi`.
 fn download_target_klib(
     dep: &ResolvedMavenDep,
     target: konvoy_targets::Target,
     cache_root: &Path,
+    multi: &MultiProgress,
 ) -> Result<(konvoy_targets::Target, String), EngineError> {
     let maven_suffix = target.to_maven_suffix();
     let per_target_artifact_id = format!("{}-{}", dep.artifact_id, maven_suffix);
@@ -141,21 +132,23 @@ fn download_target_klib(
     let url = coord.to_url(MAVEN_CENTRAL);
     let dest = coord.cache_path(cache_root);
 
-    let result = konvoy_util::artifact::ensure_artifact(
-        &url,
-        &dest,
-        None,
-        &format!("{}:{}", dep.name, target),
-        &dep.version,
-    )
-    .map_err(|e| match e {
-        konvoy_util::error::UtilError::Download { message } => EngineError::LibraryDownloadFailed {
-            name: dep.name.clone(),
-            url: url.clone(),
-            message,
-        },
-        other => EngineError::Util(other),
-    })?;
+    let progress = konvoy_util::progress::add_download_bar(
+        multi,
+        format!("{} {} [{}]", dep.name, dep.version, target),
+    );
+    let label = format!("{}:{}", dep.name, target);
+
+    let result = konvoy_util::artifact::ensure_artifact(&url, &dest, None, &label, &progress)
+        .map_err(|e| match e {
+            konvoy_util::error::UtilError::Download { message } => {
+                EngineError::LibraryDownloadFailed {
+                    name: dep.name.clone(),
+                    url: url.clone(),
+                    message,
+                }
+            }
+            other => EngineError::Util(other),
+        })?;
 
     Ok((target, result.sha256))
 }
@@ -270,23 +263,29 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
     // verified klibs without re-downloading.
     let cache_root: PathBuf = crate::plugin::maven_cache_root()?;
 
-    // Download deps in parallel; per-target downloads are parallel within each.
-    let download_results: Vec<Result<(usize, DownloadedDep), EngineError>> = needs_download
+    // Hosts all per-(dep, target) progress bars in a vertical stack on stderr.
+    // Indicatif handles interleaving from rayon workers safely.
+    let multi = MultiProgress::new();
+
+    // Download deps in parallel; per-target downloads are also parallel within
+    // each. Each (dep, target) renders its own live progress bar under `multi`.
+    let download_results: Vec<Result<(usize, DependencyLock), EngineError>> = needs_download
         .par_iter()
         .map(|(idx, dep)| {
-            let downloaded = download_dep(dep, &cache_root)?;
-            Ok((*idx, downloaded))
+            let lock = download_dep(dep, &cache_root, &multi)?;
+            Ok((*idx, lock))
         })
         .collect();
 
-    // Apply results in original order so both the lockfile and stderr output
-    // are deterministic across runs (parallel downloads finish in arbitrary
-    // order, but the user sees a stable summary).
+    multi.clear().ok();
+
+    // Apply results in original order so the lockfile output is deterministic
+    // (parallel downloads finish in arbitrary order, but the on-disk layout
+    // remains stable).
     for result in download_results {
-        let (idx, downloaded) = result?;
-        eprintln!("{}", downloaded.summary);
+        let (idx, lock) = result?;
         if let Some(slot) = new_dep_locks.get_mut(idx) {
-            *slot = downloaded.lock;
+            *slot = lock;
         }
     }
 

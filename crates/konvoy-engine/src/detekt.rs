@@ -114,8 +114,9 @@ pub fn ensure_detekt(
     let jar = detekt_jar_path(version)?;
     let url = detekt_download_url(version);
 
+    let progress = konvoy_util::progress::new_download_bar(format!("detekt {version}"));
     let result =
-        konvoy_util::artifact::ensure_artifact(&url, &jar, expected_sha256, "detekt", version)
+        konvoy_util::artifact::ensure_artifact(&url, &jar, expected_sha256, "detekt", &progress)
             .map_err(|e| map_download_err(version, e))?;
 
     Ok((result.path, result.sha256))

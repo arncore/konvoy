@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use indicatif::ProgressBar;
+
 use crate::error::UtilError;
 
 /// Result of ensuring an artifact is available locally.
@@ -82,7 +84,7 @@ pub fn ensure_artifact(
     dest: &Path,
     expected_sha256: Option<&str>,
     label: &str,
-    version: &str,
+    progress: &ProgressBar,
 ) -> Result<ArtifactResult, UtilError> {
     // 1. If the file already exists, verify its hash and return early.
     if dest.exists() {
@@ -121,7 +123,7 @@ pub fn ensure_artifact(
         .unwrap_or_else(|| PathBuf::from(&tmp_name));
 
     // Download to temp file.
-    let download_hash = crate::download::download_with_progress(url, &tmp_path, label, version)?;
+    let download_hash = crate::download::download_with_progress(url, &tmp_path, progress)?;
 
     // Verify hash of downloaded file before placing it.
     if let Some(expected) = expected_sha256 {
@@ -239,7 +241,7 @@ mod tests {
             &dest,
             Some(&expected_hash),
             "test",
-            "1.0.0",
+            &crate::progress::hidden_bar(),
         )
         .unwrap();
 
@@ -260,7 +262,7 @@ mod tests {
             &dest,
             Some(bogus_hash),
             "test",
-            "1.0.0",
+            &crate::progress::hidden_bar(),
         );
 
         assert!(result.is_err());
@@ -296,7 +298,7 @@ mod tests {
             &dest,
             None,
             "test",
-            "1.0.0",
+            &crate::progress::hidden_bar(),
         )
         .unwrap();
 
@@ -314,7 +316,7 @@ mod tests {
             &dest,
             None,
             "test",
-            "1.0.0",
+            &crate::progress::hidden_bar(),
         );
 
         assert!(result.is_err());
