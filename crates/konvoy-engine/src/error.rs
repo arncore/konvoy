@@ -19,10 +19,6 @@ pub enum EngineError {
     #[error("invalid maven coordinate `{coordinate}`: {reason}")]
     InvalidMavenCoordinate { coordinate: String, reason: String },
 
-    /// A dependency declaration is missing a required field.
-    #[error("dependency `{name}` is missing `{field}` field")]
-    MissingDependencyField { name: String, field: &'static str },
-
     /// A TOML document (lockfile, metadata, etc.) failed to serialize.
     #[error("failed to serialize {what}: {source}")]
     TomlSerialize {
@@ -243,28 +239,6 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("org.example:no-version:"), "got: {msg}");
         assert!(msg.contains("expected `groupId:artifactId`"), "got: {msg}");
-    }
-
-    #[test]
-    fn missing_dependency_field_display_includes_name_and_field() {
-        let err = EngineError::MissingDependencyField {
-            name: "ktor-core".to_owned(),
-            field: "version",
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("ktor-core"), "got: {msg}");
-        assert!(msg.contains("version"), "got: {msg}");
-    }
-
-    #[test]
-    fn missing_dependency_field_static_field_is_preserved() {
-        // The `field: &'static str` typing means callers can't accidentally
-        // pass a runtime string — pin that with a test the compiler enforces.
-        let err = EngineError::MissingDependencyField {
-            name: "x".to_owned(),
-            field: "maven",
-        };
-        assert!(err.to_string().contains("maven"));
     }
 
     #[test]

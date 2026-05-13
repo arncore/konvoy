@@ -77,10 +77,10 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
     }
 
     // 2. Collect Maven deps (those with `maven` + `version` set).
-    let maven_deps: Vec<_> = manifest
+    let maven_deps: Vec<(&String, &str, &str)> = manifest
         .dependencies
         .iter()
-        .filter(|(_, spec)| spec.is_maven())
+        .filter_map(|(name, spec)| spec.as_maven_coord().map(|(m, v)| (name, m, v)))
         .collect();
 
     if maven_deps.is_empty() {
@@ -90,30 +90,14 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
 
     // 3. Build the set of direct deps with their maven coordinates.
     let mut direct_deps: Vec<ResolvedMavenDep> = Vec::new();
-    for (dep_name, dep_spec) in &maven_deps {
-        let maven = dep_spec
-            .maven
-            .as_ref()
-            .ok_or_else(|| EngineError::MissingDependencyField {
-                name: (*dep_name).clone(),
-                field: "maven",
-            })?;
-        let version =
-            dep_spec
-                .version
-                .as_ref()
-                .ok_or_else(|| EngineError::MissingDependencyField {
-                    name: (*dep_name).clone(),
-                    field: "version",
-                })?;
-
+    for (dep_name, maven, version) in &maven_deps {
         let (group_id, artifact_id) = crate::common::split_maven_coordinate(maven)?;
 
         direct_deps.push(ResolvedMavenDep {
             name: (*dep_name).clone(),
             group_id: group_id.to_owned(),
             artifact_id: artifact_id.to_owned(),
-            version: version.clone(),
+            version: (*version).to_owned(),
             required_by: Vec::new(),
             classifier: None,
         });
