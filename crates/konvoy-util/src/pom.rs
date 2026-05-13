@@ -301,9 +301,6 @@ pub fn pom_url(group_id: &str, artifact_id: &str, version: &str) -> String {
     crate::maven::maven_artifact_url(group_id, artifact_id, version, "pom")
 }
 
-// Cache layout v1: <konvoy_home>/cache/pom/<group_path>/<artifact>-<version>.{pom,module,module.404}.
-// If the on-disk format ever changes, bump to v2 by introducing a subdirectory.
-
 /// Build the on-disk cache path for a Maven artifact metadata file.
 ///
 /// Layout matches the contract in CLAUDE.md:

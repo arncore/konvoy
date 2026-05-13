@@ -15,7 +15,7 @@
 //!    populated for transitive deps and `classifier` for non-primary artifacts.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
@@ -60,21 +60,30 @@ fn placeholder_lock(dep: &ResolvedMavenDep, maven_coord: &str) -> DependencyLock
     }
 }
 
+/// Result of downloading one dep across all known targets.
+struct DownloadedDep {
+    lock: DependencyLock,
+    /// Pre-formatted multi-line summary; printed sequentially in dep order
+    /// after parallel work completes so the user sees deterministic output.
+    summary: String,
+}
+
 /// Download a Maven dep's klib for every known target and produce its lock entry.
 ///
-/// Per-target downloads run in parallel via rayon; the final summary
-/// `eprintln!` is emitted once per dep so concurrent dep downloads don't
-/// interleave on stderr in confusing ways.
-fn download_dep(dep: &ResolvedMavenDep, tmp_base: &Path) -> Result<DependencyLock, EngineError> {
+/// Klibs are written directly into the shared Maven cache at
+/// `~/.konvoy/cache/maven/.../<artifact>-<version>.klib` so subsequent
+/// `konvoy build` runs reuse the verified file. Per-target downloads run in
+/// parallel via rayon; logging is deferred — the caller prints `summary` in
+/// dep order so concurrent downloads do not reshuffle stderr between runs.
+fn download_dep(dep: &ResolvedMavenDep, cache_root: &Path) -> Result<DownloadedDep, EngineError> {
     let known_targets = konvoy_targets::KNOWN_TARGETS;
     let maven_coord = dep.key();
 
     let target_results: Vec<Result<(konvoy_targets::Target, String), EngineError>> = known_targets
         .par_iter()
-        .map(|&target| download_target_klib(dep, target, tmp_base))
+        .map(|&target| download_target_klib(dep, target, cache_root))
         .collect();
 
-    // Build a deterministic target hash map and a multi-line summary string.
     let mut targets_map: BTreeMap<String, String> = BTreeMap::new();
     let mut summary_lines: Vec<String> = Vec::with_capacity(known_targets.len() + 1);
     summary_lines.push(format!("  Resolving {} {}...", dep.name, dep.version));
@@ -84,8 +93,6 @@ fn download_dep(dep: &ResolvedMavenDep, tmp_base: &Path) -> Result<DependencyLoc
         summary_lines.push(format!("    {target}: {display_hash}..."));
         targets_map.insert(target.to_string(), sha256);
     }
-    // Single eprintln for the whole dep so parallel deps don't interleave.
-    eprintln!("{}", summary_lines.join("\n"));
 
     let hash_input: String = targets_map
         .iter()
@@ -94,24 +101,30 @@ fn download_dep(dep: &ResolvedMavenDep, tmp_base: &Path) -> Result<DependencyLoc
         .join("\n");
     let source_hash = konvoy_util::hash::sha256_bytes(hash_input.as_bytes());
 
-    Ok(DependencyLock {
-        name: dep.name.clone(),
-        source: DepSource::Maven {
-            version: dep.version.clone(),
-            maven: maven_coord,
-            targets: targets_map,
-            required_by: dep.required_by.clone(),
-            classifier: dep.classifier.clone(),
+    Ok(DownloadedDep {
+        lock: DependencyLock {
+            name: dep.name.clone(),
+            source: DepSource::Maven {
+                version: dep.version.clone(),
+                maven: maven_coord,
+                targets: targets_map,
+                required_by: dep.required_by.clone(),
+                classifier: dep.classifier.clone(),
+            },
+            source_hash,
         },
-        source_hash,
+        summary: summary_lines.join("\n"),
     })
 }
 
 /// Download a single dep's klib for one target and return `(target, sha256)`.
+///
+/// Writes the klib to the shared Maven cache so `konvoy build` can reuse it
+/// without re-downloading.
 fn download_target_klib(
     dep: &ResolvedMavenDep,
     target: konvoy_targets::Target,
-    tmp_base: &Path,
+    cache_root: &Path,
 ) -> Result<(konvoy_targets::Target, String), EngineError> {
     let maven_suffix = target.to_maven_suffix();
     let per_target_artifact_id = format!("{}-{}", dep.artifact_id, maven_suffix);
@@ -126,14 +139,11 @@ fn download_target_klib(
         coord = coord.with_classifier(cls);
     }
     let url = coord.to_url(MAVEN_CENTRAL);
-
-    // Use a target- and dep-unique tmp filename so parallel downloads from
-    // different deps cannot collide on the same file.
-    let tmp_file = tmp_base.join(format!("{}-{}", dep.name, coord.filename()));
+    let dest = coord.cache_path(cache_root);
 
     let result = konvoy_util::artifact::ensure_artifact(
         &url,
-        &tmp_file,
+        &dest,
         None,
         &format!("{}:{}", dep.name, target),
         &dep.version,
@@ -146,8 +156,6 @@ fn download_target_klib(
         },
         other => EngineError::Util(other),
     })?;
-
-    let _ = std::fs::remove_file(&tmp_file);
 
     Ok((target, result.sha256))
 }
@@ -258,27 +266,27 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
         }
     }
 
-    // One shared tmp dir for the whole update; cleaned up at the end.
-    let pid = std::process::id();
-    let tmp_base = std::env::temp_dir().join(format!("konvoy-update-{pid}"));
-    konvoy_util::fs::ensure_dir(&tmp_base)?;
+    // Download into the shared Maven cache so `konvoy build` can reuse the
+    // verified klibs without re-downloading.
+    let cache_root: PathBuf = crate::plugin::maven_cache_root()?;
 
     // Download deps in parallel; per-target downloads are parallel within each.
-    let download_results: Vec<Result<(usize, DependencyLock), EngineError>> = needs_download
+    let download_results: Vec<Result<(usize, DownloadedDep), EngineError>> = needs_download
         .par_iter()
         .map(|(idx, dep)| {
-            let lock = download_dep(dep, &tmp_base)?;
-            Ok((*idx, lock))
+            let downloaded = download_dep(dep, &cache_root)?;
+            Ok((*idx, downloaded))
         })
         .collect();
 
-    konvoy_util::fs::remove_dir_all_if_exists(&tmp_base)?;
-
-    // Apply results in original order so the lockfile output is deterministic.
+    // Apply results in original order so both the lockfile and stderr output
+    // are deterministic across runs (parallel downloads finish in arbitrary
+    // order, but the user sees a stable summary).
     for result in download_results {
-        let (idx, lock) = result?;
+        let (idx, downloaded) = result?;
+        eprintln!("{}", downloaded.summary);
         if let Some(slot) = new_dep_locks.get_mut(idx) {
-            *slot = lock;
+            *slot = downloaded.lock;
         }
     }
 
@@ -521,13 +529,22 @@ fn resolve_transitive(
     // that level in parallel, then process children sequentially so the
     // graph mutations remain race-free.
     while !state.queue.is_empty() {
-        // Drain the current level into a Vec.
-        let level: Vec<BfsEntry> = state.queue.drain(..).collect();
+        // Drain the current level into a Vec paired with its per-entry cache
+        // keys. The key derivation is identical for prefetch and post-fetch
+        // passes; compute it once.
+        let level: Vec<(BfsEntry, String)> = state
+            .queue
+            .drain(..)
+            .map(|entry| {
+                let cache_key = format!("{}:{}-{}:{}", entry.0, entry.1, maven_suffix, entry.2);
+                (entry, cache_key)
+            })
+            .collect();
 
         // Fold pre-fetch bookkeeping (required_by entries from `requirer`)
         // into the map before doing any I/O — these only depend on `requirer`
         // and `(group_id, artifact_id)`, not on the fetched metadata.
-        for (group_id, artifact_id, _version, requirer, _path) in &level {
+        for ((group_id, artifact_id, _version, requirer, _path), _cache_key) in &level {
             let key = format!("{group_id}:{artifact_id}");
             if let Some(req) = requirer {
                 state
@@ -538,23 +555,21 @@ fn resolve_transitive(
             }
         }
 
-        // Collect unique (group, artifact, version) tuples that need fetching
-        // and are not already in the metadata cache. Multiple entries in the
-        // queue may point at the same artifact via different paths.
-        let mut to_fetch: Vec<(String, String, String, String)> = Vec::new();
+        // Collect unique tuples that need fetching and are not already in the
+        // metadata cache. Multiple entries in the queue may point at the same
+        // artifact via different paths.
+        let mut to_fetch: Vec<(String, String, String, String)> = Vec::with_capacity(level.len());
         let mut seen_keys: BTreeSet<String> = BTreeSet::new();
-        for (group_id, artifact_id, version, _requirer, _path) in &level {
-            let per_target_artifact_id = format!("{artifact_id}-{maven_suffix}");
-            let cache_key = format!("{group_id}:{per_target_artifact_id}:{version}");
-            if state.metadata_cache.contains_key(&cache_key) || !seen_keys.insert(cache_key.clone())
+        for ((group_id, artifact_id, version, _requirer, _path), cache_key) in &level {
+            if state.metadata_cache.contains_key(cache_key) || !seen_keys.insert(cache_key.clone())
             {
                 continue;
             }
             to_fetch.push((
                 group_id.clone(),
-                per_target_artifact_id,
+                format!("{artifact_id}-{maven_suffix}"),
                 version.clone(),
-                cache_key,
+                cache_key.clone(),
             ));
         }
 
@@ -580,21 +595,15 @@ fn resolve_transitive(
         }
 
         // Process this level's entries sequentially using the now-populated cache.
-        for (group_id, artifact_id, version, requirer, path) in level {
-            let per_target_artifact_id = format!("{artifact_id}-{maven_suffix}");
-            let cache_key = format!("{group_id}:{per_target_artifact_id}:{version}");
+        for ((group_id, artifact_id, _version, requirer, path), cache_key) in level {
+            // Every entry was either cached or just fetched above; a miss
+            // here means a logic bug. Surface as a typed error so tests catch
+            // future refactors that break this invariant.
             let metadata = match state.metadata_cache.get(&cache_key) {
                 Some(m) => m.clone(),
-                // Unreachable per the prefetch logic above: every entry in
-                // `level` either had its metadata already cached or was just
-                // fetched into the cache. Surface as a typed internal error
-                // so tests catch any future refactor that breaks the
-                // invariant instead of silently skipping the entry.
                 None => {
                     return Err(EngineError::InternalInvariantViolated {
-                        context: format!(
-                            "BFS prefetch missed metadata for {group_id}:{artifact_id}-{maven_suffix}:{version}"
-                        ),
+                        context: format!("BFS prefetch missed metadata for {cache_key}"),
                     });
                 }
             };
