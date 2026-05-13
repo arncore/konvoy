@@ -202,15 +202,13 @@ pub fn ensure_plugin_artifacts(
         .zip(aligned_bars.par_iter())
         .map(|(artifact, maybe_bar)| {
             let expected_hash = find_lockfile_hash(lockfile, &artifact.plugin_name);
-            let util_result = konvoy_util::progress::run_with_optional_bar(*maybe_bar, |pb| {
-                konvoy_util::artifact::ensure_artifact(
-                    &artifact.url,
-                    &artifact.cache_path,
-                    expected_hash,
-                    &artifact.plugin_name,
-                    pb,
-                )
-            })
+            let util_result = konvoy_util::progress::fetch(
+                &artifact.url,
+                &artifact.cache_path,
+                expected_hash,
+                &artifact.plugin_name,
+                *maybe_bar,
+            )
             .map_err(|e| map_download_err(&artifact.plugin_name, e))?;
 
             Ok(PluginArtifactResult {

@@ -133,6 +133,34 @@ where
     }
 }
 
+/// Fetch a Maven-style artifact: check the cache first, download (with the
+/// supplied bar) only on miss.
+///
+/// Composes [`crate::artifact::check_cached`] (no UI) and
+/// [`crate::artifact::download_artifact`] (with bar) so engine code can
+/// call one function instead of writing the match-on-cache pattern at
+/// every site. The `bar` parameter is `Option` so callers can suppress UI
+/// entirely (e.g. for already-known-cached items in a parallel batch).
+///
+/// # Errors
+/// - [`crate::error::UtilError::ArtifactHashMismatch`] if a cached file
+///   has the wrong hash, or the downloaded file has the wrong hash.
+/// - Other [`crate::error::UtilError`] variants for I/O / network failures.
+pub fn fetch(
+    url: &str,
+    dest: &std::path::Path,
+    expected_sha256: Option<&str>,
+    label: &str,
+    bar: Option<&DownloadBar>,
+) -> Result<crate::artifact::ArtifactResult, crate::error::UtilError> {
+    if let Some(cached) = crate::artifact::check_cached(dest, expected_sha256)? {
+        return Ok(cached);
+    }
+    run_with_optional_bar(bar, |pb| {
+        crate::artifact::download_artifact(url, dest, expected_sha256, label, pb)
+    })
+}
+
 /// Build a styled [`DownloadBar`] for a single-shot download.
 ///
 /// Constructs a local [`MultiProgress`] and attaches one bar to it. The

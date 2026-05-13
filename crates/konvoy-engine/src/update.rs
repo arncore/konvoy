@@ -139,9 +139,8 @@ fn download_target_klib(
     let dest = coord.cache_path(cache_root);
     let label = format!("{}:{}", dep.name, target);
 
-    let result = progress
-        .run(|pb| konvoy_util::artifact::ensure_artifact(&url, &dest, None, &label, pb))
-        .map_err(|e| match e {
+    let result = konvoy_util::progress::fetch(&url, &dest, None, &label, Some(progress)).map_err(
+        |e| match e {
             konvoy_util::error::UtilError::Download { message } => {
                 EngineError::LibraryDownloadFailed {
                     name: dep.name.clone(),
@@ -150,7 +149,8 @@ fn download_target_klib(
                 }
             }
             other => EngineError::Util(other),
-        })?;
+        },
+    )?;
 
     Ok((target, result.sha256))
 }

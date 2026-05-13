@@ -63,49 +63,75 @@ pub fn validate_identifier(identifier: &str) -> Result<(), UtilError> {
     Ok(())
 }
 
-/// Ensure a single-file artifact exists at `dest`, downloading from `url` if needed.
+/// Check whether `dest` is already on disk with the expected SHA-256.
 ///
-/// Follows the same atomic-download pattern as the detekt JAR management:
+/// Returns:
+/// - `Ok(Some(ArtifactResult))` if the file exists and (when `expected_sha256`
+///   is `Some`) its hash matches.
+/// - `Ok(None)` if the file does not exist — caller should download.
+/// - `Err(UtilError::ArtifactHashMismatch)` if the file exists but its hash
+///   does not match `expected_sha256` (this is a hard error, not a "go
+///   re-download" signal: a hash mismatch on a cached artifact usually
+///   means the lockfile is stale or the cache was tampered with).
+/// - Other `UtilError` variants for I/O failures reading the file.
 ///
-/// 1. If `dest` already exists, hash it and verify against `expected_sha256`
-///    (if provided). Return immediately with `freshly_downloaded = false`.
-/// 2. If missing, create parent directories, download to a temp file, verify
-///    the hash, then atomically rename into place.
-/// 3. Handle the race condition where another process downloads the artifact
-///    concurrently: if the rename fails but `dest` now exists, verify the
-///    placed file's hash.
-/// 4. Clean up the temp file on all error paths.
+/// This function does no UI work. Pair it with [`download_artifact`] when
+/// the result is `None`.
+///
+/// # Errors
+/// See above.
+pub fn check_cached(
+    dest: &Path,
+    expected_sha256: Option<&str>,
+) -> Result<Option<ArtifactResult>, UtilError> {
+    if !dest.exists() {
+        return Ok(None);
+    }
+    let actual_hash = crate::hash::sha256_file(dest)?;
+    if let Some(expected) = expected_sha256 {
+        if actual_hash != expected {
+            return Err(UtilError::ArtifactHashMismatch {
+                path: dest.display().to_string(),
+                expected: expected.to_owned(),
+                actual: actual_hash,
+            });
+        }
+    }
+    Ok(Some(ArtifactResult {
+        path: dest.to_path_buf(),
+        sha256: actual_hash,
+        freshly_downloaded: false,
+    }))
+}
+
+/// Download `url` to `dest`, atomically placing the file once the hash is
+/// verified.
+///
+/// Steps:
+/// 1. Create parent directories.
+/// 2. Download to a `.tmp-{label}-{pid}` sibling.
+/// 3. Verify the hash of the downloaded bytes.
+/// 4. Atomically rename into place. If another process already placed a
+///    file at `dest` concurrently (TOCTOU with `check_cached`), verify the
+///    placed file's hash and report it as the result.
+/// 5. Clean up the temp file on all error paths.
+///
+/// Callers should normally check [`check_cached`] first and only invoke
+/// this on a cache miss. The bar is provided because this function is the
+/// origin of progress events — pair it with [`crate::progress::DownloadBar::run`]
+/// or [`crate::progress::run_with_optional_bar`].
 ///
 /// # Errors
 /// Returns an error if the download fails, the hash does not match, or an
 /// I/O operation fails.
-pub fn ensure_artifact(
+pub fn download_artifact(
     url: &str,
     dest: &Path,
     expected_sha256: Option<&str>,
     label: &str,
     progress: &ProgressBar,
 ) -> Result<ArtifactResult, UtilError> {
-    // 1. If the file already exists, verify its hash and return early.
-    if dest.exists() {
-        let actual_hash = crate::hash::sha256_file(dest)?;
-        if let Some(expected) = expected_sha256 {
-            if actual_hash != expected {
-                return Err(UtilError::ArtifactHashMismatch {
-                    path: dest.display().to_string(),
-                    expected: expected.to_owned(),
-                    actual: actual_hash,
-                });
-            }
-        }
-        return Ok(ArtifactResult {
-            path: dest.to_path_buf(),
-            sha256: actual_hash,
-            freshly_downloaded: false,
-        });
-    }
-
-    // 2. Create parent directories.
+    // Create parent directories.
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|source| UtilError::Io {
             path: parent.display().to_string(),
@@ -137,7 +163,7 @@ pub fn ensure_artifact(
         }
     }
 
-    // 3. Atomic rename into final location.
+    // Atomic rename into final location.
     match std::fs::rename(&tmp_path, dest) {
         Ok(()) => {}
         Err(_) if dest.exists() => {
@@ -228,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_artifact_returns_existing_with_correct_hash() {
+    fn check_cached_returns_some_with_correct_hash() {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("artifact.jar");
         let content = b"test artifact content";
@@ -236,14 +262,7 @@ mod tests {
 
         let expected_hash = crate::hash::sha256_bytes(content);
 
-        let result = ensure_artifact(
-            "http://unused.example.com/artifact.jar",
-            &dest,
-            Some(&expected_hash),
-            "test",
-            &crate::progress::hidden_bar(),
-        )
-        .unwrap();
+        let result = check_cached(&dest, Some(&expected_hash)).unwrap().unwrap();
 
         assert!(!result.freshly_downloaded);
         assert_eq!(result.sha256, expected_hash);
@@ -251,19 +270,21 @@ mod tests {
     }
 
     #[test]
-    fn ensure_artifact_errors_on_hash_mismatch() {
+    fn check_cached_returns_none_for_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("missing.jar");
+        let result = check_cached(&dest, None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn check_cached_errors_on_hash_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("artifact.jar");
         std::fs::write(&dest, b"some content").unwrap();
 
         let bogus_hash = "0000000000000000000000000000000000000000000000000000000000000000";
-        let result = ensure_artifact(
-            "http://unused.example.com/artifact.jar",
-            &dest,
-            Some(bogus_hash),
-            "test",
-            &crate::progress::hidden_bar(),
-        );
+        let result = check_cached(&dest, Some(bogus_hash));
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -285,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_artifact_returns_existing_without_expected_hash() {
+    fn check_cached_returns_some_without_expected_hash() {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("artifact.jar");
         let content = b"no hash check content";
@@ -293,25 +314,18 @@ mod tests {
 
         let expected_hash = crate::hash::sha256_bytes(content);
 
-        let result = ensure_artifact(
-            "http://unused.example.com/artifact.jar",
-            &dest,
-            None,
-            "test",
-            &crate::progress::hidden_bar(),
-        )
-        .unwrap();
+        let result = check_cached(&dest, None).unwrap().unwrap();
 
         assert!(!result.freshly_downloaded);
         assert_eq!(result.sha256, expected_hash);
     }
 
     #[test]
-    fn ensure_artifact_errors_on_invalid_url() {
+    fn download_artifact_errors_on_invalid_url() {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("missing.jar");
 
-        let result = ensure_artifact(
+        let result = download_artifact(
             "http://127.0.0.1:1/nonexistent",
             &dest,
             None,

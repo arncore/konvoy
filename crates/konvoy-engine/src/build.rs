@@ -847,15 +847,13 @@ fn download_one_klib(
     maybe_bar: Option<&konvoy_util::progress::DownloadBar>,
 ) -> Result<LibraryInput, EngineError> {
     let dep_name = p.entry.name.to_owned();
-    let result = konvoy_util::progress::run_with_optional_bar(maybe_bar, |pb| {
-        konvoy_util::artifact::ensure_artifact(
-            &p.url,
-            &p.dest,
-            Some(p.expected_sha256),
-            &dep_name,
-            pb,
-        )
-    })
+    let result = konvoy_util::progress::fetch(
+        &p.url,
+        &p.dest,
+        Some(p.expected_sha256),
+        &dep_name,
+        maybe_bar,
+    )
     .map_err(|e| EngineError::LibraryDownloadFailed {
         name: dep_name.clone(),
         url: p.url.clone(),
