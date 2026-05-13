@@ -6,44 +6,105 @@
 
 use std::borrow::Cow;
 use std::fmt::Write;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
 
 /// Default minimum prefix column width when the caller doesn't compute one
 /// from the full set of in-flight downloads. 36 is wide enough to fit a
 /// typical `"<dep> <version> [<target>]"` like
-/// `"kotlinx-coroutines-core 1.9.0 [macos_arm64]"` (42 chars overflows but
-/// that's only for single-download paths where alignment doesn't matter).
+/// `"kotlinx-coroutines-core 1.9.0 [macos_arm64]"`.
 const DEFAULT_PREFIX_WIDTH: usize = 36;
 
-/// Build a styled standalone [`ProgressBar`] for an HTTP download.
+/// Logical width of the progress bar (visible columns ≈ 2× this since each
+/// position is a 2-column emoji).
+const BAR_LOGICAL_WIDTH: usize = 20;
+
+/// State indicator emoji shown in the `{msg}` slot at the start of each row.
+const IN_PROGRESS_MARKER: &str = "\u{2699}\u{FE0F}"; // ⚙️ (gear)
+const SUCCESS_MARKER: &str = "\u{2705}"; // ✅
+const FAILURE_MARKER: &str = "\u{274C}"; // ❌
+
+/// State values driving the bar's trail-character rendering.
+const STATE_IN_PROGRESS: u8 = 0;
+const STATE_SUCCESS: u8 = 1;
+const STATE_FAILURE: u8 = 2;
+
+/// Glyphs used inside the bar.
+const ROAD_AHEAD: &str = "\u{2B1C}"; // ⬜ empty road in front of truck
+const TRUCK: &str = "\u{1F69A}"; // 🚚 the truck (edge / cursor)
+const CRASH: &str = "\u{1F4A5}"; // 💥 crash glyph drawn over the truck on failure
+const DUST_TRAIL: &str = "\u{1F4A8}"; // 💨 dust while the truck is moving
+const DELIVERED_CARGO: &str = "\u{1F7E9}"; // 🟩 green block left after delivery
+
+/// Handle bundling a bar with the atomic flag that drives its trail glyph.
+///
+/// Returned by [`add_download_bar`] / [`new_download_bar`]. The engine layer
+/// keeps the handle alive for the bar's lifetime and flips state via
+/// [`DownloadBar::mark_success`] / [`DownloadBar::mark_failure`] once the
+/// download result is known. The custom bar renderer reads the flag on each
+/// redraw to decide whether to draw dust (in progress / failure) or cargo
+/// (success) behind the truck.
+pub struct DownloadBar {
+    /// The underlying indicatif bar — pass `&bar.bar` to functions that
+    /// expect `&ProgressBar` (like [`crate::download::download_with_progress`]).
+    pub bar: ProgressBar,
+    state: Arc<AtomicU8>,
+}
+
+impl DownloadBar {
+    /// Flip state to success (✅ + 🟩 cargo) AND stop the bar so its final
+    /// frame is preserved. Order matters: the state has to be set before
+    /// `abandon` halts further redraws.
+    pub fn mark_success(&self) {
+        self.state.store(STATE_SUCCESS, Ordering::Relaxed);
+        self.bar.abandon();
+    }
+
+    /// Flip state to failure (❌ + 💥 over the truck, dust trail stays) AND
+    /// stop the bar so its final frame is preserved.
+    pub fn mark_failure(&self) {
+        self.state.store(STATE_FAILURE, Ordering::Relaxed);
+        self.bar.abandon();
+    }
+}
+
+/// Interval at which bars redraw to drive the blinking-gear indicator.
+const BLINK_TICK: Duration = Duration::from_millis(250);
+
+/// Build a styled standalone [`DownloadBar`] for an HTTP download.
 ///
 /// Used by single-shot download paths (toolchain install, detekt JAR, plugin
 /// JAR) that render one bar at a time.
 #[must_use]
-pub fn new_download_bar(prefix: impl Into<Cow<'static, str>>) -> ProgressBar {
+pub fn new_download_bar(prefix: impl Into<Cow<'static, str>>) -> DownloadBar {
+    let state = Arc::new(AtomicU8::new(STATE_IN_PROGRESS));
     let pb = ProgressBar::new(0);
-    pb.set_style(download_style(DEFAULT_PREFIX_WIDTH));
+    pb.set_style(download_style(DEFAULT_PREFIX_WIDTH, Arc::clone(&state)));
     pb.set_prefix(prefix);
-    pb
+    pb.enable_steady_tick(BLINK_TICK);
+    DownloadBar { bar: pb, state }
 }
 
 /// Attach a styled bar to a [`MultiProgress`] container with a caller-supplied
 /// prefix column width.
 ///
 /// `prefix_width` should be the max prefix length across every bar in the
-/// container so all bar columns line up vertically. Bars added later than this
-/// call still render correctly — they just don't influence the width.
+/// container so all bar columns line up vertically.
 #[must_use]
 pub fn add_download_bar(
     mp: &MultiProgress,
     prefix: impl Into<Cow<'static, str>>,
     prefix_width: usize,
-) -> ProgressBar {
+) -> DownloadBar {
+    let state = Arc::new(AtomicU8::new(STATE_IN_PROGRESS));
     let pb = mp.add(ProgressBar::new(0));
-    pb.set_style(download_style(prefix_width));
+    pb.set_style(download_style(prefix_width, Arc::clone(&state)));
     pb.set_prefix(prefix);
-    pb
+    pb.enable_steady_tick(BLINK_TICK);
+    DownloadBar { bar: pb, state }
 }
 
 /// Hidden bar for use in tests or non-interactive contexts.
@@ -67,27 +128,139 @@ fn write_elapsed_ms(state: &ProgressState, w: &mut dyn Write) {
     let _ = write!(w, "{}ms", state.elapsed().as_millis());
 }
 
-fn download_style(prefix_width: usize) -> ProgressStyle {
-    // 2-space indent matches Konvoy's existing eprintln output (e.g.
-    // "  Resolved N dependencies..."). Bar width is capped so wide terminals
-    // don't stretch a 50 KiB download across 200 columns. The prefix column
-    // is left-padded to `prefix_width` so MultiProgress children line up.
-    // Brackets around the bar give each row a visible boundary so a stack of
-    // fully-filled bars doesn't merge into one solid block.
-    // `bytes_per_sec` minimum width 12 fits "999.99 MiB/s" (longest typical
-    // value) so the elapsed-time column stays right-aligned across rows.
+/// Custom `{kbar}` renderer driven by the bar's state flag.
+///
+/// The bar's raw position tracks downloaded bytes (so `{bytes}` and
+/// `{bytes_per_sec}` in the template stay accurate). Right-to-left fill is
+/// done HERE by computing the edge index from `len - pos`:
+///
+///   start (pos=0):           `⬜⬜⬜⬜...⬜🚚`     (truck parked at right spot)
+///   half (pos=len/2):        `⬜⬜⬜🚚💨💨💨💨`   (road ahead, truck, dust)
+///   success (pos=len):       `🚚🟩🟩🟩🟩🟩🟩🟩`  (truck delivered)
+///   failure (pos<len, frozen): same as half-state but truck → 💥
+///
+/// The truck is clamped to `bar_width - 1` so it's always visible — even at
+/// pos == 0 (the moment before any bytes arrive), the truck appears at the
+/// far right edge instead of being hidden off-screen.
+fn render_truck_bar(state: &ProgressState, w: &mut dyn Write, current_state: u8) {
+    let bar_width = BAR_LOGICAL_WIDTH;
+    let len = state.len().unwrap_or(0);
+    let pos = state.pos();
+
+    if len == 0 {
+        // No Content-Length recorded — either the spinner-mode case (download
+        // succeeded but server didn't send a length) or an early connection
+        // failure where the body never started. On failure we still want
+        // 💥 visible, so park the crash glyph at the rightmost slot (the
+        // truck's pre-departure position) with empty road to its left.
+        let edge_glyph = if current_state == STATE_FAILURE {
+            CRASH
+        } else {
+            ROAD_AHEAD
+        };
+        for _ in 0..bar_width.saturating_sub(1) {
+            let _ = write!(w, "{ROAD_AHEAD}");
+        }
+        let _ = write!(w, "{edge_glyph}");
+        return;
+    }
+
+    // Invert here: truck_at decreases as pos increases. At pos=0, truck_at =
+    // bar_width-1 (far right). At pos=len, truck_at = 0 (far left). Cast via
+    // u128 so multi-GB downloads don't overflow.
+    let remaining = len.saturating_sub(pos);
+    #[allow(clippy::cast_possible_truncation)]
+    let truck_at = {
+        let raw = (u128::from(remaining) * (bar_width as u128)) / u128::from(len);
+        (raw as usize).min(bar_width.saturating_sub(1))
+    };
+
+    let trail = if current_state == STATE_SUCCESS {
+        DELIVERED_CARGO
+    } else {
+        DUST_TRAIL
+    };
+    let edge_glyph = if current_state == STATE_FAILURE {
+        CRASH
+    } else {
+        TRUCK
+    };
+
+    for i in 0..bar_width {
+        let glyph = if i < truck_at {
+            ROAD_AHEAD
+        } else if i == truck_at {
+            edge_glyph
+        } else {
+            trail
+        };
+        let _ = write!(w, "{glyph}");
+    }
+}
+
+fn download_style(prefix_width: usize, state: Arc<AtomicU8>) -> ProgressStyle {
+    // Konvoy-themed truck bar:
+    //
+    //   ⚙️  prefix [⬜⬜⬜🚚💨💨💨] bytes / total speed time
+    //   ✅  prefix [🚚🟩🟩🟩🟩🟩🟩] bytes / total speed time
+    //
+    //   - {indicator} reads the shared atomic state to render ⚙️/✅/❌. While
+    //     in progress, the gear blinks every 500ms (driven by
+    //     `enable_steady_tick(BLINK_TICK)` on the bar). When state flips to
+    //     success/failure, the renderer locks the indicator to ✅ or ❌.
+    //   - {kbar} is our custom bar renderer (`render_truck_bar`) reading the
+    //     same shared state to choose the trail glyph: 💨 dust while the
+    //     truck is moving (or stopped on failure), 🟩 delivered cargo on
+    //     success.
+    //   - [`{kbar}`] uses plain `[` `]` brackets — they read as parking spots
+    //     the truck pulls into when delivery completes.
+    //   - `prefix_width` left-pads the dep label so columns line up.
+    //   - `bytes_per_sec` min-width 12 fits "999.99 MiB/s" so the ms column
+    //     stays right-aligned across rows.
     let template = format!(
-        "  {{spinner:.green}} {{prefix:<{prefix_width}.bold}} [{{bar:40.green/dim}}] {{bytes:>10.cyan}} / {{total_bytes:<10.cyan}} {{bytes_per_sec:>12.yellow}} {{elapsed_ms:>7.dim}}"
+        "  {{indicator}}  {{prefix:<{prefix_width}.bold}} [{{kbar}}] {{bytes:>10.cyan}} / {{total_bytes:<10.cyan}} {{bytes_per_sec:>12.yellow}} {{elapsed_ms:>7.dim}}"
     );
+    let bar_state = Arc::clone(&state);
+    let bar_closure = move |s: &ProgressState, w: &mut dyn Write| {
+        render_truck_bar(s, w, bar_state.load(Ordering::Relaxed));
+    };
+    let indicator_state = state;
+    let indicator_closure = move |s: &ProgressState, w: &mut dyn Write| {
+        write_indicator(s, w, indicator_state.load(Ordering::Relaxed));
+    };
     ProgressStyle::with_template(&template)
         .unwrap_or_else(|_| ProgressStyle::default_bar())
         .with_key("elapsed_ms", write_elapsed_ms)
-        .progress_chars("=> ")
+        .with_key("indicator", indicator_closure)
+        .with_key("kbar", bar_closure)
+}
+
+/// Render the leading state indicator: blinking ⚙️ while in-progress, static
+/// ✅/❌ on completion.
+///
+/// The "off" frame is two spaces so the column width stays constant — the
+/// emoji is 2 cells wide; blinking to "  " keeps everything to the right of
+/// the indicator from shifting on each tick.
+fn write_indicator(state: &ProgressState, w: &mut dyn Write, current_state: u8) {
+    let glyph: &str = match current_state {
+        STATE_SUCCESS => SUCCESS_MARKER,
+        STATE_FAILURE => FAILURE_MARKER,
+        _ => {
+            // Blink every 500ms.
+            let tick = state.elapsed().as_millis() / 500;
+            if tick.is_multiple_of(2) {
+                IN_PROGRESS_MARKER
+            } else {
+                "  "
+            }
+        }
+    };
+    let _ = write!(w, "{glyph}");
 }
 
 fn spinner_style(prefix_width: usize) -> ProgressStyle {
     let template = format!(
-        "  {{spinner:.green}} {{prefix:<{prefix_width}.bold}} {{bytes:>10.cyan}} {{bytes_per_sec:>12.yellow}} {{elapsed_ms:>7.dim}}"
+        "  {{msg}}  {{prefix:<{prefix_width}.bold}} {{bytes:>10.cyan}} {{bytes_per_sec:>12.yellow}} {{elapsed_ms:>7.dim}}"
     );
     ProgressStyle::with_template(&template)
         .unwrap_or_else(|_| ProgressStyle::default_spinner())
@@ -101,8 +274,14 @@ mod tests {
 
     #[test]
     fn new_download_bar_sets_prefix() {
-        let pb = new_download_bar("test-prefix");
-        assert_eq!(pb.prefix(), "test-prefix");
+        let bar = new_download_bar("test-prefix");
+        assert_eq!(bar.bar.prefix(), "test-prefix");
+    }
+
+    #[test]
+    fn new_download_bar_starts_in_progress() {
+        let bar = new_download_bar("x");
+        assert_eq!(bar.state.load(Ordering::Relaxed), STATE_IN_PROGRESS);
     }
 
     #[test]
@@ -115,14 +294,29 @@ mod tests {
     #[test]
     fn add_download_bar_attaches_to_multiprogress() {
         let mp = MultiProgress::new();
-        let pb = add_download_bar(&mp, "child", 32);
-        assert_eq!(pb.prefix(), "child");
+        let bar = add_download_bar(&mp, "child", 32);
+        assert_eq!(bar.bar.prefix(), "child");
+        assert_eq!(bar.state.load(Ordering::Relaxed), STATE_IN_PROGRESS);
+    }
+
+    #[test]
+    fn mark_success_flips_state() {
+        let bar = new_download_bar("x");
+        bar.mark_success();
+        assert_eq!(bar.state.load(Ordering::Relaxed), STATE_SUCCESS);
+    }
+
+    #[test]
+    fn mark_failure_flips_state() {
+        let bar = new_download_bar("x");
+        bar.mark_failure();
+        assert_eq!(bar.state.load(Ordering::Relaxed), STATE_FAILURE);
     }
 
     #[test]
     fn switch_to_spinner_changes_style() {
-        let pb = new_download_bar("a");
-        switch_to_spinner(&pb);
-        pb.set_position(100);
+        let bar = new_download_bar("a");
+        switch_to_spinner(&bar.bar);
+        bar.bar.set_position(100);
     }
 }

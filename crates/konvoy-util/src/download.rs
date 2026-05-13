@@ -42,6 +42,15 @@ pub fn download_with_progress(
     dest: &Path,
     progress: &ProgressBar,
 ) -> Result<String, UtilError> {
+    download_inner(url, dest, progress)
+    // Caller (engine layer holding a `DownloadBar`) finalises the bar via
+    // `DownloadBar::mark_success` / `mark_failure`, which flips state THEN
+    // calls `abandon()` — order matters so the final frame reflects state.
+}
+
+/// Inner download routine. Drives the byte stream and bar position; wrapper
+/// above flips the state indicator (✅/❌) once the result is known.
+fn download_inner(url: &str, dest: &Path, progress: &ProgressBar) -> Result<String, UtilError> {
     let agent = http_agent(600);
 
     let response = agent.get(url).call().map_err(|e| UtilError::Download {
@@ -54,16 +63,14 @@ pub fn download_with_progress(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse().ok());
 
-    match content_length {
-        Some(total) if total > 0 => {
-            progress.set_length(total);
-            // Force the bar to redraw with the new length before the download
-            // races to completion. `set_length` alone does not trigger a redraw
-            // on `MultiProgress` children at indicatif's 20Hz throttle, so a
-            // sub-50ms download can finish before the length ever renders.
-            progress.set_position(0);
-        }
-        _ => crate::progress::switch_to_spinner(progress),
+    // The bar's `position` tracks the actual downloaded byte count so the
+    // template's `{bytes}` and `{bytes_per_sec}` fields read correctly. The
+    // right-to-left fill effect is handled by the custom `{kbar}` renderer
+    // in `progress.rs`, which computes its edge index from `(len - pos)`.
+    if let Some(total) = content_length.filter(|t| *t > 0) {
+        progress.set_length(total);
+    } else {
+        crate::progress::switch_to_spinner(progress);
     }
 
     let mut body = response.into_body();
@@ -99,7 +106,6 @@ pub fn download_with_progress(
         progress.set_position(downloaded);
     }
 
-    progress.finish();
     Ok(finalize_hex(hasher))
 }
 

@@ -115,9 +115,18 @@ pub fn ensure_detekt(
     let url = detekt_download_url(version);
 
     let progress = konvoy_util::progress::new_download_bar(format!("detekt {version}"));
-    let result =
-        konvoy_util::artifact::ensure_artifact(&url, &jar, expected_sha256, "detekt", &progress)
-            .map_err(|e| map_download_err(version, e))?;
+    let ensure_result = konvoy_util::artifact::ensure_artifact(
+        &url,
+        &jar,
+        expected_sha256,
+        "detekt",
+        &progress.bar,
+    );
+    match &ensure_result {
+        Ok(_) => progress.mark_success(),
+        Err(_) => progress.mark_failure(),
+    }
+    let result = ensure_result.map_err(|e| map_download_err(version, e))?;
 
     Ok((result.path, result.sha256))
 }

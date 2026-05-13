@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
-use indicatif::{MultiProgress, ProgressBar};
+use indicatif::MultiProgress;
 use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile};
@@ -75,7 +75,7 @@ fn placeholder_lock(dep: &ResolvedMavenDep, maven_coord: &str) -> DependencyLock
 fn download_dep(
     dep: &ResolvedMavenDep,
     cache_root: &Path,
-    bars: &[ProgressBar],
+    bars: &[konvoy_util::progress::DownloadBar],
 ) -> Result<DependencyLock, EngineError> {
     let known_targets = konvoy_targets::KNOWN_TARGETS;
     let maven_coord = dep.key();
@@ -121,7 +121,7 @@ fn download_target_klib(
     dep: &ResolvedMavenDep,
     target: konvoy_targets::Target,
     cache_root: &Path,
-    progress: &ProgressBar,
+    progress: &konvoy_util::progress::DownloadBar,
 ) -> Result<(konvoy_targets::Target, String), EngineError> {
     let maven_suffix = target.to_maven_suffix();
     let per_target_artifact_id = format!("{}-{}", dep.artifact_id, maven_suffix);
@@ -139,17 +139,20 @@ fn download_target_klib(
     let dest = coord.cache_path(cache_root);
     let label = format!("{}:{}", dep.name, target);
 
-    let result = konvoy_util::artifact::ensure_artifact(&url, &dest, None, &label, progress)
-        .map_err(|e| match e {
-            konvoy_util::error::UtilError::Download { message } => {
-                EngineError::LibraryDownloadFailed {
-                    name: dep.name.clone(),
-                    url: url.clone(),
-                    message,
-                }
-            }
-            other => EngineError::Util(other),
-        })?;
+    let ensure_result =
+        konvoy_util::artifact::ensure_artifact(&url, &dest, None, &label, &progress.bar);
+    match &ensure_result {
+        Ok(_) => progress.mark_success(),
+        Err(_) => progress.mark_failure(),
+    }
+    let result = ensure_result.map_err(|e| match e {
+        konvoy_util::error::UtilError::Download { message } => EngineError::LibraryDownloadFailed {
+            name: dep.name.clone(),
+            url: url.clone(),
+            message,
+        },
+        other => EngineError::Util(other),
+    })?;
 
     Ok((target, result.sha256))
 }
@@ -283,7 +286,7 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
         .max()
         .unwrap_or(0);
 
-    let dep_bars: Vec<Vec<ProgressBar>> = labels
+    let dep_bars: Vec<Vec<konvoy_util::progress::DownloadBar>> = labels
         .into_iter()
         .map(|row| {
             row.into_iter()
@@ -304,10 +307,16 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
         })
         .collect();
 
-    // Bars remain on screen at their final state after `finish()` (called
-    // inside `download_with_progress`); the `MultiProgress` is dropped at end
-    // of scope which releases the draw region without clearing the rendered
-    // content.
+    // Bars remain on screen at their final state after each is abandoned
+    // (inside `DownloadBar::mark_success` / `mark_failure`); the
+    // `MultiProgress` is dropped at end of scope which releases the draw
+    // region without clearing the rendered content. Indicatif leaves the
+    // cursor at the end of the last bar's row, so emit one trailing newline
+    // before any subsequent `eprintln!` so the caller's status line doesn't
+    // get concatenated onto the bar row.
+    if !needs_download.is_empty() {
+        eprintln!();
+    }
 
     // Apply results in original order so the lockfile output is deterministic
     // (parallel downloads finish in arbitrary order, but the on-disk layout

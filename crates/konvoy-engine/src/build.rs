@@ -772,14 +772,18 @@ pub(crate) fn resolve_maven_deps(
 
             // Download (or use cached) and verify hash.
             let progress = konvoy_util::progress::new_download_bar(format!("{dep_name} {version}"));
-            let result = konvoy_util::artifact::ensure_artifact(
+            let ensure_result = konvoy_util::artifact::ensure_artifact(
                 &url,
                 &dest,
                 Some(expected_sha256),
                 &dep_name,
-                &progress,
-            )
-            .map_err(|e| EngineError::LibraryDownloadFailed {
+                &progress.bar,
+            );
+            match &ensure_result {
+                Ok(_) => progress.mark_success(),
+                Err(_) => progress.mark_failure(),
+            }
+            let result = ensure_result.map_err(|e| EngineError::LibraryDownloadFailed {
                 name: dep_name.clone(),
                 url: url.clone(),
                 message: e.to_string(),
