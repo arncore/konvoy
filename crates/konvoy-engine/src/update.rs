@@ -94,15 +94,18 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
         let maven = dep_spec
             .maven
             .as_ref()
-            .ok_or_else(|| EngineError::Metadata {
-                message: format!("dependency `{dep_name}` is missing `maven` field"),
+            .ok_or_else(|| EngineError::MissingDependencyField {
+                name: (*dep_name).clone(),
+                field: "maven",
             })?;
-        let version = dep_spec
-            .version
-            .as_ref()
-            .ok_or_else(|| EngineError::Metadata {
-                message: format!("dependency `{dep_name}` is missing `version` field"),
-            })?;
+        let version =
+            dep_spec
+                .version
+                .as_ref()
+                .ok_or_else(|| EngineError::MissingDependencyField {
+                    name: (*dep_name).clone(),
+                    field: "version",
+                })?;
 
         let (group_id, artifact_id) = crate::common::split_maven_coordinate(maven)?;
 
@@ -148,64 +151,62 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
         }
 
         // For each known target, download and hash (in parallel).
-        let known_targets = konvoy_targets::known_targets();
+        let known_targets = konvoy_targets::KNOWN_TARGETS;
 
         let pid = std::process::id();
         let tmp_base = std::env::temp_dir().join(format!("konvoy-update-{pid}"));
         konvoy_util::fs::ensure_dir(&tmp_base)?;
 
-        let target_results: Vec<Result<(String, String), EngineError>> = known_targets
-            .par_iter()
-            .map(|target_name| {
-                let target = target_name
-                    .parse::<konvoy_targets::Target>()
-                    .map_err(EngineError::Target)?;
-                let maven_suffix = target.to_maven_suffix();
-                let per_target_artifact_id = format!("{}-{}", dep.artifact_id, maven_suffix);
+        let target_results: Vec<Result<(konvoy_targets::Target, String), EngineError>> =
+            known_targets
+                .par_iter()
+                .map(|&target| {
+                    let maven_suffix = target.to_maven_suffix();
+                    let per_target_artifact_id = format!("{}-{}", dep.artifact_id, maven_suffix);
 
-                let mut coord = konvoy_util::maven::MavenCoordinate::new(
-                    &dep.group_id,
-                    &per_target_artifact_id,
-                    &dep.version,
-                )
-                .with_packaging("klib");
-                if let Some(cls) = &dep.classifier {
-                    coord = coord.with_classifier(cls);
-                }
-                let url = coord.to_url(MAVEN_CENTRAL);
-
-                let tmp_file = tmp_base.join(coord.filename());
-
-                let result = konvoy_util::artifact::ensure_artifact(
-                    &url,
-                    &tmp_file,
-                    None,
-                    &format!("{}:{}", dep.name, target_name),
-                    &dep.version,
-                )
-                .map_err(|e| match e {
-                    konvoy_util::error::UtilError::Download { message } => {
-                        EngineError::LibraryDownloadFailed {
-                            name: dep.name.clone(),
-                            url: url.clone(),
-                            message,
-                        }
+                    let mut coord = konvoy_util::maven::MavenCoordinate::new(
+                        &dep.group_id,
+                        &per_target_artifact_id,
+                        &dep.version,
+                    )
+                    .with_packaging("klib");
+                    if let Some(cls) = &dep.classifier {
+                        coord = coord.with_classifier(cls);
                     }
-                    other => EngineError::Util(other),
-                })?;
+                    let url = coord.to_url(MAVEN_CENTRAL);
 
-                let _ = std::fs::remove_file(&tmp_file);
+                    let tmp_file = tmp_base.join(coord.filename());
 
-                Ok(((*target_name).to_owned(), result.sha256))
-            })
-            .collect();
+                    let result = konvoy_util::artifact::ensure_artifact(
+                        &url,
+                        &tmp_file,
+                        None,
+                        &format!("{}:{}", dep.name, target),
+                        &dep.version,
+                    )
+                    .map_err(|e| match e {
+                        konvoy_util::error::UtilError::Download { message } => {
+                            EngineError::LibraryDownloadFailed {
+                                name: dep.name.clone(),
+                                url: url.clone(),
+                                message,
+                            }
+                        }
+                        other => EngineError::Util(other),
+                    })?;
+
+                    let _ = std::fs::remove_file(&tmp_file);
+
+                    Ok((target, result.sha256))
+                })
+                .collect();
 
         let mut targets_map: BTreeMap<String, String> = BTreeMap::new();
         for result in target_results {
-            let (target_name, sha256) = result?;
+            let (target, sha256) = result?;
             let display_hash = crate::common::truncate_hash(&sha256, 16);
-            eprintln!("    {target_name}: {display_hash}...");
-            targets_map.insert(target_name, sha256);
+            eprintln!("    {target}: {display_hash}...");
+            targets_map.insert(target.to_string(), sha256);
         }
 
         konvoy_util::fs::remove_dir_all_if_exists(&tmp_base)?;
@@ -425,17 +426,10 @@ fn resolve_transitive(
 ) -> Result<Vec<ResolvedMavenDep>, EngineError> {
     // Use the first known target for metadata fetching — the transitive graph is
     // identical across targets since every Kotlin/Native artifact publishes
-    // the same set of dependencies in each per-target variant.
-    let probe_target =
-        konvoy_targets::known_targets()
-            .first()
-            .ok_or_else(|| EngineError::Metadata {
-                message: "no known targets available".to_owned(),
-            })?;
-    let probe_target_parsed = probe_target
-        .parse::<konvoy_targets::Target>()
-        .map_err(EngineError::Target)?;
-    let maven_suffix = probe_target_parsed.to_maven_suffix();
+    // the same set of dependencies in each per-target variant. The enum
+    // discriminant gives us a probe target without any fallible lookup.
+    let probe_target = konvoy_targets::Target::LinuxX64;
+    let maven_suffix = probe_target.to_maven_suffix();
 
     let mut state = BfsState {
         user_versions: HashMap::new(),
@@ -476,7 +470,7 @@ fn resolve_transitive(
             &group_id,
             &per_target_artifact_id,
             &version,
-            &maven_suffix,
+            maven_suffix,
             &mut state.metadata_cache,
         )?;
 
@@ -488,7 +482,7 @@ fn resolve_transitive(
                 continue;
             }
 
-            let base_artifact_id = strip_target_suffix(&meta_dep.artifact_id, &maven_suffix);
+            let base_artifact_id = strip_target_suffix(&meta_dep.artifact_id, maven_suffix);
             let dep_key = format!("{}:{}", meta_dep.group_id, base_artifact_id);
 
             let resolved_version = state
@@ -565,7 +559,7 @@ fn resolve_transitive(
     finalize_required_by(&mut state.resolved, &state.required_by_map, direct_deps);
 
     let cinterop_deps =
-        discover_cinterop_deps(&state.resolved, &state.metadata_cache, &maven_suffix);
+        discover_cinterop_deps(&state.resolved, &state.metadata_cache, maven_suffix);
 
     let mut result: Vec<ResolvedMavenDep> = Vec::with_capacity(state.resolved.len());
     result.extend(state.resolved.into_values());

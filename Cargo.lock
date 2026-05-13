@@ -479,7 +479,9 @@ name = "konvoy-targets"
 version = "1.2.0"
 dependencies = [
  "proptest",
+ "serde",
  "thiserror",
+ "toml",
 ]
 
 [[package]]

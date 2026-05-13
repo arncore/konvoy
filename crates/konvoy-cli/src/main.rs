@@ -138,7 +138,7 @@ fn main() {
             verbose,
             force,
             locked,
-        } => cmd_build(target, release, verbose, force, locked),
+        } => cmd_build(target, profile_from_flag(release), verbose, force, locked),
         Command::Run {
             target,
             release,
@@ -146,7 +146,14 @@ fn main() {
             force,
             locked,
             args,
-        } => cmd_run(target, release, verbose, force, locked, &args),
+        } => cmd_run(
+            target,
+            profile_from_flag(release),
+            verbose,
+            force,
+            locked,
+            &args,
+        ),
         Command::Test {
             target,
             release,
@@ -154,7 +161,14 @@ fn main() {
             force,
             locked,
             filter,
-        } => cmd_test(target, release, verbose, force, locked, &filter),
+        } => cmd_test(
+            target,
+            profile_from_flag(release),
+            verbose,
+            force,
+            locked,
+            &filter,
+        ),
         Command::Lint {
             verbose,
             config,
@@ -225,44 +239,43 @@ fn cmd_init(name: Option<String>, lib: bool) -> CliResult {
     Ok(())
 }
 
+/// Map the `--release` CLI flag to a `Profile` at the boundary.
+fn profile_from_flag(release: bool) -> konvoy_config::Profile {
+    if release {
+        konvoy_config::Profile::Release
+    } else {
+        konvoy_config::Profile::Debug
+    }
+}
+
 fn build_options(
     target: Option<String>,
-    release: bool,
+    profile: konvoy_config::Profile,
     verbose: bool,
     force: bool,
     locked: bool,
 ) -> konvoy_engine::BuildOptions {
     konvoy_engine::BuildOptions {
         target,
-        release,
+        profile,
         verbose,
         force,
         locked,
     }
 }
 
-/// Return `"release"` or `"debug"` for display in build output.
-fn profile_label(release: bool) -> &'static str {
-    if release {
-        "release"
-    } else {
-        "debug"
-    }
-}
-
 fn cmd_build(
     target: Option<String>,
-    release: bool,
+    profile: konvoy_config::Profile,
     verbose: bool,
     force: bool,
     locked: bool,
 ) -> CliResult {
     let root = project_root()?;
-    let options = build_options(target, release, verbose, force, locked);
+    let options = build_options(target, profile, verbose, force, locked);
 
     let result = konvoy_engine::build(&root, &options)?;
 
-    let profile = profile_label(release);
     match result.outcome {
         konvoy_engine::BuildOutcome::Cached => {
             eprintln!(
@@ -283,7 +296,7 @@ fn cmd_build(
 
 fn cmd_run(
     target: Option<String>,
-    release: bool,
+    profile: konvoy_config::Profile,
     verbose: bool,
     force: bool,
     locked: bool,
@@ -300,11 +313,10 @@ fn cmd_run(
         );
     }
 
-    let options = build_options(target, release, verbose, force, locked);
+    let options = build_options(target, profile, verbose, force, locked);
 
     let result = konvoy_engine::build(&root, &options)?;
 
-    let profile = profile_label(release);
     eprintln!(
         "    Finished `{profile}` target in {:.2}s",
         result.duration.as_secs_f64()
@@ -326,18 +338,17 @@ fn cmd_run(
 
 fn cmd_test(
     target: Option<String>,
-    release: bool,
+    profile: konvoy_config::Profile,
     verbose: bool,
     force: bool,
     locked: bool,
     filter: &Option<String>,
 ) -> CliResult {
     let root = project_root()?;
-    let options = build_options(target, release, verbose, force, locked);
+    let options = build_options(target, profile, verbose, force, locked);
 
     let result = konvoy_engine::build_tests(&root, &options)?;
 
-    let profile = profile_label(release);
     eprintln!(
         "    Finished `{profile}` test target in {:.2}s",
         result.compile_duration.as_secs_f64()
@@ -1439,5 +1450,45 @@ mod tests {
         std::fs::remove_dir_all(root.join(".konvoy")).unwrap();
 
         clean_project(root, true).unwrap();
+    }
+
+    // ── Flag → Profile mapping ─────────────────────────────────────
+
+    #[test]
+    fn profile_from_flag_false_is_debug() {
+        assert_eq!(profile_from_flag(false), konvoy_config::Profile::Debug);
+    }
+
+    #[test]
+    fn profile_from_flag_true_is_release() {
+        assert_eq!(profile_from_flag(true), konvoy_config::Profile::Release);
+    }
+
+    // ── build_options constructor ──────────────────────────────────
+
+    #[test]
+    fn build_options_passes_fields_through() {
+        let opts = build_options(
+            Some("linux_x64".to_owned()),
+            konvoy_config::Profile::Release,
+            true,
+            true,
+            true,
+        );
+        assert_eq!(opts.target.as_deref(), Some("linux_x64"));
+        assert_eq!(opts.profile, konvoy_config::Profile::Release);
+        assert!(opts.verbose);
+        assert!(opts.force);
+        assert!(opts.locked);
+    }
+
+    #[test]
+    fn build_options_defaults_are_false() {
+        let opts = build_options(None, konvoy_config::Profile::Debug, false, false, false);
+        assert!(opts.target.is_none());
+        assert_eq!(opts.profile, konvoy_config::Profile::Debug);
+        assert!(!opts.verbose);
+        assert!(!opts.force);
+        assert!(!opts.locked);
     }
 }

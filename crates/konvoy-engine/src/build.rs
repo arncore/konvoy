@@ -8,6 +8,7 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile};
 use konvoy_config::manifest::{Manifest, PackageKind};
+use konvoy_config::Profile;
 use konvoy_konanc::detect::{resolve_konanc, KonancInfo};
 use konvoy_konanc::invoke::{KonancCommand, ProduceKind};
 use konvoy_targets::{host_target, Target};
@@ -22,14 +23,21 @@ use crate::resolve::{parallel_levels, resolve_dependencies, ResolvedGraph};
 pub struct BuildOptions {
     /// Explicit target triple, or `None` for host.
     pub target: Option<String>,
-    /// Whether to build in release mode.
-    pub release: bool,
+    /// Build profile (debug or release).
+    pub profile: Profile,
     /// Whether to show raw compiler output.
     pub verbose: bool,
     /// Force a rebuild, bypassing the cache.
     pub force: bool,
     /// Require the lockfile to be up-to-date; error on any mismatch.
     pub locked: bool,
+}
+
+impl BuildOptions {
+    /// Returns `true` when the build is in release mode.
+    pub fn is_release(&self) -> bool {
+        matches!(self.profile, Profile::Release)
+    }
 }
 
 /// Whether the build used a cached artifact or compiled fresh.
@@ -61,22 +69,18 @@ pub(crate) struct ResolvedBuildContext {
     pub manifest: Manifest,
     /// Original lockfile read from disk (before pre-stabilization).
     pub lockfile: Lockfile,
-    /// Path to `konvoy.lock` on disk.
-    pub lockfile_path: PathBuf,
     /// Serialized effective (pre-stabilized) lockfile content for cache key computation.
     pub lockfile_content: String,
     /// Resolved build target (host or explicit `--target`).
     pub target: Target,
-    /// Build profile (`"debug"` or `"release"`).
-    pub profile: String,
+    /// Build profile.
+    pub profile: Profile,
     /// Detected konanc compiler info (path, version, fingerprint).
     pub konanc: KonancInfo,
     /// JRE home directory from the managed toolchain, if available.
     pub jre_home: Option<PathBuf>,
-    /// SHA-256 of the konanc tarball (from a fresh download, or `None` if already installed).
-    pub konanc_tarball_sha256: Option<String>,
-    /// SHA-256 of the JRE tarball (from a fresh download, or `None` if already installed).
-    pub jre_tarball_sha256: Option<String>,
+    /// Inputs to `update_lockfile_if_needed` (fresh-download hashes).
+    pub lockfile_write_inputs: LockfileWriteInputs,
     /// Library paths from built path-deps and downloaded Maven klibs.
     pub library_paths: Vec<PathBuf>,
     /// Paths to downloaded compiler plugin JARs.
@@ -87,6 +91,14 @@ pub(crate) struct ResolvedBuildContext {
     pub dep_graph: ResolvedGraph,
     /// Content-addressed artifact store for this project.
     pub store: ArtifactStore,
+}
+
+/// Inputs that only flow into `update_lockfile_if_needed`.
+pub(crate) struct LockfileWriteInputs {
+    /// SHA-256 of the konanc tarball (from a fresh download, or `None` if already installed).
+    pub konanc_tarball_sha256: Option<String>,
+    /// SHA-256 of the JRE tarball (from a fresh download, or `None` if already installed).
+    pub jre_tarball_sha256: Option<String>,
 }
 
 /// Resolve the common build pipeline state (steps 1–7b).
@@ -132,7 +144,7 @@ pub(crate) fn resolve_build_context(
 
     // 4. Resolve target.
     let target = resolve_target(&options.target)?;
-    let profile = if options.release { "release" } else { "debug" };
+    let profile = options.profile;
 
     // 5. Resolve managed konanc toolchain.
     let resolved = resolve_konanc(&manifest.toolchain.kotlin)?;
@@ -244,14 +256,15 @@ pub(crate) fn resolve_build_context(
     Ok(ResolvedBuildContext {
         manifest,
         lockfile,
-        lockfile_path,
         lockfile_content,
         target,
-        profile: profile.to_owned(),
+        profile,
         konanc,
         jre_home,
-        konanc_tarball_sha256,
-        jre_tarball_sha256,
+        lockfile_write_inputs: LockfileWriteInputs {
+            konanc_tarball_sha256,
+            jre_tarball_sha256,
+        },
         library_paths,
         plugin_jars,
         plugin_locks,
@@ -294,20 +307,22 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         project_root,
         &ctx.manifest,
         &cc,
-        &ctx.profile,
+        ctx.profile,
         &ctx.lockfile_content,
     )?;
+
+    let lockfile_path = project_root.join("konvoy.lock");
 
     // 9. Update lockfile if toolchain, dependencies, or plugins changed.
     update_lockfile_if_needed(
         &ctx.lockfile,
         &ctx.konanc,
-        ctx.konanc_tarball_sha256.as_deref(),
-        ctx.jre_tarball_sha256.as_deref(),
+        ctx.lockfile_write_inputs.konanc_tarball_sha256.as_deref(),
+        ctx.lockfile_write_inputs.jre_tarball_sha256.as_deref(),
         &ctx.dep_graph,
         &ctx.plugin_locks,
         project_root,
-        &ctx.lockfile_path,
+        &lockfile_path,
         options.force,
         options.locked,
     )?;
@@ -345,7 +360,7 @@ pub(crate) fn build_single(
     project_root: &Path,
     manifest: &Manifest,
     cc: &CompileContext<'_>,
-    profile: &str,
+    profile: Profile,
     lockfile_content: &str,
 ) -> Result<(PathBuf, BuildOutcome), EngineError> {
     // Collect source files, excluding test sources (src/test/).
@@ -371,8 +386,8 @@ pub(crate) fn build_single(
         lockfile_content: lockfile_content.to_owned(),
         konanc_version: cc.konanc.version.clone(),
         konanc_fingerprint: cc.konanc.fingerprint.clone(),
-        target: cc.target.to_string(),
-        profile: profile.to_owned(),
+        target: *cc.target,
+        profile,
         source_dir: project_root.join("src"),
         source_glob: "**/*.kt".to_owned(),
         os: std::env::consts::OS.to_owned(),
@@ -395,7 +410,7 @@ pub(crate) fn build_single(
         .join(".konvoy")
         .join("build")
         .join(cc.target.to_konanc_arg())
-        .join(profile)
+        .join(profile.as_str())
         .join(&output_name);
 
     let store = ArtifactStore::new(project_root);
@@ -423,8 +438,8 @@ pub(crate) fn build_single(
 
     // Store artifact in cache.
     let metadata = BuildMetadata {
-        target: cc.target.to_string(),
-        profile: profile.to_owned(),
+        target: *cc.target,
+        profile,
         konanc_version: cc.konanc.version.clone(),
         built_at: crate::common::now_epoch_secs(),
     };
@@ -483,7 +498,7 @@ fn compile_two_step(
         .sources(sources)
         .output(&klib_path)
         .target(cc.target.to_konanc_arg())
-        .release(cc.options.release)
+        .release(cc.options.is_release())
         .produce(ProduceKind::Library)
         .libraries(cc.library_paths)
         .plugins(cc.plugin_jars);
@@ -508,7 +523,7 @@ fn compile_two_step(
             .include(&klib_path)
             .output(output_path)
             .target(cc.target.to_konanc_arg())
-            .release(cc.options.release)
+            .release(cc.options.is_release())
             .libraries(cc.library_paths);
 
         if let Some(jh) = cc.jre_home {
@@ -547,7 +562,7 @@ fn compile_single_step(
         .sources(sources)
         .output(output_path)
         .target(cc.target.to_konanc_arg())
-        .release(cc.options.release)
+        .release(cc.options.is_release())
         .produce(produce)
         .libraries(cc.library_paths)
         .plugins(cc.plugin_jars);
@@ -596,8 +611,9 @@ fn compile(
 
 /// Serialize lockfile content for cache key computation.
 pub(crate) fn lockfile_toml_content(lockfile: &Lockfile) -> Result<String, EngineError> {
-    toml::to_string_pretty(lockfile).map_err(|e| EngineError::Metadata {
-        message: e.to_string(),
+    toml::to_string_pretty(lockfile).map_err(|source| EngineError::TomlSerialize {
+        what: "konvoy.lock",
+        source,
     })
 }
 
@@ -628,7 +644,7 @@ pub(crate) fn resolve_maven_deps(
     }
 
     let cache_root = crate::plugin::maven_cache_root()?;
-    let target_str = target.to_string();
+    let target_str = target.to_konanc_arg();
     let maven_suffix = target.to_maven_suffix();
 
     let klib_paths: Vec<Result<PathBuf, EngineError>> = maven_locks
@@ -668,10 +684,10 @@ pub(crate) fn resolve_maven_deps(
             // Extract the expected SHA-256 for this target from the lockfile.
             let expected_sha256 =
                 targets
-                    .get(&target_str)
+                    .get(target_str)
                     .ok_or_else(|| EngineError::MissingTargetHash {
                         name: dep_name.clone(),
-                        target: target_str.clone(),
+                        target: target_str.to_owned(),
                     })?;
 
             // Compute the cache path and download URL.
@@ -1031,7 +1047,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let options = BuildOptions {
             target: None,
-            release: false,
+            profile: Profile::Debug,
             verbose: false,
             force: false,
             locked: false,
@@ -1054,7 +1070,7 @@ mod tests {
 
         let options = BuildOptions {
             target: None,
-            release: false,
+            profile: Profile::Debug,
             verbose: false,
             force: false,
             locked: false,
@@ -1251,13 +1267,14 @@ mod tests {
     fn build_options_defaults() {
         let opts = BuildOptions {
             target: None,
-            release: false,
+            profile: Profile::Debug,
             verbose: false,
             force: false,
             locked: false,
         };
         assert!(opts.target.is_none());
-        assert!(!opts.release);
+        assert_eq!(opts.profile, Profile::Debug);
+        assert!(!opts.is_release());
         assert!(!opts.verbose);
         assert!(!opts.force);
         assert!(!opts.locked);
@@ -1337,11 +1354,11 @@ mod tests {
             version: "2.1.0".to_owned(),
             fingerprint: "abc123".to_owned(),
         };
-        let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
-        let profile = "debug";
+        let target = konvoy_targets::Target::LinuxX64;
+        let profile = Profile::Debug;
         let options = BuildOptions {
             target: None,
-            release: false,
+            profile: Profile::Debug,
             verbose: false,
             force: false,
             locked: false,
@@ -1356,8 +1373,8 @@ mod tests {
             lockfile_content: lockfile_content.clone(),
             konanc_version: konanc.version.clone(),
             konanc_fingerprint: konanc.fingerprint.clone(),
-            target: target.to_string(),
-            profile: profile.to_owned(),
+            target,
+            profile,
             source_dir: project.join("src"),
             source_glob: "**/*.kt".to_owned(),
             os: std::env::consts::OS.to_owned(),
@@ -1373,8 +1390,8 @@ mod tests {
         let fake_artifact = staging.join("myapp");
         fs::write(&fake_artifact, "fake-binary-content").unwrap();
         let metadata = BuildMetadata {
-            target: target.to_string(),
-            profile: profile.to_owned(),
+            target,
+            profile,
             konanc_version: konanc.version.clone(),
             built_at: crate::common::now_epoch_secs(),
         };
@@ -1424,11 +1441,11 @@ mod tests {
             version: "2.1.0".to_owned(),
             fingerprint: "abc123".to_owned(),
         };
-        let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
-        let profile = "debug";
+        let target = konvoy_targets::Target::LinuxX64;
+        let profile = Profile::Debug;
         let options = BuildOptions {
             target: None,
-            release: false,
+            profile: Profile::Debug,
             verbose: false,
             force: false,
             locked: false,
@@ -1443,8 +1460,8 @@ mod tests {
             lockfile_content: lockfile_content.clone(),
             konanc_version: konanc.version.clone(),
             konanc_fingerprint: konanc.fingerprint.clone(),
-            target: target.to_string(),
-            profile: profile.to_owned(),
+            target,
+            profile,
             source_dir: project.join("src"),
             source_glob: "**/*.kt".to_owned(),
             os: std::env::consts::OS.to_owned(),
@@ -1460,8 +1477,8 @@ mod tests {
         let fake_artifact = staging.join("myapp");
         fs::write(&fake_artifact, "fake-binary-content").unwrap();
         let metadata = BuildMetadata {
-            target: target.to_string(),
-            profile: profile.to_owned(),
+            target,
+            profile,
             konanc_version: konanc.version.clone(),
             built_at: crate::common::now_epoch_secs(),
         };
@@ -1506,11 +1523,11 @@ mod tests {
             version: "2.1.0".to_owned(),
             fingerprint: "abc123".to_owned(),
         };
-        let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
-        let profile = "debug";
+        let target = konvoy_targets::Target::LinuxX64;
+        let profile = Profile::Debug;
         let options = BuildOptions {
             target: None,
-            release: false,
+            profile: Profile::Debug,
             verbose: false,
             force: false,
             locked: false,
@@ -1525,8 +1542,8 @@ mod tests {
             lockfile_content: lockfile_content.clone(),
             konanc_version: konanc.version.clone(),
             konanc_fingerprint: konanc.fingerprint.clone(),
-            target: target.to_string(),
-            profile: profile.to_owned(),
+            target,
+            profile,
             source_dir: project.join("src"),
             source_glob: "**/*.kt".to_owned(),
             os: std::env::consts::OS.to_owned(),
@@ -1542,8 +1559,8 @@ mod tests {
         let fake_artifact = staging.join("myapp");
         fs::write(&fake_artifact, "fake-binary-content").unwrap();
         let metadata = BuildMetadata {
-            target: target.to_string(),
-            profile: profile.to_owned(),
+            target,
+            profile,
             konanc_version: konanc.version.clone(),
             built_at: crate::common::now_epoch_secs(),
         };
@@ -1566,8 +1583,8 @@ mod tests {
             lockfile_content: lockfile_content.clone(),
             konanc_version: konanc.version.clone(),
             konanc_fingerprint: konanc.fingerprint.clone(),
-            target: target.to_string(),
-            profile: profile.to_owned(),
+            target,
+            profile,
             source_dir: project.join("src"),
             source_glob: "**/*.kt".to_owned(),
             os: std::env::consts::OS.to_owned(),
@@ -2125,8 +2142,8 @@ mod tests {
             version: "2.1.0".to_owned(),
             fingerprint: "abc123".to_owned(),
         };
-        let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
-        let profile = "debug";
+        let target = konvoy_targets::Target::LinuxX64;
+        let profile = Profile::Debug;
 
         // Compute the cache key that build_single would compute.
         let manifest_content = manifest.to_toml().unwrap();
@@ -2137,8 +2154,8 @@ mod tests {
             lockfile_content: lockfile_content.clone(),
             konanc_version: konanc.version.clone(),
             konanc_fingerprint: konanc.fingerprint.clone(),
-            target: target.to_string(),
-            profile: profile.to_owned(),
+            target,
+            profile,
             source_dir: project.join("src"),
             source_glob: "**/*.kt".to_owned(),
             os: std::env::consts::OS.to_owned(),
@@ -2154,8 +2171,8 @@ mod tests {
         let fake_artifact = staging.join("myapp");
         fs::write(&fake_artifact, "fake-binary-content").unwrap();
         let metadata = BuildMetadata {
-            target: target.to_string(),
-            profile: profile.to_owned(),
+            target,
+            profile,
             konanc_version: konanc.version.clone(),
             built_at: crate::common::now_epoch_secs(),
         };
@@ -2165,7 +2182,7 @@ mod tests {
         // Verify that without force, we get a cache hit.
         let options_no_force = BuildOptions {
             target: None,
-            release: false,
+            profile: Profile::Debug,
             verbose: false,
             force: false,
             locked: false,
@@ -2193,7 +2210,7 @@ mod tests {
         // which proves it bypassed the cache.
         let options_force = BuildOptions {
             target: None,
-            release: false,
+            profile: Profile::Debug,
             verbose: false,
             force: true,
             locked: false,
@@ -3682,8 +3699,8 @@ url = "https://example.com/plugin.jar"
             lockfile_content,
             konanc_version: "2.1.0".to_owned(),
             konanc_fingerprint: "abc123".to_owned(),
-            target: "linux_x64".to_owned(),
-            profile: "debug".to_owned(),
+            target: Target::LinuxX64,
+            profile: Profile::Debug,
             source_dir: dir.path().to_path_buf(),
             source_glob: "**/*.kt".to_owned(),
             os: "linux".to_owned(),
@@ -3733,8 +3750,8 @@ url = "https://example.com/plugin.jar"
             lockfile_content: content,
             konanc_version: "2.1.0".to_owned(),
             konanc_fingerprint: "abc".to_owned(),
-            target: "linux_x64".to_owned(),
-            profile: "debug".to_owned(),
+            target: Target::LinuxX64,
+            profile: Profile::Debug,
             source_dir: dir.path().to_path_buf(),
             source_glob: "**/*.kt".to_owned(),
             os: "linux".to_owned(),
@@ -3875,8 +3892,8 @@ url = "https://example.com/plugin.jar"
             lockfile_content: content,
             konanc_version: "2.1.0".to_owned(),
             konanc_fingerprint: "abc".to_owned(),
-            target: "linux_x64".to_owned(),
-            profile: "debug".to_owned(),
+            target: Target::LinuxX64,
+            profile: Profile::Debug,
             source_dir: dir.path().to_path_buf(),
             source_glob: "**/*.kt".to_owned(),
             os: "linux".to_owned(),

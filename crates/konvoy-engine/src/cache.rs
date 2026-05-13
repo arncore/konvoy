@@ -3,6 +3,9 @@
 use std::fmt;
 use std::path::Path;
 
+use konvoy_config::Profile;
+use konvoy_targets::Target;
+
 use crate::error::EngineError;
 
 /// All inputs that contribute to a deterministic cache key.
@@ -16,10 +19,10 @@ pub struct CacheInputs {
     pub konanc_version: String,
     /// SHA-256 fingerprint of the konanc binary.
     pub konanc_fingerprint: String,
-    /// Target triple (e.g. "linux_x64").
-    pub target: String,
-    /// Build profile ("debug" or "release").
-    pub profile: String,
+    /// Target triple.
+    pub target: Target,
+    /// Build profile.
+    pub profile: Profile,
     /// Root directory containing source files.
     pub source_dir: std::path::PathBuf,
     /// Glob pattern for source files (e.g. "**/*.kt").
@@ -47,13 +50,15 @@ impl CacheKey {
     pub fn compute(inputs: &CacheInputs) -> Result<Self, EngineError> {
         let source_hash = konvoy_util::hash::sha256_dir(&inputs.source_dir, &inputs.source_glob)?;
 
+        let target_str = inputs.target.to_konanc_arg();
+        let profile_str = inputs.profile.as_str();
         let mut parts: Vec<&str> = vec![
             &inputs.manifest_content,
             &inputs.lockfile_content,
             &inputs.konanc_version,
             &inputs.konanc_fingerprint,
-            &inputs.target,
-            &inputs.profile,
+            target_str,
+            profile_str,
             &source_hash,
             &inputs.os,
             &inputs.arch,
@@ -99,8 +104,8 @@ mod tests {
             lockfile_content: "".to_owned(),
             konanc_version: "2.1.0".to_owned(),
             konanc_fingerprint: "abc123".to_owned(),
-            target: "linux_x64".to_owned(),
-            profile: "debug".to_owned(),
+            target: Target::LinuxX64,
+            profile: Profile::Debug,
             source_dir: dir.to_path_buf(),
             source_glob: "**/*.kt".to_owned(),
             os: "linux".to_owned(),
@@ -182,7 +187,7 @@ mod tests {
         let key1 = CacheKey::compute(&make_inputs(tmp.path())).unwrap();
 
         let mut inputs = make_inputs(tmp.path());
-        inputs.target = "macos_arm64".to_owned();
+        inputs.target = Target::MacOsArm64;
         let key2 = CacheKey::compute(&inputs).unwrap();
 
         assert_ne!(key1, key2);
@@ -196,7 +201,7 @@ mod tests {
         let key1 = CacheKey::compute(&make_inputs(tmp.path())).unwrap();
 
         let mut inputs = make_inputs(tmp.path());
-        inputs.profile = "release".to_owned();
+        inputs.profile = Profile::Release;
         let key2 = CacheKey::compute(&inputs).unwrap();
 
         assert_ne!(key1, key2);
@@ -383,16 +388,29 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
+        fn arb_target() -> impl Strategy<Value = Target> {
+            prop_oneof![
+                Just(Target::LinuxX64),
+                Just(Target::LinuxArm64),
+                Just(Target::MacOsX64),
+                Just(Target::MacOsArm64),
+            ]
+        }
+
+        fn arb_profile() -> impl Strategy<Value = Profile> {
+            prop_oneof![Just(Profile::Debug), Just(Profile::Release)]
+        }
+
         fn arb_cache_inputs(dir: &Path) -> impl Strategy<Value = CacheInputs> + use<'_> {
             (
-                "[a-zA-Z0-9 =\n.]{1,100}",                            // manifest_content
-                "[a-zA-Z0-9 =\n.]{0,100}",                            // lockfile_content
-                "[0-9]{1,2}\\.[0-9]{1,2}\\.[0-9]{1,2}",               // konanc_version
-                "[a-f0-9]{8,16}",                                     // konanc_fingerprint
-                prop_oneof!["linux_x64", "macos_arm64", "macos_x64"], // target
-                prop_oneof!["debug", "release"],                      // profile
-                prop_oneof!["linux", "macos", "windows"],             // os
-                prop_oneof!["x86_64", "aarch64"],                     // arch
+                "[a-zA-Z0-9 =\n.]{1,100}",                // manifest_content
+                "[a-zA-Z0-9 =\n.]{0,100}",                // lockfile_content
+                "[0-9]{1,2}\\.[0-9]{1,2}\\.[0-9]{1,2}",   // konanc_version
+                "[a-f0-9]{8,16}",                         // konanc_fingerprint
+                arb_target(),                             // target
+                arb_profile(),                            // profile
+                prop_oneof!["linux", "macos", "windows"], // os
+                prop_oneof!["x86_64", "aarch64"],         // arch
             )
                 .prop_map(
                     move |(
@@ -442,8 +460,8 @@ mod tests {
                     lockfile_content: inputs1.lockfile_content.clone(),
                     konanc_version: inputs1.konanc_version.clone(),
                     konanc_fingerprint: inputs1.konanc_fingerprint.clone(),
-                    target: inputs1.target.clone(),
-                    profile: inputs1.profile.clone(),
+                    target: inputs1.target,
+                    profile: inputs1.profile,
                     source_dir: tmp.path().to_path_buf(),
                     source_glob: "**/*.kt".to_owned(),
                     os: inputs1.os.clone(),

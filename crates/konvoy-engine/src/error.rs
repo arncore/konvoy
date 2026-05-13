@@ -15,9 +15,21 @@ pub enum EngineError {
     #[error("konvoy.toml already exists at {path} — cannot initialize over an existing project")]
     ProjectExists { path: String },
 
-    /// Metadata serialization/deserialization failed.
-    #[error("cannot process metadata: {message}")]
-    Metadata { message: String },
+    /// A Maven coordinate (`groupId:artifactId`) failed to parse.
+    #[error("invalid maven coordinate `{coordinate}`: {reason}")]
+    InvalidMavenCoordinate { coordinate: String, reason: String },
+
+    /// A dependency declaration is missing a required field.
+    #[error("dependency `{name}` is missing `{field}` field")]
+    MissingDependencyField { name: String, field: &'static str },
+
+    /// A TOML document (lockfile, metadata, etc.) failed to serialize.
+    #[error("failed to serialize {what}: {source}")]
+    TomlSerialize {
+        what: &'static str,
+        #[source]
+        source: toml::ser::Error,
+    },
 
     /// A compiler operation failed.
     #[error("{0}")]
@@ -220,5 +232,75 @@ mod tests {
             msg.contains("home directory"),
             "other errors should pass through: {msg}"
         );
+    }
+
+    #[test]
+    fn invalid_maven_coordinate_display_includes_coordinate_and_reason() {
+        let err = EngineError::InvalidMavenCoordinate {
+            coordinate: "org.example:no-version:".to_owned(),
+            reason: "expected `groupId:artifactId`".to_owned(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("org.example:no-version:"), "got: {msg}");
+        assert!(msg.contains("expected `groupId:artifactId`"), "got: {msg}");
+    }
+
+    #[test]
+    fn missing_dependency_field_display_includes_name_and_field() {
+        let err = EngineError::MissingDependencyField {
+            name: "ktor-core".to_owned(),
+            field: "version",
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("ktor-core"), "got: {msg}");
+        assert!(msg.contains("version"), "got: {msg}");
+    }
+
+    #[test]
+    fn missing_dependency_field_static_field_is_preserved() {
+        // The `field: &'static str` typing means callers can't accidentally
+        // pass a runtime string — pin that with a test the compiler enforces.
+        let err = EngineError::MissingDependencyField {
+            name: "x".to_owned(),
+            field: "maven",
+        };
+        assert!(err.to_string().contains("maven"));
+    }
+
+    #[test]
+    fn toml_serialize_display_includes_what_and_source() {
+        // Build a `toml::ser::Error` via a value that fails to serialize: TOML
+        // does not allow strings as map keys with a mix of nested tables, but
+        // the cleanest reliable trigger is serializing a top-level non-table
+        // value (e.g. just an integer) which TOML rejects.
+        let ser_err: toml::ser::Error =
+            toml::to_string_pretty(&42_i64).expect_err("top-level int not valid TOML");
+        let err = EngineError::TomlSerialize {
+            what: "konvoy.lock",
+            source: ser_err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("konvoy.lock"), "got: {msg}");
+        assert!(msg.contains("failed to serialize"), "got: {msg}");
+    }
+
+    #[test]
+    fn toml_serialize_preserves_source_chain() {
+        use std::error::Error as _;
+        let ser_err: toml::ser::Error =
+            toml::to_string_pretty(&7_i64).expect_err("top-level int not valid TOML");
+        let err = EngineError::TomlSerialize {
+            what: "metadata.toml",
+            source: ser_err,
+        };
+        // `#[source]` should expose the underlying toml error so callers can
+        // walk the chain (e.g. anyhow, eyre, miette).
+        assert!(err.source().is_some(), "expected a source on TomlSerialize");
+    }
+
+    #[test]
+    fn engine_error_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<EngineError>();
     }
 }

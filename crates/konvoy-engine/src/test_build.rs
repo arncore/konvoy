@@ -66,16 +66,18 @@ pub fn build_tests(
         .collect();
     sources.extend(test_sources);
 
-    // Compute cache key (includes test sources via source hashing).
+    // Compute cache key. The test-binary build must produce a distinct cache
+    // key from a regular build of the same source tree, so we tag the lockfile
+    // content with a "test" marker (the lockfile_content is already a free-form
+    // hashed input). Keeps Profile cleanly debug/release.
     let manifest_content = ctx.manifest.to_toml()?;
     let cache_inputs = CacheInputs {
         manifest_content,
-        lockfile_content: ctx.lockfile_content,
+        lockfile_content: format!("{}\n# konvoy-test-build\n", ctx.lockfile_content),
         konanc_version: ctx.konanc.version.clone(),
         konanc_fingerprint: ctx.konanc.fingerprint.clone(),
-        target: ctx.target.to_string(),
-        // Use "debug-test" / "release-test" to differentiate from regular builds.
-        profile: format!("{}-test", ctx.profile),
+        target: ctx.target,
+        profile: ctx.profile,
         source_dir: project_root.join("src"),
         source_glob: "**/*.kt".to_owned(),
         os: std::env::consts::OS.to_owned(),
@@ -93,7 +95,7 @@ pub fn build_tests(
         .join(".konvoy")
         .join("build")
         .join(ctx.target.to_konanc_arg())
-        .join(&ctx.profile)
+        .join(ctx.profile.as_str())
         .join(&output_name);
 
     // Check cache (respecting --force).
@@ -123,7 +125,7 @@ pub fn build_tests(
         .sources(&sources)
         .output(&output_path)
         .target(ctx.target.to_konanc_arg())
-        .release(options.release)
+        .release(options.is_release())
         .produce(ProduceKind::Program)
         .generate_test_runner(true)
         .libraries(&ctx.library_paths)
@@ -148,7 +150,7 @@ pub fn build_tests(
 
     // Store in cache.
     let metadata = BuildMetadata {
-        target: ctx.target.to_string(),
+        target: ctx.target,
         profile: ctx.profile,
         konanc_version: ctx.konanc.version,
         built_at: now_epoch_secs(),
@@ -182,7 +184,7 @@ mod tests {
 
         let options = BuildOptions {
             target: None,
-            release: false,
+            profile: konvoy_config::Profile::Debug,
             verbose: false,
             force: false,
             locked: false,
@@ -211,7 +213,7 @@ mod tests {
 
         let options = BuildOptions {
             target: None,
-            release: false,
+            profile: konvoy_config::Profile::Debug,
             verbose: false,
             force: false,
             locked: false,
@@ -231,7 +233,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let options = BuildOptions {
             target: None,
-            release: false,
+            profile: konvoy_config::Profile::Debug,
             verbose: false,
             force: false,
             locked: false,
