@@ -715,15 +715,24 @@ struct MavenLockView<'a> {
     classifier: Option<&'a str>,
 }
 
+/// Everything needed to download a single Maven klib for one target.
+/// Computed sequentially upfront so we can decide which entries actually
+/// need a network fetch before creating any progress bars.
+struct PreparedKlib<'a> {
+    entry: &'a MavenLockView<'a>,
+    dest: PathBuf,
+    url: String,
+    expected_sha256: &'a str,
+    needs_download: bool,
+}
+
 pub(crate) fn resolve_maven_deps(
     lockfile: &Lockfile,
     target: &Target,
 ) -> Result<Vec<LibraryInput>, EngineError> {
     use rayon::prelude::IndexedParallelIterator;
 
-    // Filter to Maven entries AND extract their fields in one pass — the
-    // par_iter loop below then sees a flat view and never has to match on
-    // `DepSource` again.
+    // Filter to Maven entries AND extract their fields in one pass.
     let maven_locks: Vec<MavenLockView> = lockfile
         .dependencies
         .iter()
@@ -753,25 +762,15 @@ pub(crate) fn resolve_maven_deps(
     let target_str = target.to_konanc_arg();
     let maven_suffix = target.to_maven_suffix();
 
-    // Pre-allocate one bar per Maven dep in stable order so the parallel
-    // downloads render as a clean vertical stack.
-    let labels: Vec<String> = maven_locks
-        .iter()
-        .map(|m| format!("{} {}", m.name, m.version))
-        .collect();
-    let (_multi, bars) = konvoy_util::progress::pre_allocate_bars(labels);
-
-    let klib_inputs: Vec<Result<LibraryInput, EngineError>> =
+    // Compute coord/dest/url/expected-hash and check existence for every
+    // entry. Sequential because the input is small and these are cheap;
+    // doing it upfront lets us skip bar creation for cached items.
+    let prepared: Vec<PreparedKlib> =
         maven_locks
-            .par_iter()
-            .zip(bars.par_iter())
-            .map(|(entry, progress)| {
-                let dep_name = entry.name.to_owned();
+            .iter()
+            .map(|entry| {
                 let (group_id, artifact_id) = crate::common::split_maven_coordinate(entry.maven)?;
-
-                // Build the per-target artifact ID (e.g. "kotlinx-coroutines-core-linuxx64").
                 let per_target_artifact_id = format!("{artifact_id}-{maven_suffix}");
-
                 let mut coord = konvoy_util::maven::MavenCoordinate::new(
                     group_id,
                     &per_target_artifact_id,
@@ -781,54 +780,106 @@ pub(crate) fn resolve_maven_deps(
                 if let Some(cls) = entry.classifier {
                     coord = coord.with_classifier(cls);
                 }
-
-                // Extract the expected SHA-256 for this target from the lockfile.
                 let expected_sha256 = entry.targets.get(target_str).ok_or_else(|| {
                     EngineError::MissingTargetHash {
-                        name: dep_name.clone(),
+                        name: entry.name.to_owned(),
                         target: target_str.to_owned(),
                     }
                 })?;
-
-                // Compute the cache path and download URL.
                 let dest = coord.cache_path(&cache_root);
                 let url = coord.to_url(konvoy_util::maven::MAVEN_CENTRAL);
-
-                // Download (or use cached) and verify hash.
-                let result = progress
-                    .finish(konvoy_util::artifact::ensure_artifact(
-                        &url,
-                        &dest,
-                        Some(expected_sha256),
-                        &dep_name,
-                        progress.inner(),
-                    ))
-                    .map_err(|e| EngineError::LibraryDownloadFailed {
-                        name: dep_name.clone(),
-                        url: url.clone(),
-                        message: e.to_string(),
-                    })?;
-
-                // Double-check the hash matches the lockfile expectation.
-                if result.sha256 != *expected_sha256 {
-                    return Err(EngineError::LibraryHashMismatch {
-                        name: dep_name,
-                        expected: expected_sha256.clone(),
-                        actual: result.sha256,
-                    });
-                }
-
-                // Carry the freshly-verified hash through so `build_single` can
-                // reuse it for the cache key without re-reading the file.
-                Ok(LibraryInput::with_hash(result.path, result.sha256))
+                let needs_download = !dest.exists();
+                Ok(PreparedKlib {
+                    entry,
+                    dest,
+                    url,
+                    expected_sha256,
+                    needs_download,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, EngineError>>()?;
 
-    // Trailing newline so the next eprintln status line isn't concatenated
-    // onto the last bar's row.
-    eprintln!();
+    // Only allocate bars for entries that actually need a network fetch;
+    // cached entries are silent. The `aligned_bars` Vec parallels `prepared`
+    // so the par_iter zip pairs each entry with its bar (or None).
+    let download_labels: Vec<String> = prepared
+        .iter()
+        .filter(|p| p.needs_download)
+        .map(|p| format!("{} {}", p.entry.name, p.entry.version))
+        .collect();
+    let any_downloads = !download_labels.is_empty();
+    let bars: Vec<konvoy_util::progress::DownloadBar> = if any_downloads {
+        konvoy_util::progress::pre_allocate_bars(download_labels).1
+    } else {
+        Vec::new()
+    };
+    let mut bar_iter = bars.iter();
+    let aligned_bars: Vec<Option<&konvoy_util::progress::DownloadBar>> = prepared
+        .iter()
+        .map(|p| {
+            if p.needs_download {
+                bar_iter.next()
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let klib_inputs: Vec<Result<LibraryInput, EngineError>> = prepared
+        .par_iter()
+        .zip(aligned_bars.par_iter())
+        .map(|(p, maybe_bar)| download_one_klib(p, *maybe_bar))
+        .collect();
+
+    // Trailing newline only if we actually rendered any bars.
+    if any_downloads {
+        eprintln!();
+    }
 
     klib_inputs.into_iter().collect()
+}
+
+/// Run `ensure_artifact` for a single prepared klib. Uses the supplied
+/// progress bar when present (download path); silently uses a hidden bar
+/// when absent (cache-hit path that needs only a hash re-verify).
+fn download_one_klib(
+    p: &PreparedKlib<'_>,
+    maybe_bar: Option<&konvoy_util::progress::DownloadBar>,
+) -> Result<LibraryInput, EngineError> {
+    let dep_name = p.entry.name.to_owned();
+    let raw = if let Some(bar) = maybe_bar {
+        bar.finish(konvoy_util::artifact::ensure_artifact(
+            &p.url,
+            &p.dest,
+            Some(p.expected_sha256),
+            &dep_name,
+            bar.inner(),
+        ))
+    } else {
+        let hidden = konvoy_util::progress::hidden_bar();
+        konvoy_util::artifact::ensure_artifact(
+            &p.url,
+            &p.dest,
+            Some(p.expected_sha256),
+            &dep_name,
+            &hidden,
+        )
+    };
+    let result = raw.map_err(|e| EngineError::LibraryDownloadFailed {
+        name: dep_name.clone(),
+        url: p.url.clone(),
+        message: e.to_string(),
+    })?;
+    if result.sha256 != *p.expected_sha256 {
+        return Err(EngineError::LibraryHashMismatch {
+            name: dep_name,
+            expected: p.expected_sha256.to_owned(),
+            actual: result.sha256,
+        });
+    }
+    // Carry the freshly-verified hash through so `build_single` can reuse
+    // it for the cache key without re-reading the file.
+    Ok(LibraryInput::with_hash(result.path, result.sha256))
 }
 
 /// Returns `true` if the manifest declares Maven deps that have no matching

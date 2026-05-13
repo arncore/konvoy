@@ -114,17 +114,27 @@ pub fn ensure_detekt(
     let jar = detekt_jar_path(version)?;
     let url = detekt_download_url(version);
 
-    let progress = konvoy_util::progress::new_download_bar(format!("detekt {version}"));
-    let result = progress
-        .finish(konvoy_util::artifact::ensure_artifact(
+    // Only show a download bar when the JAR isn't already cached — a
+    // cached re-verify completes in milliseconds and the flash of ⚙️ → ✅
+    // is more noise than information.
+    let progress = (!jar.exists())
+        .then(|| konvoy_util::progress::new_download_bar(format!("detekt {version}")));
+    let raw = if let Some(bar) = &progress {
+        bar.finish(konvoy_util::artifact::ensure_artifact(
             &url,
             &jar,
             expected_sha256,
             "detekt",
-            progress.inner(),
+            bar.inner(),
         ))
-        .map_err(|e| map_download_err(version, e))?;
-    eprintln!();
+    } else {
+        let hidden = konvoy_util::progress::hidden_bar();
+        konvoy_util::artifact::ensure_artifact(&url, &jar, expected_sha256, "detekt", &hidden)
+    };
+    let result = raw.map_err(|e| map_download_err(version, e))?;
+    if progress.is_some() {
+        eprintln!();
+    }
 
     Ok((result.path, result.sha256))
 }
