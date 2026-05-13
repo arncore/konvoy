@@ -5,36 +5,43 @@
 //! `konvoy update`'s `MultiProgress` can host any of them as a child bar.
 
 use std::borrow::Cow;
+use std::fmt::Write;
 
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
 
-/// Template used for download bars: prefix, bar, bytes / total, speed.
-const DOWNLOAD_TEMPLATE: &str =
-    "  {prefix:<32} [{bar:30.cyan/blue}] {bytes:>10}/{total_bytes:<10} {bytes_per_sec:>12}";
+/// Default minimum prefix column width when the caller doesn't compute one
+/// from the full set of in-flight downloads. 36 is wide enough to fit a
+/// typical `"<dep> <version> [<target>]"` like
+/// `"kotlinx-coroutines-core 1.9.0 [macos_arm64]"` (42 chars overflows but
+/// that's only for single-download paths where alignment doesn't matter).
+const DEFAULT_PREFIX_WIDTH: usize = 36;
 
-/// Template used when the server didn't send `Content-Length`.
-const SPINNER_TEMPLATE: &str = "  {prefix:<32} {spinner} {bytes:>10} {bytes_per_sec:>12}";
-
-/// Build a styled [`ProgressBar`] for an HTTP download.
+/// Build a styled standalone [`ProgressBar`] for an HTTP download.
 ///
-/// The `prefix` is shown left of the bar (e.g. `"kotlinx-coroutines 1.9.0"`).
-/// The length is set later by the downloader once `Content-Length` is known;
-/// callers don't need to know it upfront.
+/// Used by single-shot download paths (toolchain install, detekt JAR, plugin
+/// JAR) that render one bar at a time.
 #[must_use]
 pub fn new_download_bar(prefix: impl Into<Cow<'static, str>>) -> ProgressBar {
     let pb = ProgressBar::new(0);
-    pb.set_style(download_style());
+    pb.set_style(download_style(DEFAULT_PREFIX_WIDTH));
     pb.set_prefix(prefix);
     pb
 }
 
-/// Build the same kind of bar but attach it to a [`MultiProgress`] container.
+/// Attach a styled bar to a [`MultiProgress`] container with a caller-supplied
+/// prefix column width.
 ///
-/// Used by `konvoy update` to render N parallel downloads in a vertical row.
+/// `prefix_width` should be the max prefix length across every bar in the
+/// container so all bar columns line up vertically. Bars added later than this
+/// call still render correctly — they just don't influence the width.
 #[must_use]
-pub fn add_download_bar(mp: &MultiProgress, prefix: impl Into<Cow<'static, str>>) -> ProgressBar {
+pub fn add_download_bar(
+    mp: &MultiProgress,
+    prefix: impl Into<Cow<'static, str>>,
+    prefix_width: usize,
+) -> ProgressBar {
     let pb = mp.add(ProgressBar::new(0));
-    pb.set_style(download_style());
+    pb.set_style(download_style(prefix_width));
     pb.set_prefix(prefix);
     pb
 }
@@ -49,20 +56,42 @@ pub fn hidden_bar() -> ProgressBar {
 ///
 /// Call from the downloader when the response has no `Content-Length`.
 pub fn switch_to_spinner(pb: &ProgressBar) {
-    pb.set_style(spinner_style());
+    pb.set_style(spinner_style(DEFAULT_PREFIX_WIDTH));
 }
 
-fn download_style() -> ProgressStyle {
-    // The template strings are static and well-formed; falling back to the
-    // default style is fine if a future indicatif version tightens parsing.
-    ProgressStyle::with_template(DOWNLOAD_TEMPLATE)
+/// Custom `{elapsed_ms}` formatter — millisecond-precision elapsed time.
+///
+/// Indicatif's built-in `{elapsed}` rounds to seconds ("0s" for fast
+/// downloads), which is too coarse for the typical sub-second klib fetches.
+fn write_elapsed_ms(state: &ProgressState, w: &mut dyn Write) {
+    let _ = write!(w, "{}ms", state.elapsed().as_millis());
+}
+
+fn download_style(prefix_width: usize) -> ProgressStyle {
+    // 2-space indent matches Konvoy's existing eprintln output (e.g.
+    // "  Resolved N dependencies..."). Bar width is capped so wide terminals
+    // don't stretch a 50 KiB download across 200 columns. The prefix column
+    // is left-padded to `prefix_width` so MultiProgress children line up.
+    // Brackets around the bar give each row a visible boundary so a stack of
+    // fully-filled bars doesn't merge into one solid block.
+    // `bytes_per_sec` minimum width 12 fits "999.99 MiB/s" (longest typical
+    // value) so the elapsed-time column stays right-aligned across rows.
+    let template = format!(
+        "  {{spinner:.green}} {{prefix:<{prefix_width}.bold}} [{{bar:40.green/dim}}] {{bytes:>10.cyan}} / {{total_bytes:<10.cyan}} {{bytes_per_sec:>12.yellow}} {{elapsed_ms:>7.dim}}"
+    );
+    ProgressStyle::with_template(&template)
         .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .with_key("elapsed_ms", write_elapsed_ms)
         .progress_chars("=> ")
 }
 
-fn spinner_style() -> ProgressStyle {
-    ProgressStyle::with_template(SPINNER_TEMPLATE)
+fn spinner_style(prefix_width: usize) -> ProgressStyle {
+    let template = format!(
+        "  {{spinner:.green}} {{prefix:<{prefix_width}.bold}} {{bytes:>10.cyan}} {{bytes_per_sec:>12.yellow}} {{elapsed_ms:>7.dim}}"
+    );
+    ProgressStyle::with_template(&template)
         .unwrap_or_else(|_| ProgressStyle::default_spinner())
+        .with_key("elapsed_ms", write_elapsed_ms)
 }
 
 #[cfg(test)]
@@ -81,13 +110,12 @@ mod tests {
         let pb = hidden_bar();
         pb.set_position(50);
         pb.finish();
-        // No assertion possible on stderr; hidden() is a no-op renderer.
     }
 
     #[test]
     fn add_download_bar_attaches_to_multiprogress() {
         let mp = MultiProgress::new();
-        let pb = add_download_bar(&mp, "child");
+        let pb = add_download_bar(&mp, "child", 32);
         assert_eq!(pb.prefix(), "child");
     }
 
@@ -95,7 +123,6 @@ mod tests {
     fn switch_to_spinner_changes_style() {
         let pb = new_download_bar("a");
         switch_to_spinner(&pb);
-        // No public API to read the style; just verify it doesn't panic.
         pb.set_position(100);
     }
 }

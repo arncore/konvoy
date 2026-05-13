@@ -17,8 +17,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
-use indicatif::MultiProgress;
-use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use indicatif::{MultiProgress, ProgressBar};
+use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile};
 use konvoy_config::manifest::Manifest;
@@ -66,19 +66,24 @@ fn placeholder_lock(dep: &ResolvedMavenDep, maven_coord: &str) -> DependencyLock
 /// Klibs are written directly into the shared Maven cache at
 /// `~/.konvoy/cache/maven/.../<artifact>-<version>.klib` so subsequent
 /// `konvoy build` runs reuse the verified file. Per-target downloads run in
-/// parallel via rayon and each renders its own progress bar under `multi` so
-/// the user sees a live vertical stack of bars updating concurrently.
+/// parallel via rayon and each renders into a pre-allocated progress bar (one
+/// per target, in `KNOWN_TARGETS` order) so the on-screen layout stays in
+/// the same stable rows regardless of completion order.
+///
+/// `bars` must have one entry per `KNOWN_TARGETS` element; caller-enforced
+/// via the zip in `update()`.
 fn download_dep(
     dep: &ResolvedMavenDep,
     cache_root: &Path,
-    multi: &MultiProgress,
+    bars: &[ProgressBar],
 ) -> Result<DependencyLock, EngineError> {
     let known_targets = konvoy_targets::KNOWN_TARGETS;
     let maven_coord = dep.key();
 
     let target_results: Vec<Result<(konvoy_targets::Target, String), EngineError>> = known_targets
         .par_iter()
-        .map(|&target| download_target_klib(dep, target, cache_root, multi))
+        .zip(bars.par_iter())
+        .map(|(&target, bar)| download_target_klib(dep, target, cache_root, bar))
         .collect();
 
     let mut targets_map: BTreeMap<String, String> = BTreeMap::new();
@@ -110,12 +115,13 @@ fn download_dep(
 /// Download a single dep's klib for one target and return `(target, sha256)`.
 ///
 /// Writes the klib to the shared Maven cache so `konvoy build` can reuse it
-/// without re-downloading. Renders its own bar in `multi`.
+/// without re-downloading. The bar is provided by the caller so the on-screen
+/// row is fixed and stable.
 fn download_target_klib(
     dep: &ResolvedMavenDep,
     target: konvoy_targets::Target,
     cache_root: &Path,
-    multi: &MultiProgress,
+    progress: &ProgressBar,
 ) -> Result<(konvoy_targets::Target, String), EngineError> {
     let maven_suffix = target.to_maven_suffix();
     let per_target_artifact_id = format!("{}-{}", dep.artifact_id, maven_suffix);
@@ -131,14 +137,9 @@ fn download_target_klib(
     }
     let url = coord.to_url(MAVEN_CENTRAL);
     let dest = coord.cache_path(cache_root);
-
-    let progress = konvoy_util::progress::add_download_bar(
-        multi,
-        format!("{} {} [{}]", dep.name, dep.version, target),
-    );
     let label = format!("{}:{}", dep.name, target);
 
-    let result = konvoy_util::artifact::ensure_artifact(&url, &dest, None, &label, &progress)
+    let result = konvoy_util::artifact::ensure_artifact(&url, &dest, None, &label, progress)
         .map_err(|e| match e {
             konvoy_util::error::UtilError::Download { message } => {
                 EngineError::LibraryDownloadFailed {
@@ -263,21 +264,50 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
     // verified klibs without re-downloading.
     let cache_root: PathBuf = crate::plugin::maven_cache_root()?;
 
-    // Hosts all per-(dep, target) progress bars in a vertical stack on stderr.
-    // Indicatif handles interleaving from rayon workers safely.
+    // Hosts all per-(dep, target) bars. Bars are added in stable order
+    // (`needs_download` order × `KNOWN_TARGETS` order) BEFORE any parallel
+    // work starts so the on-screen rows stay fixed regardless of which
+    // download finishes first.
     let multi = MultiProgress::new();
+    let known_targets = konvoy_targets::KNOWN_TARGETS;
+
+    // Build labels once, then reuse them to compute the max width AND to
+    // construct the bars — avoids formatting each prefix twice.
+    let labels: Vec<Vec<String>> = needs_download
+        .iter()
+        .map(|(_, dep)| known_targets.iter().map(|&t| dep.bar_label(t)).collect())
+        .collect();
+    let prefix_width = labels
+        .iter()
+        .flat_map(|row| row.iter().map(String::len))
+        .max()
+        .unwrap_or(0);
+
+    let dep_bars: Vec<Vec<ProgressBar>> = labels
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|label| konvoy_util::progress::add_download_bar(&multi, label, prefix_width))
+                .collect()
+        })
+        .collect();
 
     // Download deps in parallel; per-target downloads are also parallel within
-    // each. Each (dep, target) renders its own live progress bar under `multi`.
+    // each. `zip` pairs each dep with its pre-allocated bar row, removing any
+    // index-based fallback.
     let download_results: Vec<Result<(usize, DependencyLock), EngineError>> = needs_download
         .par_iter()
-        .map(|(idx, dep)| {
-            let lock = download_dep(dep, &cache_root, &multi)?;
+        .zip(dep_bars.par_iter())
+        .map(|((idx, dep), bars)| {
+            let lock = download_dep(dep, &cache_root, bars)?;
             Ok((*idx, lock))
         })
         .collect();
 
-    multi.clear().ok();
+    // Bars remain on screen at their final state after `finish()` (called
+    // inside `download_with_progress`); the `MultiProgress` is dropped at end
+    // of scope which releases the draw region without clearing the rendered
+    // content.
 
     // Apply results in original order so the lockfile output is deterministic
     // (parallel downloads finish in arbitrary order, but the on-disk layout
@@ -352,6 +382,11 @@ impl ResolvedMavenDep {
     /// Render the `"groupId:artifactId"` key used in lockfile entries and BFS maps.
     fn key(&self) -> String {
         format!("{}:{}", self.group_id, self.artifact_id)
+    }
+
+    /// Render the human-readable label shown on a download progress bar.
+    fn bar_label(&self, target: konvoy_targets::Target) -> String {
+        format!("{} {} [{}]", self.name, self.version, target)
     }
 }
 
