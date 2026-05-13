@@ -119,19 +119,10 @@ pub fn ensure_detekt(
     // is more noise than information.
     let progress = (!jar.exists())
         .then(|| konvoy_util::progress::new_download_bar(format!("detekt {version}")));
-    let raw = if let Some(bar) = &progress {
-        bar.finish(konvoy_util::artifact::ensure_artifact(
-            &url,
-            &jar,
-            expected_sha256,
-            "detekt",
-            bar.inner(),
-        ))
-    } else {
-        let hidden = konvoy_util::progress::hidden_bar();
-        konvoy_util::artifact::ensure_artifact(&url, &jar, expected_sha256, "detekt", &hidden)
-    };
-    let result = raw.map_err(|e| map_download_err(version, e))?;
+    let result = konvoy_util::progress::run_with_optional_bar(progress.as_ref(), |pb| {
+        konvoy_util::artifact::ensure_artifact(&url, &jar, expected_sha256, "detekt", pb)
+    })
+    .map_err(|e| map_download_err(version, e))?;
     if progress.is_some() {
         eprintln!();
     }

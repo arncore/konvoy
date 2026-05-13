@@ -140,13 +140,7 @@ fn download_target_klib(
     let label = format!("{}:{}", dep.name, target);
 
     let result = progress
-        .finish(konvoy_util::artifact::ensure_artifact(
-            &url,
-            &dest,
-            None,
-            &label,
-            progress.inner(),
-        ))
+        .run(|pb| konvoy_util::artifact::ensure_artifact(&url, &dest, None, &label, pb))
         .map_err(|e| match e {
             konvoy_util::error::UtilError::Download { message } => {
                 EngineError::LibraryDownloadFailed {

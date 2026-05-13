@@ -61,17 +61,32 @@ pub struct DownloadBar {
 }
 
 impl DownloadBar {
-    /// Access the underlying `ProgressBar` for functions that take
-    /// `&ProgressBar` (e.g. [`crate::download::download_with_progress`] and
-    /// [`crate::artifact::ensure_artifact`]).
-    #[must_use]
-    pub fn inner(&self) -> &ProgressBar {
-        &self.bar
+    /// Run a download function with this bar attached and finalise based on
+    /// the result.
+    ///
+    /// The closure receives a `&ProgressBar` it can hand to lower-level
+    /// download primitives (e.g. [`crate::artifact::ensure_artifact`] or
+    /// [`crate::download::download_with_progress`]). When the closure
+    /// returns, this bar's state flips to ✅ on `Ok` or ❌ on `Err`, and
+    /// the bar is abandoned so its final frame stays on screen.
+    ///
+    /// This is the recommended way to use a `DownloadBar` — callers should
+    /// not need to touch the inner `ProgressBar` directly.
+    ///
+    /// # Errors
+    /// Returns whatever `Err` the closure produced, unchanged.
+    pub fn run<F, T, E>(&self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(&ProgressBar) -> Result<T, E>,
+    {
+        self.finish(f(&self.bar))
     }
 
-    /// Finalise the bar based on a download result: success on `Ok`,
-    /// failure on `Err`. Returns the result unchanged so callers can chain
-    /// `?` on it.
+    /// Finalise the bar based on a pre-computed download result.
+    ///
+    /// Most callers should prefer [`Self::run`], which wires both halves
+    /// together via a closure. Use `finish` only when the result was
+    /// produced separately and you just need to flip state.
     ///
     /// # Errors
     /// Returns whatever `Err` was passed in, unchanged.
@@ -96,6 +111,25 @@ impl DownloadBar {
     pub fn mark_failure(&self) {
         self.state.store(STATE_FAILURE, Ordering::Relaxed);
         self.bar.abandon();
+    }
+}
+
+/// Run a download function with an optional bar attached.
+///
+/// Mirrors [`DownloadBar::run`] but lets the caller pass `None` for the
+/// cache-hit path where no UI should appear. When `bar` is `None`, the
+/// closure receives a hidden `ProgressBar` and no state flip happens.
+///
+/// # Errors
+/// Returns whatever `Err` the closure produced, unchanged.
+pub fn run_with_optional_bar<F, T, E>(bar: Option<&DownloadBar>, f: F) -> Result<T, E>
+where
+    F: FnOnce(&ProgressBar) -> Result<T, E>,
+{
+    if let Some(b) = bar {
+        b.run(f)
+    } else {
+        f(&hidden_bar())
     }
 }
 
@@ -321,7 +355,7 @@ mod tests {
     #[test]
     fn new_download_bar_sets_prefix() {
         let bar = new_download_bar("test-prefix");
-        assert_eq!(bar.inner().prefix(), "test-prefix");
+        assert_eq!(bar.bar.prefix(), "test-prefix");
     }
 
     #[test]
@@ -341,7 +375,7 @@ mod tests {
     fn add_download_bar_attaches_to_multiprogress() {
         let mp = MultiProgress::new();
         let bar = add_download_bar(&mp, "child", 32);
-        assert_eq!(bar.inner().prefix(), "child");
+        assert_eq!(bar.bar.prefix(), "child");
         assert_eq!(bar.state.load(Ordering::Relaxed), STATE_IN_PROGRESS);
     }
 
