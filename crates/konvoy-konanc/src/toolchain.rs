@@ -196,6 +196,7 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
                 progress.inner(),
             ))
             .map_err(|e| map_download_err(version, e))?;
+        eprintln!();
 
         let (_extract_guard, tmp_extract) = temp_extract_dir(&toolchains_root, &prefix)?;
         extract_tarball(&tmp_tarball, &tmp_extract, "Kotlin/Native", version)?;
@@ -254,6 +255,7 @@ fn install_jre(version: &str) -> Result<(PathBuf, Option<String>), KonancError> 
             progress.inner(),
         ))
         .map_err(|e| map_download_err(version, e))?;
+    eprintln!();
 
     let (_extract_guard, tmp_extract) = temp_extract_dir(&toolchains_root, &prefix)?;
     extract_tarball(&tmp_tarball, &tmp_extract, "JRE", version)?;

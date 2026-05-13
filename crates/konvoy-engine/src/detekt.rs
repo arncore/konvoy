@@ -124,6 +124,7 @@ pub fn ensure_detekt(
             progress.inner(),
         ))
         .map_err(|e| map_download_err(version, e))?;
+    eprintln!();
 
     Ok((result.path, result.sha256))
 }

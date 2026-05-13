@@ -50,9 +50,21 @@ const BLINK_TICK: Duration = Duration::from_millis(250);
 /// finalises each bar via [`DownloadBar::finish`] (or the lower-level
 /// [`DownloadBar::mark_success`] / [`DownloadBar::mark_failure`]) once the
 /// download result is known.
+///
+/// Both constructors render through a [`MultiProgress`] — single-bar paths
+/// ([`new_download_bar`]) own theirs internally for lifetime management;
+/// multi-bar paths ([`add_download_bar`]) attach to a caller-owned one.
+/// Callers are responsible for emitting a single trailing `eprintln!()`
+/// after the bar block so the next stderr line doesn't get concatenated
+/// onto the last bar's row.
 pub struct DownloadBar {
     bar: ProgressBar,
     state: Arc<AtomicU8>,
+    /// Owned `MultiProgress` for single-bar paths. Kept alive for the
+    /// bar's lifetime so the remote draw target doesn't dangle. Field-drop
+    /// order is bar → state → `_owned_multi`, so the multi state outlives
+    /// the bar that renders into it.
+    _owned_multi: Option<MultiProgress>,
 }
 
 impl DownloadBar {
@@ -94,25 +106,30 @@ impl DownloadBar {
     }
 }
 
-/// Build a styled standalone [`DownloadBar`] for an HTTP download.
+/// Build a styled [`DownloadBar`] for a single-shot download.
 ///
-/// Used by single-shot download paths (toolchain install, detekt JAR, plugin
-/// JAR) that render one bar at a time.
+/// Creates an owned [`MultiProgress`] internally so the rendering pipeline
+/// matches the multi-bar path used by `konvoy update`'s parallel klib
+/// downloads. Caller must still emit a trailing `eprintln!()` after the
+/// download finishes (same as for multi-bar paths) so the next stderr line
+/// doesn't get concatenated onto the bar's row.
 #[must_use]
 pub fn new_download_bar(prefix: impl Into<Cow<'static, str>>) -> DownloadBar {
+    let multi = MultiProgress::new();
     let state = Arc::new(AtomicU8::new(STATE_IN_PROGRESS));
-    let pb = ProgressBar::new(0);
-    pb.set_style(download_style(DEFAULT_PREFIX_WIDTH, Arc::clone(&state)));
-    pb.set_prefix(prefix);
-    pb.enable_steady_tick(BLINK_TICK);
-    DownloadBar { bar: pb, state }
+    let pb = build_bar(&multi, prefix, DEFAULT_PREFIX_WIDTH, Arc::clone(&state));
+    DownloadBar {
+        bar: pb,
+        state,
+        _owned_multi: Some(multi),
+    }
 }
 
-/// Attach a styled bar to a [`MultiProgress`] container with a caller-supplied
-/// prefix column width.
+/// Attach a styled bar to a caller-owned [`MultiProgress`] container.
 ///
 /// `prefix_width` should be the max prefix length across every bar in the
-/// container so all bar columns line up vertically.
+/// container so all bar columns line up vertically. The caller is
+/// responsible for emitting a trailing newline after the whole bar group.
 #[must_use]
 pub fn add_download_bar(
     mp: &MultiProgress,
@@ -120,11 +137,27 @@ pub fn add_download_bar(
     prefix_width: usize,
 ) -> DownloadBar {
     let state = Arc::new(AtomicU8::new(STATE_IN_PROGRESS));
+    let pb = build_bar(mp, prefix, prefix_width, Arc::clone(&state));
+    DownloadBar {
+        bar: pb,
+        state,
+        _owned_multi: None,
+    }
+}
+
+/// Shared bar construction: attach to `mp`, apply the styled template,
+/// set the prefix, and start the blink ticker.
+fn build_bar(
+    mp: &MultiProgress,
+    prefix: impl Into<Cow<'static, str>>,
+    prefix_width: usize,
+    state: Arc<AtomicU8>,
+) -> ProgressBar {
     let pb = mp.add(ProgressBar::new(0));
-    pb.set_style(download_style(prefix_width, Arc::clone(&state)));
+    pb.set_style(download_style(prefix_width, state));
     pb.set_prefix(prefix);
     pb.enable_steady_tick(BLINK_TICK);
-    DownloadBar { bar: pb, state }
+    pb
 }
 
 /// Hidden bar for use in tests or non-interactive contexts.
