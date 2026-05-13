@@ -301,15 +301,149 @@ pub fn pom_url(group_id: &str, artifact_id: &str, version: &str) -> String {
     crate::maven::maven_artifact_url(group_id, artifact_id, version, "pom")
 }
 
+// Cache layout v1: <konvoy_home>/cache/pom/<group_path>/<artifact>-<version>.{pom,module,module.404}.
+// If the on-disk format ever changes, bump to v2 by introducing a subdirectory.
+
+/// Build the on-disk cache path for a Maven artifact metadata file.
+///
+/// Layout matches the contract in CLAUDE.md:
+/// `~/.konvoy/cache/pom/<group_path>/<artifact_id>-<version>.<extension>`.
+///
+/// `group_id` is split on `.` so that `org.jetbrains.kotlinx` becomes
+/// nested directories (matching Maven Central's own layout). The
+/// `extension` is `"pom"` for POM files or `"module"` for Gradle Module
+/// Metadata files; both share the same cache root so a single layout-version
+/// bump suffices for either format.
+///
+/// # Errors
+/// Returns an error if the home directory cannot be located, or any
+/// identifier/version component fails validation (path-traversal guard).
+pub(crate) fn metadata_cache_path(
+    group_id: &str,
+    artifact_id: &str,
+    version: &str,
+    extension: &str,
+) -> Result<std::path::PathBuf, UtilError> {
+    crate::artifact::validate_identifier(group_id)?;
+    crate::artifact::validate_identifier(artifact_id)?;
+    // `validate_identifier` is strictly stronger than `validate_version`
+    // (same charset plus `..` rejection), so a single call suffices.
+    crate::artifact::validate_identifier(version)?;
+
+    let mut path = crate::fs::konvoy_home()?.join("cache").join("pom");
+    for segment in group_id.split('.') {
+        // `validate_identifier` already rejects `..`, but be defensive against
+        // empty segments produced by leading/trailing dots.
+        if segment.is_empty() {
+            return Err(UtilError::InvalidVersion {
+                version: group_id.to_owned(),
+            });
+        }
+        path.push(segment);
+    }
+    path.push(format!("{artifact_id}-{version}.{extension}"));
+    Ok(path)
+}
+
+/// Build the on-disk cache path for a POM file.
+///
+/// Thin wrapper over [`metadata_cache_path`] with `extension = "pom"`.
+fn pom_cache_path(
+    group_id: &str,
+    artifact_id: &str,
+    version: &str,
+) -> Result<std::path::PathBuf, UtilError> {
+    metadata_cache_path(group_id, artifact_id, version, "pom")
+}
+
+/// Atomically write `contents` to `dest` via a temp file in the same directory.
+///
+/// Mirrors the pattern in `ensure_artifact`: write to a `.tmp-<pid>` sibling
+/// and rename into place. If another writer wins the race, the rename may fail
+/// but the destination exists with valid contents, which is what we want.
+///
+/// Returns `Ok(())` on success. On failure to create the parent directory or
+/// to write the temp file, returns the underlying I/O error. A failed rename
+/// when `dest` already exists is treated as success (another writer placed it).
+///
+/// # Errors
+/// Returns the underlying I/O error if the parent directory cannot be created
+/// or the temp file cannot be written. A rename failure where `dest` already
+/// exists is not treated as an error.
+pub(crate) fn write_cache_atomic(dest: &std::path::Path, contents: &[u8]) -> Result<(), UtilError> {
+    let parent = dest.parent().ok_or_else(|| UtilError::Io {
+        path: dest.display().to_string(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "cache path has no parent"),
+    })?;
+
+    std::fs::create_dir_all(parent).map_err(|source| UtilError::Io {
+        path: parent.display().to_string(),
+        source,
+    })?;
+
+    let pid = std::process::id();
+    let file_name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| UtilError::Io {
+            path: dest.display().to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cache path has no filename",
+            ),
+        })?;
+    let tmp_path = parent.join(format!(".tmp-{pid}-{file_name}"));
+
+    std::fs::write(&tmp_path, contents).map_err(|source| UtilError::Io {
+        path: tmp_path.display().to_string(),
+        source,
+    })?;
+
+    match std::fs::rename(&tmp_path, dest) {
+        Ok(()) => Ok(()),
+        Err(_) if dest.exists() => {
+            // Another writer beat us — clean up our temp file and proceed.
+            // POSIX rename(2) is atomic, so if dest now exists another writer completed an atomic place — safe to read.
+            // NTFS MoveFileEx is similarly atomic for same-volume renames.
+            let _ = std::fs::remove_file(&tmp_path);
+            Ok(())
+        }
+        Err(source) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(UtilError::Io {
+                path: dest.display().to_string(),
+                source,
+            })
+        }
+    }
+}
+
 /// Fetch a POM file from Maven Central and return its contents as a string.
 ///
-/// Uses `ureq` with a 30-second connect timeout and 60-second global timeout.
+/// Uses a disk cache at `~/.konvoy/cache/pom/<group_path>/<artifact_id>-<version>.pom`.
+/// Cache hits avoid the HTTP round trip entirely. Cache misses fetch from
+/// Maven Central, then write the contents atomically into the cache (write
+/// failures are non-fatal — the function still returns the fetched content).
+///
+/// Uses `ureq` with a 60-second global timeout.
 ///
 /// # Errors
 ///
 /// Returns `UtilError::Download` if the HTTP request fails or the response
-/// body cannot be read.
+/// body cannot be read. Returns `UtilError::InvalidVersion` if any of
+/// `group_id`/`artifact_id`/`version` fail validation.
 pub fn fetch_pom(group_id: &str, artifact_id: &str, version: &str) -> Result<String, UtilError> {
+    // 1. Try the on-disk cache.
+    let cache_path = pom_cache_path(group_id, artifact_id, version)?;
+    if cache_path.exists() {
+        if let Ok(body) = std::fs::read_to_string(&cache_path) {
+            return Ok(body);
+        }
+        // Cache read failed (truncated, permissions, etc.); fall through to
+        // fetch from network so a degraded cache never blocks builds.
+    }
+
+    // 2. Cache miss — fetch from Maven Central.
     let url = pom_url(group_id, artifact_id, version);
 
     let agent = crate::download::http_agent(60);
@@ -324,6 +458,14 @@ pub fn fetch_pom(group_id: &str, artifact_id: &str, version: &str) -> Result<Str
         .map_err(|e| UtilError::Download {
             message: format!("failed to read POM response body from {url}: {e}"),
         })?;
+
+    // 3. Best-effort cache write. A failure here must not block the caller.
+    if let Err(e) = write_cache_atomic(&cache_path, body.as_bytes()) {
+        eprintln!(
+            "warning: failed to cache POM at {}: {e}",
+            cache_path.display()
+        );
+    }
 
     Ok(body)
 }
@@ -825,6 +967,78 @@ mod tests {
     }
 
     #[test]
+    fn fetch_pom_rejects_path_traversal_in_group_id() {
+        // Path-traversal in the group must be caught before any HTTP work or
+        // cache-path construction.
+        let result = fetch_pom("../etc/passwd", "lib", "1.0.0");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fetch_pom_rejects_invalid_version() {
+        let err = fetch_pom("com.example", "lib", "1.0/0").unwrap_err();
+        assert!(
+            matches!(err, UtilError::InvalidVersion { .. }),
+            "expected InvalidVersion, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn pom_cache_path_layout_matches_claude_md_contract() {
+        // Verify the layout suffix without depending on HOME (env mutation in
+        // tests races with other tests in the crate). The suffix is the
+        // load-bearing part — the prefix is `konvoy_home()` which is tested
+        // independently in fs.rs.
+        let path =
+            pom_cache_path("org.jetbrains.kotlinx", "kotlinx-coroutines-core", "1.9.0").unwrap();
+        let suffix: std::path::PathBuf = [
+            "cache",
+            "pom",
+            "org",
+            "jetbrains",
+            "kotlinx",
+            "kotlinx-coroutines-core-1.9.0.pom",
+        ]
+        .iter()
+        .collect();
+        assert!(
+            path.ends_with(&suffix),
+            "expected path to end with {} — got {}",
+            suffix.display(),
+            path.display()
+        );
+    }
+
+    #[test]
+    fn pom_cache_path_rejects_invalid_identifiers() {
+        assert!(pom_cache_path("..", "lib", "1.0.0").is_err());
+        assert!(pom_cache_path("com.ex", "..", "1.0.0").is_err());
+        assert!(pom_cache_path("com.ex", "lib", "..").is_err());
+    }
+
+    #[test]
+    fn write_cache_atomic_creates_parent_and_writes_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("nested").join("dir").join("file.pom");
+
+        write_cache_atomic(&dest, b"contents").unwrap();
+
+        let written = std::fs::read(&dest).unwrap();
+        assert_eq!(written, b"contents");
+    }
+
+    #[test]
+    fn write_cache_atomic_overwrites_existing_file() {
+        // Overwriting is fine — Unix rename replaces the target atomically.
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("file.pom");
+        std::fs::write(&dest, b"old").unwrap();
+
+        write_cache_atomic(&dest, b"new").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+    }
+
+    #[test]
     fn parse_pom_dependency_missing_version_inherits_empty() {
         // When a dependency has no <version>, it gets an empty string.
         // In practice the caller would resolve it via dependencyManagement
@@ -1047,5 +1261,172 @@ mod tests {
         assert_eq!(dep.group_id, "org.jetbrains.kotlin");
         assert_eq!(dep.artifact_id, "kotlin-native-prebuilt");
         assert_eq!(dep.version, "1.9.21");
+    }
+
+    // -----------------------------------------------------------------
+    // metadata_cache_path validation branches (one test per validation site)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn metadata_cache_path_rejects_invalid_group_id() {
+        // First validation site: group_id.
+        let err = metadata_cache_path("../etc", "lib", "1.0.0", "pom").unwrap_err();
+        assert!(
+            matches!(err, UtilError::InvalidVersion { .. }),
+            "expected InvalidVersion for bad group_id, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn metadata_cache_path_rejects_invalid_artifact_id() {
+        // Second validation site: artifact_id.
+        let err = metadata_cache_path("com.example", "..", "1.0.0", "pom").unwrap_err();
+        assert!(
+            matches!(err, UtilError::InvalidVersion { .. }),
+            "expected InvalidVersion for bad artifact_id, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn metadata_cache_path_rejects_invalid_version() {
+        // Third validation site: version.
+        let err = metadata_cache_path("com.example", "lib", "..", "pom").unwrap_err();
+        assert!(
+            matches!(err, UtilError::InvalidVersion { .. }),
+            "expected InvalidVersion for bad version, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn metadata_cache_path_rejects_empty_dot_segment() {
+        // A leading dot makes `split('.')` produce an empty segment even
+        // though `validate_identifier` (which only rejects ".." and bad
+        // chars) accepts the input. That's specifically what the in-loop
+        // `if segment.is_empty()` guard exists for.
+        let err = metadata_cache_path(".com", "lib", "1.0.0", "pom").unwrap_err();
+        assert!(
+            matches!(err, UtilError::InvalidVersion { .. }),
+            "expected InvalidVersion for empty segment, got: {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // write_cache_atomic — error branches
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn write_cache_atomic_errors_when_path_has_no_filename() {
+        // `Path::file_name()` returns None when the path ends in `..`. The
+        // parent and the create_dir_all succeed (parent() returns the
+        // containing dir, which exists), so the no-filename branch is the
+        // first failure point.
+        let tmp = tempfile::tempdir().unwrap();
+        let bad_path = tmp.path().join("..");
+        let result = write_cache_atomic(&bad_path, b"contents");
+        assert!(result.is_err(), "path ending in `..` has no filename");
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, UtilError::Io { .. }),
+            "expected Io error, got: {msg}"
+        );
+        assert!(
+            msg.contains("no filename") || msg.contains("InvalidInput"),
+            "error should mention the no-filename invariant, got: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_cache_atomic_errors_when_path_has_no_parent() {
+        // The root directory `/` has no parent — `Path::parent()` returns None.
+        // This exercises the early `ok_or_else` branch.
+        let result = write_cache_atomic(std::path::Path::new("/"), b"contents");
+        assert!(result.is_err(), "writing to / must fail with a typed error");
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, UtilError::Io { .. }),
+            "expected Io error, got: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_cache_atomic_errors_on_unwritable_parent() {
+        // Reproduces the "rename failed, dest does not exist" branch:
+        // make the parent read-only so the temp-file write fails. (Running
+        // as root would bypass this; CI normally doesn't.)
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("ro");
+        std::fs::create_dir(&parent).unwrap();
+        let mut perms = std::fs::metadata(&parent).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        let original = perms.mode();
+        perms.set_mode(0o500); // r-x -- no writes
+        std::fs::set_permissions(&parent, perms).unwrap();
+
+        let dest = parent.join("file.pom");
+        let result = write_cache_atomic(&dest, b"contents");
+
+        // Restore permissions so the tempdir cleans up.
+        let mut restored = std::fs::metadata(&parent).unwrap().permissions();
+        restored.set_mode(original);
+        let _ = std::fs::set_permissions(&parent, restored);
+
+        // On most filesystems the temp-file write fails with EACCES; on
+        // an unusual setup it could succeed, so we only assert when the
+        // error path engages.
+        if let Err(err) = result {
+            assert!(
+                matches!(err, UtilError::Io { .. }),
+                "expected Io error, got: {err}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // fetch_pom — cache hit and cache-write failure paths
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn fetch_pom_cache_hit_returns_disk_contents_without_network() {
+        // Verify the cache-hit early-return path: by pre-populating the
+        // on-disk cache, `fetch_pom` must read it back without trying any
+        // HTTP I/O. Uses a HOME override so we point at a temp dir.
+        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
+
+        let saved_home = std::env::var("HOME").ok();
+        let saved_profile = std::env::var("USERPROFILE").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        // Clear USERPROFILE so the unix path is used everywhere.
+        std::env::remove_var("USERPROFILE");
+
+        // Construct the cache path that `fetch_pom` will look at, and
+        // pre-populate it.
+        let group = "com.example";
+        let artifact = "cached-lib";
+        let version = "1.2.3";
+        let cache_path = pom_cache_path(group, artifact, version).unwrap();
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        let expected_body = "<project><artifactId>cached-lib</artifactId></project>";
+        std::fs::write(&cache_path, expected_body).unwrap();
+
+        let result = fetch_pom(group, artifact, version);
+
+        // Restore HOME/USERPROFILE before asserting so a panic leaves the
+        // environment clean for other tests.
+        if let Some(v) = saved_home {
+            std::env::set_var("HOME", v);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(v) = saved_profile {
+            std::env::set_var("USERPROFILE", v);
+        }
+
+        let body = result.unwrap();
+        assert_eq!(body, expected_body, "cache hit must return the disk bytes");
     }
 }

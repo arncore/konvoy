@@ -126,23 +126,84 @@ pub fn module_metadata_url(group_id: &str, artifact_id: &str, version: &str) -> 
     crate::maven::maven_artifact_url(group_id, artifact_id, version, "module")
 }
 
+/// Build the on-disk cache path for a Gradle Module Metadata file.
+///
+/// Layout matches the POM cache scheme:
+/// `~/.konvoy/cache/pom/<group_path>/<artifact_id>-<version>.module`.
+/// (Same root directory; a different extension keeps POM and module entries
+/// from colliding.) Delegates to [`crate::pom::metadata_cache_path`] so both
+/// formats share validation and layout-versioning logic.
+fn module_cache_path(
+    group_id: &str,
+    artifact_id: &str,
+    version: &str,
+) -> Result<std::path::PathBuf, UtilError> {
+    crate::pom::metadata_cache_path(group_id, artifact_id, version, "module")
+}
+
+/// Build the 404-sentinel path that records "this artifact has no .module file".
+///
+/// Appends `.404` to the body filename. Fails loudly if the body path has no
+/// filename component — the caller (this module) always constructs the body
+/// via [`module_cache_path`], which guarantees a filename, so this is an
+/// invariant check rather than a user-facing error.
+fn module_404_sentinel_path(body: &std::path::Path) -> Result<std::path::PathBuf, UtilError> {
+    let file_name = body
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| UtilError::Io {
+            path: body.display().to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cache path has no filename",
+            ),
+        })?;
+    let mut name = file_name.to_owned();
+    name.push_str(".404");
+    Ok(body.with_file_name(name))
+}
+
 /// Fetch a Gradle Module Metadata file from Maven Central.
 ///
 /// Returns `Ok(Some(json))` if the file exists, `Ok(None)` if the server
 /// returns a 404 (meaning the artifact does not publish `.module` files),
 /// or an error for other HTTP failures.
 ///
+/// Uses a disk cache at `~/.konvoy/cache/pom/<group_path>/<artifact_id>-<version>.module`.
+/// 404 responses are recorded by writing an empty sentinel file at
+/// `<path>.404`, so re-runs do not hit the network for known-missing
+/// artifacts. Cache writes are best-effort: failures are logged but the
+/// fetched content is still returned.
+///
 /// # Errors
 ///
-/// Returns `UtilError::Download` if the HTTP request fails with a non-404 error
-/// or the response body cannot be read.
+/// Returns `UtilError::Download` if the HTTP request fails with a non-404
+/// error or the response body cannot be read. Returns `UtilError::InvalidVersion`
+/// if any of `group_id`/`artifact_id`/`version` fail validation.
 pub fn fetch_module_metadata(
     group_id: &str,
     artifact_id: &str,
     version: &str,
 ) -> Result<Option<String>, UtilError> {
-    let url = module_metadata_url(group_id, artifact_id, version);
+    // 1. Try the disk cache. Check the body file first, then the 404 sentinel.
+    // Body file wins over the 404 sentinel if both exist. This recovers
+    // gracefully from the case where Maven Central publishes a previously
+    // missing artifact between two `konvoy update` runs.
+    let cache_path = module_cache_path(group_id, artifact_id, version)?;
+    if cache_path.exists() {
+        if let Ok(body) = std::fs::read_to_string(&cache_path) {
+            return Ok(Some(body));
+        }
+        // Cache read failed (truncated, permissions, etc.); fall through to
+        // fetch from network rather than block builds.
+    }
+    let sentinel_path = module_404_sentinel_path(&cache_path)?;
+    if sentinel_path.exists() {
+        return Ok(None);
+    }
 
+    // 2. Cache miss — fetch from Maven Central.
+    let url = module_metadata_url(group_id, artifact_id, version);
     let agent = crate::download::http_agent(60);
 
     match agent.get(&url).call() {
@@ -155,9 +216,26 @@ pub fn fetch_module_metadata(
                         "failed to read module metadata response body from {url}: {e}"
                     ),
                 })?;
+
+            if let Err(e) = crate::pom::write_cache_atomic(&cache_path, body.as_bytes()) {
+                eprintln!(
+                    "warning: failed to cache module metadata at {}: {e}",
+                    cache_path.display()
+                );
+            }
+
             Ok(Some(body))
         }
-        Err(ureq::Error::StatusCode(404)) => Ok(None),
+        Err(ureq::Error::StatusCode(404)) => {
+            // Persist the 404 so we don't re-hit the network on every run.
+            if let Err(e) = crate::pom::write_cache_atomic(&sentinel_path, &[]) {
+                eprintln!(
+                    "warning: failed to cache module 404 sentinel at {}: {e}",
+                    sentinel_path.display()
+                );
+            }
+            Ok(None)
+        }
         Err(e) => Err(UtilError::Download {
             message: format!("failed to fetch module metadata from {url}: {e}"),
         }),
@@ -504,6 +582,60 @@ mod tests {
     }
 
     #[test]
+    fn module_cache_path_uses_module_extension() {
+        let path = module_cache_path("com.example", "lib", "1.0.0").unwrap();
+        let suffix: std::path::PathBuf = ["cache", "pom", "com", "example", "lib-1.0.0.module"]
+            .iter()
+            .collect();
+        assert!(
+            path.ends_with(&suffix),
+            "expected {} to end with {}",
+            path.display(),
+            suffix.display()
+        );
+    }
+
+    #[test]
+    fn module_cache_path_rejects_path_traversal() {
+        assert!(module_cache_path("..", "lib", "1.0.0").is_err());
+        assert!(module_cache_path("com.ex", "..", "1.0.0").is_err());
+        assert!(module_cache_path("com.ex", "lib", "..").is_err());
+    }
+
+    #[test]
+    fn module_404_sentinel_path_appends_suffix() {
+        let body = std::path::PathBuf::from("/tmp/cache/pom/com/example/lib-1.0.0.module");
+        let sentinel = module_404_sentinel_path(&body).unwrap();
+        assert_eq!(
+            sentinel,
+            std::path::PathBuf::from("/tmp/cache/pom/com/example/lib-1.0.0.module.404")
+        );
+    }
+
+    #[test]
+    fn module_404_sentinel_path_rejects_path_without_filename() {
+        // An empty path has no file_name — the invariant check should fire.
+        let body = std::path::PathBuf::from("");
+        let result = module_404_sentinel_path(&body);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fetch_module_metadata_rejects_path_traversal_in_group_id() {
+        let result = fetch_module_metadata("../etc/passwd", "lib", "1.0.0");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fetch_module_metadata_rejects_invalid_version() {
+        let err = fetch_module_metadata("com.example", "lib", "1.0/0").unwrap_err();
+        assert!(
+            matches!(err, UtilError::InvalidVersion { .. }),
+            "expected InvalidVersion, got: {err:?}"
+        );
+    }
+
+    #[test]
     fn fetch_module_metadata_nonexistent_returns_none() {
         // Use a non-existent artifact to test 404 handling.
         let result = fetch_module_metadata("com.nonexistent.fake", "no-such-artifact", "0.0.0");
@@ -624,5 +756,109 @@ mod tests {
         assert_eq!(metadata.files.len(), 1);
         // sha256 is None because it was not present (sha512/md5 are different fields).
         assert!(metadata.files.first().unwrap().sha256.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // fetch_module_metadata — disk-cache behavior (HOME-override pattern)
+    // -----------------------------------------------------------------
+
+    /// Run `f` with HOME pointing at a tempdir, serialized against other
+    /// HOME-mutating tests. Restores HOME before assertions can panic.
+    fn with_fake_home<F, R>(f: F) -> R
+    where
+        F: FnOnce(&std::path::Path) -> R,
+    {
+        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
+
+        let saved_home = std::env::var("HOME").ok();
+        let saved_profile = std::env::var("USERPROFILE").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("USERPROFILE");
+
+        // Catch any panic so we always restore the env.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(tmp.path())));
+
+        if let Some(v) = saved_home {
+            std::env::set_var("HOME", v);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(v) = saved_profile {
+            std::env::set_var("USERPROFILE", v);
+        }
+
+        match result {
+            Ok(r) => r,
+            Err(e) => std::panic::resume_unwind(e),
+        }
+    }
+
+    #[test]
+    fn fetch_module_metadata_cache_hit_body_returns_some_without_network() {
+        // Pre-populate the body file; the function must return `Some(body)`
+        // without any HTTP I/O.
+        with_fake_home(|_home| {
+            let group = "com.example";
+            let artifact = "cached-mod";
+            let version = "1.0.0";
+            let body_path = module_cache_path(group, artifact, version).unwrap();
+            std::fs::create_dir_all(body_path.parent().unwrap()).unwrap();
+            let expected = r#"{"variants":[{"name":"x"}]}"#;
+            std::fs::write(&body_path, expected).unwrap();
+
+            let result = fetch_module_metadata(group, artifact, version).unwrap();
+            assert_eq!(
+                result.as_deref(),
+                Some(expected),
+                "cache hit must return Some(body)"
+            );
+        });
+    }
+
+    #[test]
+    fn fetch_module_metadata_cache_hit_404_sentinel_returns_none() {
+        // Pre-populate ONLY the 404 sentinel; the function must return None
+        // without any HTTP I/O.
+        with_fake_home(|_home| {
+            let group = "com.example";
+            let artifact = "no-module";
+            let version = "1.0.0";
+            let body_path = module_cache_path(group, artifact, version).unwrap();
+            let sentinel = module_404_sentinel_path(&body_path).unwrap();
+            std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+            std::fs::write(&sentinel, b"").unwrap();
+
+            let result = fetch_module_metadata(group, artifact, version).unwrap();
+            assert!(
+                result.is_none(),
+                "sentinel hit must return None (no .module published)"
+            );
+        });
+    }
+
+    #[test]
+    fn fetch_module_metadata_body_wins_over_404_sentinel() {
+        // If both the body and the sentinel exist (Maven Central started
+        // publishing a previously-missing artifact), the body must win.
+        // This is the recovery contract documented at the call site.
+        with_fake_home(|_home| {
+            let group = "com.example";
+            let artifact = "now-published";
+            let version = "1.0.0";
+            let body_path = module_cache_path(group, artifact, version).unwrap();
+            let sentinel = module_404_sentinel_path(&body_path).unwrap();
+            std::fs::create_dir_all(body_path.parent().unwrap()).unwrap();
+            let expected = r#"{"variants":[{"name":"y"}]}"#;
+            std::fs::write(&body_path, expected).unwrap();
+            std::fs::write(&sentinel, b"").unwrap();
+
+            let result = fetch_module_metadata(group, artifact, version).unwrap();
+            assert_eq!(
+                result.as_deref(),
+                Some(expected),
+                "body file must take precedence over stale 404 sentinel"
+            );
+        });
     }
 }

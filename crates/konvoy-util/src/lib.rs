@@ -10,3 +10,6 @@ pub mod maven;
 pub mod metadata;
 pub mod module_metadata;
 pub mod pom;
+
+#[cfg(test)]
+pub(crate) mod test_util;

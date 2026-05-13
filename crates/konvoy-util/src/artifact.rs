@@ -35,6 +35,32 @@ pub fn validate_version(version: &str) -> Result<(), UtilError> {
     Ok(())
 }
 
+/// Validate that a Maven group or artifact identifier is safe for filesystem paths.
+///
+/// Allows only `[a-zA-Z0-9._-]`. Must be non-empty and must not contain `..`
+/// path-traversal sequences. This protects functions that build cache paths
+/// from identifier components (e.g. `~/.konvoy/cache/pom/<group>/<artifact>-<version>.pom`).
+///
+/// # Errors
+/// Returns `UtilError::InvalidVersion` (re-used: the underlying constraint is
+/// identical) if the string is empty, contains disallowed characters, or
+/// contains a `..` sequence.
+pub fn validate_identifier(identifier: &str) -> Result<(), UtilError> {
+    // `..` would let a malicious coordinate escape the cache dir even though
+    // every individual character is in the allowed set (`.` and `.` are both ok).
+    if identifier.is_empty()
+        || identifier.contains("..")
+        || !identifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        return Err(UtilError::InvalidVersion {
+            version: identifier.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Ensure a single-file artifact exists at `dest`, downloading from `url` if needed.
 ///
 /// Follows the same atomic-download pattern as the detekt JAR management:
@@ -172,6 +198,31 @@ mod tests {
     fn validate_version_rejects_special_chars() {
         assert!(validate_version("1.0; rm -rf /").is_err());
         assert!(validate_version("ver\0sion").is_err());
+    }
+
+    #[test]
+    fn validate_identifier_accepts_typical_maven_ids() {
+        assert!(validate_identifier("org.jetbrains.kotlinx").is_ok());
+        assert!(validate_identifier("kotlinx-coroutines-core").is_ok());
+        assert!(validate_identifier("kotlin_stdlib").is_ok());
+        assert!(validate_identifier("a").is_ok());
+    }
+
+    #[test]
+    fn validate_identifier_rejects_path_traversal() {
+        assert!(validate_identifier("..").is_err());
+        assert!(validate_identifier("..foo").is_err());
+        assert!(validate_identifier("foo..bar").is_err());
+        assert!(validate_identifier("../etc").is_err());
+    }
+
+    #[test]
+    fn validate_identifier_rejects_empty_and_special_chars() {
+        assert!(validate_identifier("").is_err());
+        assert!(validate_identifier("foo/bar").is_err());
+        assert!(validate_identifier("foo bar").is_err());
+        assert!(validate_identifier("foo\0bar").is_err());
+        assert!(validate_identifier("foo:bar").is_err());
     }
 
     #[test]
