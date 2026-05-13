@@ -26,23 +26,29 @@ pub fn http_agent(global_timeout_secs: u64) -> ureq::Agent {
 
 /// Stream a URL to a file, calling `on_progress` as bytes arrive and computing SHA-256.
 ///
+/// Pure network primitive: no UI dependencies. Callers in
+/// [`crate::artifact`] and [`crate::progress`] adapt it to higher-level
+/// flows; engine code should not call this directly — use
+/// [`crate::progress::stream_with_bar`] for tarballs or
+/// [`crate::progress::fetch`] for hash-verified artifacts.
+///
 /// `on_progress(downloaded, total)` is invoked after each chunk:
 /// - `downloaded`: cumulative bytes written so far
 /// - `total`: `Content-Length` from the response (or `None` if absent)
 ///
-/// `total` is `None` until the response headers are parsed and the server
-/// advertises a content length; from the first chunk onward it's either
-/// always `Some(n)` for the same `n` or always `None`.
-///
-/// This function knows nothing about progress bars — callers in
-/// `konvoy_util::progress` adapt it.
+/// `total` is consistent across chunks — either always `Some(n)` for the
+/// same `n` or always `None`.
 ///
 /// Returns the hex-encoded SHA-256 hash of the downloaded content.
 ///
 /// # Errors
 /// Returns an error if the HTTP request fails, the file cannot be written,
 /// or a read error occurs during streaming.
-pub fn stream_download<F>(url: &str, dest: &Path, mut on_progress: F) -> Result<String, UtilError>
+pub(crate) fn stream_download<F>(
+    url: &str,
+    dest: &Path,
+    mut on_progress: F,
+) -> Result<String, UtilError>
 where
     F: FnMut(u64, Option<u64>),
 {
