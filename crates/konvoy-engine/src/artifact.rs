@@ -1,7 +1,9 @@
 //! Content-addressed artifact store for build outputs.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -142,19 +144,15 @@ impl ArtifactStore {
                 // Another process beat us; guard will clean up the temp dir.
                 Ok(())
             }
-            Err(e) => {
-                // On Linux, rename(2) on directories returns ENOTEMPTY (not
-                // EEXIST) when the target directory already exists and is
-                // non-empty. Map this to the same "lost the race" semantics.
-                if is_directory_not_empty_error(&e) {
-                    return Ok(());
-                }
-                Err(konvoy_util::error::UtilError::Io {
-                    path: entry_dir.display().to_string(),
-                    source: e,
-                }
-                .into())
+            // On Linux/macOS, rename(2) on directories returns ENOTEMPTY (not
+            // EEXIST) when the target directory already exists and is
+            // non-empty. Map this to the same "lost the race" semantics.
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
+            Err(e) => Err(konvoy_util::error::UtilError::Io {
+                path: entry_dir.display().to_string(),
+                source: e,
             }
+            .into()),
         }
     }
 
@@ -208,6 +206,15 @@ fn path_contains_symlink(path: &Path) -> bool {
     false
 }
 
+/// Per-process memoization of `resolve_cache_root` results.
+///
+/// `ArtifactStore::new` may be called once per dependency during a build; without
+/// memoization we would fork `git rev-parse` N+1 times per build.
+fn cache_root_memo() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
+    static MEMO: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Resolve the cache root directory, sharing cache across git worktrees.
 ///
 /// In a git worktree, `git rev-parse --git-common-dir` returns the `.git`
@@ -218,6 +225,22 @@ fn path_contains_symlink(path: &Path) -> bool {
 /// and the local fallback path is used instead (to avoid symlink-based
 /// redirection of cache reads/writes).
 fn resolve_cache_root(project_root: &Path) -> PathBuf {
+    if let Ok(memo) = cache_root_memo().lock() {
+        if let Some(cached) = memo.get(project_root) {
+            return cached.clone();
+        }
+    }
+
+    let resolved = resolve_cache_root_uncached(project_root);
+
+    if let Ok(mut memo) = cache_root_memo().lock() {
+        memo.insert(project_root.to_path_buf(), resolved.clone());
+    }
+
+    resolved
+}
+
+fn resolve_cache_root_uncached(project_root: &Path) -> PathBuf {
     let fallback = project_root.join(".konvoy").join("cache");
 
     let output = Command::new("git")
@@ -299,17 +322,6 @@ fn make_temp_dir(parent: &Path) -> Result<PathBuf, EngineError> {
     })?;
 
     Ok(tmp_path)
-}
-
-/// Check whether an I/O error indicates that a directory rename target already
-/// exists and is non-empty.
-///
-/// On Linux, `rename(2)` on directories returns `ENOTEMPTY` (mapped to
-/// `DirectoryNotEmpty`) rather than `EEXIST` when the target is a non-empty
-/// directory. On macOS, it returns `ENOTEMPTY` as well.
-fn is_directory_not_empty_error(err: &std::io::Error) -> bool {
-    // Stable variant available since Rust 1.64.
-    err.kind() == std::io::ErrorKind::DirectoryNotEmpty
 }
 
 #[cfg(test)]
@@ -709,5 +721,73 @@ mod tests {
             .join(".konvoy")
             .join("cache");
         assert_eq!(root, expected);
+    }
+
+    #[test]
+    fn resolve_cache_root_memoizes_per_project_root() {
+        // First call resolves and caches; second call must return the same
+        // path. We then break the underlying state (rename project root) and
+        // confirm we still get the cached value — proves the second call
+        // hit the memo instead of re-running `git rev-parse`.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        fs::create_dir_all(&project).unwrap();
+
+        let first = resolve_cache_root(&project);
+
+        // Remove the project directory; an uncached resolve would now return
+        // the fallback path computed from a non-existent directory.
+        fs::remove_dir_all(&project).unwrap();
+
+        let second = resolve_cache_root(&project);
+        assert_eq!(
+            first, second,
+            "second call must hit memo and return cached path"
+        );
+    }
+
+    #[test]
+    fn store_rename_failure_surfaces_as_engine_error() {
+        // Pre-create the would-be cache entry as a regular file. `is_dir()`
+        // returns false so `store` falls through to the rename branch; rename
+        // of a directory onto an existing file fails with NotADirectory,
+        // which is neither AlreadyExists nor DirectoryNotEmpty — so the
+        // final `Err(e)` arm fires.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let store = ArtifactStore::new(project);
+        let key = test_key();
+
+        // Non-git tempdir → cache root is project/.konvoy/cache.
+        let cache_root = project.join(".konvoy").join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+        let blocker = cache_root.join(key.as_hex());
+        fs::write(&blocker, b"not a directory").unwrap();
+
+        let artifact = tmp.path().join("artifact.bin");
+        fs::write(&artifact, b"content").unwrap();
+
+        let result = store.store(&key, &artifact, &test_metadata());
+        assert!(
+            result.is_err(),
+            "rename onto an existing file should surface as error"
+        );
+    }
+
+    #[test]
+    fn resolve_cache_root_memo_keys_by_project_root() {
+        // Distinct project roots must not share memoized entries.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_a = tmp.path().join("a");
+        let project_b = tmp.path().join("b");
+        fs::create_dir_all(&project_a).unwrap();
+        fs::create_dir_all(&project_b).unwrap();
+
+        let root_a = resolve_cache_root(&project_a);
+        let root_b = resolve_cache_root(&project_b);
+
+        assert_ne!(root_a, root_b, "different projects, different cache roots");
+        assert!(root_a.starts_with(&project_a));
+        assert!(root_b.starts_with(&project_b));
     }
 }

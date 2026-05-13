@@ -130,7 +130,7 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
     let mut new_dep_locks = Vec::new();
 
     for dep in &all_deps {
-        let maven_coord = format!("{}:{}", dep.group_id, dep.artifact_id);
+        let maven_coord = dep.key();
         eprintln!("  Resolving {} {}...", dep.name, dep.version);
 
         // Check if lockfile already has this dep at this version and classifier.
@@ -203,12 +203,12 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
         let mut targets_map: BTreeMap<String, String> = BTreeMap::new();
         for result in target_results {
             let (target_name, sha256) = result?;
-            let display_hash = crate::build::truncate_hash(&sha256, 16);
+            let display_hash = crate::common::truncate_hash(&sha256, 16);
             eprintln!("    {target_name}: {display_hash}...");
             targets_map.insert(target_name, sha256);
         }
 
-        let _ = std::fs::remove_dir_all(&tmp_base);
+        konvoy_util::fs::remove_dir_all_if_exists(&tmp_base)?;
 
         let hash_input: String = targets_map
             .iter()
@@ -274,6 +274,13 @@ struct ResolvedMavenDep {
     /// Maven classifier for non-primary artifacts (e.g. "cinterop-interop").
     /// `None` for the main klib.
     classifier: Option<String>,
+}
+
+impl ResolvedMavenDep {
+    /// Render the `"groupId:artifactId"` key used in lockfile entries and BFS maps.
+    fn key(&self) -> String {
+        format!("{}:{}", self.group_id, self.artifact_id)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -403,9 +410,7 @@ fn finalize_required_by(
 ) {
     for (key, dep) in resolved.iter_mut() {
         if let Some(requirers) = required_by_map.get(key) {
-            let is_direct = direct_deps
-                .iter()
-                .any(|d| format!("{}:{}", d.group_id, d.artifact_id) == *key);
+            let is_direct = direct_deps.iter().any(|d| d.key() == *key);
             if is_direct {
                 dep.required_by = Vec::new();
             } else {
@@ -442,7 +447,7 @@ fn resolve_transitive(
 
     // Build user-specified version map and seed the BFS queue.
     for dep in direct_deps {
-        let key = format!("{}:{}", dep.group_id, dep.artifact_id);
+        let key = dep.key();
         state.user_versions.insert(key.clone(), dep.version.clone());
         state.resolved.insert(key.clone(), dep.clone());
         state.queue.push_back((
@@ -1122,6 +1127,124 @@ kotlin = "2.1.0"
             classifier: Some("cinterop-interop".to_owned()),
         };
         assert_eq!(dep.classifier.as_deref(), Some("cinterop-interop"));
+    }
+
+    #[test]
+    fn resolved_maven_dep_key_is_group_colon_artifact() {
+        let dep = ResolvedMavenDep {
+            name: "kotlinx-coroutines".to_owned(),
+            group_id: "org.jetbrains.kotlinx".to_owned(),
+            artifact_id: "kotlinx-coroutines-core".to_owned(),
+            version: "1.8.0".to_owned(),
+            required_by: Vec::new(),
+            classifier: None,
+        };
+        assert_eq!(dep.key(), "org.jetbrains.kotlinx:kotlinx-coroutines-core");
+    }
+
+    #[test]
+    fn finalize_required_by_clears_direct_deps_and_fills_transitive() {
+        // Build a minimal graph: one direct dep `kotlinx-coroutines-core`
+        // that pulls in transitive `atomicfu`. `finalize_required_by` should
+        // clear required_by on the direct dep and populate it on the
+        // transitive one.
+        let direct = ResolvedMavenDep {
+            name: "kotlinx-coroutines".to_owned(),
+            group_id: "org.jetbrains.kotlinx".to_owned(),
+            artifact_id: "kotlinx-coroutines-core".to_owned(),
+            version: "1.8.0".to_owned(),
+            required_by: vec!["leftover".to_owned()], // must be cleared
+            classifier: None,
+        };
+        let transitive = ResolvedMavenDep {
+            name: "atomicfu".to_owned(),
+            group_id: "org.jetbrains.kotlinx".to_owned(),
+            artifact_id: "atomicfu".to_owned(),
+            version: "0.23.1".to_owned(),
+            required_by: Vec::new(),
+            classifier: None,
+        };
+
+        let mut resolved = HashMap::new();
+        resolved.insert(direct.key(), direct.clone());
+        resolved.insert(transitive.key(), transitive.clone());
+
+        let mut required_by_map: HashMap<String, BTreeSet<String>> = HashMap::new();
+        required_by_map.insert(
+            direct.key(),
+            BTreeSet::from(["self-ref-ignored".to_owned()]),
+        );
+        required_by_map.insert(
+            transitive.key(),
+            BTreeSet::from(["kotlinx-coroutines-core".to_owned()]),
+        );
+
+        finalize_required_by(&mut resolved, &required_by_map, &[direct.clone()]);
+
+        // Direct dep: required_by must be cleared even though the map has an entry.
+        assert!(
+            resolved
+                .get(&direct.key())
+                .expect("direct still present")
+                .required_by
+                .is_empty(),
+            "direct dep should have empty required_by"
+        );
+        // Transitive dep: required_by must reflect the map.
+        assert_eq!(
+            resolved
+                .get(&transitive.key())
+                .expect("transitive still present")
+                .required_by,
+            vec!["kotlinx-coroutines-core".to_owned()]
+        );
+    }
+
+    #[test]
+    fn finalize_required_by_skips_deps_with_no_map_entry() {
+        // A dep absent from `required_by_map` is left untouched.
+        let dep = ResolvedMavenDep {
+            name: "isolated".to_owned(),
+            group_id: "org.example".to_owned(),
+            artifact_id: "isolated".to_owned(),
+            version: "1.0.0".to_owned(),
+            required_by: vec!["pre-existing".to_owned()],
+            classifier: None,
+        };
+        let mut resolved = HashMap::new();
+        resolved.insert(dep.key(), dep.clone());
+        let required_by_map: HashMap<String, BTreeSet<String>> = HashMap::new();
+
+        finalize_required_by(&mut resolved, &required_by_map, &[]);
+
+        assert_eq!(
+            resolved
+                .get(&dep.key())
+                .expect("dep still present")
+                .required_by,
+            vec!["pre-existing".to_owned()],
+            "dep with no map entry should be untouched"
+        );
+    }
+
+    #[test]
+    fn resolved_maven_dep_key_ignores_version_and_classifier() {
+        // `key()` is a group:artifact identity — version and classifier must
+        // not influence it (they're separate fields in lockfile entries).
+        let a = ResolvedMavenDep {
+            name: "atomicfu".to_owned(),
+            group_id: "org.jetbrains.kotlinx".to_owned(),
+            artifact_id: "atomicfu".to_owned(),
+            version: "0.23.1".to_owned(),
+            required_by: Vec::new(),
+            classifier: None,
+        };
+        let b = ResolvedMavenDep {
+            version: "0.24.0".to_owned(),
+            classifier: Some("cinterop-interop".to_owned()),
+            ..a.clone()
+        };
+        assert_eq!(a.key(), b.key());
     }
 
     #[test]

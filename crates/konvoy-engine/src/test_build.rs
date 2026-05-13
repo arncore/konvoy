@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::artifact::BuildMetadata;
-use crate::build::{now_epoch_secs, resolve_build_context, BuildOptions, BuildOutcome};
+use crate::build::{resolve_build_context, BuildOptions, BuildOutcome};
 use crate::cache::{CacheInputs, CacheKey};
+use crate::common::now_epoch_secs;
 use crate::error::EngineError;
 use konvoy_konanc::invoke::{KonancCommand, ProduceKind};
 

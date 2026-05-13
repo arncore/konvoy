@@ -155,43 +155,42 @@ pub fn ensure_plugin_artifacts(
     lockfile: &Lockfile,
     locked: bool,
 ) -> Result<Vec<PluginArtifactResult>, EngineError> {
-    let mut results = Vec::with_capacity(artifacts.len());
+    use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
-    for artifact in artifacts {
-        let expected_hash = find_lockfile_hash(lockfile, &artifact.plugin_name);
-
-        // In --locked mode, the hash must be present in the lockfile.
-        if locked && expected_hash.is_none() {
-            return Err(EngineError::LockfileUpdateRequired);
+    // Fail fast in --locked mode before spawning any downloads.
+    if locked {
+        for artifact in artifacts {
+            if find_lockfile_hash(lockfile, &artifact.plugin_name).is_none() {
+                return Err(EngineError::LockfileUpdateRequired);
+            }
         }
-
-        let util_result = konvoy_util::artifact::ensure_artifact(
-            &artifact.url,
-            &artifact.cache_path,
-            expected_hash,
-            &artifact.plugin_name,
-            &artifact.maven_coord.version,
-        )
-        .map_err(|e| map_download_err(&artifact.plugin_name, e))?;
-
-        // Reconstruct the groupId:artifactId for the lockfile.
-        let maven = format!(
-            "{}:{}",
-            artifact.maven_coord.group_id, artifact.maven_coord.artifact_id
-        );
-
-        results.push(PluginArtifactResult {
-            plugin_name: artifact.plugin_name.clone(),
-            path: util_result.path,
-            sha256: util_result.sha256,
-            url: artifact.url.clone(),
-            freshly_downloaded: util_result.freshly_downloaded,
-            maven,
-            version: artifact.maven_coord.version.clone(),
-        });
     }
 
-    Ok(results)
+    artifacts
+        .par_iter()
+        .map(|artifact| {
+            let expected_hash = find_lockfile_hash(lockfile, &artifact.plugin_name);
+
+            let util_result = konvoy_util::artifact::ensure_artifact(
+                &artifact.url,
+                &artifact.cache_path,
+                expected_hash,
+                &artifact.plugin_name,
+                &artifact.maven_coord.version,
+            )
+            .map_err(|e| map_download_err(&artifact.plugin_name, e))?;
+
+            Ok(PluginArtifactResult {
+                plugin_name: artifact.plugin_name.clone(),
+                path: util_result.path,
+                sha256: util_result.sha256,
+                url: artifact.url.clone(),
+                freshly_downloaded: util_result.freshly_downloaded,
+                maven: artifact.maven_coord.group_artifact(),
+                version: artifact.maven_coord.version.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Build `PluginLock` entries from download results.
@@ -790,5 +789,103 @@ mod tests {
         );
         let err = result.unwrap_err().to_string();
         assert!(err.contains("lockfile is out of date"), "error was: {err}");
+    }
+
+    #[test]
+    fn ensure_plugin_artifacts_empty_input_returns_empty() {
+        let lockfile = Lockfile::default();
+        let result = ensure_plugin_artifacts(&[], &lockfile, false).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn ensure_plugin_artifacts_locked_failfast_before_downloads() {
+        // Two artifacts, only one has a hash in the lockfile. Both URLs point
+        // at an unreachable address. If the precheck fires first (as intended),
+        // we get LockfileUpdateRequired — not a download failure — proving the
+        // parallel downloads never start.
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile = Lockfile {
+            plugins: vec![PluginLock {
+                name: "has-lock".to_owned(),
+                maven: "org.example:lib1".to_owned(),
+                version: "1.0.0".to_owned(),
+                sha256: "0".repeat(64),
+                url: "http://example.com".to_owned(),
+            }],
+            ..Lockfile::default()
+        };
+        let artifacts = vec![
+            ResolvedPluginArtifact {
+                plugin_name: "has-lock".to_owned(),
+                maven_coord: MavenCoordinate::new("org.example", "lib1", "1.0.0"),
+                url: "http://127.0.0.1:1/lib1.jar".to_owned(),
+                cache_path: tmp.path().join("lib1.jar"),
+            },
+            ResolvedPluginArtifact {
+                plugin_name: "no-lock".to_owned(),
+                maven_coord: MavenCoordinate::new("org.example", "lib2", "1.0.0"),
+                url: "http://127.0.0.1:1/lib2.jar".to_owned(),
+                cache_path: tmp.path().join("lib2.jar"),
+            },
+        ];
+
+        let result = ensure_plugin_artifacts(&artifacts, &lockfile, true);
+        assert!(matches!(result, Err(EngineError::LockfileUpdateRequired)));
+    }
+
+    #[test]
+    fn ensure_plugin_artifacts_reuses_existing_cached_file() {
+        // Pre-seed a "downloaded" plugin JAR with a known hash matching the
+        // lockfile entry. The function should return it without attempting any
+        // network I/O, exercising the par_iter happy path.
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_path = tmp.path().join("plugin.jar");
+        let content = b"plugin content";
+        std::fs::write(&cache_path, content).unwrap();
+        let expected_hash = konvoy_util::hash::sha256_bytes(content);
+
+        let lockfile = Lockfile {
+            plugins: vec![PluginLock {
+                name: "test-plugin".to_owned(),
+                maven: "org.example:plugin".to_owned(),
+                version: "1.0.0".to_owned(),
+                sha256: expected_hash.clone(),
+                url: "http://example.com".to_owned(),
+            }],
+            ..Lockfile::default()
+        };
+        let artifacts = vec![ResolvedPluginArtifact {
+            plugin_name: "test-plugin".to_owned(),
+            maven_coord: MavenCoordinate::new("org.example", "plugin", "1.0.0"),
+            url: "http://127.0.0.1:1/plugin.jar".to_owned(), // unused
+            cache_path: cache_path.clone(),
+        }];
+
+        let result = ensure_plugin_artifacts(&artifacts, &lockfile, true).unwrap();
+        assert_eq!(result.len(), 1);
+        let r = &result[0];
+        assert_eq!(r.plugin_name, "test-plugin");
+        assert_eq!(r.sha256, expected_hash);
+        assert!(!r.freshly_downloaded);
+        assert_eq!(r.path, cache_path);
+        assert_eq!(r.maven, "org.example:plugin");
+        assert_eq!(r.version, "1.0.0");
+    }
+
+    #[test]
+    fn ensure_plugin_artifacts_unlocked_download_failure_maps_to_engine_error() {
+        // Unlocked mode + unreachable URL + missing cache file → download fails.
+        // Exercises the map_download_err path in the par_iter closure.
+        let tmp = tempfile::tempdir().unwrap();
+        let artifact = ResolvedPluginArtifact {
+            plugin_name: "unreachable-plugin".to_owned(),
+            maven_coord: MavenCoordinate::new("org.example", "lib", "1.0.0"),
+            url: "http://127.0.0.1:1/lib.jar".to_owned(),
+            cache_path: tmp.path().join("lib.jar"),
+        };
+        let lockfile = Lockfile::default();
+        let result = ensure_plugin_artifacts(&[artifact], &lockfile, false);
+        assert!(result.is_err());
     }
 }
