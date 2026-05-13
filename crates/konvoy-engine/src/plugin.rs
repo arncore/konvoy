@@ -155,7 +155,6 @@ pub fn ensure_plugin_artifacts(
     lockfile: &Lockfile,
     locked: bool,
 ) -> Result<Vec<PluginArtifactResult>, EngineError> {
-    use indicatif::MultiProgress;
     use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
     // Fail fast in --locked mode before spawning any downloads.
@@ -174,16 +173,11 @@ pub fn ensure_plugin_artifacts(
     // Pre-allocate one bar per artifact in stable order with a uniform
     // prefix width so the parallel downloads render as a clean vertical
     // stack instead of overwriting each other.
-    let multi = MultiProgress::new();
     let labels: Vec<String> = artifacts
         .iter()
         .map(|a| format!("{} {}", a.plugin_name, a.maven_coord.version))
         .collect();
-    let prefix_width = labels.iter().map(String::len).max().unwrap_or(0);
-    let bars: Vec<konvoy_util::progress::DownloadBar> = labels
-        .into_iter()
-        .map(|label| konvoy_util::progress::add_download_bar(&multi, label, prefix_width))
-        .collect();
+    let (_multi, bars) = konvoy_util::progress::pre_allocate_bars(labels);
 
     let results: Vec<Result<PluginArtifactResult, EngineError>> = artifacts
         .par_iter()

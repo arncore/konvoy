@@ -51,20 +51,13 @@ const BLINK_TICK: Duration = Duration::from_millis(250);
 /// [`DownloadBar::mark_success`] / [`DownloadBar::mark_failure`]) once the
 /// download result is known.
 ///
-/// Both constructors render through a [`MultiProgress`] — single-bar paths
-/// ([`new_download_bar`]) own theirs internally for lifetime management;
-/// multi-bar paths ([`add_download_bar`]) attach to a caller-owned one.
-/// Callers are responsible for emitting a single trailing `eprintln!()`
-/// after the bar block so the next stderr line doesn't get concatenated
-/// onto the last bar's row.
+/// Both constructors render through a [`MultiProgress`]. Callers are
+/// responsible for emitting a single trailing `eprintln!()` after the bar
+/// block so the next stderr line doesn't get concatenated onto the last
+/// bar's row.
 pub struct DownloadBar {
     bar: ProgressBar,
     state: Arc<AtomicU8>,
-    /// Owned `MultiProgress` for single-bar paths. Kept alive for the
-    /// bar's lifetime so the remote draw target doesn't dangle. Field-drop
-    /// order is bar → state → `_owned_multi`, so the multi state outlives
-    /// the bar that renders into it.
-    _owned_multi: Option<MultiProgress>,
 }
 
 impl DownloadBar {
@@ -108,21 +101,19 @@ impl DownloadBar {
 
 /// Build a styled [`DownloadBar`] for a single-shot download.
 ///
-/// Creates an owned [`MultiProgress`] internally so the rendering pipeline
-/// matches the multi-bar path used by `konvoy update`'s parallel klib
-/// downloads. Caller must still emit a trailing `eprintln!()` after the
-/// download finishes (same as for multi-bar paths) so the next stderr line
-/// doesn't get concatenated onto the bar's row.
+/// Constructs a local [`MultiProgress`] and attaches one bar to it. The
+/// `MultiProgress` is dropped on return — that's safe because
+/// `MultiProgress::add` clones the inner `Arc<MultiState>` into the bar's
+/// draw target, so the state stays alive as long as the bar does.
+///
+/// Caller must emit a trailing `eprintln!()` after the download finishes
+/// so the next stderr line isn't concatenated onto the bar's row.
 #[must_use]
 pub fn new_download_bar(prefix: impl Into<Cow<'static, str>>) -> DownloadBar {
     let multi = MultiProgress::new();
     let state = Arc::new(AtomicU8::new(STATE_IN_PROGRESS));
     let pb = build_bar(&multi, prefix, DEFAULT_PREFIX_WIDTH, Arc::clone(&state));
-    DownloadBar {
-        bar: pb,
-        state,
-        _owned_multi: Some(multi),
-    }
+    DownloadBar { bar: pb, state }
 }
 
 /// Attach a styled bar to a caller-owned [`MultiProgress`] container.
@@ -138,11 +129,29 @@ pub fn add_download_bar(
 ) -> DownloadBar {
     let state = Arc::new(AtomicU8::new(STATE_IN_PROGRESS));
     let pb = build_bar(mp, prefix, prefix_width, Arc::clone(&state));
-    DownloadBar {
-        bar: pb,
-        state,
-        _owned_multi: None,
-    }
+    DownloadBar { bar: pb, state }
+}
+
+/// Build a [`MultiProgress`] + a stable-ordered `Vec<DownloadBar>` from
+/// per-bar labels.
+///
+/// Computes the max label length once so every bar gets the same prefix
+/// padding (so columns line up). The returned `MultiProgress` is held by
+/// the caller; each returned bar internally clones its `Arc<MultiState>`
+/// so dropping the `MultiProgress` early would still leave the bars
+/// rendering, but holding it is more explicit and lets the caller add
+/// more bars later if needed.
+///
+/// Caller emits a trailing `eprintln!()` after the bar block.
+#[must_use]
+pub fn pre_allocate_bars(labels: Vec<String>) -> (MultiProgress, Vec<DownloadBar>) {
+    let multi = MultiProgress::new();
+    let prefix_width = labels.iter().map(String::len).max().unwrap_or(0);
+    let bars: Vec<DownloadBar> = labels
+        .into_iter()
+        .map(|label| add_download_bar(&multi, label, prefix_width))
+        .collect();
+    (multi, bars)
 }
 
 /// Shared bar construction: attach to `mp`, apply the styled template,

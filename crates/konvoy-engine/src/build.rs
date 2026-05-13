@@ -704,18 +704,45 @@ pub(crate) fn lockfile_toml_content(lockfile: &Lockfile) -> Result<String, Engin
 /// # Errors
 /// Returns an error if a Maven dependency is missing from the lockfile, the
 /// target hash is not present, or the download/hash verification fails.
+/// View into the Maven-specific fields of a `DependencyLock`. Built once
+/// upfront so the inner par_iter loop doesn't have to match on the source
+/// variant again.
+struct MavenLockView<'a> {
+    name: &'a str,
+    version: &'a str,
+    maven: &'a str,
+    targets: &'a std::collections::BTreeMap<String, String>,
+    classifier: Option<&'a str>,
+}
+
 pub(crate) fn resolve_maven_deps(
     lockfile: &Lockfile,
     target: &Target,
 ) -> Result<Vec<LibraryInput>, EngineError> {
-    use indicatif::MultiProgress;
     use rayon::prelude::IndexedParallelIterator;
 
-    // Collect all Maven dependency entries from the lockfile (direct + transitive).
-    let maven_locks: Vec<&DependencyLock> = lockfile
+    // Filter to Maven entries AND extract their fields in one pass — the
+    // par_iter loop below then sees a flat view and never has to match on
+    // `DepSource` again.
+    let maven_locks: Vec<MavenLockView> = lockfile
         .dependencies
         .iter()
-        .filter(|d| matches!(&d.source, DepSource::Maven { .. }))
+        .filter_map(|d| match &d.source {
+            DepSource::Maven {
+                version,
+                maven,
+                targets,
+                classifier,
+                ..
+            } => Some(MavenLockView {
+                name: &d.name,
+                version,
+                maven,
+                targets,
+                classifier: classifier.as_deref(),
+            }),
+            DepSource::Path { .. } => None,
+        })
         .collect();
 
     if maven_locks.is_empty() {
@@ -726,102 +753,76 @@ pub(crate) fn resolve_maven_deps(
     let target_str = target.to_konanc_arg();
     let maven_suffix = target.to_maven_suffix();
 
-    // Pre-allocate one bar per Maven dep in stable order with uniform prefix
-    // width so the parallel downloads render as a clean vertical stack.
-    let multi = MultiProgress::new();
+    // Pre-allocate one bar per Maven dep in stable order so the parallel
+    // downloads render as a clean vertical stack.
     let labels: Vec<String> = maven_locks
         .iter()
-        .map(|lock| {
-            let version = match &lock.source {
-                DepSource::Maven { version, .. } => version.as_str(),
-                DepSource::Path { .. } => "",
-            };
-            format!("{} {}", lock.name, version)
-        })
+        .map(|m| format!("{} {}", m.name, m.version))
         .collect();
-    let prefix_width = labels.iter().map(String::len).max().unwrap_or(0);
-    let bars: Vec<konvoy_util::progress::DownloadBar> = labels
-        .into_iter()
-        .map(|label| konvoy_util::progress::add_download_bar(&multi, label, prefix_width))
-        .collect();
+    let (_multi, bars) = konvoy_util::progress::pre_allocate_bars(labels);
 
-    let klib_inputs: Vec<Result<LibraryInput, EngineError>> = maven_locks
-        .par_iter()
-        .zip(bars.par_iter())
-        .map(|(lock_entry, progress)| {
-            let dep_name = lock_entry.name.clone();
+    let klib_inputs: Vec<Result<LibraryInput, EngineError>> =
+        maven_locks
+            .par_iter()
+            .zip(bars.par_iter())
+            .map(|(entry, progress)| {
+                let dep_name = entry.name.to_owned();
+                let (group_id, artifact_id) = crate::common::split_maven_coordinate(entry.maven)?;
 
-            let (version, maven_coord, targets, classifier) = match &lock_entry.source {
-                DepSource::Maven {
-                    version,
-                    maven,
-                    targets,
-                    classifier,
-                    ..
-                } => (version, maven, targets, classifier),
-                DepSource::Path { .. } => {
-                    return Err(EngineError::MissingLockfileEntry { name: dep_name });
+                // Build the per-target artifact ID (e.g. "kotlinx-coroutines-core-linuxx64").
+                let per_target_artifact_id = format!("{artifact_id}-{maven_suffix}");
+
+                let mut coord = konvoy_util::maven::MavenCoordinate::new(
+                    group_id,
+                    &per_target_artifact_id,
+                    entry.version,
+                )
+                .with_packaging("klib");
+                if let Some(cls) = entry.classifier {
+                    coord = coord.with_classifier(cls);
                 }
-            };
 
-            // Split "groupId:artifactId" into parts.
-            let (group_id, artifact_id) = crate::common::split_maven_coordinate(maven_coord)?;
-
-            // Build the per-target artifact ID (e.g. "kotlinx-coroutines-core-linuxx64").
-            let per_target_artifact_id = format!("{artifact_id}-{maven_suffix}");
-
-            let mut coord = konvoy_util::maven::MavenCoordinate::new(
-                group_id,
-                &per_target_artifact_id,
-                version,
-            )
-            .with_packaging("klib");
-            if let Some(cls) = classifier {
-                coord = coord.with_classifier(cls);
-            }
-
-            // Extract the expected SHA-256 for this target from the lockfile.
-            let expected_sha256 =
-                targets
-                    .get(target_str)
-                    .ok_or_else(|| EngineError::MissingTargetHash {
+                // Extract the expected SHA-256 for this target from the lockfile.
+                let expected_sha256 = entry.targets.get(target_str).ok_or_else(|| {
+                    EngineError::MissingTargetHash {
                         name: dep_name.clone(),
                         target: target_str.to_owned(),
-                    })?;
-
-            // Compute the cache path and download URL.
-            let dest = coord.cache_path(&cache_root);
-            let url = coord.to_url(konvoy_util::maven::MAVEN_CENTRAL);
-
-            // Download (or use cached) and verify hash.
-            let result = progress
-                .finish(konvoy_util::artifact::ensure_artifact(
-                    &url,
-                    &dest,
-                    Some(expected_sha256),
-                    &dep_name,
-                    progress.inner(),
-                ))
-                .map_err(|e| EngineError::LibraryDownloadFailed {
-                    name: dep_name.clone(),
-                    url: url.clone(),
-                    message: e.to_string(),
+                    }
                 })?;
 
-            // Double-check the hash matches the lockfile expectation.
-            if result.sha256 != *expected_sha256 {
-                return Err(EngineError::LibraryHashMismatch {
-                    name: dep_name,
-                    expected: expected_sha256.clone(),
-                    actual: result.sha256,
-                });
-            }
+                // Compute the cache path and download URL.
+                let dest = coord.cache_path(&cache_root);
+                let url = coord.to_url(konvoy_util::maven::MAVEN_CENTRAL);
 
-            // Carry the freshly-verified hash through so `build_single` can
-            // reuse it for the cache key without re-reading the file.
-            Ok(LibraryInput::with_hash(result.path, result.sha256))
-        })
-        .collect();
+                // Download (or use cached) and verify hash.
+                let result = progress
+                    .finish(konvoy_util::artifact::ensure_artifact(
+                        &url,
+                        &dest,
+                        Some(expected_sha256),
+                        &dep_name,
+                        progress.inner(),
+                    ))
+                    .map_err(|e| EngineError::LibraryDownloadFailed {
+                        name: dep_name.clone(),
+                        url: url.clone(),
+                        message: e.to_string(),
+                    })?;
+
+                // Double-check the hash matches the lockfile expectation.
+                if result.sha256 != *expected_sha256 {
+                    return Err(EngineError::LibraryHashMismatch {
+                        name: dep_name,
+                        expected: expected_sha256.clone(),
+                        actual: result.sha256,
+                    });
+                }
+
+                // Carry the freshly-verified hash through so `build_single` can
+                // reuse it for the cache key without re-reading the file.
+                Ok(LibraryInput::with_hash(result.path, result.sha256))
+            })
+            .collect();
 
     // Trailing newline so the next eprintln status line isn't concatenated
     // onto the last bar's row.
