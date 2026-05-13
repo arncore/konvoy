@@ -708,6 +708,9 @@ pub(crate) fn resolve_maven_deps(
     lockfile: &Lockfile,
     target: &Target,
 ) -> Result<Vec<LibraryInput>, EngineError> {
+    use indicatif::MultiProgress;
+    use rayon::prelude::IndexedParallelIterator;
+
     // Collect all Maven dependency entries from the lockfile (direct + transitive).
     let maven_locks: Vec<&DependencyLock> = lockfile
         .dependencies
@@ -723,9 +726,29 @@ pub(crate) fn resolve_maven_deps(
     let target_str = target.to_konanc_arg();
     let maven_suffix = target.to_maven_suffix();
 
+    // Pre-allocate one bar per Maven dep in stable order with uniform prefix
+    // width so the parallel downloads render as a clean vertical stack.
+    let multi = MultiProgress::new();
+    let labels: Vec<String> = maven_locks
+        .iter()
+        .map(|lock| {
+            let version = match &lock.source {
+                DepSource::Maven { version, .. } => version.as_str(),
+                DepSource::Path { .. } => "",
+            };
+            format!("{} {}", lock.name, version)
+        })
+        .collect();
+    let prefix_width = labels.iter().map(String::len).max().unwrap_or(0);
+    let bars: Vec<konvoy_util::progress::DownloadBar> = labels
+        .into_iter()
+        .map(|label| konvoy_util::progress::add_download_bar(&multi, label, prefix_width))
+        .collect();
+
     let klib_inputs: Vec<Result<LibraryInput, EngineError>> = maven_locks
         .par_iter()
-        .map(|lock_entry| {
+        .zip(bars.par_iter())
+        .map(|(lock_entry, progress)| {
             let dep_name = lock_entry.name.clone();
 
             let (version, maven_coord, targets, classifier) = match &lock_entry.source {
@@ -771,7 +794,6 @@ pub(crate) fn resolve_maven_deps(
             let url = coord.to_url(konvoy_util::maven::MAVEN_CENTRAL);
 
             // Download (or use cached) and verify hash.
-            let progress = konvoy_util::progress::new_download_bar(format!("{dep_name} {version}"));
             let result = progress
                 .finish(konvoy_util::artifact::ensure_artifact(
                     &url,
@@ -800,6 +822,10 @@ pub(crate) fn resolve_maven_deps(
             Ok(LibraryInput::with_hash(result.path, result.sha256))
         })
         .collect();
+
+    // Trailing newline so the next eprintln status line isn't concatenated
+    // onto the last bar's row.
+    eprintln!();
 
     klib_inputs.into_iter().collect()
 }

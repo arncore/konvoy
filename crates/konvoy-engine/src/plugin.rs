@@ -155,7 +155,8 @@ pub fn ensure_plugin_artifacts(
     lockfile: &Lockfile,
     locked: bool,
 ) -> Result<Vec<PluginArtifactResult>, EngineError> {
-    use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+    use indicatif::MultiProgress;
+    use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
     // Fail fast in --locked mode before spawning any downloads.
     if locked {
@@ -166,15 +167,29 @@ pub fn ensure_plugin_artifacts(
         }
     }
 
-    artifacts
-        .par_iter()
-        .map(|artifact| {
-            let expected_hash = find_lockfile_hash(lockfile, &artifact.plugin_name);
+    if artifacts.is_empty() {
+        return Ok(Vec::new());
+    }
 
-            let progress = konvoy_util::progress::new_download_bar(format!(
-                "{} {}",
-                artifact.plugin_name, artifact.maven_coord.version
-            ));
+    // Pre-allocate one bar per artifact in stable order with a uniform
+    // prefix width so the parallel downloads render as a clean vertical
+    // stack instead of overwriting each other.
+    let multi = MultiProgress::new();
+    let labels: Vec<String> = artifacts
+        .iter()
+        .map(|a| format!("{} {}", a.plugin_name, a.maven_coord.version))
+        .collect();
+    let prefix_width = labels.iter().map(String::len).max().unwrap_or(0);
+    let bars: Vec<konvoy_util::progress::DownloadBar> = labels
+        .into_iter()
+        .map(|label| konvoy_util::progress::add_download_bar(&multi, label, prefix_width))
+        .collect();
+
+    let results: Vec<Result<PluginArtifactResult, EngineError>> = artifacts
+        .par_iter()
+        .zip(bars.par_iter())
+        .map(|(artifact, progress)| {
+            let expected_hash = find_lockfile_hash(lockfile, &artifact.plugin_name);
             let util_result = progress
                 .finish(konvoy_util::artifact::ensure_artifact(
                     &artifact.url,
@@ -195,7 +210,13 @@ pub fn ensure_plugin_artifacts(
                 version: artifact.maven_coord.version.clone(),
             })
         })
-        .collect()
+        .collect();
+
+    // Trailing newline so the next eprintln status line isn't concatenated
+    // onto the last bar's row (indicatif leaves the cursor at end-of-line).
+    eprintln!();
+
+    results.into_iter().collect()
 }
 
 /// Build `PluginLock` entries from download results.
