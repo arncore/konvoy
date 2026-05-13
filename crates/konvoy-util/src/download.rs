@@ -2,7 +2,6 @@
 
 use std::path::Path;
 
-use indicatif::ProgressBar;
 use sha2::{Digest, Sha256};
 
 use crate::error::UtilError;
@@ -25,26 +24,28 @@ pub fn http_agent(global_timeout_secs: u64) -> ureq::Agent {
     )
 }
 
-/// Download a URL to a file, updating `progress` as bytes arrive and computing SHA-256.
+/// Stream a URL to a file, calling `on_progress` as bytes arrive and computing SHA-256.
 ///
-/// The caller owns the `ProgressBar` — set its prefix/style before calling so
-/// it can host a single download or attach to a [`indicatif::MultiProgress`].
-/// If the response has a `Content-Length`, the bar's length is set; otherwise
-/// the bar is switched to spinner mode.
+/// `on_progress(downloaded, total)` is invoked after each chunk:
+/// - `downloaded`: cumulative bytes written so far
+/// - `total`: `Content-Length` from the response (or `None` if absent)
+///
+/// `total` is `None` until the response headers are parsed and the server
+/// advertises a content length; from the first chunk onward it's either
+/// always `Some(n)` for the same `n` or always `None`.
+///
+/// This function knows nothing about progress bars — callers in
+/// `konvoy_util::progress` adapt it.
 ///
 /// Returns the hex-encoded SHA-256 hash of the downloaded content.
 ///
 /// # Errors
 /// Returns an error if the HTTP request fails, the file cannot be written,
 /// or a read error occurs during streaming.
-pub fn download_with_progress(
-    url: &str,
-    dest: &Path,
-    progress: &ProgressBar,
-) -> Result<String, UtilError> {
-    // Caller (engine layer holding a `DownloadBar`) finalises the bar via
-    // `DownloadBar::finish` after this returns — state must flip BEFORE
-    // `abandon()` halts redraws so the final frame reflects success/failure.
+pub fn stream_download<F>(url: &str, dest: &Path, mut on_progress: F) -> Result<String, UtilError>
+where
+    F: FnMut(u64, Option<u64>),
+{
     let agent = http_agent(600);
 
     let response = agent.get(url).call().map_err(|e| UtilError::Download {
@@ -55,18 +56,8 @@ pub fn download_with_progress(
         .headers()
         .get("content-length")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok());
-
-    // The bar's `position` tracks the actual downloaded byte count so the
-    // template's `{bytes}` and `{bytes_per_sec}` fields read correctly. The
-    // right-to-left fill is handled inside the custom `{kbar}` renderer
-    // (`progress.rs::render_truck_bar`), which computes its edge from
-    // `(len - pos)`. If `Content-Length` is missing, `set_length` is never
-    // called and the renderer's `len == 0` branch shows an all-road bar
-    // with the truck (or crash glyph on failure) at the right edge.
-    if let Some(total) = content_length.filter(|t| *t > 0) {
-        progress.set_length(total);
-    }
+        .and_then(|s| s.parse().ok())
+        .filter(|t: &u64| *t > 0);
 
     let mut body = response.into_body();
     let mut file = std::fs::File::create(dest).map_err(|source| UtilError::Io {
@@ -98,7 +89,7 @@ pub fn download_with_progress(
         hasher.update(chunk);
 
         downloaded = downloaded.saturating_add(u64_from_usize(n));
-        progress.set_position(downloaded);
+        on_progress(downloaded, content_length);
     }
 
     Ok(finalize_hex(hasher))
@@ -107,8 +98,10 @@ pub fn download_with_progress(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::u64_from_usize;
-    use crate::progress::hidden_bar;
+    use super::{stream_download, u64_from_usize};
+
+    /// No-op progress callback used by tests that don't care about events.
+    fn ignore_progress(_: u64, _: Option<u64>) {}
 
     #[test]
     fn u64_from_usize_roundtrips() {
@@ -127,8 +120,7 @@ mod tests {
     fn download_invalid_url_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("out.bin");
-        let result =
-            super::download_with_progress("http://127.0.0.1:1/nonexistent", &dest, &hidden_bar());
+        let result = stream_download("http://127.0.0.1:1/nonexistent", &dest, ignore_progress);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("download failed"), "error was: {err}");
@@ -138,16 +130,16 @@ mod tests {
     fn download_malformed_url_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("out.bin");
-        let result = super::download_with_progress("not-a-valid-url", &dest, &hidden_bar());
+        let result = stream_download("not-a-valid-url", &dest, ignore_progress);
         assert!(result.is_err());
     }
 
     #[test]
     fn download_unwritable_dest_returns_error() {
-        let result = super::download_with_progress(
+        let result = stream_download(
             "http://127.0.0.1:1/file.bin",
             std::path::Path::new("/nonexistent_root/subdir/out.bin"),
-            &hidden_bar(),
+            ignore_progress,
         );
         assert!(result.is_err());
     }

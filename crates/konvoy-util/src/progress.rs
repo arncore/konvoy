@@ -133,12 +133,29 @@ where
     }
 }
 
+/// Build a progress callback that drives a [`ProgressBar`] from the
+/// `(downloaded, total)` events emitted by network primitives.
+///
+/// The callback sets the bar's length from the first `Some(total)` it
+/// receives and updates its position on every chunk.
+fn bar_progress(pb: &ProgressBar) -> impl FnMut(u64, Option<u64>) + '_ {
+    move |downloaded, total| {
+        if let Some(t) = total {
+            pb.set_length(t);
+        }
+        pb.set_position(downloaded);
+    }
+}
+
+/// No-op progress callback for the cache-hit / hidden-bar path.
+const fn ignore_progress(_: u64, _: Option<u64>) {}
+
 /// Fetch a Maven-style artifact: check the cache first, download (with the
 /// supplied bar) only on miss.
 ///
 /// Composes [`crate::artifact::check_cached`] (no UI) and
-/// [`crate::artifact::download_artifact`] (with bar) so engine code can
-/// call one function instead of writing the match-on-cache pattern at
+/// [`crate::artifact::download_artifact`] (callback-driven) so engine code
+/// can call one function instead of writing the match-on-cache pattern at
 /// every site. The `bar` parameter is `Option` so callers can suppress UI
 /// entirely (e.g. for already-known-cached items in a parallel batch).
 ///
@@ -156,9 +173,37 @@ pub fn fetch(
     if let Some(cached) = crate::artifact::check_cached(dest, expected_sha256)? {
         return Ok(cached);
     }
-    run_with_optional_bar(bar, |pb| {
-        crate::artifact::download_artifact(url, dest, expected_sha256, label, pb)
-    })
+    let download = |on_progress: &mut dyn FnMut(u64, Option<u64>)| {
+        crate::artifact::download_artifact(url, dest, expected_sha256, label, on_progress)
+    };
+    if let Some(b) = bar {
+        b.run(|pb| download(&mut bar_progress(pb)))
+    } else {
+        download(&mut ignore_progress)
+    }
+}
+
+/// Stream a URL to `dest` with an optional bar; returns the SHA-256.
+///
+/// Thin UI-aware wrapper over [`crate::download::stream_download`] for
+/// callers (toolchain tarballs, JRE tarballs) that don't need
+/// hash-verified atomic placement.
+///
+/// # Errors
+/// Returns whatever [`crate::download::stream_download`] returns.
+pub fn stream_download(
+    url: &str,
+    dest: &std::path::Path,
+    bar: Option<&DownloadBar>,
+) -> Result<String, crate::error::UtilError> {
+    let download = |on_progress: &mut dyn FnMut(u64, Option<u64>)| {
+        crate::download::stream_download(url, dest, on_progress)
+    };
+    if let Some(b) = bar {
+        b.run(|pb| download(&mut bar_progress(pb)))
+    } else {
+        download(&mut ignore_progress)
+    }
 }
 
 /// Build a styled [`DownloadBar`] for a single-shot download.

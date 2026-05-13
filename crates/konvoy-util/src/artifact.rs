@@ -2,8 +2,6 @@
 
 use std::path::{Path, PathBuf};
 
-use indicatif::ProgressBar;
-
 use crate::error::UtilError;
 
 /// Result of ensuring an artifact is available locally.
@@ -117,20 +115,22 @@ pub fn check_cached(
 /// 5. Clean up the temp file on all error paths.
 ///
 /// Callers should normally check [`check_cached`] first and only invoke
-/// this on a cache miss. The bar is provided because this function is the
-/// origin of progress events — pair it with [`crate::progress::DownloadBar::run`]
-/// or [`crate::progress::run_with_optional_bar`].
+/// this on a cache miss. `on_progress(downloaded, total)` is invoked once
+/// per chunk; the UI layer (`konvoy_util::progress`) wires this to a bar.
 ///
 /// # Errors
 /// Returns an error if the download fails, the hash does not match, or an
 /// I/O operation fails.
-pub fn download_artifact(
+pub fn download_artifact<F>(
     url: &str,
     dest: &Path,
     expected_sha256: Option<&str>,
     label: &str,
-    progress: &ProgressBar,
-) -> Result<ArtifactResult, UtilError> {
+    on_progress: F,
+) -> Result<ArtifactResult, UtilError>
+where
+    F: FnMut(u64, Option<u64>),
+{
     // Create parent directories.
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|source| UtilError::Io {
@@ -149,7 +149,7 @@ pub fn download_artifact(
         .unwrap_or_else(|| PathBuf::from(&tmp_name));
 
     // Download to temp file.
-    let download_hash = crate::download::download_with_progress(url, &tmp_path, progress)?;
+    let download_hash = crate::download::stream_download(url, &tmp_path, on_progress)?;
 
     // Verify hash of downloaded file before placing it.
     if let Some(expected) = expected_sha256 {
@@ -330,7 +330,7 @@ mod tests {
             &dest,
             None,
             "test",
-            &crate::progress::hidden_bar(),
+            |_, _| {},
         );
 
         assert!(result.is_err());
