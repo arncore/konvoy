@@ -355,7 +355,7 @@ fn pom_cache_path(
 
 /// Atomically write `contents` to `dest` via a temp file in the same directory.
 ///
-/// Mirrors the pattern in `ensure_artifact`: write to a `.tmp-<pid>` sibling
+/// Mirrors the pattern in `download_artifact`: write to a `.tmp-<pid>` sibling
 /// and rename into place. If another writer wins the race, the rename may fail
 /// but the destination exists with valid contents, which is what we want.
 ///

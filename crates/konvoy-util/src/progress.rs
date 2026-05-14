@@ -68,7 +68,7 @@ impl DownloadBar {
     /// directly — prefer the higher-level helpers [`fetch`] and
     /// [`stream_with_bar`] in this module, which adapt the lower-level
     /// callback-based primitives ([`crate::artifact::download_artifact`]
-    /// and [`crate::download::stream_download`]) to a bar internally.
+    /// and `crate::download::stream_download`) to a bar internally.
     /// When the closure returns, this bar's state flips to ✅ on `Ok` or
     /// ❌ on `Err`, and the bar is abandoned so its final frame stays on
     /// screen.
@@ -173,14 +173,14 @@ pub fn fetch(
 
 /// Stream a URL to `dest` with an optional bar; returns the SHA-256.
 ///
-/// Thin UI-aware wrapper over [`crate::download::stream_download`] for
+/// Thin UI-aware wrapper over `crate::download::stream_download` for
 /// callers (toolchain tarballs, JRE tarballs) that just need to drop
 /// bytes onto disk and get a hash back — no `expected_sha256`, no
 /// atomic-rename dance, no `freshly_downloaded` flag. The bar is wired
 /// up internally; pass `None` to suppress UI.
 ///
 /// # Errors
-/// Returns whatever [`crate::download::stream_download`] returns.
+/// Returns whatever `crate::download::stream_download` returns.
 pub fn stream_with_bar(
     url: &str,
     dest: &std::path::Path,

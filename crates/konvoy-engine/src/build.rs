@@ -839,9 +839,9 @@ pub(crate) fn resolve_maven_deps(
     klib_inputs.into_iter().collect()
 }
 
-/// Run `download_artifact` for a single prepared klib. Uses the supplied
-/// progress bar when present (download path); silently uses a hidden bar
-/// when absent (cache-hit path that needs only a hash re-verify).
+/// Resolve a single prepared klib via [`konvoy_util::progress::fetch`]
+/// (cache check + atomic download). The supplied bar renders progress on
+/// the download path; cache-hit entries pass `None` and produce no UI.
 fn download_one_klib(
     p: &PreparedKlib<'_>,
     maybe_bar: Option<&konvoy_util::progress::DownloadBar>,

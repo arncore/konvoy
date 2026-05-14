@@ -401,21 +401,11 @@ impl ResolvedMavenDep {
 // Transitive resolution (BFS on artifact metadata)
 // ---------------------------------------------------------------------------
 
-/// Resolve the full transitive closure of Maven dependencies via BFS on
-/// artifact metadata (`.module` JSON first, POM XML as fallback).
+/// A BFS queue entry: `(group_id, artifact_id, version, requirer_name, ancestor_path)`.
 ///
-/// Uses the first known target to discover transitive deps (the dependency
-/// graph is the same across targets — only the klib differs).
-///
-/// After resolving the dependency graph, inspects each dep's metadata for
-/// additional klib files (e.g. cinterop klibs) and adds them as separate
-/// entries with a `classifier` set.
-///
-/// # Errors
-///
-/// Returns an error if metadata cannot be fetched or parsed, a version conflict
-/// is detected, or a dependency cycle is found.
-/// A BFS queue entry: (group_id, artifact_id, version, requirer_name, ancestor_path).
+/// `requirer_name` is `None` for direct deps and `Some(parent_name)` for
+/// transitive ones; `ancestor_path` carries the `group:artifact` chain
+/// from a direct dep down to here for cycle detection.
 type BfsEntry = (String, String, String, Option<String>, Vec<String>);
 
 /// State accumulated during the BFS traversal of Maven transitive dependencies.
@@ -534,6 +524,31 @@ fn finalize_required_by(
     }
 }
 
+/// Resolve the full transitive closure of Maven dependencies via a
+/// level-parallel BFS on artifact metadata (`.module` JSON first, POM XML
+/// as fallback).
+///
+/// Each BFS level is processed in three phases:
+/// 1. Drain the queue and fold per-entry `required_by` bookkeeping (no I/O).
+/// 2. Dedupe + parallel-fetch metadata for unique `(group, artifact, version)`
+///    tuples not already in the in-memory cache (rayon `par_iter`).
+/// 3. Sequentially process each entry against the now-populated cache,
+///    pushing children onto the queue for the next level. Cycle detection
+///    uses the per-entry ancestor path.
+///
+/// Uses the first known target ([`konvoy_targets::Target::LinuxX64`]) to
+/// discover transitive deps — the dependency graph is identical across
+/// targets, only the klib differs.
+///
+/// After the graph is resolved, [`discover_cinterop_deps`] scans the
+/// metadata cache for cinterop `.klib` files and adds them as separate
+/// entries with `classifier` set.
+///
+/// # Errors
+///
+/// Returns an error if metadata cannot be fetched or parsed, a version
+/// conflict is detected (see [`check_version_conflict`]), or a dependency
+/// cycle is found.
 fn resolve_transitive(
     direct_deps: &[ResolvedMavenDep],
 ) -> Result<Vec<ResolvedMavenDep>, EngineError> {

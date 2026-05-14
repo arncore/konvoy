@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::UtilError;
 
-/// Result of ensuring an artifact is available locally.
+/// Result of resolving an artifact locally — either a cache-hit reported by
+/// [`check_cached`] or a fresh fetch from [`download_artifact`].
 #[derive(Debug, Clone)]
 pub struct ArtifactResult {
     /// Path to the artifact on disk.
