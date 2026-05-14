@@ -10,3 +10,7 @@ pub mod maven;
 pub mod metadata;
 pub mod module_metadata;
 pub mod pom;
+pub mod progress;
+
+#[cfg(test)]
+pub(crate) mod test_util;

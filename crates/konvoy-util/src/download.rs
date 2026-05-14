@@ -12,16 +12,6 @@ fn u64_from_usize(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 
-/// Compute download percentage as a `u8` (0..=100).
-///
-/// Returns 0 when `total` is 0 to avoid division by zero.
-fn pct_u8(downloaded: u64, total: u64) -> u8 {
-    if total == 0 {
-        return 0;
-    }
-    u8::try_from((downloaded * 100) / total).unwrap_or(100)
-}
-
 /// Create an HTTP agent with the given global timeout.
 ///
 /// Uses a 30-second connect timeout for all requests.
@@ -34,19 +24,34 @@ pub fn http_agent(global_timeout_secs: u64) -> ureq::Agent {
     )
 }
 
-/// Download a URL to a file, showing progress on stderr and computing SHA-256.
+/// Stream a URL to a file, calling `on_progress` as bytes arrive and computing SHA-256.
+///
+/// Pure network primitive: no UI dependencies. Callers in
+/// [`crate::artifact`] and [`crate::progress`] adapt it to higher-level
+/// flows; engine code should not call this directly — use
+/// [`crate::progress::stream_with_bar`] for tarballs or
+/// [`crate::progress::fetch`] for hash-verified artifacts.
+///
+/// `on_progress(downloaded, total)` is invoked after each chunk:
+/// - `downloaded`: cumulative bytes written so far
+/// - `total`: `Content-Length` from the response (or `None` if absent)
+///
+/// `total` is consistent across chunks — either always `Some(n)` for the
+/// same `n` or always `None`.
 ///
 /// Returns the hex-encoded SHA-256 hash of the downloaded content.
 ///
 /// # Errors
 /// Returns an error if the HTTP request fails, the file cannot be written,
 /// or a read error occurs during streaming.
-pub fn download_with_progress(
+pub(crate) fn stream_download<F>(
     url: &str,
     dest: &Path,
-    label: &str,
-    version: &str,
-) -> Result<String, UtilError> {
+    mut on_progress: F,
+) -> Result<String, UtilError>
+where
+    F: FnMut(u64, Option<u64>),
+{
     let agent = http_agent(600);
 
     let response = agent.get(url).call().map_err(|e| UtilError::Download {
@@ -57,7 +62,8 @@ pub fn download_with_progress(
         .headers()
         .get("content-length")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok());
+        .and_then(|s| s.parse().ok())
+        .filter(|t: &u64| *t > 0);
 
     let mut body = response.into_body();
     let mut file = std::fs::File::create(dest).map_err(|source| UtilError::Io {
@@ -67,7 +73,6 @@ pub fn download_with_progress(
 
     let mut hasher = Sha256::new();
     let mut downloaded: u64 = 0;
-    let mut last_pct: u8 = 0;
     let mut buf = vec![0u8; 64 * 1024];
 
     loop {
@@ -90,28 +95,7 @@ pub fn download_with_progress(
         hasher.update(chunk);
 
         downloaded = downloaded.saturating_add(u64_from_usize(n));
-
-        if let Some(total) = content_length {
-            if total > 0 {
-                let pct = pct_u8(downloaded, total);
-                if pct != last_pct && pct.is_multiple_of(10) {
-                    eprint!("\r    Downloading {label} {version}... {pct}%");
-                    last_pct = pct;
-                }
-            }
-        }
-    }
-
-    if content_length.is_some() {
-        eprintln!("\r    Downloading {label} {version}... done   ");
-    } else {
-        let kb = downloaded / 1024;
-        if kb >= 1024 {
-            let mb = (kb + 512) / 1024;
-            eprintln!("    Downloaded {label} {version} ({mb} MB)");
-        } else {
-            eprintln!("    Downloaded {label} {version} ({kb} KB)");
-        }
+        on_progress(downloaded, content_length);
     }
 
     Ok(finalize_hex(hasher))
@@ -120,28 +104,10 @@ pub fn download_with_progress(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{pct_u8, u64_from_usize};
+    use super::{stream_download, u64_from_usize};
 
-    #[test]
-    fn pct_u8_zero_total_returns_zero() {
-        assert_eq!(pct_u8(0, 0), 0);
-        assert_eq!(pct_u8(100, 0), 0);
-    }
-
-    #[test]
-    fn pct_u8_basic_percentages() {
-        assert_eq!(pct_u8(0, 100), 0);
-        assert_eq!(pct_u8(50, 100), 50);
-        assert_eq!(pct_u8(100, 100), 100);
-    }
-
-    #[test]
-    fn pct_u8_over_100_saturates() {
-        // When downloaded > total, the ratio exceeds 100.
-        // Values above 255 clamp to 100 via unwrap_or.
-        assert_eq!(pct_u8(200, 100), 200); // 200% fits in u8
-        assert_eq!(pct_u8(1000, 100), 100); // 1000% overflows u8 → clamps
-    }
+    /// No-op progress callback used by tests that don't care about events.
+    fn ignore_progress(_: u64, _: Option<u64>) {}
 
     #[test]
     fn u64_from_usize_roundtrips() {
@@ -150,40 +116,9 @@ mod tests {
     }
 
     #[test]
-    fn pct_u8_rounding_down() {
-        // Integer division truncates: 1/3 * 100 = 33, not 34.
-        assert_eq!(pct_u8(1, 3), 33);
-        assert_eq!(pct_u8(2, 3), 66);
-    }
-
-    #[test]
-    fn pct_u8_exact_multiples_of_ten() {
-        assert_eq!(pct_u8(10, 100), 10);
-        assert_eq!(pct_u8(20, 100), 20);
-        assert_eq!(pct_u8(90, 100), 90);
-    }
-
-    #[test]
-    fn pct_u8_large_values() {
-        // Test with large but non-overflowing u64 values.
-        let total: u64 = 1_000_000_000;
-        assert_eq!(pct_u8(500_000_000, total), 50);
-        assert_eq!(pct_u8(total, total), 100);
-    }
-
-    #[test]
-    fn pct_u8_one_byte_downloaded() {
-        // 1 byte out of 1000 is 0%.
-        assert_eq!(pct_u8(1, 1000), 0);
-        // 1 byte out of 1 is 100%.
-        assert_eq!(pct_u8(1, 1), 100);
-    }
-
-    #[test]
     fn u64_from_usize_max_value() {
         // usize::MAX should convert to u64 on 64-bit, or saturate to u64::MAX on 128-bit+.
         let result = u64_from_usize(usize::MAX);
-        // On 64-bit platforms, usize::MAX == u64::MAX; on 32-bit, it fits.
         assert!(result > 0);
     }
 
@@ -191,8 +126,7 @@ mod tests {
     fn download_invalid_url_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("out.bin");
-        let result =
-            super::download_with_progress("http://127.0.0.1:1/nonexistent", &dest, "test", "0.0");
+        let result = stream_download("http://127.0.0.1:1/nonexistent", &dest, ignore_progress);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("download failed"), "error was: {err}");
@@ -202,22 +136,16 @@ mod tests {
     fn download_malformed_url_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("out.bin");
-        let result = super::download_with_progress("not-a-valid-url", &dest, "test", "0.0");
+        let result = stream_download("not-a-valid-url", &dest, ignore_progress);
         assert!(result.is_err());
     }
 
     #[test]
     fn download_unwritable_dest_returns_error() {
-        // Destination directory that doesn't exist and can't be created is
-        // caught by File::create failing. However download_with_progress
-        // doesn't call ensure_dir — it trusts the caller. If the server
-        // rejects before writing, the download error comes first. Trying
-        // with a valid-looking URL to an unroutable host + bad dest path.
-        let result = super::download_with_progress(
+        let result = stream_download(
             "http://127.0.0.1:1/file.bin",
             std::path::Path::new("/nonexistent_root/subdir/out.bin"),
-            "test",
-            "0.0",
+            ignore_progress,
         );
         assert!(result.is_err());
     }

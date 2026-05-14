@@ -155,7 +155,7 @@ pub fn ensure_plugin_artifacts(
     lockfile: &Lockfile,
     locked: bool,
 ) -> Result<Vec<PluginArtifactResult>, EngineError> {
-    use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+    use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
     // Fail fast in --locked mode before spawning any downloads.
     if locked {
@@ -166,17 +166,48 @@ pub fn ensure_plugin_artifacts(
         }
     }
 
-    artifacts
-        .par_iter()
-        .map(|artifact| {
-            let expected_hash = find_lockfile_hash(lockfile, &artifact.plugin_name);
+    if artifacts.is_empty() {
+        return Ok(Vec::new());
+    }
 
-            let util_result = konvoy_util::artifact::ensure_artifact(
+    // Only allocate bars for artifacts that actually need a network fetch.
+    // Cached items (cache_path already exists) re-verify their hash via a
+    // hidden bar so the user sees no UI flash when nothing's being
+    // downloaded.
+    let download_labels: Vec<String> = artifacts
+        .iter()
+        .filter(|a| !a.cache_path.exists())
+        .map(|a| format!("{} {}", a.plugin_name, a.maven_coord.version))
+        .collect();
+    let any_downloads = !download_labels.is_empty();
+    let bars: Vec<konvoy_util::progress::DownloadBar> = if any_downloads {
+        konvoy_util::progress::pre_allocate_bars(download_labels).1
+    } else {
+        Vec::new()
+    };
+    let mut bar_iter = bars.iter();
+    let aligned_bars: Vec<Option<&konvoy_util::progress::DownloadBar>> = artifacts
+        .iter()
+        .map(|a| {
+            if a.cache_path.exists() {
+                None
+            } else {
+                bar_iter.next()
+            }
+        })
+        .collect();
+
+    let results: Vec<Result<PluginArtifactResult, EngineError>> = artifacts
+        .par_iter()
+        .zip(aligned_bars.par_iter())
+        .map(|(artifact, maybe_bar)| {
+            let expected_hash = find_lockfile_hash(lockfile, &artifact.plugin_name);
+            let util_result = konvoy_util::progress::fetch(
                 &artifact.url,
                 &artifact.cache_path,
                 expected_hash,
                 &artifact.plugin_name,
-                &artifact.maven_coord.version,
+                *maybe_bar,
             )
             .map_err(|e| map_download_err(&artifact.plugin_name, e))?;
 
@@ -190,7 +221,13 @@ pub fn ensure_plugin_artifacts(
                 version: artifact.maven_coord.version.clone(),
             })
         })
-        .collect()
+        .collect();
+
+    if any_downloads {
+        eprintln!();
+    }
+
+    results.into_iter().collect()
 }
 
 /// Build `PluginLock` entries from download results.

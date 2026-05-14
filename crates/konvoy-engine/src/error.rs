@@ -185,6 +185,11 @@ pub enum EngineError {
     /// A cycle was detected during Maven transitive dependency resolution.
     #[error("maven dependency cycle detected: {cycle} — remove one of these dependencies from konvoy.toml or file an issue upstream")]
     MavenDependencyCycle { cycle: String },
+
+    /// An internal invariant was violated. This indicates a bug in konvoy
+    /// itself; user code/config should never trigger it.
+    #[error("internal invariant violated: {context} — please file a bug report")]
+    InternalInvariantViolated { context: String },
 }
 
 /// Map a `UtilError` from artifact download/verify to an `EngineError`.

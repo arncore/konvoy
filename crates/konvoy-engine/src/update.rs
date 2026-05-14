@@ -15,9 +15,10 @@
 //!    populated for transitive deps and `classifier` for non-primary artifacts.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use indicatif::MultiProgress;
+use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile};
 use konvoy_config::manifest::Manifest;
@@ -37,6 +38,122 @@ const FILTERED_GROUP_ARTIFACTS: &[(&str, &str)] = &[
     ("org.jetbrains.kotlin", "kotlin-stdlib"),
     ("org.jetbrains.kotlin", "kotlin-stdlib-common"),
 ];
+
+// ---------------------------------------------------------------------------
+// Per-dep download helpers
+// ---------------------------------------------------------------------------
+
+/// Build a placeholder lock entry used while the real one is being downloaded.
+///
+/// The placeholder is overwritten before the lockfile is written, so its
+/// `targets`/`source_hash` are never observed.
+fn placeholder_lock(dep: &ResolvedMavenDep, maven_coord: &str) -> DependencyLock {
+    DependencyLock {
+        name: dep.name.clone(),
+        source: DepSource::Maven {
+            version: dep.version.clone(),
+            maven: maven_coord.to_owned(),
+            targets: BTreeMap::new(),
+            required_by: dep.required_by.clone(),
+            classifier: dep.classifier.clone(),
+        },
+        source_hash: String::new(),
+    }
+}
+
+/// Download a Maven dep's klib for every known target and produce its lock entry.
+///
+/// Klibs are written directly into the shared Maven cache at
+/// `~/.konvoy/cache/maven/.../<artifact>-<version>.klib` so subsequent
+/// `konvoy build` runs reuse the verified file. Per-target downloads run in
+/// parallel via rayon and each renders into a pre-allocated progress bar (one
+/// per target, in `KNOWN_TARGETS` order) so the on-screen layout stays in
+/// the same stable rows regardless of completion order.
+///
+/// `bars` must have one entry per `KNOWN_TARGETS` element; caller-enforced
+/// via the zip in `update()`.
+fn download_dep(
+    dep: &ResolvedMavenDep,
+    cache_root: &Path,
+    bars: &[konvoy_util::progress::DownloadBar],
+) -> Result<DependencyLock, EngineError> {
+    let known_targets = konvoy_targets::KNOWN_TARGETS;
+    let maven_coord = dep.key();
+
+    let target_results: Vec<Result<(konvoy_targets::Target, String), EngineError>> = known_targets
+        .par_iter()
+        .zip(bars.par_iter())
+        .map(|(&target, bar)| download_target_klib(dep, target, cache_root, bar))
+        .collect();
+
+    let mut targets_map: BTreeMap<String, String> = BTreeMap::new();
+    for result in target_results {
+        let (target, sha256) = result?;
+        targets_map.insert(target.to_string(), sha256);
+    }
+
+    let hash_input: String = targets_map
+        .iter()
+        .map(|(k, v)| format!("{k}:{v}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let source_hash = konvoy_util::hash::sha256_bytes(hash_input.as_bytes());
+
+    Ok(DependencyLock {
+        name: dep.name.clone(),
+        source: DepSource::Maven {
+            version: dep.version.clone(),
+            maven: maven_coord,
+            targets: targets_map,
+            required_by: dep.required_by.clone(),
+            classifier: dep.classifier.clone(),
+        },
+        source_hash,
+    })
+}
+
+/// Download a single dep's klib for one target and return `(target, sha256)`.
+///
+/// Writes the klib to the shared Maven cache so `konvoy build` can reuse it
+/// without re-downloading. The bar is provided by the caller so the on-screen
+/// row is fixed and stable.
+fn download_target_klib(
+    dep: &ResolvedMavenDep,
+    target: konvoy_targets::Target,
+    cache_root: &Path,
+    progress: &konvoy_util::progress::DownloadBar,
+) -> Result<(konvoy_targets::Target, String), EngineError> {
+    let maven_suffix = target.to_maven_suffix();
+    let per_target_artifact_id = format!("{}-{}", dep.artifact_id, maven_suffix);
+
+    let mut coord = konvoy_util::maven::MavenCoordinate::new(
+        &dep.group_id,
+        &per_target_artifact_id,
+        &dep.version,
+    )
+    .with_packaging("klib");
+    if let Some(cls) = &dep.classifier {
+        coord = coord.with_classifier(cls);
+    }
+    let url = coord.to_url(MAVEN_CENTRAL);
+    let dest = coord.cache_path(cache_root);
+    let label = format!("{}:{}", dep.name, target);
+
+    let result = konvoy_util::progress::fetch(&url, &dest, None, &label, Some(progress)).map_err(
+        |e| match e {
+            konvoy_util::error::UtilError::Download { message } => {
+                EngineError::LibraryDownloadFailed {
+                    name: dep.name.clone(),
+                    url: url.clone(),
+                    message,
+                }
+            }
+            other => EngineError::Util(other),
+        },
+    )?;
+
+    Ok((target, result.sha256))
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -113,14 +230,17 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
         all_deps.len().saturating_sub(direct_deps.len())
     );
 
-    // 5. Check if all resolved deps already match the lockfile — skip download if so.
-    let mut new_dep_locks = Vec::new();
+    // 5. Partition deps into "already locked" vs "needs download" before any
+    //    parallel work, so we don't read the lockfile under contention.
+    //
+    //    Then download the "needs download" set in parallel (across deps),
+    //    while each dep also parallelizes its per-target downloads (nested
+    //    rayon is fine).
+    let mut new_dep_locks: Vec<DependencyLock> = Vec::with_capacity(all_deps.len());
+    let mut needs_download: Vec<(usize, &ResolvedMavenDep)> = Vec::new();
 
-    for dep in &all_deps {
+    for (idx, dep) in all_deps.iter().enumerate() {
         let maven_coord = dep.key();
-        eprintln!("  Resolving {} {}...", dep.name, dep.version);
-
-        // Check if lockfile already has this dep at this version and classifier.
         let dep_classifier = &dep.classifier;
         let already_locked = lockfile.dependencies.iter().find(|d| {
             d.name == dep.name
@@ -129,90 +249,94 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
         });
 
         if let Some(existing) = already_locked {
-            eprintln!("    (already up to date)");
+            // Reserve a slot — we'll fill the same index for needs_download
+            // entries after the parallel work completes.
             new_dep_locks.push(existing.clone());
-            continue;
+            eprintln!("  Resolving {} {}...", dep.name, dep.version);
+            eprintln!("    (already up to date)");
+        } else {
+            // Placeholder; replaced below.
+            new_dep_locks.push(placeholder_lock(dep, &maven_coord));
+            needs_download.push((idx, dep));
         }
+    }
 
-        // For each known target, download and hash (in parallel).
-        let known_targets = konvoy_targets::KNOWN_TARGETS;
+    // Download into the shared Maven cache so `konvoy build` can reuse the
+    // verified klibs without re-downloading.
+    let cache_root: PathBuf = crate::plugin::maven_cache_root()?;
 
-        let pid = std::process::id();
-        let tmp_base = std::env::temp_dir().join(format!("konvoy-update-{pid}"));
-        konvoy_util::fs::ensure_dir(&tmp_base)?;
+    // Hosts all per-(dep, target) bars. Bars are added in stable order
+    // (`needs_download` order × `KNOWN_TARGETS` order) BEFORE any parallel
+    // work starts so the on-screen rows stay fixed regardless of which
+    // download finishes first.
+    let multi = MultiProgress::new();
+    let known_targets = konvoy_targets::KNOWN_TARGETS;
 
-        let target_results: Vec<Result<(konvoy_targets::Target, String), EngineError>> =
-            known_targets
-                .par_iter()
-                .map(|&target| {
-                    let maven_suffix = target.to_maven_suffix();
-                    let per_target_artifact_id = format!("{}-{}", dep.artifact_id, maven_suffix);
+    // Build labels once, then reuse them to compute the max width AND to
+    // construct the bars — avoids formatting each prefix twice.
+    let labels: Vec<Vec<String>> = needs_download
+        .iter()
+        .map(|(_, dep)| known_targets.iter().map(|&t| dep.bar_label(t)).collect())
+        .collect();
+    let prefix_width = labels
+        .iter()
+        .flat_map(|row| row.iter().map(String::len))
+        .max()
+        .unwrap_or(0);
 
-                    let mut coord = konvoy_util::maven::MavenCoordinate::new(
-                        &dep.group_id,
-                        &per_target_artifact_id,
-                        &dep.version,
-                    )
-                    .with_packaging("klib");
-                    if let Some(cls) = &dep.classifier {
-                        coord = coord.with_classifier(cls);
-                    }
-                    let url = coord.to_url(MAVEN_CENTRAL);
+    let dep_bars: Vec<Vec<konvoy_util::progress::DownloadBar>> = labels
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|label| konvoy_util::progress::add_download_bar(&multi, label, prefix_width))
+                .collect()
+        })
+        .collect();
 
-                    let tmp_file = tmp_base.join(coord.filename());
+    // Download deps in parallel; per-target downloads are also parallel within
+    // each. `zip` pairs each dep with its pre-allocated bar row, removing any
+    // index-based fallback.
+    let download_results: Vec<Result<(usize, DependencyLock), EngineError>> = needs_download
+        .par_iter()
+        .zip(dep_bars.par_iter())
+        .map(|((idx, dep), bars)| {
+            let lock = download_dep(dep, &cache_root, bars)?;
+            Ok((*idx, lock))
+        })
+        .collect();
 
-                    let result = konvoy_util::artifact::ensure_artifact(
-                        &url,
-                        &tmp_file,
-                        None,
-                        &format!("{}:{}", dep.name, target),
-                        &dep.version,
-                    )
-                    .map_err(|e| match e {
-                        konvoy_util::error::UtilError::Download { message } => {
-                            EngineError::LibraryDownloadFailed {
-                                name: dep.name.clone(),
-                                url: url.clone(),
-                                message,
-                            }
-                        }
-                        other => EngineError::Util(other),
-                    })?;
+    // Bars remain on screen at their final state after each is abandoned
+    // (inside `DownloadBar::mark_success` / `mark_failure`); the
+    // `MultiProgress` is dropped at end of scope which releases the draw
+    // region without clearing the rendered content. Indicatif leaves the
+    // cursor at the end of the last bar's row, so emit one trailing newline
+    // before any subsequent `eprintln!` so the caller's status line doesn't
+    // get concatenated onto the bar row.
+    if !needs_download.is_empty() {
+        eprintln!();
+    }
 
-                    let _ = std::fs::remove_file(&tmp_file);
-
-                    Ok((target, result.sha256))
-                })
-                .collect();
-
-        let mut targets_map: BTreeMap<String, String> = BTreeMap::new();
-        for result in target_results {
-            let (target, sha256) = result?;
-            let display_hash = crate::common::truncate_hash(&sha256, 16);
-            eprintln!("    {target}: {display_hash}...");
-            targets_map.insert(target.to_string(), sha256);
+    // Apply results in original order so the lockfile output is deterministic
+    // (parallel downloads finish in arbitrary order, but the on-disk layout
+    // remains stable).
+    for result in download_results {
+        let (idx, lock) = result?;
+        if let Some(slot) = new_dep_locks.get_mut(idx) {
+            *slot = lock;
         }
+    }
 
-        konvoy_util::fs::remove_dir_all_if_exists(&tmp_base)?;
-
-        let hash_input: String = targets_map
-            .iter()
-            .map(|(k, v)| format!("{k}:{v}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let source_hash = konvoy_util::hash::sha256_bytes(hash_input.as_bytes());
-
-        new_dep_locks.push(DependencyLock {
-            name: dep.name.clone(),
-            source: DepSource::Maven {
-                version: dep.version.clone(),
-                maven: maven_coord,
-                targets: targets_map,
-                required_by: dep.required_by.clone(),
-                classifier: dep.classifier.clone(),
-            },
-            source_hash,
-        });
+    // After applying parallel results, every placeholder should have been
+    // replaced with a real lock entry carrying a non-empty source_hash. Use
+    // a debug_assert so a future bug (e.g. an index miscount or a skipped
+    // download) surfaces immediately in test/debug builds without changing
+    // release-time behavior.
+    for lock in &new_dep_locks {
+        debug_assert!(
+            !lock.source_hash.is_empty(),
+            "placeholder lock for {} not replaced",
+            lock.name
+        );
     }
 
     // 6. Merge: preserve existing path deps, replace all Maven deps.
@@ -266,27 +390,22 @@ impl ResolvedMavenDep {
     fn key(&self) -> String {
         format!("{}:{}", self.group_id, self.artifact_id)
     }
+
+    /// Render the human-readable label shown on a download progress bar.
+    fn bar_label(&self, target: konvoy_targets::Target) -> String {
+        format!("{} {} [{}]", self.name, self.version, target)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Transitive resolution (BFS on artifact metadata)
 // ---------------------------------------------------------------------------
 
-/// Resolve the full transitive closure of Maven dependencies via BFS on
-/// artifact metadata (`.module` JSON first, POM XML as fallback).
+/// A BFS queue entry: `(group_id, artifact_id, version, requirer_name, ancestor_path)`.
 ///
-/// Uses the first known target to discover transitive deps (the dependency
-/// graph is the same across targets — only the klib differs).
-///
-/// After resolving the dependency graph, inspects each dep's metadata for
-/// additional klib files (e.g. cinterop klibs) and adds them as separate
-/// entries with a `classifier` set.
-///
-/// # Errors
-///
-/// Returns an error if metadata cannot be fetched or parsed, a version conflict
-/// is detected, or a dependency cycle is found.
-/// A BFS queue entry: (group_id, artifact_id, version, requirer_name, ancestor_path).
+/// `requirer_name` is `None` for direct deps and `Some(parent_name)` for
+/// transitive ones; `ancestor_path` carries the `group:artifact` chain
+/// from a direct dep down to here for cycle detection.
 type BfsEntry = (String, String, String, Option<String>, Vec<String>);
 
 /// State accumulated during the BFS traversal of Maven transitive dependencies.
@@ -405,6 +524,31 @@ fn finalize_required_by(
     }
 }
 
+/// Resolve the full transitive closure of Maven dependencies via a
+/// level-parallel BFS on artifact metadata (`.module` JSON first, POM XML
+/// as fallback).
+///
+/// Each BFS level is processed in three phases:
+/// 1. Drain the queue and fold per-entry `required_by` bookkeeping (no I/O).
+/// 2. Dedupe + parallel-fetch metadata for unique `(group, artifact, version)`
+///    tuples not already in the in-memory cache (rayon `par_iter`).
+/// 3. Sequentially process each entry against the now-populated cache,
+///    pushing children onto the queue for the next level. Cycle detection
+///    uses the per-entry ancestor path.
+///
+/// Uses the first known target ([`konvoy_targets::Target::LinuxX64`]) to
+/// discover transitive deps — the dependency graph is identical across
+/// targets, only the klib differs.
+///
+/// After the graph is resolved, [`discover_cinterop_deps`] scans the
+/// metadata cache for cinterop `.klib` files and adds them as separate
+/// entries with `classifier` set.
+///
+/// # Errors
+///
+/// Returns an error if metadata cannot be fetched or parsed, a version
+/// conflict is detected (see [`check_version_conflict`]), or a dependency
+/// cycle is found.
 fn resolve_transitive(
     direct_deps: &[ResolvedMavenDep],
 ) -> Result<Vec<ResolvedMavenDep>, EngineError> {
@@ -437,106 +581,169 @@ fn resolve_transitive(
         ));
     }
 
-    // BFS loop.
-    while let Some((group_id, artifact_id, version, requirer, path)) = state.queue.pop_front() {
-        let key = format!("{group_id}:{artifact_id}");
+    // Level-based BFS: drain the queue into a Vec, fetch all metadata for
+    // that level in parallel, then process children sequentially so the
+    // graph mutations remain race-free.
+    while !state.queue.is_empty() {
+        // Drain the current level into a Vec paired with its per-entry cache
+        // keys. The key derivation is identical for prefetch and post-fetch
+        // passes; compute it once.
+        let level: Vec<(BfsEntry, String)> = state
+            .queue
+            .drain(..)
+            .map(|entry| {
+                let cache_key = format!("{}:{}-{}:{}", entry.0, entry.1, maven_suffix, entry.2);
+                (entry, cache_key)
+            })
+            .collect();
 
-        if let Some(req) = &requirer {
-            state
-                .required_by_map
-                .entry(key.clone())
-                .or_default()
-                .insert(req.clone());
+        // Fold pre-fetch bookkeeping (required_by entries from `requirer`)
+        // into the map before doing any I/O — these only depend on `requirer`
+        // and `(group_id, artifact_id)`, not on the fetched metadata.
+        for ((group_id, artifact_id, _version, requirer, _path), _cache_key) in &level {
+            let key = format!("{group_id}:{artifact_id}");
+            if let Some(req) = requirer {
+                state
+                    .required_by_map
+                    .entry(key)
+                    .or_default()
+                    .insert(req.clone());
+            }
         }
 
-        let per_target_artifact_id = format!("{artifact_id}-{maven_suffix}");
-        let metadata = fetch_metadata_cached(
-            &group_id,
-            &per_target_artifact_id,
-            &version,
-            maven_suffix,
-            &mut state.metadata_cache,
-        )?;
-
-        for meta_dep in &metadata.dependencies {
-            if is_filtered_dependency(&meta_dep.group_id, &meta_dep.artifact_id) {
+        // Collect unique tuples that need fetching and are not already in the
+        // metadata cache. Multiple entries in the queue may point at the same
+        // artifact via different paths.
+        let mut to_fetch: Vec<(String, String, String, String)> = Vec::with_capacity(level.len());
+        let mut seen_keys: BTreeSet<String> = BTreeSet::new();
+        for ((group_id, artifact_id, version, _requirer, _path), cache_key) in &level {
+            if state.metadata_cache.contains_key(cache_key) || !seen_keys.insert(cache_key.clone())
+            {
                 continue;
             }
-            if meta_dep.version.is_empty() {
-                continue;
-            }
+            to_fetch.push((
+                group_id.clone(),
+                format!("{artifact_id}-{maven_suffix}"),
+                version.clone(),
+                cache_key.clone(),
+            ));
+        }
 
-            let base_artifact_id = strip_target_suffix(&meta_dep.artifact_id, maven_suffix);
-            let dep_key = format!("{}:{}", meta_dep.group_id, base_artifact_id);
+        // Parallel fetch — no shared mutable state.
+        let fetched: Vec<Result<(String, ArtifactMetadata), EngineError>> = to_fetch
+            .par_iter()
+            .map(|(group_id, per_target_artifact_id, version, cache_key)| {
+                let metadata = konvoy_util::metadata::fetch_artifact_metadata(
+                    group_id,
+                    per_target_artifact_id,
+                    version,
+                    maven_suffix,
+                )
+                .map_err(EngineError::Util)?;
+                Ok((cache_key.clone(), metadata))
+            })
+            .collect();
 
-            let resolved_version = state
-                .user_versions
-                .get(&dep_key)
-                .cloned()
-                .unwrap_or_else(|| meta_dep.version.clone());
+        // Merge fetched metadata into the cache (sequential, no contention).
+        for result in fetched {
+            let (cache_key, metadata) = result?;
+            state.metadata_cache.insert(cache_key, metadata);
+        }
 
-            // Already resolved — check for version conflict, then skip.
-            if let Some(existing) = state.resolved.get(&dep_key) {
-                check_version_conflict(
-                    existing,
-                    &resolved_version,
-                    &dep_key,
-                    &base_artifact_id,
-                    requirer.as_deref(),
-                )?;
-                if let Some(req) = &requirer {
-                    state
-                        .required_by_map
-                        .entry(dep_key)
-                        .or_default()
-                        .insert(req.clone());
+        // Process this level's entries sequentially using the now-populated cache.
+        for ((group_id, artifact_id, _version, requirer, path), cache_key) in level {
+            // Every entry was either cached or just fetched above; a miss
+            // here means a logic bug. Surface as a typed error so tests catch
+            // future refactors that break this invariant.
+            let metadata = match state.metadata_cache.get(&cache_key) {
+                Some(m) => m.clone(),
+                None => {
+                    return Err(EngineError::InternalInvariantViolated {
+                        context: format!("BFS prefetch missed metadata for {cache_key}"),
+                    });
                 }
-                continue;
-            }
-
-            let dep_name = base_artifact_id.clone();
-            let parent_name = requirer
-                .clone()
-                .or_else(|| {
-                    state
-                        .resolved
-                        .get(&format!("{group_id}:{artifact_id}"))
-                        .map(|d| d.name.clone())
-                })
-                .unwrap_or_else(|| "unknown".to_owned());
-
-            state
-                .required_by_map
-                .entry(dep_key.clone())
-                .or_default()
-                .insert(parent_name.clone());
-
-            // Check for cycles.
-            if path.contains(&dep_key) {
-                let cycle = format!("{} -> {dep_key}", path.join(" -> "));
-                return Err(EngineError::MavenDependencyCycle { cycle });
-            }
-
-            let new_dep = ResolvedMavenDep {
-                name: dep_name.clone(),
-                group_id: meta_dep.group_id.clone(),
-                artifact_id: base_artifact_id.clone(),
-                version: resolved_version.clone(),
-                required_by: vec![parent_name],
-                classifier: None,
             };
 
-            let mut child_path = path.clone();
-            child_path.push(dep_key.clone());
+            for meta_dep in &metadata.dependencies {
+                if is_filtered_dependency(&meta_dep.group_id, &meta_dep.artifact_id) {
+                    continue;
+                }
+                if meta_dep.version.is_empty() {
+                    continue;
+                }
 
-            state.resolved.insert(dep_key, new_dep);
-            state.queue.push_back((
-                meta_dep.group_id.clone(),
-                base_artifact_id,
-                resolved_version,
-                Some(dep_name),
-                child_path,
-            ));
+                let base_artifact_id = strip_target_suffix(&meta_dep.artifact_id, maven_suffix);
+                let dep_key = format!("{}:{}", meta_dep.group_id, base_artifact_id);
+
+                let resolved_version = state
+                    .user_versions
+                    .get(&dep_key)
+                    .cloned()
+                    .unwrap_or_else(|| meta_dep.version.clone());
+
+                // Already resolved — check for version conflict, then skip.
+                if let Some(existing) = state.resolved.get(&dep_key) {
+                    check_version_conflict(
+                        existing,
+                        &resolved_version,
+                        &dep_key,
+                        &base_artifact_id,
+                        requirer.as_deref(),
+                    )?;
+                    if let Some(req) = &requirer {
+                        state
+                            .required_by_map
+                            .entry(dep_key)
+                            .or_default()
+                            .insert(req.clone());
+                    }
+                    continue;
+                }
+
+                let dep_name = base_artifact_id.clone();
+                let parent_name = requirer
+                    .clone()
+                    .or_else(|| {
+                        state
+                            .resolved
+                            .get(&format!("{group_id}:{artifact_id}"))
+                            .map(|d| d.name.clone())
+                    })
+                    .unwrap_or_else(|| "unknown".to_owned());
+
+                state
+                    .required_by_map
+                    .entry(dep_key.clone())
+                    .or_default()
+                    .insert(parent_name.clone());
+
+                // Check for cycles.
+                if path.contains(&dep_key) {
+                    let cycle = format!("{} -> {dep_key}", path.join(" -> "));
+                    return Err(EngineError::MavenDependencyCycle { cycle });
+                }
+
+                let new_dep = ResolvedMavenDep {
+                    name: dep_name.clone(),
+                    group_id: meta_dep.group_id.clone(),
+                    artifact_id: base_artifact_id.clone(),
+                    version: resolved_version.clone(),
+                    required_by: vec![parent_name],
+                    classifier: None,
+                };
+
+                let mut child_path = path.clone();
+                child_path.push(dep_key.clone());
+
+                state.resolved.insert(dep_key, new_dep);
+                state.queue.push_back((
+                    meta_dep.group_id.clone(),
+                    base_artifact_id,
+                    resolved_version,
+                    Some(dep_name),
+                    child_path,
+                ));
+            }
         }
     }
 
@@ -560,42 +767,6 @@ fn resolve_transitive(
     });
 
     Ok(result)
-}
-
-// ---------------------------------------------------------------------------
-// Metadata caching
-// ---------------------------------------------------------------------------
-
-/// Fetch artifact metadata via the provider chain, with an in-memory cache.
-///
-/// Uses `fetch_artifact_metadata()` (`.module` first, POM fallback) and stores
-/// the result in `cache` keyed by `groupId:artifactId:version`.
-///
-/// # Errors
-///
-/// Returns an error if both `.module` and POM fetching/parsing fail.
-fn fetch_metadata_cached(
-    group_id: &str,
-    artifact_id: &str,
-    version: &str,
-    maven_suffix: &str,
-    cache: &mut HashMap<String, ArtifactMetadata>,
-) -> Result<ArtifactMetadata, EngineError> {
-    let key = format!("{group_id}:{artifact_id}:{version}");
-    if let Some(cached) = cache.get(&key) {
-        return Ok(cached.clone());
-    }
-
-    let metadata = konvoy_util::metadata::fetch_artifact_metadata(
-        group_id,
-        artifact_id,
-        version,
-        maven_suffix,
-    )
-    .map_err(EngineError::Util)?;
-
-    cache.insert(key, metadata.clone());
-    Ok(metadata)
 }
 
 // ---------------------------------------------------------------------------
@@ -1336,5 +1507,71 @@ atomicfu = { maven = "org.jetbrains.kotlinx:atomicfu", version = "0.23.1" }
         let url = "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/atomicfu-linuxx64/0.23.1/atomicfu-linuxx64-0.23.1-cinterop-interop.klib";
         let cls = extract_classifier_from_url(url, "0.23.1");
         assert_eq!(cls.as_deref(), Some("cinterop-interop"));
+    }
+
+    // -------------------------------------------------------------------
+    // placeholder_lock
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn placeholder_lock_produces_maven_source_with_empty_targets_and_hash() {
+        // The placeholder is overwritten after download_dep completes, but its
+        // shape still matters: if the post-download replacement is ever skipped
+        // (e.g. an index miscount) the placeholder propagates into the
+        // lockfile. The empty `source_hash` is what the debug_assert in
+        // `update()` keys on to catch that bug.
+        let dep = ResolvedMavenDep {
+            name: "kotlinx-coroutines".to_owned(),
+            group_id: "org.jetbrains.kotlinx".to_owned(),
+            artifact_id: "kotlinx-coroutines-core".to_owned(),
+            version: "1.8.0".to_owned(),
+            required_by: vec!["root".to_owned()],
+            classifier: Some("cinterop-interop".to_owned()),
+        };
+        let coord = "org.jetbrains.kotlinx:kotlinx-coroutines-core";
+        let lock = placeholder_lock(&dep, coord);
+
+        assert_eq!(lock.name, "kotlinx-coroutines");
+        assert!(
+            lock.source_hash.is_empty(),
+            "placeholder source_hash must be empty so the debug_assert in update() fires if it leaks"
+        );
+        match &lock.source {
+            DepSource::Maven {
+                version,
+                maven,
+                targets,
+                required_by,
+                classifier,
+            } => {
+                assert_eq!(version, "1.8.0");
+                assert_eq!(maven, coord);
+                assert!(
+                    targets.is_empty(),
+                    "placeholder targets must be empty — they are filled by download_dep"
+                );
+                assert_eq!(required_by, &vec!["root".to_owned()]);
+                assert_eq!(classifier.as_deref(), Some("cinterop-interop"));
+            }
+            other => panic!("expected Maven source, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn placeholder_lock_no_classifier_for_main_klib() {
+        // The classifier flows through unchanged; for a regular dep it stays None.
+        let dep = ResolvedMavenDep {
+            name: "atomicfu".to_owned(),
+            group_id: "org.jetbrains.kotlinx".to_owned(),
+            artifact_id: "atomicfu".to_owned(),
+            version: "0.23.1".to_owned(),
+            required_by: Vec::new(),
+            classifier: None,
+        };
+        let lock = placeholder_lock(&dep, "org.jetbrains.kotlinx:atomicfu");
+        match &lock.source {
+            DepSource::Maven { classifier, .. } => assert!(classifier.is_none()),
+            other => panic!("expected Maven source, got: {other:?}"),
+        }
     }
 }

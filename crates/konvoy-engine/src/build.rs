@@ -60,6 +60,56 @@ pub struct BuildResult {
     pub duration: std::time::Duration,
 }
 
+/// A klib (or plugin jar) input to a compilation, with an optional
+/// pre-computed SHA-256.
+///
+/// When `precomputed_sha256` is `Some`, the build cache-key code reuses that
+/// hash instead of re-hashing the file. The pre-computed value MUST match
+/// what `konvoy_util::hash::sha256_file` would return for the same file —
+/// i.e. it must be a SHA-256 over the file contents. Maven dependency klibs
+/// satisfy this because `download_artifact` hashes the file bytes.
+///
+/// Path-deps and plugin jars use `None` because their hash is computed at
+/// a different layer (path-dep source hash) or not at all (plugins are pinned
+/// in the lockfile separately).
+#[derive(Debug, Clone)]
+pub(crate) struct LibraryInput {
+    /// Filesystem path to the `.klib` file.
+    pub path: PathBuf,
+    /// Pre-computed SHA-256 hex of the file's contents, when available.
+    pub precomputed_sha256: Option<String>,
+}
+
+impl LibraryInput {
+    /// Construct a library input without a pre-computed hash.
+    ///
+    /// The cache-key code will read the file to compute the SHA-256 on demand.
+    pub(crate) fn unhashed(path: PathBuf) -> Self {
+        Self {
+            path,
+            precomputed_sha256: None,
+        }
+    }
+
+    /// Construct a library input with a pre-computed SHA-256 hash.
+    ///
+    /// Used by Maven klib downloads where `download_artifact` already hashed
+    /// the file bytes, so the cache-key code can reuse that value instead
+    /// of re-reading the file.
+    pub(crate) fn with_hash(path: PathBuf, sha256: String) -> Self {
+        Self {
+            path,
+            precomputed_sha256: Some(sha256),
+        }
+    }
+}
+
+/// Extract bare paths from a slice of [`LibraryInput`] for passing to the
+/// compiler (`konanc -library` only needs paths, not hashes).
+pub(crate) fn library_paths_of(libs: &[LibraryInput]) -> Vec<PathBuf> {
+    libs.iter().map(|l| l.path.clone()).collect()
+}
+
 /// Common state resolved during steps 1–7b of the build pipeline.
 ///
 /// Shared between `build()` and `build_tests()` to avoid duplicating the
@@ -81,8 +131,9 @@ pub(crate) struct ResolvedBuildContext {
     pub jre_home: Option<PathBuf>,
     /// Inputs to `update_lockfile_if_needed` (fresh-download hashes).
     pub lockfile_write_inputs: LockfileWriteInputs,
-    /// Library paths from built path-deps and downloaded Maven klibs.
-    pub library_paths: Vec<PathBuf>,
+    /// Library inputs (path + optional pre-computed hash) from built path-deps
+    /// and downloaded Maven klibs.
+    pub library_inputs: Vec<LibraryInput>,
     /// Paths to downloaded compiler plugin JARs.
     pub plugin_jars: Vec<PathBuf>,
     /// Lockfile entries for resolved plugins (used by `update_lockfile_if_needed`).
@@ -197,7 +248,13 @@ pub(crate) fn resolve_build_context(
     let mut completed: HashMap<String, PathBuf> = HashMap::new();
 
     for level in &levels {
-        let lib_paths: Vec<PathBuf> = completed.values().cloned().collect();
+        // Path-deps don't carry a pre-computed hash through the build pipeline,
+        // so the cache-key code rehashes them as needed.
+        let lib_inputs: Vec<LibraryInput> = completed
+            .values()
+            .cloned()
+            .map(LibraryInput::unhashed)
+            .collect();
         let results: Vec<Result<(String, PathBuf, BuildOutcome), EngineError>> = level
             .par_iter()
             .map(|dep| {
@@ -206,7 +263,7 @@ pub(crate) fn resolve_build_context(
                     jre_home: jre_home.as_deref(),
                     target: &target,
                     options,
-                    library_paths: &lib_paths,
+                    library_inputs: &lib_inputs,
                     plugin_jars: &[],
                 };
                 let (output, outcome) = build_single(
@@ -226,10 +283,11 @@ pub(crate) fn resolve_build_context(
         }
     }
 
-    let mut library_paths: Vec<PathBuf> = dep_graph
+    let mut library_inputs: Vec<LibraryInput> = dep_graph
         .order
         .iter()
         .filter_map(|dep| completed.get(&dep.name).cloned())
+        .map(LibraryInput::unhashed)
         .collect();
 
     // 7a. Resolve and download plugin artifacts.
@@ -248,8 +306,10 @@ pub(crate) fn resolve_build_context(
     };
 
     // 7b. Resolve and download Maven dependency klibs for the current target.
+    //     Each Maven klib comes back with a precomputed sha256 from
+    //     `download_artifact`, which the cache-key code reuses to skip rehashing.
     let maven_klibs = resolve_maven_deps(&effective_lockfile, &target)?;
-    library_paths.extend(maven_klibs);
+    library_inputs.extend(maven_klibs);
 
     let store = ArtifactStore::new(project_root);
 
@@ -265,7 +325,7 @@ pub(crate) fn resolve_build_context(
             konanc_tarball_sha256,
             jre_tarball_sha256,
         },
-        library_paths,
+        library_inputs,
         plugin_jars,
         plugin_locks,
         dep_graph,
@@ -300,7 +360,7 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         jre_home: ctx.jre_home.as_deref(),
         target: &ctx.target,
         options,
-        library_paths: &ctx.library_paths,
+        library_inputs: &ctx.library_inputs,
         plugin_jars: &ctx.plugin_jars,
     };
     let (output_path, outcome) = build_single(
@@ -347,8 +407,10 @@ pub(crate) struct CompileContext<'a> {
     pub target: &'a Target,
     /// Build options (release, verbose, force, locked).
     pub options: &'a BuildOptions,
-    /// Dependency `.klib` paths to pass as `-library` args.
-    pub library_paths: &'a [PathBuf],
+    /// Dependency `.klib` inputs (path + optional pre-computed hash).
+    ///
+    /// The compiler only consumes the paths; the hashes feed the cache key.
+    pub library_inputs: &'a [LibraryInput],
     /// Compiler plugin JAR paths to pass as `-Xplugin` args.
     pub plugin_jars: &'a [PathBuf],
 }
@@ -393,9 +455,14 @@ pub(crate) fn build_single(
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
         dependency_hashes: cc
-            .library_paths
+            .library_inputs
             .iter()
-            .map(|p| konvoy_util::hash::sha256_file(p).map_err(EngineError::from))
+            .map(|lib| match &lib.precomputed_sha256 {
+                // Reuse the hash that `download_artifact` already computed for
+                // this file's bytes — it's value-equivalent to sha256_file.
+                Some(h) => Ok(h.clone()),
+                None => konvoy_util::hash::sha256_file(&lib.path).map_err(EngineError::from),
+            })
             .collect::<Result<Vec<_>, _>>()?,
     };
     let cache_key = CacheKey::compute(&cache_inputs)?;
@@ -494,13 +561,16 @@ fn compile_two_step(
     // Step 1: compile sources → temporary klib (with plugins active).
     let klib_path = output_path.with_extension("klib");
 
+    // konanc only consumes paths — strip the precomputed hashes here.
+    let lib_paths = library_paths_of(cc.library_inputs);
+
     let mut compile_cmd = KonancCommand::new()
         .sources(sources)
         .output(&klib_path)
         .target(cc.target.to_konanc_arg())
         .release(cc.options.is_release())
         .produce(ProduceKind::Library)
-        .libraries(cc.library_paths)
+        .libraries(&lib_paths)
         .plugins(cc.plugin_jars);
 
     if let Some(jh) = cc.jre_home {
@@ -524,7 +594,7 @@ fn compile_two_step(
             .output(output_path)
             .target(cc.target.to_konanc_arg())
             .release(cc.options.is_release())
-            .libraries(cc.library_paths);
+            .libraries(&lib_paths);
 
         if let Some(jh) = cc.jre_home {
             link_cmd = link_cmd.java_home(jh);
@@ -558,13 +628,15 @@ fn compile_single_step(
     output_path: &Path,
     produce: ProduceKind,
 ) -> Result<PathBuf, EngineError> {
+    let lib_paths = library_paths_of(cc.library_inputs);
+
     let mut cmd = KonancCommand::new()
         .sources(sources)
         .output(output_path)
         .target(cc.target.to_konanc_arg())
         .release(cc.options.is_release())
         .produce(produce)
-        .libraries(cc.library_paths)
+        .libraries(&lib_paths)
         .plugins(cc.plugin_jars);
 
     if let Some(jh) = cc.jre_home {
@@ -621,22 +693,65 @@ pub(crate) fn lockfile_toml_content(lockfile: &Lockfile) -> Result<String, Engin
 ///
 /// Iterates over all Maven dependency entries in the lockfile (both direct
 /// and transitive), downloads the per-target `.klib` artifact, verifies the
-/// SHA-256 hash, and returns the list of klib paths to pass to `konanc -library`.
+/// SHA-256 hash, and returns the list of klib inputs to pass to the build.
+///
+/// Each returned [`LibraryInput`] carries the file path plus the SHA-256 of
+/// its contents (produced by `download_artifact`), so the cache-key code does
+/// not rehash the file.
 ///
 /// Only the klib for the current build target is downloaded (lazy download).
 ///
 /// # Errors
 /// Returns an error if a Maven dependency is missing from the lockfile, the
 /// target hash is not present, or the download/hash verification fails.
+/// View into the Maven-specific fields of a `DependencyLock`. Built once
+/// upfront so the inner par_iter loop doesn't have to match on the source
+/// variant again.
+struct MavenLockView<'a> {
+    name: &'a str,
+    version: &'a str,
+    maven: &'a str,
+    targets: &'a std::collections::BTreeMap<String, String>,
+    classifier: Option<&'a str>,
+}
+
+/// Everything needed to download a single Maven klib for one target.
+/// Computed sequentially upfront so we can decide which entries actually
+/// need a network fetch before creating any progress bars.
+struct PreparedKlib<'a> {
+    entry: &'a MavenLockView<'a>,
+    dest: PathBuf,
+    url: String,
+    expected_sha256: &'a str,
+    needs_download: bool,
+}
+
 pub(crate) fn resolve_maven_deps(
     lockfile: &Lockfile,
     target: &Target,
-) -> Result<Vec<PathBuf>, EngineError> {
-    // Collect all Maven dependency entries from the lockfile (direct + transitive).
-    let maven_locks: Vec<&DependencyLock> = lockfile
+) -> Result<Vec<LibraryInput>, EngineError> {
+    use rayon::prelude::IndexedParallelIterator;
+
+    // Filter to Maven entries AND extract their fields in one pass.
+    let maven_locks: Vec<MavenLockView> = lockfile
         .dependencies
         .iter()
-        .filter(|d| matches!(&d.source, DepSource::Maven { .. }))
+        .filter_map(|d| match &d.source {
+            DepSource::Maven {
+                version,
+                maven,
+                targets,
+                classifier,
+                ..
+            } => Some(MavenLockView {
+                name: &d.name,
+                version,
+                maven,
+                targets,
+                classifier: classifier.as_deref(),
+            }),
+            DepSource::Path { .. } => None,
+        })
         .collect();
 
     if maven_locks.is_empty() {
@@ -647,81 +762,108 @@ pub(crate) fn resolve_maven_deps(
     let target_str = target.to_konanc_arg();
     let maven_suffix = target.to_maven_suffix();
 
-    let klib_paths: Vec<Result<PathBuf, EngineError>> = maven_locks
-        .par_iter()
-        .map(|lock_entry| {
-            let dep_name = lock_entry.name.clone();
-
-            let (version, maven_coord, targets, classifier) = match &lock_entry.source {
-                DepSource::Maven {
-                    version,
-                    maven,
-                    targets,
-                    classifier,
-                    ..
-                } => (version, maven, targets, classifier),
-                DepSource::Path { .. } => {
-                    return Err(EngineError::MissingLockfileEntry { name: dep_name });
+    // Compute coord/dest/url/expected-hash and check existence for every
+    // entry. Sequential because the input is small and these are cheap;
+    // doing it upfront lets us skip bar creation for cached items.
+    let prepared: Vec<PreparedKlib> =
+        maven_locks
+            .iter()
+            .map(|entry| {
+                let (group_id, artifact_id) = crate::common::split_maven_coordinate(entry.maven)?;
+                let per_target_artifact_id = format!("{artifact_id}-{maven_suffix}");
+                let mut coord = konvoy_util::maven::MavenCoordinate::new(
+                    group_id,
+                    &per_target_artifact_id,
+                    entry.version,
+                )
+                .with_packaging("klib");
+                if let Some(cls) = entry.classifier {
+                    coord = coord.with_classifier(cls);
                 }
-            };
-
-            // Split "groupId:artifactId" into parts.
-            let (group_id, artifact_id) = crate::common::split_maven_coordinate(maven_coord)?;
-
-            // Build the per-target artifact ID (e.g. "kotlinx-coroutines-core-linuxx64").
-            let per_target_artifact_id = format!("{artifact_id}-{maven_suffix}");
-
-            let mut coord = konvoy_util::maven::MavenCoordinate::new(
-                group_id,
-                &per_target_artifact_id,
-                version,
-            )
-            .with_packaging("klib");
-            if let Some(cls) = classifier {
-                coord = coord.with_classifier(cls);
-            }
-
-            // Extract the expected SHA-256 for this target from the lockfile.
-            let expected_sha256 =
-                targets
-                    .get(target_str)
-                    .ok_or_else(|| EngineError::MissingTargetHash {
-                        name: dep_name.clone(),
+                let expected_sha256 = entry.targets.get(target_str).ok_or_else(|| {
+                    EngineError::MissingTargetHash {
+                        name: entry.name.to_owned(),
                         target: target_str.to_owned(),
-                    })?;
+                    }
+                })?;
+                let dest = coord.cache_path(&cache_root);
+                let url = coord.to_url(konvoy_util::maven::MAVEN_CENTRAL);
+                let needs_download = !dest.exists();
+                Ok(PreparedKlib {
+                    entry,
+                    dest,
+                    url,
+                    expected_sha256,
+                    needs_download,
+                })
+            })
+            .collect::<Result<Vec<_>, EngineError>>()?;
 
-            // Compute the cache path and download URL.
-            let dest = coord.cache_path(&cache_root);
-            let url = coord.to_url(konvoy_util::maven::MAVEN_CENTRAL);
-
-            // Download (or use cached) and verify hash.
-            let result = konvoy_util::artifact::ensure_artifact(
-                &url,
-                &dest,
-                Some(expected_sha256),
-                &dep_name,
-                version,
-            )
-            .map_err(|e| EngineError::LibraryDownloadFailed {
-                name: dep_name.clone(),
-                url: url.clone(),
-                message: e.to_string(),
-            })?;
-
-            // Double-check the hash matches the lockfile expectation.
-            if result.sha256 != *expected_sha256 {
-                return Err(EngineError::LibraryHashMismatch {
-                    name: dep_name,
-                    expected: expected_sha256.clone(),
-                    actual: result.sha256,
-                });
+    // Only allocate bars for entries that actually need a network fetch;
+    // cached entries are silent. The `aligned_bars` Vec parallels `prepared`
+    // so the par_iter zip pairs each entry with its bar (or None).
+    let download_labels: Vec<String> = prepared
+        .iter()
+        .filter(|p| p.needs_download)
+        .map(|p| format!("{} {}", p.entry.name, p.entry.version))
+        .collect();
+    let any_downloads = !download_labels.is_empty();
+    let bars: Vec<konvoy_util::progress::DownloadBar> = if any_downloads {
+        konvoy_util::progress::pre_allocate_bars(download_labels).1
+    } else {
+        Vec::new()
+    };
+    let mut bar_iter = bars.iter();
+    let aligned_bars: Vec<Option<&konvoy_util::progress::DownloadBar>> = prepared
+        .iter()
+        .map(|p| {
+            if p.needs_download {
+                bar_iter.next()
+            } else {
+                None
             }
-
-            Ok(result.path)
         })
         .collect();
 
-    klib_paths.into_iter().collect()
+    let klib_inputs: Vec<Result<LibraryInput, EngineError>> = prepared
+        .par_iter()
+        .zip(aligned_bars.par_iter())
+        .map(|(p, maybe_bar)| download_one_klib(p, *maybe_bar))
+        .collect();
+
+    // Trailing newline only if we actually rendered any bars.
+    if any_downloads {
+        eprintln!();
+    }
+
+    klib_inputs.into_iter().collect()
+}
+
+/// Resolve a single prepared klib via [`konvoy_util::progress::fetch`]
+/// (cache check + atomic download). The supplied bar renders progress on
+/// the download path; cache-hit entries pass `None` and produce no UI.
+fn download_one_klib(
+    p: &PreparedKlib<'_>,
+    maybe_bar: Option<&konvoy_util::progress::DownloadBar>,
+) -> Result<LibraryInput, EngineError> {
+    let dep_name = p.entry.name.to_owned();
+    let result = konvoy_util::progress::fetch(
+        &p.url,
+        &p.dest,
+        Some(p.expected_sha256),
+        &dep_name,
+        maybe_bar,
+    )
+    .map_err(|e| EngineError::LibraryDownloadFailed {
+        name: dep_name,
+        url: p.url.clone(),
+        message: e.to_string(),
+    })?;
+    // `progress::fetch` already enforces `expected_sha256` (via
+    // `check_cached` on hit, `download_artifact` on miss), so `result.sha256`
+    // is guaranteed to match. Carry the freshly-verified hash through so
+    // `build_single` can reuse it for the cache key without re-reading.
+    Ok(LibraryInput::with_hash(result.path, result.sha256))
 }
 
 /// Returns `true` if the manifest declares Maven deps that have no matching
@@ -1404,7 +1546,7 @@ mod tests {
             jre_home: None,
             target: &target,
             options: &options,
-            library_paths: &[],
+            library_inputs: &[],
             plugin_jars: &[],
         };
         let (output_path, outcome) =
@@ -1491,7 +1633,7 @@ mod tests {
             jre_home: None,
             target: &target,
             options: &options,
-            library_paths: &[],
+            library_inputs: &[],
             plugin_jars: &[],
         };
         let (output_path, outcome) =
@@ -1603,7 +1745,7 @@ mod tests {
             jre_home: None,
             target: &target,
             options: &options,
-            library_paths: &[],
+            library_inputs: &[],
             plugin_jars: &[],
         };
         let (output_path, outcome) =
@@ -2192,7 +2334,7 @@ mod tests {
             jre_home: None,
             target: &target,
             options: &options_no_force,
-            library_paths: &[],
+            library_inputs: &[],
             plugin_jars: &[],
         };
         let (_, outcome) = build_single(
@@ -2220,7 +2362,7 @@ mod tests {
             jre_home: None,
             target: &target,
             options: &options_force,
-            library_paths: &[],
+            library_inputs: &[],
             plugin_jars: &[],
         };
         let result = build_single(&project, &manifest, &cc_force, profile, &lockfile_content);
@@ -4587,5 +4729,60 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
             false,
         );
         assert!(result.is_ok(), "force should bypass hash mismatch");
+    }
+
+    // -------------------------------------------------------------------
+    // LibraryInput constructors + helpers
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn library_input_unhashed_carries_path_and_no_hash() {
+        // `unhashed` is used for path-deps and pre-built klibs where the
+        // cache-key code will hash on demand.
+        let p = PathBuf::from("/tmp/some.klib");
+        let lib = LibraryInput::unhashed(p.clone());
+        assert_eq!(lib.path, p);
+        assert!(
+            lib.precomputed_sha256.is_none(),
+            "unhashed must produce None for the hash"
+        );
+    }
+
+    #[test]
+    fn library_input_with_hash_carries_both_path_and_hash() {
+        // `with_hash` is used by Maven downloads where `download_artifact`
+        // already hashed the file — the cache-key code reuses that value.
+        let p = PathBuf::from("/tmp/dep.klib");
+        let h = "deadbeef".to_owned();
+        let lib = LibraryInput::with_hash(p.clone(), h.clone());
+        assert_eq!(lib.path, p);
+        assert_eq!(lib.precomputed_sha256.as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn library_paths_of_extracts_paths_in_order() {
+        // `library_paths_of` strips the hashes; konanc only needs paths.
+        // Order must be preserved so `-library` args feed in deterministically.
+        let libs = vec![
+            LibraryInput::unhashed(PathBuf::from("/a.klib")),
+            LibraryInput::with_hash(PathBuf::from("/b.klib"), "h".to_owned()),
+            LibraryInput::unhashed(PathBuf::from("/c.klib")),
+        ];
+        let paths = library_paths_of(&libs);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/a.klib"),
+                PathBuf::from("/b.klib"),
+                PathBuf::from("/c.klib"),
+            ]
+        );
+    }
+
+    #[test]
+    fn library_paths_of_empty_input_returns_empty() {
+        // Empty input must not allocate a spurious element.
+        let paths = library_paths_of(&[]);
+        assert!(paths.is_empty());
     }
 }

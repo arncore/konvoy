@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+indicatif.workspace = true
 konvoy-config.workspace = true
 konvoy-konanc.workspace = true
 konvoy-targets.workspace = true

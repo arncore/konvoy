@@ -83,9 +83,12 @@ pub fn build_tests(
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
         dependency_hashes: ctx
-            .library_paths
+            .library_inputs
             .iter()
-            .map(|p| konvoy_util::hash::sha256_file(p).map_err(EngineError::from))
+            .map(|lib| match &lib.precomputed_sha256 {
+                Some(h) => Ok(h.clone()),
+                None => konvoy_util::hash::sha256_file(&lib.path).map_err(EngineError::from),
+            })
             .collect::<Result<Vec<_>, _>>()?,
     };
     let cache_key = CacheKey::compute(&cache_inputs)?;
@@ -121,6 +124,8 @@ pub fn build_tests(
         konvoy_util::fs::ensure_dir(parent)?;
     }
 
+    let library_paths = crate::build::library_paths_of(&ctx.library_inputs);
+
     let mut cmd = KonancCommand::new()
         .sources(&sources)
         .output(&output_path)
@@ -128,7 +133,7 @@ pub fn build_tests(
         .release(options.is_release())
         .produce(ProduceKind::Program)
         .generate_test_runner(true)
-        .libraries(&ctx.library_paths)
+        .libraries(&library_paths)
         .plugins(&ctx.plugin_jars);
 
     if let Some(jh) = ctx.jre_home.as_deref() {

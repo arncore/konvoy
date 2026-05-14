@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 glob.workspace = true
+indicatif.workspace = true
 rayon.workspace = true
 roxmltree.workspace = true
 serde.workspace = true

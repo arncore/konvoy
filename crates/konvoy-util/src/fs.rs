@@ -325,9 +325,10 @@ mod tests {
         assert!(files.iter().any(|f| f.ends_with("beta.kt")));
     }
 
-    /// Guards tests that read or mutate HOME / USERPROFILE env vars so they
-    /// don't race with each other (env vars are process-wide shared state).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Shared with `pom::tests` and `module_metadata::tests` via
+    // `crate::test_util::ENV_LOCK` so HOME-override tests in different
+    // modules don't race when `cargo test` runs them on multiple threads.
+    use crate::test_util::ENV_LOCK;
 
     #[test]
     fn konvoy_home_returns_dotkonvoy_subdir() {

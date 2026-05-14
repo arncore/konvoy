@@ -404,7 +404,7 @@ fn cmd_update() -> CliResult {
     let root = project_root()?;
     let result = konvoy_engine::update(&root)?;
     eprintln!(
-        "    Updated {} dependencies in konvoy.lock",
+        "  Updated {} dependencies in konvoy.lock",
         result.updated_count
     );
     Ok(())
