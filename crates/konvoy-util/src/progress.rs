@@ -471,4 +471,100 @@ mod tests {
         assert_eq!(result, Err("boom"));
         assert_eq!(bar.state.load(Ordering::Relaxed), STATE_FAILURE);
     }
+
+    /// `fetch` should short-circuit on a cache hit and never touch the
+    /// (bogus) URL. The dest file is pre-written so `check_cached` returns
+    /// `Some` before any network attempt.
+    #[test]
+    fn fetch_returns_cached_when_hash_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("artifact.jar");
+        let content = b"cached artifact content";
+        std::fs::write(&dest, content).unwrap();
+        let expected = crate::hash::sha256_bytes(content);
+
+        let result = fetch(
+            "http://127.0.0.1:1/should-not-be-hit",
+            &dest,
+            Some(&expected),
+            "test",
+            None,
+        )
+        .unwrap();
+
+        assert!(!result.freshly_downloaded);
+        assert_eq!(result.sha256, expected);
+        assert_eq!(result.path, dest);
+    }
+
+    /// With no `expected_sha256`, an existing file is still served from
+    /// cache — `check_cached` hashes it and returns `Some` with the
+    /// computed hash. The bogus URL must not be hit.
+    #[test]
+    fn fetch_returns_cached_without_expected_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("artifact.jar");
+        let content = b"unverified cached content";
+        std::fs::write(&dest, content).unwrap();
+        let computed = crate::hash::sha256_bytes(content);
+
+        let result = fetch(
+            "http://127.0.0.1:1/should-not-be-hit",
+            &dest,
+            None,
+            "test",
+            None,
+        )
+        .unwrap();
+
+        assert!(!result.freshly_downloaded);
+        assert_eq!(result.sha256, computed);
+    }
+
+    /// Cached file with the wrong hash returns `ArtifactHashMismatch`
+    /// without falling through to the download path.
+    #[test]
+    fn fetch_errors_on_cached_hash_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("artifact.jar");
+        std::fs::write(&dest, b"any content").unwrap();
+        let bogus = "0".repeat(64);
+
+        let result = fetch(
+            "http://127.0.0.1:1/should-not-be-hit",
+            &dest,
+            Some(&bogus),
+            "test",
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(crate::error::UtilError::ArtifactHashMismatch { .. })
+        ));
+    }
+
+    /// Cache-hit path doesn't touch the bar (no `run`, no state flip).
+    /// The supplied `DownloadBar`'s state must stay `STATE_IN_PROGRESS`
+    /// after a cache-hit fetch.
+    #[test]
+    fn fetch_cache_hit_leaves_bar_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("artifact.jar");
+        let content = b"cached";
+        std::fs::write(&dest, content).unwrap();
+        let expected = crate::hash::sha256_bytes(content);
+
+        let bar = new_download_bar("test");
+        let result = fetch(
+            "http://127.0.0.1:1/should-not-be-hit",
+            &dest,
+            Some(&expected),
+            "test",
+            Some(&bar),
+        )
+        .unwrap();
+
+        assert!(!result.freshly_downloaded);
+        assert_eq!(bar.state.load(Ordering::Relaxed), STATE_IN_PROGRESS);
+    }
 }
