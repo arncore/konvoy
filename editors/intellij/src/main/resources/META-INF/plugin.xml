@@ -33,10 +33,10 @@
         <!-- Gutter run icons -->
         <runLineMarkerContributor
                 language="kotlin"
-                implementation="com.konvoy.ide.run.KonvoyRunLineMarkerContributor"/>
+                implementationClass="com.konvoy.ide.run.KonvoyRunLineMarkerContributor"/>
         <runLineMarkerContributor
                 language="kotlin"
-                implementation="com.konvoy.ide.run.KonvoyTestLineMarkerContributor"/>
+                implementationClass="com.konvoy.ide.run.KonvoyTestLineMarkerContributor"/>
 
         <!-- Clickable file:line:col links in build output -->
         <consoleFilterProvider
