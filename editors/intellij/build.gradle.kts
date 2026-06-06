@@ -31,7 +31,7 @@ intellijPlatform {
         name = providers.gradleProperty("pluginName")
         ideaVersion {
             sinceBuild = "242"
-            untilBuild = "253.*"
+            untilBuild = "262.*"
         }
     }
     pluginVerification {

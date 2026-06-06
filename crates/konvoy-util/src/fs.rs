@@ -1,5 +1,6 @@
 //! Filesystem utilities for Konvoy.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use crate::error::UtilError;
@@ -98,6 +99,24 @@ pub fn konvoy_home() -> Result<PathBuf, UtilError> {
         .map(PathBuf::from)
         .map_err(|_| UtilError::NoHomeDir)?;
     Ok(home.join(".konvoy"))
+}
+
+/// Return an environment path with `entry` prepended before the existing entries.
+///
+/// This is intended for `PATH`-style environment variables. It uses the platform
+/// separator through [`std::env::join_paths`] rather than hard-coding `:`.
+///
+/// # Errors
+/// Returns an error if any path entry cannot be represented in a joined search path.
+pub fn prepend_to_environment_path(
+    entry: &Path,
+    existing_path: Option<&OsStr>,
+) -> Result<OsString, std::env::JoinPathsError> {
+    let mut paths = vec![entry.to_path_buf()];
+    if let Some(existing_path) = existing_path {
+        paths.extend(std::env::split_paths(existing_path));
+    }
+    std::env::join_paths(paths)
 }
 
 /// Collect all files with the given `extension` under `dir`, recursively, sorted by path.
@@ -441,6 +460,54 @@ mod tests {
         }
 
         assert_eq!(result, PathBuf::from("/tmp/fake_home/.konvoy"));
+    }
+
+    #[test]
+    fn prepend_to_environment_path_adds_entry_before_existing_path() {
+        let path = prepend_to_environment_path(
+            Path::new("/shim"),
+            Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+        )
+        .unwrap();
+        assert_eq!(path.to_string_lossy(), "/shim:/usr/bin:/bin");
+    }
+
+    #[test]
+    fn prepend_to_environment_path_handles_missing_existing_path() {
+        let path = prepend_to_environment_path(Path::new("/shim"), None).unwrap();
+        assert_eq!(path.to_string_lossy(), "/shim");
+    }
+
+    #[test]
+    fn prepend_to_environment_path_preserves_empty_existing_path_entry() {
+        let path = prepend_to_environment_path(Path::new("/shim"), Some(std::ffi::OsStr::new("")))
+            .unwrap();
+        assert_eq!(path.to_string_lossy(), "/shim:");
+    }
+
+    #[test]
+    fn prepend_to_environment_path_preserves_duplicate_entries() {
+        let path = prepend_to_environment_path(
+            Path::new("/shim"),
+            Some(std::ffi::OsStr::new("/usr/bin:/shim:/usr/bin")),
+        )
+        .unwrap();
+        assert_eq!(path.to_string_lossy(), "/shim:/usr/bin:/shim:/usr/bin");
+    }
+
+    #[test]
+    fn prepend_to_environment_path_preserves_entries_with_spaces() {
+        let path = prepend_to_environment_path(
+            Path::new("/tmp/konvoy shim"),
+            Some(std::ffi::OsStr::new(
+                "/usr/local/bin:/Applications/My Tool/bin",
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            path.to_string_lossy(),
+            "/tmp/konvoy shim:/usr/local/bin:/Applications/My Tool/bin"
+        );
     }
 
     #[test]

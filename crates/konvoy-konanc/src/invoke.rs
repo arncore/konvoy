@@ -1,6 +1,9 @@
 //! Compiler invocation and diagnostics normalization.
 
 use std::collections::HashSet;
+use std::env;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -252,6 +255,18 @@ impl KonancCommand {
         if let Some(jh) = &self.java_home {
             cmd.env("JAVA_HOME", jh);
         }
+        let _xcodebuild_shim = maybe_create_macos_xcodebuild_shim(self.target.as_deref())
+            .map_err(|source| KonancError::Exec { source })?;
+        if let Some(shim) = &_xcodebuild_shim {
+            let path = konvoy_util::fs::prepend_to_environment_path(
+                shim.path(),
+                env::var_os("PATH").as_deref(),
+            )
+            .map_err(|source| KonancError::Exec {
+                source: io::Error::other(source),
+            })?;
+            cmd.env("PATH", path);
+        }
         let cmd_output = cmd
             .output()
             .map_err(|source| KonancError::Exec { source })?;
@@ -270,6 +285,73 @@ impl KonancCommand {
             raw_stderr,
         })
     }
+}
+
+fn should_try_macos_xcodebuild_shim(target: Option<&str>) -> bool {
+    target.is_some_and(|target| target.starts_with("macos_"))
+}
+
+fn maybe_create_macos_xcodebuild_shim(
+    target: Option<&str>,
+) -> io::Result<Option<tempfile::TempDir>> {
+    if !should_try_macos_xcodebuild_shim(target) || xcrun_xcodebuild_available() {
+        return Ok(None);
+    }
+
+    // Do not mask a genuinely missing Apple toolchain. This shim is only for
+    // CLT-only installs where clang/SDK are present but xcodebuild is absent.
+    if !xcrun_tool_available("clang") {
+        return Ok(None);
+    }
+
+    let dir = tempfile::tempdir()?;
+    let xcode_version = command_line_tools_xcode_version().unwrap_or_else(|| "16.0".to_owned());
+    let script = format!(
+        "#!/bin/sh\ncase \"$1\" in\n  -version|--version|\"\")\n    echo \"Xcode {xcode_version}\"\n    echo \"Build version CLT\"\n    ;;\n  *)\n    echo \"xcodebuild shim only supports -version\" >&2\n    exit 1\n    ;;\nesac\n"
+    );
+    let path = dir.path().join("xcodebuild");
+    fs::write(&path, script)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+    }
+
+    Ok(Some(dir))
+}
+
+fn xcrun_xcodebuild_available() -> bool {
+    Command::new("/usr/bin/xcrun")
+        .args(["xcodebuild", "-version"])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn xcrun_tool_available(tool: &str) -> bool {
+    Command::new("/usr/bin/xcrun")
+        .args(["--find", tool])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn command_line_tools_xcode_version() -> Option<String> {
+    let output = Command::new("/usr/sbin/pkgutil")
+        .args(["--pkg-info", "com.apple.pkg.CLTools_Executables"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let version = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("version: "))?;
+    let mut parts = version.split('.');
+    let major = parts.next()?;
+    let minor = parts.next().unwrap_or("0");
+    Some(format!("{major}.{minor}"))
 }
 
 /// Parse compiler stderr into structured diagnostics.
@@ -723,6 +805,14 @@ mod tests {
 
         let args = cmd.build_args().unwrap();
         assert!(!args.contains(&"-generate-test-runner".to_owned()));
+    }
+
+    #[test]
+    fn macos_xcodebuild_shim_only_applies_to_macos_targets() {
+        assert!(should_try_macos_xcodebuild_shim(Some("macos_arm64")));
+        assert!(should_try_macos_xcodebuild_shim(Some("macos_x64")));
+        assert!(!should_try_macos_xcodebuild_shim(Some("linux_x64")));
+        assert!(!should_try_macos_xcodebuild_shim(None));
     }
 
     #[test]
