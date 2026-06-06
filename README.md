@@ -55,6 +55,20 @@ Early-stage prototype / design-driven build. Expect rapid iteration and breaking
   - **macOS:** Xcode Command Line Tools (`xcode-select --install`)
   - **Linux:** GCC/build-essential (`sudo apt install build-essential` on Debian/Ubuntu)
 
+### macOS Command Line Tools support
+
+Konvoy does not require a full Xcode install for normal Kotlin/Native macOS builds. It requires the actual compiler/linker tools provided by Xcode Command Line Tools:
+
+```bash
+xcrun --find clang
+xcrun --find ld
+xcrun --sdk macosx --show-sdk-path
+```
+
+Some Kotlin/Native versions also call `xcrun xcodebuild -version` as an environment probe, even when the build only needs `clang`, `ld`, and the macOS SDK. On Command Line Tools-only systems that probe may fail because `xcodebuild` is provided by full Xcode.
+
+When the required CLT tools are present but `xcodebuild -version` is unavailable, Konvoy uses a temporary compatibility shim for that version probe during the Kotlin/Native compiler invocation. The shim only answers `xcodebuild -version`; it is not used for compiling, linking, SDK discovery, signing, or any other build step. If Kotlin/Native or a future workflow needs real `xcodebuild` behavior, the shim fails instead of pretending to support it.
+
 ## Quick start
 
 ### 1) Create a new project
@@ -360,4 +374,3 @@ The plugin zip will be at `build/distributions/konvoy-intellij-<version>.zip`. I
 **Requirements:** IntelliJ IDEA 2024.2+ (Community or Ultimate) with the Kotlin plugin installed.
 
 See the [plugin README](editors/intellij/README.md) for full details.
-

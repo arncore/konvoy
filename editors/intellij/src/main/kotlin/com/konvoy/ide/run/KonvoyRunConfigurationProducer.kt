@@ -35,10 +35,19 @@ class KonvoyRunConfigurationProducer : LazyRunConfigurationProducer<KonvoyRunCon
         // Check if we're on a test function
         val testFunction = KonvoyPsiUtils.findTestFunction(element, project)
         if (testFunction != null) {
-            val testName = testFunction.name ?: return false
-            configuration.name = "konvoy test $testName"
+            val testFilter = KonvoyPsiUtils.testFilter(testFunction) ?: return false
+            configuration.name = "konvoy test $testFilter"
             configuration.command = KonvoyCommand.TEST
-            configuration.extraArgs = "--filter=$testName"
+            configuration.extraArgs = "--filter=$testFilter"
+            return true
+        }
+
+        // Any other context inside src/test/ should run the full Konvoy test suite.
+        // This covers class/file/all-tests gutter icons provided by the Kotlin plugin.
+        if (KonvoyPsiUtils.isInTestSource(element, project)) {
+            configuration.name = "konvoy test ${manifest.`package`.name}"
+            configuration.command = KonvoyCommand.TEST
+            configuration.extraArgs = ""
             return true
         }
 
@@ -69,9 +78,14 @@ class KonvoyRunConfigurationProducer : LazyRunConfigurationProducer<KonvoyRunCon
 
         val testFunction = KonvoyPsiUtils.findTestFunction(element, project)
         if (testFunction != null) {
-            val testName = testFunction.name ?: return false
+            val testFilter = KonvoyPsiUtils.testFilter(testFunction) ?: return false
             return configuration.command == KonvoyCommand.TEST &&
-                configuration.extraArgs.contains(testName)
+                configuration.extraArgs.contains(testFilter)
+        }
+
+        if (KonvoyPsiUtils.isInTestSource(element, project)) {
+            return configuration.command == KonvoyCommand.TEST &&
+                configuration.extraArgs.isBlank()
         }
 
         val mainFunction = KonvoyPsiUtils.findMainFunction(element, project)
