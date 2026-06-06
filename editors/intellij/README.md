@@ -26,6 +26,9 @@ Then install the built plugin: go to **Settings → Plugins → ⚙️ → Insta
 - IntelliJ IDEA 2024.2+ (Community or Ultimate)
 - Kotlin plugin (bundled with IntelliJ)
 - Konvoy CLI installed (`konvoy` on PATH)
+- macOS builds require Xcode Command Line Tools (`xcode-select --install`), not a full Xcode install for normal Konvoy Kotlin/Native builds
+
+On macOS, Konvoy validates and uses the actual Command Line Tools compiler pieces (`clang`, `ld`, and the macOS SDK). Some Kotlin/Native versions still probe `xcrun xcodebuild -version`; on CLT-only systems Konvoy supplies a temporary version-only compatibility shim during compiler invocation. The shim is limited to that probe and is not used for compilation, linking, SDK lookup, signing, or any other `xcodebuild` behavior.
 
 ## Features
 
