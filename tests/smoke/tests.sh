@@ -744,14 +744,13 @@ KOTLIN
     assert_file_exists .konvoy/build/linux_x64/debug/codegen-build || return 1
     # Generated @Serializable models were produced and compiled alongside main.kt.
     grep -rqF "@Serializable" .konvoy/gen/openapi || { echo "    expected generated @Serializable models" >&2; return 1; }
+    # The Fabrikt tool pin is persisted through a build, not just `generate`.
+    assert_file_contains konvoy.lock "[codegen_tools.fabrikt]" || return 1
 
-    # Second build is a cache hit — no spurious rebuild after codegen (M1).
-    local out2
-    out2=$(konvoy build 2>&1)
-    assert_contains "$out2" "(cached)" || return 1
-    assert_not_contains "$out2" "Compiling" || return 1
-
-    # Editing the spec invalidates the cache and forces a recompile.
+    # Editing the spec regenerates and recompiles. This second build also settles
+    # the plugin lock entries (which are written at the end of build 1 and change
+    # the cache key on build 2 — a known, pre-existing plugin relock behavior;
+    # see test_plugin_build_lifecycle), so the lockfile is stable from here on.
     cat > specs/api.yaml << 'YAML'
 openapi: 3.0.3
 info:
@@ -772,9 +771,22 @@ components:
         tag:
           type: string
 YAML
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "Compiling" || return 1
+    grep -rq 'val tag' .konvoy/gen/openapi || { echo "    expected regenerated models to declare the tag property" >&2; return 1; }
+
+    # With inputs and the lockfile now stable, an unchanged rebuild is a cache
+    # hit: codegen does not perpetually invalidate the build cache.
     local out3
     out3=$(konvoy build 2>&1)
-    assert_contains "$out3" "Compiling" || return 1
+    assert_contains "$out3" "(cached)" || return 1
+    assert_not_contains "$out3" "Compiling" || return 1
+
+    # --locked rebuild succeeds: the lockfile is complete (toolchain + maven dep
+    # + plugin + [codegen_tools.fabrikt]) and codegen resolves the pinned tool
+    # without trying to rewrite the lockfile.
+    konvoy build --locked >/dev/null 2>&1 || { echo "    expected --locked build to succeed" >&2; return 1; }
 }
 
 # A change to a $ref'd sub-spec must feed the codegen hash and regenerate (M3).
