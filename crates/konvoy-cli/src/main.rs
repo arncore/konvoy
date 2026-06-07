@@ -99,6 +99,15 @@ enum Command {
         #[arg(long)]
         locked: bool,
     },
+    /// Generate configured source files without compiling
+    Generate {
+        /// Show raw codegen tool output
+        #[arg(long, short = 'v')]
+        verbose: bool,
+        /// Require the lockfile to be up-to-date; error on any mismatch
+        #[arg(long)]
+        locked: bool,
+    },
     /// Resolve Maven dependencies and update konvoy.lock
     Update,
     /// Remove build artifacts
@@ -174,6 +183,7 @@ fn main() {
             config,
             locked,
         } => cmd_lint(verbose, config, locked),
+        Command::Generate { verbose, locked } => cmd_generate(verbose, locked),
         Command::Update => cmd_update(),
         Command::Clean { all } => cmd_clean(all),
         Command::Doctor => cmd_doctor(),
@@ -400,6 +410,40 @@ fn cmd_lint(verbose: bool, config: Option<PathBuf>, locked: bool) -> CliResult {
     Err(format!("lint found {} issue(s)", result.finding_count).into())
 }
 
+fn cmd_generate(verbose: bool, locked: bool) -> CliResult {
+    let root = project_root()?;
+    let manifest = konvoy_config::Manifest::from_path(&root.join("konvoy.toml"))?;
+    if !manifest.codegen.has_any() {
+        return Err(konvoy_engine::EngineError::CodegenNotConfigured.into());
+    }
+
+    let lockfile_path = root.join("konvoy.lock");
+    let lockfile = konvoy_config::lockfile::Lockfile::from_path(&lockfile_path)?;
+    let sources = konvoy_engine::codegen::run_codegen(
+        &root,
+        &manifest.codegen,
+        &lockfile,
+        &lockfile_path,
+        &manifest.toolchain.kotlin,
+        None,
+        verbose,
+        locked,
+    )?;
+
+    if manifest.codegen.openapi.is_some() {
+        let output_dir = konvoy_engine::codegen::generator_output_dir(&root, "openapi");
+        eprintln!(
+            "    Generated openapi: {} file(s) ({})",
+            sources.len(),
+            output_dir.display()
+        );
+    } else {
+        eprintln!("    Generated {} file(s)", sources.len());
+    }
+
+    Ok(())
+}
+
 fn cmd_update() -> CliResult {
     let root = project_root()?;
     let result = konvoy_engine::update(&root)?;
@@ -501,6 +545,36 @@ fn check_detekt(manifest: &konvoy_config::Manifest) -> u32 {
     }
 }
 
+fn check_codegen(manifest: &konvoy_config::Manifest) -> u32 {
+    let Some(ref openapi) = manifest.codegen.openapi else {
+        return 0;
+    };
+
+    match konvoy_engine::codegen::openapi::is_installed(&openapi.version) {
+        Ok(true) => match konvoy_engine::codegen::openapi::fabrikt_jar_path(&openapi.version) {
+            Ok(path) => {
+                eprintln!("  [ok] fabrikt: {} ({})", openapi.version, path.display());
+                0
+            }
+            Err(e) => {
+                eprintln!("  [!!] fabrikt: {e}");
+                1
+            }
+        },
+        Ok(false) => {
+            eprintln!(
+                "  [--] fabrikt: {} not downloaded — will download on first `konvoy generate` or `konvoy build`",
+                openapi.version
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("  [!!] fabrikt: {e}");
+            1
+        }
+    }
+}
+
 fn check_maven_deps(manifest: &konvoy_config::Manifest, cwd: &std::path::Path) -> u32 {
     let maven_deps: Vec<_> = manifest
         .dependencies
@@ -581,6 +655,7 @@ fn cmd_doctor() -> CliResult {
                 eprintln!("  [ok] Project: {}", manifest.package.name);
                 issues = issues.saturating_add(check_toolchain(&manifest));
                 issues = issues.saturating_add(check_detekt(&manifest));
+                issues = issues.saturating_add(check_codegen(&manifest));
                 issues = issues.saturating_add(check_maven_deps(&manifest, &cwd));
             }
             Err(e) => {
@@ -1010,6 +1085,42 @@ mod tests {
     }
 
     #[test]
+    fn parse_generate_defaults() {
+        let cli = Cli::try_parse_from(["konvoy", "generate"]).unwrap();
+        match cli.command {
+            Command::Generate { verbose, locked } => {
+                assert!(!verbose);
+                assert!(!locked);
+            }
+            other => panic!("expected Generate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_generate_verbose() {
+        let cli = Cli::try_parse_from(["konvoy", "generate", "--verbose"]).unwrap();
+        match cli.command {
+            Command::Generate { verbose, locked } => {
+                assert!(verbose);
+                assert!(!locked);
+            }
+            other => panic!("expected Generate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_generate_locked() {
+        let cli = Cli::try_parse_from(["konvoy", "generate", "--locked"]).unwrap();
+        match cli.command {
+            Command::Generate { verbose, locked } => {
+                assert!(!verbose);
+                assert!(locked);
+            }
+            other => panic!("expected Generate, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_toolchain_install_with_version() {
         let args = ["konvoy", "toolchain", "install", "2.1.0"];
         let cli = Cli::try_parse_from(args).unwrap();
@@ -1253,6 +1364,7 @@ mod tests {
             "run",
             "test",
             "lint",
+            "generate",
             "update",
             "clean",
             "doctor",
@@ -1361,6 +1473,12 @@ mod tests {
     #[test]
     fn help_flag_on_update() {
         let err = Cli::try_parse_from(["konvoy", "update", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn help_flag_on_generate() {
+        let err = Cli::try_parse_from(["konvoy", "generate", "--help"]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayHelp);
     }
 

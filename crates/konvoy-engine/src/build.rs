@@ -263,6 +263,8 @@ pub(crate) fn resolve_build_context(
                     jre_home: jre_home.as_deref(),
                     target: &target,
                     options,
+                    lockfile: &lockfile,
+                    lockfile_path: &lockfile_path,
                     library_inputs: &lib_inputs,
                     plugin_jars: &[],
                 };
@@ -353,6 +355,7 @@ pub(crate) fn resolve_build_context(
 pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult, EngineError> {
     let start = Instant::now();
     let ctx = resolve_build_context(project_root, options)?;
+    let lockfile_path = project_root.join("konvoy.lock");
 
     // 8. Build the root project.
     let cc = CompileContext {
@@ -360,6 +363,8 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         jre_home: ctx.jre_home.as_deref(),
         target: &ctx.target,
         options,
+        lockfile: &ctx.lockfile,
+        lockfile_path: &lockfile_path,
         library_inputs: &ctx.library_inputs,
         plugin_jars: &ctx.plugin_jars,
     };
@@ -370,8 +375,6 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         ctx.profile,
         &ctx.lockfile_content,
     )?;
-
-    let lockfile_path = project_root.join("konvoy.lock");
 
     // 9. Update lockfile if toolchain, dependencies, or plugins changed.
     update_lockfile_if_needed(
@@ -407,6 +410,10 @@ pub(crate) struct CompileContext<'a> {
     pub target: &'a Target,
     /// Build options (release, verbose, force, locked).
     pub options: &'a BuildOptions,
+    /// Lockfile used for codegen tool hash verification.
+    pub lockfile: &'a Lockfile,
+    /// Path to `konvoy.lock` for persisting codegen tool hashes.
+    pub lockfile_path: &'a Path,
     /// Dependency `.klib` inputs (path + optional pre-computed hash).
     ///
     /// The compiler only consumes the paths; the hashes feed the cache key.
@@ -428,8 +435,8 @@ pub(crate) fn build_single(
     // Collect source files, excluding test sources (src/test/).
     let src_dir = project_root.join("src");
     let test_dir = src_dir.join("test");
-    let all_sources = konvoy_util::fs::collect_files(&src_dir, "kt")?;
-    let sources: Vec<PathBuf> = all_sources
+    let collected_sources = konvoy_util::fs::collect_files(&src_dir, "kt")?;
+    let sources: Vec<PathBuf> = collected_sources
         .into_iter()
         .filter(|p| !p.starts_with(&test_dir))
         .collect();
@@ -440,6 +447,7 @@ pub(crate) fn build_single(
     }
 
     let is_lib = manifest.package.kind == PackageKind::Lib;
+    let codegen_hashes = crate::codegen::compute_codegen_hashes(project_root, &manifest.codegen)?;
 
     // Compute cache key.
     let manifest_content = manifest.to_toml()?;
@@ -454,6 +462,7 @@ pub(crate) fn build_single(
         source_glob: "**/*.kt".to_owned(),
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
+        codegen_hashes,
         dependency_hashes: cc
             .library_inputs
             .iter()
@@ -501,7 +510,20 @@ pub(crate) fn build_single(
     } else {
         ProduceKind::Program
     };
-    let compile_output = compile(cc, &sources, &output_path, produce)?;
+    let gen_sources = crate::codegen::run_codegen(
+        project_root,
+        &manifest.codegen,
+        cc.lockfile,
+        cc.lockfile_path,
+        &manifest.toolchain.kotlin,
+        cc.jre_home,
+        cc.options.verbose,
+        cc.options.locked,
+    )?;
+    let mut compile_sources = sources;
+    compile_sources.extend(gen_sources);
+
+    let compile_output = compile(cc, &compile_sources, &output_path, produce)?;
 
     // Store artifact in cache.
     let metadata = BuildMetadata {
@@ -909,6 +931,14 @@ pub(crate) fn check_lockfile_staleness(
         }
     }
 
+    if let Some(openapi) = &manifest.codegen.openapi {
+        if tc.fabrikt_version.as_deref() != Some(openapi.version.as_str())
+            || tc.fabrikt_jar_sha256.is_none()
+        {
+            return Err(EngineError::LockfileUpdateRequired);
+        }
+    }
+
     // Each declared plugin must have a matching lockfile entry.
     for plugin_name in manifest.plugins.keys() {
         if !lockfile.plugins.iter().any(|p| p.name == *plugin_name) {
@@ -1061,6 +1091,17 @@ fn update_lockfile_if_needed(
         final_konanc_sha.as_deref(),
         final_jre_sha.as_deref(),
     );
+    let latest_lockfile = Lockfile::from_path(lockfile_path)?;
+    let toolchain_source = latest_lockfile
+        .toolchain
+        .as_ref()
+        .or(lockfile.toolchain.as_ref());
+    if let (Some(updated_tc), Some(source_tc)) = (&mut updated.toolchain, toolchain_source) {
+        updated_tc.detekt_version = source_tc.detekt_version.clone();
+        updated_tc.detekt_jar_sha256 = source_tc.detekt_jar_sha256.clone();
+        updated_tc.fabrikt_version = source_tc.fabrikt_version.clone();
+        updated_tc.fabrikt_jar_sha256 = source_tc.fabrikt_jar_sha256.clone();
+    }
     updated.dependencies = new_deps;
     updated.plugins = plugin_locks.to_vec();
     updated.write_to(lockfile_path)?;
@@ -1510,6 +1551,7 @@ mod tests {
         let manifest_content = manifest.to_toml().unwrap();
         let effective_lockfile = Lockfile::with_toolchain(&konanc.version);
         let lockfile_content = lockfile_toml_content(&effective_lockfile).unwrap();
+        let lockfile_path = project.join("konvoy.lock");
         let cache_inputs = CacheInputs {
             manifest_content,
             lockfile_content: lockfile_content.clone(),
@@ -1521,6 +1563,7 @@ mod tests {
             source_glob: "**/*.kt".to_owned(),
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
+            codegen_hashes: Vec::new(),
             dependency_hashes: Vec::new(),
         };
         let cache_key = CacheKey::compute(&cache_inputs).unwrap();
@@ -1546,6 +1589,8 @@ mod tests {
             jre_home: None,
             target: &target,
             options: &options,
+            lockfile: &effective_lockfile,
+            lockfile_path: &lockfile_path,
             library_inputs: &[],
             plugin_jars: &[],
         };
@@ -1597,6 +1642,7 @@ mod tests {
         let manifest_content = manifest.to_toml().unwrap();
         let effective_lockfile = Lockfile::with_toolchain(&konanc.version);
         let lockfile_content = lockfile_toml_content(&effective_lockfile).unwrap();
+        let lockfile_path = project.join("konvoy.lock");
         let cache_inputs = CacheInputs {
             manifest_content,
             lockfile_content: lockfile_content.clone(),
@@ -1608,6 +1654,7 @@ mod tests {
             source_glob: "**/*.kt".to_owned(),
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
+            codegen_hashes: Vec::new(),
             dependency_hashes: Vec::new(),
         };
         let cache_key = CacheKey::compute(&cache_inputs).unwrap();
@@ -1633,6 +1680,8 @@ mod tests {
             jre_home: None,
             target: &target,
             options: &options,
+            lockfile: &effective_lockfile,
+            lockfile_path: &lockfile_path,
             library_inputs: &[],
             plugin_jars: &[],
         };
@@ -1679,6 +1728,7 @@ mod tests {
         let manifest_content = manifest.to_toml().unwrap();
         let effective_lockfile = Lockfile::with_toolchain(&konanc.version);
         let lockfile_content = lockfile_toml_content(&effective_lockfile).unwrap();
+        let lockfile_path = project.join("konvoy.lock");
         let cache_inputs_before = CacheInputs {
             manifest_content: manifest_content.clone(),
             lockfile_content: lockfile_content.clone(),
@@ -1690,6 +1740,7 @@ mod tests {
             source_glob: "**/*.kt".to_owned(),
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
+            codegen_hashes: Vec::new(),
             dependency_hashes: Vec::new(),
         };
         let key_before = CacheKey::compute(&cache_inputs_before).unwrap();
@@ -1731,6 +1782,7 @@ mod tests {
             source_glob: "**/*.kt".to_owned(),
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
+            codegen_hashes: Vec::new(),
             dependency_hashes: Vec::new(),
         };
         let key_after = CacheKey::compute(&cache_inputs_after).unwrap();
@@ -1745,6 +1797,8 @@ mod tests {
             jre_home: None,
             target: &target,
             options: &options,
+            lockfile: &effective_lockfile,
+            lockfile_path: &lockfile_path,
             library_inputs: &[],
             plugin_jars: &[],
         };
@@ -2291,6 +2345,7 @@ mod tests {
         let manifest_content = manifest.to_toml().unwrap();
         let effective_lockfile = Lockfile::with_toolchain(&konanc.version);
         let lockfile_content = lockfile_toml_content(&effective_lockfile).unwrap();
+        let lockfile_path = project.join("konvoy.lock");
         let cache_inputs = CacheInputs {
             manifest_content,
             lockfile_content: lockfile_content.clone(),
@@ -2302,6 +2357,7 @@ mod tests {
             source_glob: "**/*.kt".to_owned(),
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
+            codegen_hashes: Vec::new(),
             dependency_hashes: Vec::new(),
         };
         let cache_key = CacheKey::compute(&cache_inputs).unwrap();
@@ -2334,6 +2390,8 @@ mod tests {
             jre_home: None,
             target: &target,
             options: &options_no_force,
+            lockfile: &effective_lockfile,
+            lockfile_path: &lockfile_path,
             library_inputs: &[],
             plugin_jars: &[],
         };
@@ -2362,6 +2420,8 @@ mod tests {
             jre_home: None,
             target: &target,
             options: &options_force,
+            lockfile: &effective_lockfile,
+            lockfile_path: &lockfile_path,
             library_inputs: &[],
             plugin_jars: &[],
         };
@@ -3847,6 +3907,7 @@ url = "https://example.com/plugin.jar"
             source_glob: "**/*.kt".to_owned(),
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
+            codegen_hashes: Vec::new(),
             dependency_hashes: Vec::new(),
         };
 
@@ -3898,6 +3959,7 @@ url = "https://example.com/plugin.jar"
             source_glob: "**/*.kt".to_owned(),
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
+            codegen_hashes: Vec::new(),
             dependency_hashes: Vec::new(),
         };
 
@@ -4040,6 +4102,7 @@ url = "https://example.com/plugin.jar"
             source_glob: "**/*.kt".to_owned(),
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
+            codegen_hashes: Vec::new(),
             dependency_hashes: Vec::new(),
         };
         let key = CacheKey::compute(&inputs).unwrap();

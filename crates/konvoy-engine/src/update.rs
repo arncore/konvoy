@@ -190,6 +190,8 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
             jre_tarball_sha256: None,
             detekt_version: None,
             detekt_jar_sha256: None,
+            fabrikt_version: None,
+            fabrikt_jar_sha256: None,
         });
     }
 

@@ -55,6 +55,7 @@ object KonvoyTomlParser {
         val toolchainTable = tables.find { it.header.key?.text == "toolchain" }
         val depsTable = tables.find { it.header.key?.text == "dependencies" }
         val pluginsTable = tables.find { it.header.key?.text == "plugins" }
+        val openApiCodegenTable = tables.find { it.header.key?.text == "codegen.openapi" }
 
         if (pkgTable == null || toolchainTable == null) {
             LOG.warn("konvoy.toml missing required [package] or [toolchain] section")
@@ -75,8 +76,23 @@ object KonvoyTomlParser {
 
         val dependencies = parseDependencySpecs(tables, "dependencies")
         val plugins = parseDependencySpecs(tables, "plugins")
+        val codegen = KonvoyCodegen(
+            openapi = openApiCodegenTable?.let {
+                OpenApiCodegen(
+                    version = it.stringValue("version") ?: return null,
+                    spec = it.stringValue("spec") ?: return null,
+                    basePackage = it.stringValue("base_package") ?: return null,
+                )
+            },
+        )
 
-        return KonvoyManifest(pkg, toolchain, dependencies, plugins)
+        return KonvoyManifest(
+            `package` = pkg,
+            toolchain = toolchain,
+            codegen = codegen,
+            dependencies = dependencies,
+            plugins = plugins,
+        )
     }
 
     /**
@@ -128,6 +144,8 @@ object KonvoyTomlParser {
                 jreTarballSha256 = it.stringValue("jre_tarball_sha256"),
                 detektVersion = it.stringValue("detekt_version"),
                 detektJarSha256 = it.stringValue("detekt_jar_sha256"),
+                fabriktVersion = it.stringValue("fabrikt_version"),
+                fabriktJarSha256 = it.stringValue("fabrikt_jar_sha256"),
             )
         }
 
@@ -206,6 +224,13 @@ object KonvoyTomlParser {
             kotlin = toolchainSection["kotlin"] ?: return null,
             detekt = toolchainSection["detekt"],
         )
+        val openApiCodegen = sections["codegen.openapi"]?.let {
+            OpenApiCodegen(
+                version = it["version"] ?: return null,
+                spec = it["spec"] ?: return null,
+                basePackage = it["base_package"] ?: return null,
+            )
+        }
 
         val deps = mutableMapOf<String, DependencySpec>()
         for ((key, values) in sections) {
@@ -221,7 +246,12 @@ object KonvoyTomlParser {
         // Inline deps under [dependencies] need more complex parsing;
         // for now we handle sub-table style which is the common case
 
-        return KonvoyManifest(pkg, toolchain, deps)
+        return KonvoyManifest(
+            `package` = pkg,
+            toolchain = toolchain,
+            codegen = KonvoyCodegen(openapi = openApiCodegen),
+            dependencies = deps,
+        )
     }
 
     fun parseLockfileFromText(content: String): KonvoyLockfile {
@@ -235,6 +265,8 @@ object KonvoyTomlParser {
                 jreTarballSha256 = it["jre_tarball_sha256"],
                 detektVersion = it["detekt_version"],
                 detektJarSha256 = it["detekt_jar_sha256"],
+                fabriktVersion = it["fabrikt_version"],
+                fabriktJarSha256 = it["fabrikt_jar_sha256"],
             )
         }
 

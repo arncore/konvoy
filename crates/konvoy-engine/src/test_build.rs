@@ -65,6 +65,8 @@ pub fn build_tests(
         .filter(|p| !p.starts_with(&test_dir))
         .collect();
     sources.extend(test_sources);
+    let codegen_hashes =
+        crate::codegen::compute_codegen_hashes(project_root, &ctx.manifest.codegen)?;
 
     // Compute cache key. The test-binary build must produce a distinct cache
     // key from a regular build of the same source tree, so we tag the lockfile
@@ -82,6 +84,7 @@ pub fn build_tests(
         source_glob: "**/*.kt".to_owned(),
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
+        codegen_hashes,
         dependency_hashes: ctx
             .library_inputs
             .iter()
@@ -123,6 +126,19 @@ pub fn build_tests(
     if let Some(parent) = output_path.parent() {
         konvoy_util::fs::ensure_dir(parent)?;
     }
+
+    let lockfile_path = project_root.join("konvoy.lock");
+    let gen_sources = crate::codegen::run_codegen(
+        project_root,
+        &ctx.manifest.codegen,
+        &ctx.lockfile,
+        &lockfile_path,
+        &ctx.manifest.toolchain.kotlin,
+        ctx.jre_home.as_deref(),
+        options.verbose,
+        options.locked,
+    )?;
+    sources.extend(gen_sources);
 
     let library_paths = crate::build::library_paths_of(&ctx.library_inputs);
 

@@ -7,6 +7,7 @@ package com.konvoy.ide.config
 data class KonvoyManifest(
     val `package`: KonvoyPackage,
     val toolchain: KonvoyToolchain,
+    val codegen: KonvoyCodegen = KonvoyCodegen(),
     val dependencies: Map<String, DependencySpec> = emptyMap(),
     val plugins: Map<String, DependencySpec> = emptyMap(),
 )
@@ -33,6 +34,16 @@ enum class PackageKind {
 data class KonvoyToolchain(
     val kotlin: String,
     val detekt: String? = null,
+)
+
+data class KonvoyCodegen(
+    val openapi: OpenApiCodegen? = null,
+)
+
+data class OpenApiCodegen(
+    val version: String,
+    val spec: String,
+    val basePackage: String,
 )
 
 data class DependencySpec(

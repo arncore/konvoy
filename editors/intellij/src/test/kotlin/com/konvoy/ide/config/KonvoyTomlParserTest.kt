@@ -91,6 +91,29 @@ class KonvoyTomlParserTest {
     }
 
     @Test
+    fun `parse manifest with openapi codegen`() {
+        val manifest = KonvoyTomlParser.parseManifestFromText("""
+            [package]
+            name = "app"
+
+            [toolchain]
+            kotlin = "2.3.20"
+
+            [codegen.openapi]
+            version = "20.0.0"
+            spec = "specs/api.yaml"
+            base_package = "com.example.api"
+        """.trimIndent())
+
+        assertNotNull(manifest)
+        val openapi = manifest!!.codegen.openapi
+        assertNotNull(openapi)
+        assertEquals("20.0.0", openapi!!.version)
+        assertEquals("specs/api.yaml", openapi.spec)
+        assertEquals("com.example.api", openapi.basePackage)
+    }
+
+    @Test
     fun `returns null for missing package section`() {
         val manifest = KonvoyTomlParser.parseManifestFromText("""
             [toolchain]
@@ -143,6 +166,8 @@ class KonvoyTomlParserTest {
             konanc_version = "2.3.20"
             konanc_tarball_sha256 = "abc123"
             jre_tarball_sha256 = "def456"
+            fabrikt_version = "20.0.0"
+            fabrikt_jar_sha256 = "f00d"
         """.trimIndent())
 
         assertNotNull(lockfile)
@@ -150,6 +175,8 @@ class KonvoyTomlParserTest {
         assertEquals("2.3.20", lockfile.toolchain!!.konancVersion)
         assertEquals("abc123", lockfile.toolchain!!.konancTarballSha256)
         assertEquals("def456", lockfile.toolchain!!.jreTarballSha256)
+        assertEquals("20.0.0", lockfile.toolchain!!.fabriktVersion)
+        assertEquals("f00d", lockfile.toolchain!!.fabriktJarSha256)
     }
 
     @Test

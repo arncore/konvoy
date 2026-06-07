@@ -42,6 +42,10 @@ pub struct ToolchainLock {
     pub detekt_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detekt_jar_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fabrikt_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fabrikt_jar_sha256: Option<String>,
 }
 
 /// A locked dependency entry.
@@ -109,6 +113,8 @@ impl Lockfile {
                 jre_tarball_sha256: None,
                 detekt_version: None,
                 detekt_jar_sha256: None,
+                fabrikt_version: None,
+                fabrikt_jar_sha256: None,
             }),
             dependencies: Vec::new(),
             plugins: Vec::new(),
@@ -128,6 +134,8 @@ impl Lockfile {
                 jre_tarball_sha256: jre_sha256.map(str::to_owned),
                 detekt_version: None,
                 detekt_jar_sha256: None,
+                fabrikt_version: None,
+                fabrikt_jar_sha256: None,
             }),
             dependencies: Vec::new(),
             plugins: Vec::new(),
@@ -298,6 +306,70 @@ konanc_version = "2.1.0"
             .unwrap_or_else(|| panic!("missing toolchain"));
         assert!(toolchain.konanc_tarball_sha256.is_none());
         assert!(toolchain.jre_tarball_sha256.is_none());
+    }
+
+    #[test]
+    fn round_trip_with_fabrikt_fields() {
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        let toolchain = lockfile
+            .toolchain
+            .as_mut()
+            .unwrap_or_else(|| panic!("missing toolchain"));
+        toolchain.fabrikt_version = Some("20.0.0".to_owned());
+        toolchain.fabrikt_jar_sha256 = Some("abc123".to_owned());
+
+        lockfile.write_to(&path).unwrap();
+        let reparsed = Lockfile::from_path(&path).unwrap();
+
+        assert_eq!(lockfile, reparsed);
+        let reparsed_toolchain = reparsed
+            .toolchain
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing toolchain"));
+        assert_eq!(
+            reparsed_toolchain.fabrikt_version.as_deref(),
+            Some("20.0.0")
+        );
+        assert_eq!(
+            reparsed_toolchain.fabrikt_jar_sha256.as_deref(),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn backward_compat_without_fabrikt_fields() {
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        fs::write(
+            &path,
+            r#"
+[toolchain]
+konanc_version = "2.1.0"
+"#,
+        )
+        .unwrap();
+
+        let lockfile = Lockfile::from_path(&path).unwrap();
+        let toolchain = lockfile
+            .toolchain
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing toolchain"));
+        assert!(toolchain.fabrikt_version.is_none());
+        assert!(toolchain.fabrikt_jar_sha256.is_none());
+    }
+
+    #[test]
+    fn fabrikt_fields_omitted_when_none() {
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+
+        lockfile.write_to(&path).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+
+        assert!(!content.contains("fabrikt"), "content was: {content}");
     }
 
     #[test]

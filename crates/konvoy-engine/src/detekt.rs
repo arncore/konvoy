@@ -168,6 +168,8 @@ fn persist_detekt_hash(
             jre_tarball_sha256: None,
             detekt_version: Some(detekt_version.to_owned()),
             detekt_jar_sha256: Some(hash),
+            fabrikt_version: None,
+            fabrikt_jar_sha256: None,
         });
     }
     updated.write_to(lockfile_path)?;

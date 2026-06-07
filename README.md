@@ -33,6 +33,7 @@ Konvoy avoids Gradle/Maven-style complexity by providing:
   - [Path dependencies](#path-dependencies)
   - [Maven dependencies](#maven-dependencies)
   - [Plugins](#plugins)
+- [Code generation](#code-generation)
 - [Testing](#testing)
 - [Managed toolchains](#managed-toolchains)
 - [Linting](#linting)
@@ -118,6 +119,7 @@ hello/
 - `konvoy run [--target <triple|host>] [--release] [--force] [--locked] [-- <args…>]` — build and run
 - `konvoy test [--target <triple|host>] [--release] [--verbose] [--force] [--locked] [--filter <pattern>]` — build and run tests
 - `konvoy lint [--verbose] [--config <path>] [--locked]` — run detekt static analysis on Kotlin sources
+- `konvoy generate [--verbose] [--locked]` — run configured source generators without compiling
 - `konvoy update` — resolve Maven dependencies (including transitives via POM) and update `konvoy.lock`
 - `konvoy clean` — remove build artifacts
 - `konvoy doctor` — check environment, toolchain, and dependency setup
@@ -258,6 +260,21 @@ The `{kotlin}` placeholder resolves to the Kotlin version set in `[toolchain]`. 
 kotlinx-serialization-core = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-core", version = "1.7.3" }
 kotlinx-serialization-json = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-json", version = "1.7.3" }
 ```
+
+## Code generation
+
+Konvoy can generate Kotlin sources before compilation. OpenAPI generation uses a managed Fabrikt JAR and writes ephemeral files under `.konvoy/gen/openapi/`:
+
+```toml
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.api"
+```
+
+Generated sources are included in `konvoy build` and `konvoy test` cache keys through the spec hash. Use `konvoy generate` to refresh generated files without compiling. The Fabrikt JAR hash is pinned in `konvoy.lock`; `--locked` requires the pinned JAR to already be downloaded.
+
+Fabrikt is invoked with `KOTLINX_SERIALIZATION` output, so projects using generated `@Serializable` models should also declare the serialization compiler plugin and runtime dependencies.
 
 ## Testing
 

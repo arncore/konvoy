@@ -105,6 +105,7 @@ pub fn init_project_with_kind(
             kotlin: DEFAULT_KOTLIN_VERSION.to_owned(),
             detekt: None,
         },
+        codegen: Default::default(),
         dependencies: std::collections::BTreeMap::new(),
         plugins: std::collections::BTreeMap::new(),
     };

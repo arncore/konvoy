@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 pub struct Manifest {
     pub package: Package,
     pub toolchain: Toolchain,
+    #[serde(default, skip_serializing_if = "Codegen::is_empty")]
+    pub codegen: Codegen,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dependencies: BTreeMap<String, DependencySpec>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -63,6 +65,39 @@ pub struct DependencySpec {
     /// Maven coordinate in `groupId:artifactId` format (e.g. "org.jetbrains.kotlinx:kotlinx-coroutines-core").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maven: Option<String>,
+}
+
+/// Code generation tools configured for this project.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Codegen {
+    /// OpenAPI code generation using Fabrikt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openapi: Option<OpenApiCodegen>,
+}
+
+impl Codegen {
+    /// Return `true` when no code generators are configured.
+    pub fn is_empty(&self) -> bool {
+        self.openapi.is_none()
+    }
+
+    /// Return `true` when at least one code generator is configured.
+    pub fn has_any(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+/// OpenAPI code generation configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenApiCodegen {
+    /// Fabrikt version to use.
+    pub version: String,
+    /// Project-relative path to the OpenAPI spec file.
+    pub spec: String,
+    /// Kotlin package name for generated sources.
+    pub base_package: String,
 }
 
 impl DependencySpec {
@@ -174,6 +209,41 @@ fn validate_plugins(
     Ok(())
 }
 
+fn validate_codegen(codegen: &Codegen, path: &str) -> Result<(), ManifestError> {
+    let Some(openapi) = &codegen.openapi else {
+        return Ok(());
+    };
+
+    let err = |reason: String| ManifestError::InvalidCodegenConfig {
+        path: path.to_owned(),
+        name: "openapi".to_owned(),
+        reason,
+    };
+
+    if openapi.version.trim().is_empty() {
+        return Err(err("version must not be empty".to_owned()));
+    }
+    if openapi.spec.trim().is_empty() {
+        return Err(err("spec must not be empty".to_owned()));
+    }
+    if Path::new(&openapi.spec).is_absolute() {
+        return Err(err(
+            "spec must be a relative path inside the project".to_owned()
+        ));
+    }
+    let spec = openapi.spec.as_str();
+    if !(spec.ends_with(".yaml") || spec.ends_with(".yml") || spec.ends_with(".json")) {
+        return Err(err(
+            "spec must point to an OpenAPI .yaml, .yml, or .json file".to_owned(),
+        ));
+    }
+    if openapi.base_package.trim().is_empty() {
+        return Err(err("base_package must not be empty".to_owned()));
+    }
+
+    Ok(())
+}
+
 /// Validate dependency entries: names, source types, Maven coordinates, and versions.
 fn validate_dependencies(
     dependencies: &BTreeMap<String, DependencySpec>,
@@ -282,6 +352,7 @@ fn validate(manifest: &Manifest, path: &str) -> Result<(), ManifestError> {
         });
     }
     validate_plugins(&manifest.plugins, path)?;
+    validate_codegen(&manifest.codegen, path)?;
     validate_dependencies(&manifest.dependencies, &manifest.package.name, path)?;
     Ok(())
 }
@@ -371,6 +442,12 @@ pub enum ManifestError {
     DependencySelfReference { path: String, name: String },
     #[error("invalid plugin `{name}` in {path}: {reason}")]
     InvalidPluginConfig {
+        path: String,
+        name: String,
+        reason: String,
+    },
+    #[error("invalid codegen `{name}` in {path}: {reason}")]
+    InvalidCodegenConfig {
         path: String,
         name: String,
         reason: String,
@@ -803,6 +880,172 @@ detekt = ""
             err.contains("detekt version must not be empty"),
             "error was: {err}"
         );
+    }
+
+    #[test]
+    fn parse_manifest_with_openapi_codegen() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.api"
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        let openapi = manifest
+            .codegen
+            .openapi
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing openapi codegen config"));
+        assert_eq!(openapi.version, "20.0.0");
+        assert_eq!(openapi.spec, "specs/api.yaml");
+        assert_eq!(openapi.base_package, "com.example.api");
+        assert!(manifest.codegen.has_any());
+        assert!(!manifest.codegen.is_empty());
+    }
+
+    #[test]
+    fn parse_manifest_without_codegen() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        assert!(manifest.codegen.openapi.is_none());
+        assert!(manifest.codegen.is_empty());
+        assert!(!manifest.codegen.has_any());
+    }
+
+    #[test]
+    fn reject_unknown_codegen_tool() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[codegen.grpc]
+version = "1.0.0"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err(), "unknown codegen tools should be rejected");
+    }
+
+    #[test]
+    fn reject_openapi_codegen_empty_fields() {
+        for (field, toml) in [
+            (
+                "version",
+                format!(
+                    r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[codegen.openapi]
+version = ""
+spec = "specs/api.yaml"
+base_package = "com.example.api"
+"#
+                ),
+            ),
+            (
+                "spec",
+                format!(
+                    r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[codegen.openapi]
+version = "20.0.0"
+spec = ""
+base_package = "com.example.api"
+"#
+                ),
+            ),
+            (
+                "base_package",
+                format!(
+                    r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = ""
+"#
+                ),
+            ),
+        ] {
+            let result = Manifest::from_str(&toml, "konvoy.toml");
+            assert!(result.is_err(), "{field} should be rejected");
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains(field), "error was: {err}");
+        }
+    }
+
+    #[test]
+    fn reject_openapi_codegen_absolute_spec_path() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[codegen.openapi]
+version = "20.0.0"
+spec = "/tmp/api.yaml"
+base_package = "com.example.api"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("relative"), "error was: {err}");
+    }
+
+    #[test]
+    fn reject_openapi_codegen_unsupported_spec_extension() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.txt"
+base_package = "com.example.api"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains(".yaml"), "error was: {err}");
+    }
+
+    #[test]
+    fn round_trip_with_openapi_codegen() {
+        let toml = format!(
+            r#"
+[package]
+name = "with-codegen"
+{TOOLCHAIN}
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.json"
+base_package = "com.example.api"
+"#
+        );
+        let original = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        let serialized = original.to_toml().unwrap();
+        assert!(serialized.contains("[codegen.openapi]"));
+        let reparsed = Manifest::from_str(&serialized, "konvoy.toml").unwrap();
+        assert_eq!(original, reparsed);
     }
 
     #[test]

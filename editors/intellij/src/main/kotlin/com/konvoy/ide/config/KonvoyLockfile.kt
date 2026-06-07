@@ -16,6 +16,8 @@ data class ToolchainLock(
     val jreTarballSha256: String? = null,
     val detektVersion: String? = null,
     val detektJarSha256: String? = null,
+    val fabriktVersion: String? = null,
+    val fabriktJarSha256: String? = null,
 )
 
 data class DependencyLock(

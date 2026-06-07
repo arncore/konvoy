@@ -31,6 +31,8 @@ pub struct CacheInputs {
     pub os: String,
     /// Architecture identifier.
     pub arch: String,
+    /// SHA-256 hashes of codegen inputs, tagged by generator name.
+    pub codegen_hashes: Vec<String>,
     /// SHA-256 hashes of dependency `.klib` files (empty for projects with no deps).
     pub dependency_hashes: Vec<String>,
 }
@@ -63,6 +65,11 @@ impl CacheKey {
             &inputs.os,
             &inputs.arch,
         ];
+        // Include codegen hashes so cache key changes when generated sources
+        // would be regenerated from different inputs.
+        for h in &inputs.codegen_hashes {
+            parts.push(h);
+        }
         // Include dependency hashes so cache key changes when deps are rebuilt.
         for h in &inputs.dependency_hashes {
             parts.push(h);
@@ -110,6 +117,7 @@ mod tests {
             source_glob: "**/*.kt".to_owned(),
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
+            codegen_hashes: Vec::new(),
             dependency_hashes: Vec::new(),
         }
     }
@@ -244,6 +252,22 @@ mod tests {
 
         fs::write(tmp.path().join("src").join("extra.kt"), "fun extra() {}").unwrap();
         let key2 = CacheKey::compute(&make_inputs(tmp.path())).unwrap();
+
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn changing_codegen_hashes_changes_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_sources(tmp.path());
+
+        let mut inputs1 = make_inputs(tmp.path());
+        inputs1.codegen_hashes = vec!["openapi:abc123".to_owned()];
+        let mut inputs2 = make_inputs(tmp.path());
+        inputs2.codegen_hashes = vec!["openapi:def456".to_owned()];
+
+        let key1 = CacheKey::compute(&inputs1).unwrap();
+        let key2 = CacheKey::compute(&inputs2).unwrap();
 
         assert_ne!(key1, key2);
     }
@@ -434,6 +458,7 @@ mod tests {
                             source_glob: "**/*.kt".to_owned(),
                             os,
                             arch,
+                            codegen_hashes: Vec::new(),
                             dependency_hashes: Vec::new(),
                         }
                     },
@@ -466,6 +491,7 @@ mod tests {
                     source_glob: "**/*.kt".to_owned(),
                     os: inputs1.os.clone(),
                     arch: inputs1.arch.clone(),
+                    codegen_hashes: Vec::new(),
                     dependency_hashes: Vec::new(),
                 };
 

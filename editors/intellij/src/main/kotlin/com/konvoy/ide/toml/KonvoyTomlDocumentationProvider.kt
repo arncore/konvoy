@@ -33,6 +33,8 @@ class KonvoyTomlDocumentationProvider : AbstractDocumentationProvider() {
             return when {
                 sectionName == "package" -> "<b>[package]</b><br/>Package metadata: name, kind, version, and entrypoint."
                 sectionName == "toolchain" -> "<b>[toolchain]</b><br/>Toolchain versions: Kotlin/Native compiler and optional tools."
+                sectionName == "codegen" -> "<b>[codegen]</b><br/>Source generators that run before compilation."
+                sectionName == "codegen.openapi" -> "<b>[codegen.openapi]</b><br/>OpenAPI code generation using Fabrikt."
                 sectionName == "dependencies" -> "<b>[dependencies]</b><br/>Project dependencies — path-based or Maven-based."
                 sectionName == "plugins" -> "<b>[plugins]</b><br/>Compiler plugins (e.g., kotlinx-serialization)."
                 else -> null

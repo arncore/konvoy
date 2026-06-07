@@ -50,6 +50,37 @@
         }
       }
     },
+    "codegen": {
+      "type": "object",
+      "description": "Source generators that run before compilation.",
+      "additionalProperties": false,
+      "properties": {
+        "openapi": {
+          "type": "object",
+          "description": "OpenAPI code generation using a managed Fabrikt JAR.",
+          "required": ["version", "spec", "base_package"],
+          "additionalProperties": false,
+          "properties": {
+            "version": {
+              "type": "string",
+              "description": "Fabrikt version, e.g. '20.0.0'.",
+              "minLength": 1
+            },
+            "spec": {
+              "type": "string",
+              "description": "Project-relative path to an OpenAPI .yaml, .yml, or .json file.",
+              "pattern": ".*\\.(yaml|yml|json)$",
+              "minLength": 1
+            },
+            "base_package": {
+              "type": "string",
+              "description": "Kotlin package for generated sources.",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    },
     "dependencies": {
       "type": "object",
       "description": "Project dependencies. Each entry must have exactly one of 'path' or 'version'.",
