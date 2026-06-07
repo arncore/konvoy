@@ -14,6 +14,8 @@ import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VfsUtil
 import com.intellij.openapi.vfs.VirtualFile
 import com.konvoy.ide.config.*
+import org.jetbrains.jps.model.java.JavaSourceRootType
+import org.jetbrains.jps.model.java.JpsJavaExtensionService
 import org.jetbrains.kotlin.cli.common.arguments.K2NativeCompilerArguments
 import org.jetbrains.kotlin.config.CompilerSettings
 import org.jetbrains.kotlin.idea.base.platforms.KotlinNativeLibraryKind
@@ -122,7 +124,15 @@ object KonvoyWorkspaceModelUpdater {
             if (genRoots.isEmpty()) {
                 contentEntry.addExcludeFolder(konvoyDir)
             } else {
-                genRoots.forEach { contentEntry.addSourceFolder(it, false) }
+                // Mark these as *generated* source roots (distinct icon; some
+                // inspections/refactors are suppressed for generated code).
+                genRoots.forEach { root ->
+                    contentEntry.addSourceFolder(
+                        root,
+                        JavaSourceRootType.SOURCE,
+                        JpsJavaExtensionService.getInstance().createSourceRootProperties("", true),
+                    )
+                }
                 // Exclude everything under .konvoy except the generated tree.
                 konvoyDir.children.forEach { child ->
                     if (child.name != "gen") {
