@@ -81,11 +81,6 @@ impl Codegen {
     pub fn is_empty(&self) -> bool {
         self.openapi.is_none()
     }
-
-    /// Return `true` when at least one code generator is configured.
-    pub fn has_any(&self) -> bool {
-        !self.is_empty()
-    }
 }
 
 /// OpenAPI code generation configuration.
@@ -980,7 +975,6 @@ base_package = "com.example.api"
         assert_eq!(openapi.version, "20.0.0");
         assert_eq!(openapi.spec, "specs/api.yaml");
         assert_eq!(openapi.base_package, "com.example.api");
-        assert!(manifest.codegen.has_any());
         assert!(!manifest.codegen.is_empty());
     }
 
@@ -995,7 +989,6 @@ name = "my-app"
         let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
         assert!(manifest.codegen.openapi.is_none());
         assert!(manifest.codegen.is_empty());
-        assert!(!manifest.codegen.has_any());
     }
 
     #[test]

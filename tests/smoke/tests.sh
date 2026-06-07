@@ -646,6 +646,33 @@ base_package = "com.example.api"
 TOML
 }
 
+# Write konvoy.toml with the given [codegen.openapi] fields:
+#   $1 = version, $2 = spec, $3 = base_package
+_codegen_write_manifest() {
+    cat > konvoy.toml <<TOML
+[package]
+name = "codegen-bad"
+
+[toolchain]
+kotlin = "2.2.0"
+
+[codegen.openapi]
+version = "$1"
+spec = "$2"
+base_package = "$3"
+TOML
+}
+
+# Assert `konvoy generate` fails and its output contains $1.
+_codegen_generate_fails_with() {
+    local needle="$1" out
+    if out=$(konvoy generate 2>&1); then
+        echo "    expected generate to fail (looking for: $needle)" >&2
+        return 1
+    fi
+    assert_contains "$out" "$needle"
+}
+
 # Generate-only lifecycle: first generate, idempotent re-run, --force, spec edit.
 # Exercises JRE + Fabrikt (no konanc compile).
 test_codegen_generate_lifecycle() {
@@ -895,44 +922,12 @@ test_codegen_invalid_version_rejected() {
     _codegen_write_single_spec
 
     # Below the supported floor.
-    cat > konvoy.toml << 'TOML'
-[package]
-name = "codegen-badver"
-
-[toolchain]
-kotlin = "2.2.0"
-
-[codegen.openapi]
-version = "17.0.0"
-spec = "specs/api.yaml"
-base_package = "com.example.api"
-TOML
-    local out_old
-    if out_old=$(konvoy generate 2>&1); then
-        echo "    expected generate to fail with an unsupported version" >&2
-        return 1
-    fi
-    assert_contains "$out_old" "18.0.0 or newer" || return 1
+    _codegen_write_manifest "17.0.0" "specs/api.yaml" "com.example.api"
+    _codegen_generate_fails_with "18.0.0 or newer" || return 1
 
     # Non-numeric version.
-    cat > konvoy.toml << 'TOML'
-[package]
-name = "codegen-badver"
-
-[toolchain]
-kotlin = "2.2.0"
-
-[codegen.openapi]
-version = "latest"
-spec = "specs/api.yaml"
-base_package = "com.example.api"
-TOML
-    local out_bad
-    if out_bad=$(konvoy generate 2>&1); then
-        echo "    expected generate to fail with a non-numeric version" >&2
-        return 1
-    fi
-    assert_contains "$out_bad" "is not a valid Fabrikt version" || return 1
+    _codegen_write_manifest "latest" "specs/api.yaml" "com.example.api"
+    _codegen_generate_fails_with "is not a valid Fabrikt version" || return 1
 }
 
 # Manifest validation rejects unsafe / wrong-extension spec paths (L1).
@@ -941,64 +936,16 @@ test_codegen_invalid_spec_rejected() {
     _codegen_write_single_spec
 
     # Absolute spec path.
-    cat > konvoy.toml << 'TOML'
-[package]
-name = "codegen-badspec"
-
-[toolchain]
-kotlin = "2.2.0"
-
-[codegen.openapi]
-version = "20.0.0"
-spec = "/etc/api.yaml"
-base_package = "com.example.api"
-TOML
-    local out_abs
-    if out_abs=$(konvoy generate 2>&1); then
-        echo "    expected generate to fail with an absolute spec path" >&2
-        return 1
-    fi
-    assert_contains "$out_abs" "spec must be a relative path inside the project" || return 1
+    _codegen_write_manifest "20.0.0" "/etc/api.yaml" "com.example.api"
+    _codegen_generate_fails_with "spec must be a relative path inside the project" || return 1
 
     # Parent-directory traversal.
-    cat > konvoy.toml << 'TOML'
-[package]
-name = "codegen-badspec"
-
-[toolchain]
-kotlin = "2.2.0"
-
-[codegen.openapi]
-version = "20.0.0"
-spec = "../api.yaml"
-base_package = "com.example.api"
-TOML
-    local out_dotdot
-    if out_dotdot=$(konvoy generate 2>&1); then
-        echo "    expected generate to fail with a traversal spec path" >&2
-        return 1
-    fi
-    assert_contains "$out_dotdot" "must not contain" || return 1
+    _codegen_write_manifest "20.0.0" "../api.yaml" "com.example.api"
+    _codegen_generate_fails_with "must not contain" || return 1
 
     # Wrong file extension.
-    cat > konvoy.toml << 'TOML'
-[package]
-name = "codegen-badspec"
-
-[toolchain]
-kotlin = "2.2.0"
-
-[codegen.openapi]
-version = "20.0.0"
-spec = "specs/api.txt"
-base_package = "com.example.api"
-TOML
-    local out_ext
-    if out_ext=$(konvoy generate 2>&1); then
-        echo "    expected generate to fail with a non-OpenAPI extension" >&2
-        return 1
-    fi
-    assert_contains "$out_ext" "must point to an OpenAPI" || return 1
+    _codegen_write_manifest "20.0.0" "specs/api.txt" "com.example.api"
+    _codegen_generate_fails_with "must point to an OpenAPI" || return 1
 }
 
 # A configured spec that does not exist on disk is an error.

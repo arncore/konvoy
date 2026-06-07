@@ -420,7 +420,7 @@ fn cmd_lint(verbose: bool, config: Option<PathBuf>, locked: bool) -> CliResult {
 fn cmd_generate(verbose: bool, locked: bool, force: bool) -> CliResult {
     let root = project_root()?;
     let manifest = konvoy_config::Manifest::from_path(&root.join("konvoy.toml"))?;
-    if !manifest.codegen.has_any() {
+    if manifest.codegen.is_empty() {
         return Err(konvoy_engine::EngineError::CodegenNotConfigured.into());
     }
 

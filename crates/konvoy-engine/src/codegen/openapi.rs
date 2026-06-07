@@ -250,7 +250,7 @@ fn extract_ref_targets(text: &str) -> Vec<String> {
 /// would escape the project root are preserved as relative components (the path
 /// is never made absolute).
 fn normalize_relative(base_dir: &Path, rel: &str) -> PathBuf {
-    use std::ffi::{OsStr, OsString};
+    use std::ffi::OsStr;
     use std::path::Component;
 
     let mut stack: Vec<OsString> = Vec::new();

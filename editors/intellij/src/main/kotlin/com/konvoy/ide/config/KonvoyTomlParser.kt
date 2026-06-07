@@ -48,6 +48,18 @@ object KonvoyTomlParser {
 
     // -- PSI-based parsing --
 
+    /**
+     * Build [OpenApiCodegen] only when all required keys are present. An
+     * incomplete optional `[codegen.openapi]` section yields null rather than
+     * failing the whole manifest parse (which would break IDE sync mid-edit).
+     */
+    private fun openApiCodegenOf(version: String?, spec: String?, basePackage: String?): OpenApiCodegen? =
+        if (version != null && spec != null && basePackage != null) {
+            OpenApiCodegen(version, spec, basePackage)
+        } else {
+            null
+        }
+
     private fun parseManifestFromPsi(file: TomlFile): KonvoyManifest? {
         val tables = file.children.filterIsInstance<TomlTable>()
 
@@ -83,15 +95,12 @@ object KonvoyTomlParser {
         // source roots/libraries on every save. Treat it as "no codegen" until
         // all three keys are present; the annotator flags the missing ones.
         val codegen = KonvoyCodegen(
-            openapi = openApiCodegenTable?.let { table ->
-                val version = table.stringValue("version")
-                val spec = table.stringValue("spec")
-                val basePackage = table.stringValue("base_package")
-                if (version != null && spec != null && basePackage != null) {
-                    OpenApiCodegen(version, spec, basePackage)
-                } else {
-                    null
-                }
+            openapi = openApiCodegenTable?.let {
+                openApiCodegenOf(
+                    it.stringValue("version"),
+                    it.stringValue("spec"),
+                    it.stringValue("base_package"),
+                )
             },
         )
 
@@ -261,14 +270,7 @@ object KonvoyTomlParser {
         // Incomplete optional section must not fail the whole manifest parse
         // (see parseManifestFromPsi); treat it as "no codegen" until complete.
         val openApiCodegen = sections["codegen.openapi"]?.let { sec ->
-            val version = sec["version"]
-            val spec = sec["spec"]
-            val basePackage = sec["base_package"]
-            if (version != null && spec != null && basePackage != null) {
-                OpenApiCodegen(version, spec, basePackage)
-            } else {
-                null
-            }
+            openApiCodegenOf(sec["version"], sec["spec"], sec["base_package"])
         }
 
         val deps = mutableMapOf<String, DependencySpec>()
