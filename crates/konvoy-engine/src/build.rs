@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
-use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile};
+use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile, PluginLock};
 use konvoy_config::manifest::{Manifest, PackageKind};
 use konvoy_config::Profile;
 use konvoy_konanc::detect::{resolve_konanc, KonancInfo};
@@ -110,7 +110,7 @@ pub(crate) fn library_paths_of(libs: &[LibraryInput]) -> Vec<PathBuf> {
     libs.iter().map(|l| l.path.clone()).collect()
 }
 
-/// Common state resolved during steps 1–7b of the build pipeline.
+/// Common state resolved during steps 1–7a of the build pipeline.
 ///
 /// Shared between `build()` and `build_tests()` to avoid duplicating the
 /// manifest, lockfile, toolchain, and dependency resolution logic.
@@ -152,7 +152,69 @@ pub(crate) struct LockfileWriteInputs {
     pub jre_tarball_sha256: Option<String>,
 }
 
-/// Resolve the common build pipeline state (steps 1–7b).
+/// Compute the pre-stabilized "effective" lockfile used for the cache key.
+///
+/// Predicts the `konvoy.lock` that `update_lockfile_if_needed` will write after
+/// the build, so the cache key is identical on the first and on subsequent
+/// builds (issue #133):
+///
+/// - In `--locked` mode the on-disk lockfile is authoritative and returned
+///   unchanged (the user explicitly forbids any modification; it already
+///   contains the plugin entries, enforced by the staleness check).
+/// - Otherwise the toolchain section is stabilized to the detected konanc
+///   version (predicting the post-build write), existing dependencies are
+///   preserved, and the predicted `[[plugins]]` entries (`plugin_locks`,
+///   resolved before the cache key is computed) are folded in.
+///
+/// Folding the plugin entries in BOTH the version-matches branch and the
+/// stabilized branch is what fixes the spurious one-time recompile of projects
+/// with plugins: the first build's on-disk lockfile has no `[[plugins]]`
+/// entries yet, but the second build reads them back from disk. Without folding,
+/// the two builds produce different `lockfile_content` and therefore different
+/// cache keys. Plugins genuinely affect compilation, so they must stay in the
+/// cache key — folding the predicted entries in is what keeps it stable.
+fn predicted_effective_lockfile(
+    lockfile: &Lockfile,
+    konanc_version: &str,
+    konanc_tarball_sha256: Option<&str>,
+    jre_tarball_sha256: Option<&str>,
+    plugin_locks: &[PluginLock],
+    locked: bool,
+) -> Lockfile {
+    // In --locked mode the lockfile must not change. It already contains the
+    // plugin entries (the staleness check enforces this), so no fold is needed.
+    if locked {
+        return lockfile.clone();
+    }
+
+    let mut effective = match &lockfile.toolchain {
+        // Lockfile already has the correct version — use as-is (preserves any
+        // existing tarball hashes and detekt info).
+        Some(tc) if tc.konanc_version == konanc_version => lockfile.clone(),
+        // Lockfile is missing or has a different version. Build the same
+        // lockfile that will eventually be written so the cache key is stable
+        // from the first build. Preserve existing dependencies (e.g. Maven deps
+        // written by `konvoy update`).
+        _ => {
+            let mut stabilized = Lockfile::with_managed_toolchain(
+                konanc_version,
+                konanc_tarball_sha256,
+                jre_tarball_sha256,
+            );
+            stabilized.dependencies = lockfile.dependencies.clone();
+            stabilized
+        }
+    };
+
+    // Fold the predicted [[plugins]] entries into the effective lockfile in
+    // BOTH branches above, matching what `update_lockfile_if_needed` writes
+    // (`updated.plugins = plugin_locks`). This keeps the cache key identical
+    // across the first and second builds of a project with plugins.
+    effective.plugins = plugin_locks.to_vec();
+    effective
+}
+
+/// Resolve the common build pipeline state (steps 1–7a).
 ///
 /// This is the shared core of both `build()` and `build_tests()`:
 /// 1. Read `konvoy.toml` and `konvoy.lock`
@@ -160,9 +222,11 @@ pub(crate) struct LockfileWriteInputs {
 /// 3. Check lockfile staleness in `--locked` mode
 /// 4. Resolve target and profile
 /// 5. Resolve managed konanc toolchain
-/// 6. Pre-stabilize lockfile for cache key consistency
-/// 7. Resolve + build path dependencies in topological order,
-///    resolve plugin artifacts, and download Maven dependency klibs
+/// 6. Resolve plugin artifacts, then pre-stabilize the lockfile for cache-key
+///    consistency (the predicted `[[plugins]]` entries are folded in so the
+///    cache key is stable from the first build)
+/// 7. Resolve + build path dependencies in topological order, then download
+///    Maven dependency klibs
 pub(crate) fn resolve_build_context(
     project_root: &Path,
     options: &BuildOptions,
@@ -204,7 +268,8 @@ pub(crate) fn resolve_build_context(
     let konanc_tarball_sha256 = resolved.konanc_tarball_sha256;
     let jre_tarball_sha256 = resolved.jre_tarball_sha256;
 
-    // 6. Pre-stabilize the lockfile for cache key consistency (issue #133).
+    // 6. Resolve plugin artifacts, then pre-stabilize the lockfile for
+    //    cache-key consistency (issue #133).
     //
     // When `konvoy.lock` does not exist (first build) or the toolchain version
     // has changed, the lockfile read at step 2 will differ from what
@@ -213,32 +278,38 @@ pub(crate) fn resolve_build_context(
     // stale/empty lockfile, then the lockfile is updated on disk, and the
     // second build sees different content and misses the cache.
     //
+    // Plugins are part of this prediction: their `[[plugins]]` lock entries are
+    // only written at the END of the build, so we must resolve them HERE —
+    // before computing `lockfile_content` — and fold the predicted entries into
+    // the effective lockfile. Otherwise a project with a `[plugins]` section
+    // recompiles once unnecessarily after its first build (issue #133 class).
+    //
+    // Hash lookup uses the on-disk `lockfile` (its `[[plugins]]` entries, if
+    // any), which is exactly what the effective lockfile carried before folding.
+    // On a warm cache the artifacts are already present and pinned, so
+    // `ensure_plugin_artifacts` only re-verifies hashes — it does not download.
+    let (plugin_jars, plugin_locks) = if !manifest.plugins.is_empty() {
+        let resolved_artifacts = crate::plugin::resolve_plugin_artifacts(&manifest)?;
+        let results =
+            crate::plugin::ensure_plugin_artifacts(&resolved_artifacts, &lockfile, options.locked)?;
+        let locks = crate::plugin::build_plugin_locks(&results);
+        let jars: Vec<PathBuf> = results.iter().map(|r| r.path.clone()).collect();
+        (jars, locks)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     // We predict the lockfile content that will eventually be written, so the
     // cache key is the same in the first and second builds. In `--locked` mode
-    // we must use the lockfile as-is because the user explicitly forbids changes.
-    let effective_lockfile = if options.locked {
-        lockfile.clone()
-    } else {
-        match &lockfile.toolchain {
-            // Lockfile already has the correct version — use as-is
-            // (preserves any existing tarball hashes and detekt info).
-            Some(tc) if tc.konanc_version == konanc.version => lockfile.clone(),
-            // Lockfile is missing or has a different version. Build the same
-            // lockfile that will eventually be written so the cache key is
-            // stable from the first build. Preserve existing dependencies and
-            // plugins (e.g. Maven deps written by `konvoy update`).
-            _ => {
-                let mut stabilized = Lockfile::with_managed_toolchain(
-                    &konanc.version,
-                    konanc_tarball_sha256.as_deref(),
-                    jre_tarball_sha256.as_deref(),
-                );
-                stabilized.dependencies = lockfile.dependencies.clone();
-                stabilized.plugins = lockfile.plugins.clone();
-                stabilized
-            }
-        }
-    };
+    // the lockfile is used as-is because the user explicitly forbids changes.
+    let effective_lockfile = predicted_effective_lockfile(
+        &lockfile,
+        &konanc.version,
+        konanc_tarball_sha256.as_deref(),
+        jre_tarball_sha256.as_deref(),
+        &plugin_locks,
+        options.locked,
+    );
 
     // 7. Resolve dependencies and build them in topological order.
     let dep_graph = resolve_dependencies(project_root, &manifest)?;
@@ -292,22 +363,7 @@ pub(crate) fn resolve_build_context(
         .map(LibraryInput::unhashed)
         .collect();
 
-    // 7a. Resolve and download plugin artifacts.
-    let (plugin_jars, plugin_locks) = if !manifest.plugins.is_empty() {
-        let resolved_artifacts = crate::plugin::resolve_plugin_artifacts(&manifest)?;
-        let results = crate::plugin::ensure_plugin_artifacts(
-            &resolved_artifacts,
-            &effective_lockfile,
-            options.locked,
-        )?;
-        let locks = crate::plugin::build_plugin_locks(&results);
-        let jars: Vec<PathBuf> = results.iter().map(|r| r.path.clone()).collect();
-        (jars, locks)
-    } else {
-        (Vec::new(), Vec::new())
-    };
-
-    // 7b. Resolve and download Maven dependency klibs for the current target.
+    // 7a. Resolve and download Maven dependency klibs for the current target.
     //     Each Maven klib comes back with a precomputed sha256 from
     //     `download_artifact`, which the cache-key code reuses to skip rehashing.
     let maven_klibs = resolve_maven_deps(&effective_lockfile, &target)?;
@@ -343,11 +399,12 @@ pub(crate) fn resolve_build_context(
 /// 3. Check lockfile staleness (in --locked mode)
 /// 4. Detect host target (or resolve `--target` flag)
 /// 5. Detect `konanc` and get version + fingerprint
-/// 6. Pre-stabilize lockfile for cache key consistency (issue #133)
+/// 6. Resolve plugin artifacts and pre-stabilize the lockfile (including the
+///    predicted `[[plugins]]` entries) for cache key consistency (issue #133)
 /// 7. Resolve dependencies and build them in topological order
 /// 8. Build the root project (collect sources, compute cache key,
 ///    check cache, invoke compiler, store artifact)
-/// 9. Update `konvoy.lock` if toolchain version changed
+/// 9. Update `konvoy.lock` if toolchain, dependencies, or plugins changed
 ///
 /// # Errors
 /// Returns an error if any step fails (config parsing, compiler detection,
@@ -2531,6 +2588,70 @@ mod tests {
         assert_eq!(
             content_first_h, content_second_h,
             "cache key lockfile content must be identical between first and second builds (with hashes)"
+        );
+    }
+
+    /// Like `pre_stabilized_lockfile_matches_post_update_lockfile` but for a
+    /// project with a `[plugins]` section. The pre-stabilized lockfile content
+    /// computed on the first build (when the on-disk lockfile has no plugin
+    /// entries yet) MUST equal the content computed on the second build (when
+    /// the lockfile has been populated with plugin entries by the first build).
+    ///
+    /// Otherwise the cache key differs and the project recompiles once
+    /// unnecessarily after its first build (issue #133 class). Plugins genuinely
+    /// affect compilation, so they must stay in the cache key — they cannot be
+    /// excluded; instead the predicted entries are folded in on the first build.
+    #[test]
+    fn pre_stabilized_lockfile_matches_post_update_lockfile_with_plugins() {
+        let konanc_version = "2.1.0";
+
+        // The plugin lock entries resolved during the build — these are what
+        // `update_lockfile_if_needed` writes to disk (`updated.plugins`).
+        let plugin_locks = vec![PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: konanc_version.to_owned(),
+            sha256: "plugin-sha-deadbeef".to_owned(),
+            url: "https://repo.maven.apache.org/plugin.jar".to_owned(),
+        }];
+
+        // First build: no lockfile on disk (default — no toolchain, no plugins).
+        let first_on_disk = Lockfile::default();
+        let effective_first = predicted_effective_lockfile(
+            &first_on_disk,
+            konanc_version,
+            None,
+            None,
+            &plugin_locks,
+            false,
+        );
+
+        // After the first build, `update_lockfile_if_needed` writes a lockfile
+        // with the managed toolchain plus the resolved plugin entries.
+        let mut written = Lockfile::with_managed_toolchain(konanc_version, None, None);
+        written.plugins = plugin_locks.clone();
+
+        // Second build reads `written` from disk (version matches) and resolves
+        // the same plugin locks again.
+        let effective_second = predicted_effective_lockfile(
+            &written,
+            konanc_version,
+            None,
+            None,
+            &plugin_locks,
+            false,
+        );
+
+        let content_first = lockfile_toml_content(&effective_first).unwrap();
+        let content_second = lockfile_toml_content(&effective_second).unwrap();
+        assert_eq!(
+            content_first, content_second,
+            "cache key lockfile content must be identical between the first and second \
+             builds of a project with plugins"
+        );
+        assert!(
+            content_first.contains("kotlin-serialization"),
+            "predicted plugin entries must be folded into the cache-key lockfile content"
         );
     }
 

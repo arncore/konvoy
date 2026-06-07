@@ -5,12 +5,15 @@
 //! `konvoy update`'s `MultiProgress` can host any of them as a child bar.
 
 use std::borrow::Cow;
-use std::fmt::Write;
+use std::fmt::{Debug, Write};
+use std::io::{IsTerminal, Write as IoWrite};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
+use indicatif::{
+    MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle, TermLike,
+};
 
 /// Default minimum prefix column width when the caller doesn't compute one
 /// from the full set of in-flight downloads. 36 is wide enough to fit a
@@ -44,6 +47,196 @@ const DELIVERED_CARGO: &str = "\u{1F7E9}"; // 🟩 green block left after delive
 /// boundary is hit at least once even with indicatif's 20Hz draw throttle.
 const BLINK_TICK: Duration = Duration::from_millis(250);
 
+const KONVOY_PROGRESS_ENV: &str = "KONVOY_PROGRESS";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProgressMode {
+    Auto,
+    Ansi,
+    Plain,
+}
+
+struct StderrTerm {
+    stderr: Mutex<std::io::Stderr>,
+}
+
+impl StderrTerm {
+    fn new() -> Self {
+        Self {
+            stderr: Mutex::new(std::io::stderr()),
+        }
+    }
+
+    fn width_from_env() -> u16 {
+        terminal_width_from_columns(std::env::var("COLUMNS").ok().as_deref())
+    }
+
+    fn write_escape(&self, escape: &str) -> std::io::Result<()> {
+        self.write_str(escape)
+    }
+}
+
+impl Debug for StderrTerm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StderrTerm").finish_non_exhaustive()
+    }
+}
+
+impl TermLike for StderrTerm {
+    fn width(&self) -> u16 {
+        Self::width_from_env()
+    }
+
+    fn height(&self) -> u16 {
+        24
+    }
+
+    fn move_cursor_up(&self, n: usize) -> std::io::Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        self.write_escape(&format!("\x1b[{n}A"))
+    }
+
+    fn move_cursor_down(&self, n: usize) -> std::io::Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        self.write_escape(&format!("\x1b[{n}B"))
+    }
+
+    fn move_cursor_right(&self, n: usize) -> std::io::Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        self.write_escape(&format!("\x1b[{n}C"))
+    }
+
+    fn move_cursor_left(&self, n: usize) -> std::io::Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        self.write_escape(&format!("\x1b[{n}D"))
+    }
+
+    fn write_line(&self, s: &str) -> std::io::Result<()> {
+        let mut stderr = self
+            .stderr
+            .lock()
+            .map_err(|_| std::io::Error::other("stderr lock poisoned"))?;
+        stderr.write_all(s.as_bytes())?;
+        stderr.write_all(b"\n")
+    }
+
+    fn write_str(&self, s: &str) -> std::io::Result<()> {
+        let mut stderr = self
+            .stderr
+            .lock()
+            .map_err(|_| std::io::Error::other("stderr lock poisoned"))?;
+        stderr.write_all(s.as_bytes())
+    }
+
+    fn clear_line(&self) -> std::io::Result<()> {
+        self.write_escape("\r\x1b[2K")
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        self.stderr
+            .lock()
+            .map_err(|_| std::io::Error::other("stderr lock poisoned"))?
+            .flush()
+    }
+}
+
+fn progress_draw_target() -> ProgressDrawTarget {
+    if current_progress_mode() == ProgressMode::Plain {
+        return ProgressDrawTarget::hidden();
+    }
+
+    let default = ProgressDrawTarget::stderr();
+    if !default.is_hidden() {
+        return default;
+    }
+
+    if should_force_ansi_progress(
+        std::io::stderr().is_terminal(),
+        std::env::var(KONVOY_PROGRESS_ENV).ok().as_deref(),
+    ) {
+        return ProgressDrawTarget::term_like_with_hz(Box::new(StderrTerm::new()), 20);
+    }
+
+    ProgressDrawTarget::hidden()
+}
+
+fn current_progress_mode() -> ProgressMode {
+    progress_mode_from_env(std::env::var(KONVOY_PROGRESS_ENV).ok().as_deref())
+}
+
+fn progress_mode_from_env(value: Option<&str>) -> ProgressMode {
+    value.map_or(ProgressMode::Auto, |value| {
+        if progress_env_requests_plain(value) {
+            ProgressMode::Plain
+        } else if progress_env_requests_ansi(value) {
+            ProgressMode::Ansi
+        } else {
+            ProgressMode::Auto
+        }
+    })
+}
+
+fn terminal_width_from_columns(value: Option<&str>) -> u16 {
+    value
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|width| *width > 0)
+        .unwrap_or(80)
+}
+
+fn should_force_ansi_progress(stderr_is_terminal: bool, env_value: Option<&str>) -> bool {
+    stderr_is_terminal || env_value.is_some_and(progress_env_requests_ansi)
+}
+
+fn progress_env_requests_ansi(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "ansi" | "always"
+    )
+}
+
+fn progress_env_requests_plain(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "plain" | "line" | "lines" | "log"
+    )
+}
+
+#[derive(Clone, Debug)]
+struct PlainProgressLine {
+    prefix: String,
+    prefix_width: usize,
+}
+
+impl PlainProgressLine {
+    fn new(prefix: &str, prefix_width: usize) -> Option<Self> {
+        (current_progress_mode() == ProgressMode::Plain).then(|| Self {
+            prefix: prefix.to_owned(),
+            prefix_width,
+        })
+    }
+
+    fn print(&self, bar: &ProgressBar, state: u8) {
+        eprintln!(
+            "{}",
+            plain_progress_line(
+                &self.prefix,
+                self.prefix_width,
+                bar.position(),
+                bar.length(),
+                state,
+            )
+        );
+    }
+}
+
 /// Handle bundling a bar with the atomic flag that drives its glyph state.
 ///
 /// Returned by [`add_download_bar`] / [`new_download_bar`]. The engine layer
@@ -58,6 +251,7 @@ const BLINK_TICK: Duration = Duration::from_millis(250);
 pub struct DownloadBar {
     bar: ProgressBar,
     state: Arc<AtomicU8>,
+    plain_line: Option<PlainProgressLine>,
 }
 
 impl DownloadBar {
@@ -106,6 +300,8 @@ impl DownloadBar {
     /// `abandon` halts further redraws.
     pub fn mark_success(&self) {
         self.state.store(STATE_SUCCESS, Ordering::Relaxed);
+        self.bar.force_draw();
+        self.print_plain_line(STATE_SUCCESS);
         self.bar.abandon();
     }
 
@@ -113,7 +309,15 @@ impl DownloadBar {
     /// stop the bar so its final frame is preserved.
     pub fn mark_failure(&self) {
         self.state.store(STATE_FAILURE, Ordering::Relaxed);
+        self.bar.force_draw();
+        self.print_plain_line(STATE_FAILURE);
         self.bar.abandon();
+    }
+
+    fn print_plain_line(&self, state: u8) {
+        if let Some(line) = &self.plain_line {
+            line.print(&self.bar, state);
+        }
     }
 }
 
@@ -207,10 +411,16 @@ pub fn stream_with_bar(
 /// so the next stderr line isn't concatenated onto the bar's row.
 #[must_use]
 pub fn new_download_bar(prefix: impl Into<Cow<'static, str>>) -> DownloadBar {
-    let multi = MultiProgress::new();
+    let multi = new_multi_progress();
     let state = Arc::new(AtomicU8::new(STATE_IN_PROGRESS));
+    let prefix = prefix.into();
+    let plain_line = PlainProgressLine::new(prefix.as_ref(), DEFAULT_PREFIX_WIDTH);
     let pb = build_bar(&multi, prefix, DEFAULT_PREFIX_WIDTH, Arc::clone(&state));
-    DownloadBar { bar: pb, state }
+    DownloadBar {
+        bar: pb,
+        state,
+        plain_line,
+    }
 }
 
 /// Attach a styled bar to a caller-owned [`MultiProgress`] container.
@@ -225,8 +435,14 @@ pub fn add_download_bar(
     prefix_width: usize,
 ) -> DownloadBar {
     let state = Arc::new(AtomicU8::new(STATE_IN_PROGRESS));
+    let prefix = prefix.into();
+    let plain_line = PlainProgressLine::new(prefix.as_ref(), prefix_width);
     let pb = build_bar(mp, prefix, prefix_width, Arc::clone(&state));
-    DownloadBar { bar: pb, state }
+    DownloadBar {
+        bar: pb,
+        state,
+        plain_line,
+    }
 }
 
 /// Build a [`MultiProgress`] + a stable-ordered `Vec<DownloadBar>` from
@@ -242,13 +458,25 @@ pub fn add_download_bar(
 /// Caller emits a trailing `eprintln!()` after the bar block.
 #[must_use]
 pub fn pre_allocate_bars(labels: Vec<String>) -> (MultiProgress, Vec<DownloadBar>) {
-    let multi = MultiProgress::new();
+    let multi = new_multi_progress();
     let prefix_width = labels.iter().map(String::len).max().unwrap_or(0);
     let bars: Vec<DownloadBar> = labels
         .into_iter()
         .map(|label| add_download_bar(&multi, label, prefix_width))
         .collect();
     (multi, bars)
+}
+
+/// Build a [`MultiProgress`] with Konvoy's draw target policy.
+///
+/// Indicatif hides its default terminal target when `TERM=dumb` or `NO_COLOR`
+/// is set. IDE consoles commonly present that way while still supporting
+/// cursor movement, so Konvoy forces a terminal-like stderr target for attended
+/// stderr or when `KONVOY_PROGRESS=ansi` explicitly opts in. Progress stays
+/// hidden when stderr is a real pipe/file and no opt-in is present.
+#[must_use]
+pub fn new_multi_progress() -> MultiProgress {
+    MultiProgress::with_draw_target(progress_draw_target())
 }
 
 /// Shared bar construction: attach to `mp`, apply the styled template,
@@ -295,9 +523,16 @@ fn write_elapsed_ms(state: &ProgressState, w: &mut dyn Write) {
 /// pos == 0 (the moment before any bytes arrive), the truck appears at the
 /// far right edge instead of being hidden off-screen.
 fn render_truck_bar(state: &ProgressState, w: &mut dyn Write, current_state: u8) {
+    let _ = write!(
+        w,
+        "{}",
+        truck_bar_string(state.len().unwrap_or(0), state.pos(), current_state)
+    );
+}
+
+fn truck_bar_string(len: u64, pos: u64, current_state: u8) -> String {
     let bar_width = BAR_LOGICAL_WIDTH;
-    let len = state.len().unwrap_or(0);
-    let pos = state.pos();
+    let mut output = String::new();
 
     if len == 0 {
         // No Content-Length recorded — either the spinner-mode case (download
@@ -311,10 +546,10 @@ fn render_truck_bar(state: &ProgressState, w: &mut dyn Write, current_state: u8)
             ROAD_AHEAD
         };
         for _ in 0..bar_width.saturating_sub(1) {
-            let _ = write!(w, "{ROAD_AHEAD}");
+            output.push_str(ROAD_AHEAD);
         }
-        let _ = write!(w, "{edge_glyph}");
-        return;
+        output.push_str(edge_glyph);
+        return output;
     }
 
     // Invert here: truck_at decreases as pos increases. At pos=0, truck_at =
@@ -346,8 +581,52 @@ fn render_truck_bar(state: &ProgressState, w: &mut dyn Write, current_state: u8)
         } else {
             trail
         };
-        let _ = write!(w, "{glyph}");
+        output.push_str(glyph);
     }
+
+    output
+}
+
+fn plain_progress_line(
+    prefix: &str,
+    prefix_width: usize,
+    downloaded: u64,
+    total: Option<u64>,
+    state: u8,
+) -> String {
+    let indicator = match state {
+        STATE_SUCCESS => SUCCESS_MARKER,
+        STATE_FAILURE => FAILURE_MARKER,
+        _ => IN_PROGRESS_MARKER,
+    };
+    let prefix = format!("{prefix:<prefix_width$}");
+    let total_len = total.filter(|total| *total > 0);
+    let total_label = total_len
+        .map(format_bytes)
+        .unwrap_or_else(|| "unknown".to_owned());
+    format!(
+        "  {indicator}  {prefix} [{}] {} / {total_label}",
+        truck_bar_string(total_len.unwrap_or(downloaded), downloaded, state),
+        format_bytes(downloaded),
+    )
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    if bytes < KIB {
+        format!("{bytes} B")
+    } else if bytes < MIB {
+        format_decimal_bytes(bytes, KIB, "KiB")
+    } else {
+        format_decimal_bytes(bytes, MIB, "MiB")
+    }
+}
+
+fn format_decimal_bytes(bytes: u64, unit: u64, suffix: &str) -> String {
+    let whole = bytes / unit;
+    let fractional = ((bytes % unit) * 100) / unit;
+    format!("{whole}.{fractional:02} {suffix}")
 }
 
 fn download_style(prefix_width: usize, state: Arc<AtomicU8>) -> ProgressStyle {
@@ -440,6 +719,107 @@ mod tests {
         let bar = add_download_bar(&mp, "child", 32);
         assert_eq!(bar.bar.prefix(), "child");
         assert_eq!(bar.state.load(Ordering::Relaxed), STATE_IN_PROGRESS);
+    }
+
+    #[test]
+    fn progress_env_requests_ansi_for_explicit_truthy_values() {
+        for value in ["1", "true", "TRUE", " yes ", "on", "ansi", "always"] {
+            assert!(
+                progress_env_requests_ansi(value),
+                "{value:?} should opt into ANSI progress"
+            );
+        }
+    }
+
+    #[test]
+    fn progress_env_does_not_request_ansi_for_empty_or_falsey_values() {
+        for value in ["", "0", "false", "no", "off", "never", "auto", "plain"] {
+            assert!(
+                !progress_env_requests_ansi(value),
+                "{value:?} should not opt into ANSI progress"
+            );
+        }
+    }
+
+    #[test]
+    fn progress_env_requests_plain_for_plain_line_values() {
+        for value in ["plain", "PLAIN", " line ", "lines", "log"] {
+            assert!(
+                progress_env_requests_plain(value),
+                "{value:?} should opt into plain progress"
+            );
+        }
+    }
+
+    #[test]
+    fn progress_env_does_not_request_plain_for_ansi_or_falsey_values() {
+        for value in ["", "0", "false", "ansi", "always", "true"] {
+            assert!(
+                !progress_env_requests_plain(value),
+                "{value:?} should not opt into plain progress"
+            );
+        }
+    }
+
+    #[test]
+    fn should_force_ansi_progress_for_attended_stderr_without_env() {
+        assert!(should_force_ansi_progress(true, None));
+    }
+
+    #[test]
+    fn should_force_ansi_progress_for_explicit_ide_opt_in_without_tty() {
+        assert!(should_force_ansi_progress(false, Some("ansi")));
+    }
+
+    #[test]
+    fn should_not_force_ansi_progress_for_unattended_stderr_without_opt_in() {
+        assert!(!should_force_ansi_progress(false, None));
+        assert!(!should_force_ansi_progress(false, Some("")));
+        assert!(!should_force_ansi_progress(false, Some("false")));
+    }
+
+    #[test]
+    fn terminal_width_parses_valid_columns() {
+        assert_eq!(terminal_width_from_columns(Some("120")), 120);
+        assert_eq!(terminal_width_from_columns(Some(" 132 ")), 132);
+    }
+
+    #[test]
+    fn terminal_width_falls_back_for_missing_invalid_or_zero_columns() {
+        for value in [None, Some(""), Some("0"), Some("-1"), Some("wide")] {
+            assert_eq!(terminal_width_from_columns(value), 80);
+        }
+    }
+
+    #[test]
+    fn plain_progress_line_renders_success_with_truck_bar() {
+        let line = plain_progress_line("dep", 8, 1024, Some(1024), STATE_SUCCESS);
+
+        assert!(line.contains("✅"));
+        assert!(line.contains("dep     "));
+        assert!(line.contains("🚚"));
+        assert!(line.contains("🟩"));
+        assert!(line.contains("1.00 KiB / 1.00 KiB"));
+    }
+
+    #[test]
+    fn plain_progress_line_treats_zero_total_as_unknown() {
+        let line = plain_progress_line("dep", 3, 512, Some(0), STATE_SUCCESS);
+
+        assert!(line.contains("512 B / unknown"));
+        assert!(
+            !line.contains("512 B / 0 B"),
+            "zero-length progress bars are placeholders, not real totals"
+        );
+    }
+
+    #[test]
+    fn plain_progress_line_renders_failure_with_crash_bar() {
+        let line = plain_progress_line("dep", 3, 128, Some(1024), STATE_FAILURE);
+
+        assert!(line.contains("❌"));
+        assert!(line.contains("💥"));
+        assert!(line.contains("128 B / 1.00 KiB"));
     }
 
     #[test]

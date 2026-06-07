@@ -28,7 +28,7 @@ pub struct TestBuildResult {
 /// sources (`src/test/**/*.kt`), then invokes konanc with `-generate-test-runner`
 /// to produce a test binary.
 ///
-/// Uses `resolve_build_context()` for the shared pipeline (steps 1–7b), then
+/// Uses `resolve_build_context()` for the shared pipeline (steps 1–7a), then
 /// adds test-specific source collection and compilation.
 ///
 /// # Errors
