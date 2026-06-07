@@ -757,10 +757,8 @@ KOTLIN
     # The Fabrikt tool pin is persisted through a build, not just `generate`.
     assert_file_contains konvoy.lock "[codegen_tools.fabrikt]" || return 1
 
-    # Editing the spec regenerates and recompiles. This second build also settles
-    # the plugin lock entries (which are written at the end of build 1 and change
-    # the cache key on build 2 — a known, pre-existing plugin relock behavior;
-    # see test_plugin_build_lifecycle), so the lockfile is stable from here on.
+    # Editing the spec changes the codegen input hash, so the next build is a
+    # cache miss and recompiles (and regenerates the models).
     cat > specs/api.yaml << 'YAML'
 openapi: 3.0.3
 info:
