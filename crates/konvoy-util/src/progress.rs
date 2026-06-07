@@ -600,7 +600,7 @@ fn plain_progress_line(
         _ => IN_PROGRESS_MARKER,
     };
     let prefix = format!("{prefix:<prefix_width$}");
-    let total_len = total;
+    let total_len = total.filter(|total| *total > 0);
     let total_label = total_len
         .map(format_bytes)
         .unwrap_or_else(|| "unknown".to_owned());
@@ -800,6 +800,17 @@ mod tests {
         assert!(line.contains("🚚"));
         assert!(line.contains("🟩"));
         assert!(line.contains("1.00 KiB / 1.00 KiB"));
+    }
+
+    #[test]
+    fn plain_progress_line_treats_zero_total_as_unknown() {
+        let line = plain_progress_line("dep", 3, 512, Some(0), STATE_SUCCESS);
+
+        assert!(line.contains("512 B / unknown"));
+        assert!(
+            !line.contains("512 B / 0 B"),
+            "zero-length progress bars are placeholders, not real totals"
+        );
     }
 
     #[test]
