@@ -10,13 +10,13 @@ Design crate APIs, data flow, and structural decisions before implementation beg
 - Design the data flow between crates (what types cross crate boundaries)
 - Decide where new functionality belongs in the crate hierarchy
 - Ensure no circular dependencies between crates
-- Validate that proposed changes align with CLAUDE.md philosophy (no task graphs, no DSLs, no JVM)
+- Validate that proposed changes align with AGENTS.md philosophy (no task graphs, no DSLs, no JVM)
 - Reject scope creep beyond MVP boundaries
 
 ## Inputs
 
 - Feature requests or bug reports
-- CLAUDE.md (project philosophy and constraints)
+- AGENTS.md (project philosophy and constraints)
 - Current crate structure and public APIs
 
 ## Outputs
