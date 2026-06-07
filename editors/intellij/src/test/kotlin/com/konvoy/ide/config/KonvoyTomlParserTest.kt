@@ -182,20 +182,6 @@ class KonvoyTomlParserTest {
     }
 
     @Test
-    fun `parse legacy lockfile fabrikt fields`() {
-        val lockfile = KonvoyTomlParser.parseLockfileFromText("""
-            [toolchain]
-            konanc_version = "2.3.20"
-            fabrikt_version = "20.0.0"
-            fabrikt_jar_sha256 = "f00d"
-        """.trimIndent())
-
-        assertNotNull(lockfile)
-        assertEquals("20.0.0", lockfile.toolchain!!.fabriktVersion)
-        assertEquals("f00d", lockfile.toolchain!!.fabriktJarSha256)
-    }
-
-    @Test
     fun `ignores comments and blank lines`() {
         val manifest = KonvoyTomlParser.parseManifestFromText("""
             # This is a comment

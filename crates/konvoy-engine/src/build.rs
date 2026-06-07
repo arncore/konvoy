@@ -1097,8 +1097,6 @@ fn update_lockfile_if_needed(
     if let (Some(updated_tc), Some(source_tc)) = (&mut updated.toolchain, toolchain_source) {
         updated_tc.detekt_version = source_tc.detekt_version.clone();
         updated_tc.detekt_jar_sha256 = source_tc.detekt_jar_sha256.clone();
-        updated_tc.fabrikt_version = source_tc.fabrikt_version.clone();
-        updated_tc.fabrikt_jar_sha256 = source_tc.fabrikt_jar_sha256.clone();
     }
     updated.dependencies = new_deps;
     updated.plugins = plugin_locks.to_vec();

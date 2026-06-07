@@ -144,8 +144,6 @@ object KonvoyTomlParser {
                 jreTarballSha256 = it.stringValue("jre_tarball_sha256"),
                 detektVersion = it.stringValue("detekt_version"),
                 detektJarSha256 = it.stringValue("detekt_jar_sha256"),
-                fabriktVersion = it.stringValue("fabrikt_version"),
-                fabriktJarSha256 = it.stringValue("fabrikt_jar_sha256"),
             )
         }
 
@@ -281,8 +279,6 @@ object KonvoyTomlParser {
                 jreTarballSha256 = it["jre_tarball_sha256"],
                 detektVersion = it["detekt_version"],
                 detektJarSha256 = it["detekt_jar_sha256"],
-                fabriktVersion = it["fabrikt_version"],
-                fabriktJarSha256 = it["fabrikt_jar_sha256"],
             )
         }
 

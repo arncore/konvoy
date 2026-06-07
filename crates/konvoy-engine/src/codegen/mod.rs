@@ -295,8 +295,6 @@ fn persist_managed_tool_hash(
             jre_tarball_sha256: None,
             detekt_version: None,
             detekt_jar_sha256: None,
-            fabrikt_version: None,
-            fabrikt_jar_sha256: None,
         });
     }
     updated.set_codegen_tool(&spec.id, spec.version(), hash);
