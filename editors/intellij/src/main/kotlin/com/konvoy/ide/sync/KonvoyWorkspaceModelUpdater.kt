@@ -12,6 +12,7 @@ import com.intellij.openapi.roots.impl.libraries.LibraryEx
 import com.intellij.openapi.roots.libraries.LibraryTablesRegistrar
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VfsUtil
+import com.intellij.openapi.vfs.VirtualFile
 import com.konvoy.ide.config.*
 import org.jetbrains.kotlin.cli.common.arguments.K2NativeCompilerArguments
 import org.jetbrains.kotlin.config.CompilerSettings
@@ -29,7 +30,8 @@ import java.io.File
  *
  * This is the bridge between konvoy.toml/konvoy.lock and IntelliJ's project model.
  * It configures:
- * - Module with source roots (src/, excluding src/test/) and test roots (src/test/)
+ * - Module with source roots (src/, excluding src/test/), test roots (src/test/),
+ *   and generated source roots (.konvoy/gen/<generator>/...)
  * - Library dependencies (klibs from ~/.konvoy/cache/maven/)
  * - Kotlin facet with Native target platform
  * - Compiler plugin configuration
@@ -110,13 +112,52 @@ object KonvoyWorkspaceModelUpdater {
             contentEntry.addSourceFolder(testDir, true)
         }
 
-        // Exclude build output directory
-        val buildDir = projectDir.findChild(".konvoy")
-        if (buildDir != null) {
-            contentEntry.addExcludeFolder(buildDir)
+        // Index generated sources (e.g. .konvoy/gen/openapi/src/main/kotlin) as
+        // source roots so the IDE resolves generated types, while excluding the
+        // rest of .konvoy/ (build outputs and caches). Generated dirs must exist
+        // on disk, so run `konvoy generate`/`build` and re-sync to pick them up.
+        val konvoyDir = projectDir.findChild(".konvoy")
+        if (konvoyDir != null) {
+            val genRoots = generatedSourceRoots(konvoyDir)
+            if (genRoots.isEmpty()) {
+                contentEntry.addExcludeFolder(konvoyDir)
+            } else {
+                genRoots.forEach { contentEntry.addSourceFolder(it, false) }
+                // Exclude everything under .konvoy except the generated tree.
+                konvoyDir.children.forEach { child ->
+                    if (child.name != "gen") {
+                        contentEntry.addExcludeFolder(child)
+                    }
+                }
+            }
         }
 
         model.commit()
+    }
+
+    /**
+     * Generated Kotlin source roots under `.konvoy/gen/<generator>/`.
+     *
+     * Each generator writes into its own subdirectory. Returns the package-root
+     * directory per generator so IntelliJ resolves generated types with the
+     * correct package (Fabrikt nests sources under `src/main/kotlin`).
+     */
+    private fun generatedSourceRoots(konvoyDir: VirtualFile): List<VirtualFile> {
+        val genDir = konvoyDir.findChild("gen")?.takeIf { it.isDirectory } ?: return emptyList()
+        return genDir.children
+            .filter { it.isDirectory }
+            .mapNotNull { generatedSourceRootFor(it) }
+    }
+
+    private fun generatedSourceRootFor(generatorDir: VirtualFile): VirtualFile? {
+        // Common generator output layouts (Fabrikt emits src/main/kotlin).
+        generatorDir.findChild("src")?.findChild("main")?.let { main ->
+            main.findChild("kotlin")?.takeIf { it.isDirectory }?.let { return it }
+            main.findChild("java")?.takeIf { it.isDirectory }?.let { return it }
+        }
+        generatorDir.findChild("kotlin")?.takeIf { it.isDirectory }?.let { return it }
+        // Fallback: the generator wrote .kt files directly in its output dir.
+        return generatorDir.takeIf { dir -> dir.children.any { it.extension == "kt" } }
     }
 
     private fun configureLibraries(
