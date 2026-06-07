@@ -591,6 +591,410 @@ KOTLIN
 }
 
 # ---------------------------------------------------------------------------
+# Tests: codegen (OpenAPI)
+# ---------------------------------------------------------------------------
+
+# Shared fixture helpers for codegen tests. Each writes into the current
+# (already-fresh) temp dir.
+
+# Write a minimal single-file OpenAPI spec at specs/api.yaml.
+_codegen_write_single_spec() {
+    mkdir -p specs
+    cat > specs/api.yaml << 'YAML'
+openapi: 3.0.3
+info:
+  title: Pet API
+  version: 1.0.0
+paths: {}
+components:
+  schemas:
+    Pet:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+YAML
+}
+
+# Write a generate-only manifest (codegen + spec, no deps/plugins) at konvoy.toml.
+_codegen_write_generate_manifest() {
+    cat > konvoy.toml << 'TOML'
+[package]
+name = "codegen-gen"
+
+[toolchain]
+kotlin = "2.2.0"
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.api"
+TOML
+}
+
+# Generate-only lifecycle: first generate, idempotent re-run, --force, spec edit.
+# Exercises JRE + Fabrikt (no konanc compile).
+test_codegen_generate_lifecycle() {
+    _codegen_write_generate_manifest
+    _codegen_write_single_spec
+
+    # First generate produces sources.
+    local out1
+    out1=$(konvoy generate 2>&1)
+    assert_contains "$out1" "Generating OpenAPI sources with Fabrikt" || return 1
+
+    # Generated dir exists and contains at least one .kt file.
+    assert_dir_exists .konvoy/gen/openapi || return 1
+    local kt_count
+    kt_count=$(find .konvoy/gen/openapi -name '*.kt' | wc -l)
+    [ "$kt_count" -ge 1 ] || { echo "    expected at least one generated .kt file" >&2; return 1; }
+
+    # A generated .kt file carries the @Serializable marker.
+    grep -rqF "@Serializable" .konvoy/gen/openapi || { echo "    expected a generated file to contain @Serializable" >&2; return 1; }
+
+    # Input-hash file is written.
+    assert_file_exists .konvoy/gen/openapi/.input_hash || return 1
+
+    # Lockfile pins the Fabrikt tool.
+    assert_file_exists konvoy.lock || return 1
+    assert_file_contains konvoy.lock "[codegen_tools.fabrikt]" || return 1
+
+    # Re-run is idempotent: still succeeds, pin unchanged.
+    konvoy generate >/dev/null 2>&1 || { echo "    expected idempotent re-generate to succeed" >&2; return 1; }
+    assert_file_contains konvoy.lock "[codegen_tools.fabrikt]" || return 1
+
+    # --force regenerates even when inputs are unchanged: delete a generated
+    # file, then prove generated .kt files reappear after --force.
+    local victim
+    victim=$(find .konvoy/gen/openapi -name '*.kt' | head -n 1)
+    [ -n "$victim" ] || { echo "    expected a generated .kt file to delete" >&2; return 1; }
+    rm -f "$victim"
+    konvoy generate --force >/dev/null 2>&1 || { echo "    expected --force generate to succeed" >&2; return 1; }
+    local kt_after
+    kt_after=$(find .konvoy/gen/openapi -name '*.kt' | wc -l)
+    [ "$kt_after" -ge 1 ] || { echo "    expected generated .kt files to reappear after --force" >&2; return 1; }
+
+    # Editing the spec (add a second schema) changes the generated set.
+    cat > specs/api.yaml << 'YAML'
+openapi: 3.0.3
+info:
+  title: Pet API
+  version: 1.0.0
+paths: {}
+components:
+  schemas:
+    Pet:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+    Owner:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: integer
+          format: int64
+        nickname:
+          type: string
+YAML
+    konvoy generate >/dev/null 2>&1 || { echo "    expected generate after spec edit to succeed" >&2; return 1; }
+    grep -rqF "Owner" .konvoy/gen/openapi || { echo "    expected generated output to mention the new Owner schema" >&2; return 1; }
+}
+
+# Full compile lifecycle: build with codegen + serialization plugin + dep.
+# The heavy test (konanc + JRE + Fabrikt + Maven).
+test_codegen_build_lifecycle() {
+    cat > konvoy.toml << 'TOML'
+[package]
+name = "codegen-build"
+
+[toolchain]
+kotlin = "2.2.0"
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.api"
+
+[dependencies]
+kotlinx-serialization-core = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-core", version = "1.7.3" }
+
+[plugins]
+serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+TOML
+    _codegen_write_single_spec
+    mkdir -p src
+    cat > src/main.kt << 'KOTLIN'
+fun main() { println("ok") }
+KOTLIN
+
+    # First build generates, compiles, and links the generated models.
+    local out1
+    out1=$(konvoy build 2>&1)
+    assert_contains "$out1" "Compiling" || return 1
+    assert_file_exists .konvoy/build/linux_x64/debug/codegen-build || return 1
+    # Generated @Serializable models were produced and compiled alongside main.kt.
+    grep -rqF "@Serializable" .konvoy/gen/openapi || { echo "    expected generated @Serializable models" >&2; return 1; }
+
+    # Second build is a cache hit — no spurious rebuild after codegen (M1).
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "(cached)" || return 1
+    assert_not_contains "$out2" "Compiling" || return 1
+
+    # Editing the spec invalidates the cache and forces a recompile.
+    cat > specs/api.yaml << 'YAML'
+openapi: 3.0.3
+info:
+  title: Pet API
+  version: 1.0.0
+paths: {}
+components:
+  schemas:
+    Pet:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        tag:
+          type: string
+YAML
+    local out3
+    out3=$(konvoy build 2>&1)
+    assert_contains "$out3" "Compiling" || return 1
+}
+
+# A change to a $ref'd sub-spec must feed the codegen hash and regenerate (M3).
+test_codegen_ref_change_regenerates() {
+    _codegen_write_generate_manifest
+    mkdir -p specs
+    cat > specs/api.yaml << 'YAML'
+openapi: 3.0.3
+info:
+  title: Pet API
+  version: 1.0.0
+paths: {}
+components:
+  schemas:
+    Pet:
+      $ref: './pet.yaml#/Pet'
+YAML
+    cat > specs/pet.yaml << 'YAML'
+Pet:
+  type: object
+  required: [id, name]
+  properties:
+    id:
+      type: integer
+      format: int64
+    name:
+      type: string
+YAML
+
+    # First generate.
+    konvoy generate >/dev/null 2>&1 || { echo "    expected first generate to succeed" >&2; return 1; }
+    assert_dir_exists .konvoy/gen/openapi || return 1
+
+    # Edit ONLY the sub-spec to add a `tag` property.
+    cat > specs/pet.yaml << 'YAML'
+Pet:
+  type: object
+  required: [id, name]
+  properties:
+    id:
+      type: integer
+      format: int64
+    name:
+      type: string
+    tag:
+      type: string
+YAML
+
+    # Regenerate — the change to the sub-file must be reflected.
+    konvoy generate >/dev/null 2>&1 || { echo "    expected regenerate after sub-spec edit to succeed" >&2; return 1; }
+    # Match the generated Kotlin field declaration (`val tag`) rather than the
+    # bare word "tag", which could appear in unrelated boilerplate.
+    grep -rq 'val tag' .konvoy/gen/openapi || { echo "    expected regenerated output to declare the new tag property" >&2; return 1; }
+}
+
+# --locked refuses to generate before a pin exists, then succeeds once pinned.
+test_codegen_locked_requires_pin() {
+    _codegen_write_generate_manifest
+    _codegen_write_single_spec
+
+    # Fresh project: --locked must fail because the lockfile has no fabrikt pin.
+    local out
+    if out=$(konvoy generate --locked 2>&1); then
+        echo "    expected --locked generate to fail without a pin" >&2
+        return 1
+    fi
+    assert_contains "$out" "lockfile is out of date" || return 1
+
+    # Plain generate pins fabrikt.
+    konvoy generate >/dev/null 2>&1 || { echo "    expected plain generate to succeed" >&2; return 1; }
+    assert_file_contains konvoy.lock "[codegen_tools.fabrikt]" || return 1
+
+    # Now --locked succeeds.
+    konvoy generate --locked >/dev/null 2>&1 || { echo "    expected --locked generate to succeed after pin" >&2; return 1; }
+}
+
+# Doctor surfaces both the installed tool and the lockfile pin (L4).
+test_codegen_doctor_reports_pin() {
+    _codegen_write_generate_manifest
+    _codegen_write_single_spec
+
+    # Before any generate, doctor flags the missing pin.
+    local out_before
+    out_before=$(konvoy doctor 2>&1)
+    assert_contains "$out_before" "[!!] Lockfile pin:" || return 1
+
+    # After a generate, doctor reports the tool and the pin as ok.
+    konvoy generate >/dev/null 2>&1 || { echo "    expected generate to succeed" >&2; return 1; }
+    local out_after
+    out_after=$(konvoy doctor 2>&1)
+    assert_contains "$out_after" "[ok] fabrikt:" || return 1
+    assert_contains "$out_after" "[ok] Lockfile pin: fabrikt" || return 1
+}
+
+# Manifest validation rejects unsupported / non-numeric Fabrikt versions (M4).
+# Fast: fails before any download.
+test_codegen_invalid_version_rejected() {
+    _codegen_write_single_spec
+
+    # Below the supported floor.
+    cat > konvoy.toml << 'TOML'
+[package]
+name = "codegen-badver"
+
+[toolchain]
+kotlin = "2.2.0"
+
+[codegen.openapi]
+version = "17.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.api"
+TOML
+    local out_old
+    if out_old=$(konvoy generate 2>&1); then
+        echo "    expected generate to fail with an unsupported version" >&2
+        return 1
+    fi
+    assert_contains "$out_old" "18.0.0 or newer" || return 1
+
+    # Non-numeric version.
+    cat > konvoy.toml << 'TOML'
+[package]
+name = "codegen-badver"
+
+[toolchain]
+kotlin = "2.2.0"
+
+[codegen.openapi]
+version = "latest"
+spec = "specs/api.yaml"
+base_package = "com.example.api"
+TOML
+    local out_bad
+    if out_bad=$(konvoy generate 2>&1); then
+        echo "    expected generate to fail with a non-numeric version" >&2
+        return 1
+    fi
+    assert_contains "$out_bad" "is not a valid Fabrikt version" || return 1
+}
+
+# Manifest validation rejects unsafe / wrong-extension spec paths (L1).
+# Fast: fails before any download.
+test_codegen_invalid_spec_rejected() {
+    _codegen_write_single_spec
+
+    # Absolute spec path.
+    cat > konvoy.toml << 'TOML'
+[package]
+name = "codegen-badspec"
+
+[toolchain]
+kotlin = "2.2.0"
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "/etc/api.yaml"
+base_package = "com.example.api"
+TOML
+    local out_abs
+    if out_abs=$(konvoy generate 2>&1); then
+        echo "    expected generate to fail with an absolute spec path" >&2
+        return 1
+    fi
+    assert_contains "$out_abs" "spec must be a relative path inside the project" || return 1
+
+    # Parent-directory traversal.
+    cat > konvoy.toml << 'TOML'
+[package]
+name = "codegen-badspec"
+
+[toolchain]
+kotlin = "2.2.0"
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "../api.yaml"
+base_package = "com.example.api"
+TOML
+    local out_dotdot
+    if out_dotdot=$(konvoy generate 2>&1); then
+        echo "    expected generate to fail with a traversal spec path" >&2
+        return 1
+    fi
+    assert_contains "$out_dotdot" "must not contain" || return 1
+
+    # Wrong file extension.
+    cat > konvoy.toml << 'TOML'
+[package]
+name = "codegen-badspec"
+
+[toolchain]
+kotlin = "2.2.0"
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.txt"
+base_package = "com.example.api"
+TOML
+    local out_ext
+    if out_ext=$(konvoy generate 2>&1); then
+        echo "    expected generate to fail with a non-OpenAPI extension" >&2
+        return 1
+    fi
+    assert_contains "$out_ext" "must point to an OpenAPI" || return 1
+}
+
+# A configured spec that does not exist on disk is an error.
+test_codegen_missing_spec_errors() {
+    # Valid manifest pointing at a spec file that does not exist.
+    _codegen_write_generate_manifest
+
+    local out
+    if out=$(konvoy generate 2>&1); then
+        echo "    expected generate to fail with a missing spec file" >&2
+        return 1
+    fi
+    assert_contains "$out" "not found at" || return 1
+}
+
+# ---------------------------------------------------------------------------
 # Tests: Maven dependencies
 # ---------------------------------------------------------------------------
 
@@ -1509,6 +1913,16 @@ run_test test_plugin_kotlin_placeholder_resolves
 
 # Issue #239: serialization plugin must use embeddable JAR
 run_test test_issue_239_serialization_plugin_applied
+
+# codegen (OpenAPI)
+run_test test_codegen_generate_lifecycle
+run_test test_codegen_build_lifecycle
+run_test test_codegen_ref_change_regenerates
+run_test test_codegen_locked_requires_pin
+run_test test_codegen_doctor_reports_pin
+run_test test_codegen_invalid_version_rejected
+run_test test_codegen_invalid_spec_rejected
+run_test test_codegen_missing_spec_errors
 
 # Maven dependencies
 run_test test_update_help
