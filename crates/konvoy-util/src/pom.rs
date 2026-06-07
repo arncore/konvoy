@@ -303,7 +303,7 @@ pub fn pom_url(group_id: &str, artifact_id: &str, version: &str) -> String {
 
 /// Build the on-disk cache path for a Maven artifact metadata file.
 ///
-/// Layout matches the contract in CLAUDE.md:
+/// Layout matches the contract in AGENTS.md:
 /// `~/.konvoy/cache/pom/<group_path>/<artifact_id>-<version>.<extension>`.
 ///
 /// `group_id` is split on `.` so that `org.jetbrains.kotlinx` becomes
@@ -981,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn pom_cache_path_layout_matches_claude_md_contract() {
+    fn pom_cache_path_layout_matches_agents_md_contract() {
         // Verify the layout suffix without depending on HOME (env mutation in
         // tests races with other tests in the crate). The suffix is the
         // load-bearing part — the prefix is `konvoy_home()` which is tested

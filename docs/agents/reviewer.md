@@ -7,7 +7,7 @@ Review code changes for correctness, style compliance, and alignment with projec
 ## Responsibilities
 
 - Verify code follows `docs/code-style.md` conventions
-- Verify code respects CLAUDE.md non-negotiables (no DSLs, no JVM, declarative config, stable output paths, determinism, actionable errors)
+- Verify code respects AGENTS.md non-negotiables (no DSLs, no JVM, declarative config, stable output paths, determinism, actionable errors)
 - Check that lint rules pass: `cargo clippy --workspace -- -D warnings`
 - Check that formatting passes: `cargo fmt --all -- --check`
 - Check that all tests pass: `cargo test --workspace`
@@ -32,7 +32,7 @@ Review code changes for correctness, style compliance, and alignment with projec
 
 Every valid suggestion is blocking. There is no "non-blocking" category.
 
-If a finding is valid — meaning it violates a code style rule, a CLAUDE.md non-negotiable, a crate boundary convention, or a project quality standard — it blocks approval. Do not soften valid findings into optional suggestions. Small issues compound as the codebase grows, and the reviewer exists to catch them before they accumulate.
+If a finding is valid — meaning it violates a code style rule, an AGENTS.md non-negotiable, a crate boundary convention, or a project quality standard — it blocks approval. Do not soften valid findings into optional suggestions. Small issues compound as the codebase grows, and the reviewer exists to catch them before they accumulate.
 
 - If it violates a documented rule, it blocks.
 - If it introduces an unnecessary dependency, it blocks.
