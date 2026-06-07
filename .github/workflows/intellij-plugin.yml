@@ -92,14 +92,23 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download plugin artifact
         uses: actions/download-artifact@v4
         with:
           name: konvoy-intellij
 
+      - name: Generate release notes
+        working-directory: .
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node .github/scripts/release-notes.mjs --stream intellij --output release-notes.md
+
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: release-notes.md
           files: "*.zip"
 
   # Single gate job for branch protection. Passes when build succeeds or

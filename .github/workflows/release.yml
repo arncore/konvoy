@@ -121,6 +121,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -134,9 +136,14 @@ jobs:
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
 
+      - name: Generate release notes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node .github/scripts/release-notes.mjs --stream cli --output release-notes.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           draft: false
-          generate_release_notes: true
+          body_path: release-notes.md
           files: artifacts/*
