@@ -251,13 +251,18 @@ object KonvoyWorkspaceModelUpdater {
         val version = source.version
 
         val classifier = source.classifier
+        // The engine stores per-target klibs under the per-target artifact id
+        // ("artifactId-suffix") — used for BOTH the directory and the filename,
+        // e.g. .../kotlinx-serialization-core-macosarm64/1.7.3/
+        //          kotlinx-serialization-core-macosarm64-1.7.3.klib
+        val targetArtifactId = "$artifactId-$mavenSuffix"
         val fileName = if (classifier != null) {
-            "$artifactId-$mavenSuffix-$version-$classifier.klib"
+            "$targetArtifactId-$version-$classifier.klib"
         } else {
-            "$artifactId-$mavenSuffix-$version.klib"
+            "$targetArtifactId-$version.klib"
         }
 
-        val path = "$konvoyHome/cache/maven/$groupPath/$artifactId/$version/$fileName"
+        val path = "$konvoyHome/cache/maven/$groupPath/$targetArtifactId/$version/$fileName"
         return if (File(path).exists()) path else null
     }
 
