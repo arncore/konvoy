@@ -13,10 +13,15 @@ const GENERATOR_NAME: &str = "openapi";
 const TOOL_NAME: &str = "fabrikt";
 
 /// Fixed Fabrikt generation flags. These affect generated output, so they are
-/// also folded into the config hash (see `config_hash_parts`) — if either ever
-/// changes, the codegen hash and build cache key change with it.
+/// also folded into the config hash (see `config_hash_parts`) — if any of them
+/// ever changes, the codegen hash and build cache key change with it.
 const FABRIKT_TARGETS: &str = "HTTP_MODELS";
 const FABRIKT_SERIALIZATION_LIBRARY: &str = "KOTLINX_SERIALIZATION";
+/// Fabrikt defaults to `JAVAX_VALIDATION`, which emits `javax.validation.*`
+/// annotations on required/constrained fields. Those are JVM-only and do not
+/// exist on Kotlin/Native, so generated models would not compile. Konvoy is
+/// native-first, so validation annotations are disabled.
+const FABRIKT_VALIDATION_LIBRARY: &str = "NO_VALIDATION";
 
 /// Upper bound on the number of spec files (top-level + transitive `$ref`
 /// targets) hashed for a single generator. A safety cap against pathological
@@ -99,6 +104,7 @@ impl CodeGenerator for OpenApiGenerator {
             format!("base_package={}", self.config.base_package),
             format!("targets={FABRIKT_TARGETS}"),
             format!("serialization_library={FABRIKT_SERIALIZATION_LIBRARY}"),
+            format!("validation_library={FABRIKT_VALIDATION_LIBRARY}"),
         ]
     }
 
@@ -141,6 +147,8 @@ impl CodeGenerator for OpenApiGenerator {
                 OsString::from(FABRIKT_TARGETS),
                 OsString::from("--serialization-library"),
                 OsString::from(FABRIKT_SERIALIZATION_LIBRARY),
+                OsString::from("--validation-library"),
+                OsString::from(FABRIKT_VALIDATION_LIBRARY),
             ],
             verbose,
         )
