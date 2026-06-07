@@ -12,6 +12,32 @@ const CATEGORIES = [
 
 const STREAMS = new Set(["cli", "intellij"]);
 
+const CATEGORY_OVERRIDES = new Map([
+  [250, "Testing"],
+  [251, "Enhancements"],
+  [252, "Enhancements"],
+  [253, "Enhancements"],
+  [254, "Bug Fixes"],
+  [255, "Bug Fixes"],
+  [256, "Bug Fixes"],
+  [257, "Other Changes"],
+  [258, "Other Changes"],
+  [259, "Other Changes"],
+  [260, "Other Changes"],
+  [261, "Other Changes"],
+  [263, "Other Changes"],
+  [264, "Testing"],
+  [265, "Testing"],
+  [266, "Enhancements"],
+  [269, "Enhancements"],
+  [270, "Enhancements"],
+  [271, "Bug Fixes"],
+  [272, "Bug Fixes"],
+  [273, "Other Changes"],
+  [274, "Security"],
+  [275, "Other Changes"],
+]);
+
 function parseArgs(argv) {
   const args = {};
   for (let index = 0; index < argv.length; index += 1) {
@@ -72,14 +98,53 @@ export function filterPullRequests(pullRequests, stream) {
   return pullRequests.filter((pullRequest) => classifyPullRequest(pullRequest, stream));
 }
 
-function categoryForPullRequest(pullRequest) {
+function categoryByLabel(pullRequest) {
   const labels = new Set(pullRequest.labels.map((label) => label.name));
   return CATEGORIES.find((category) => {
     if (category.labels.includes("*")) {
-      return true;
+      return false;
     }
     return category.labels.some((label) => labels.has(label));
   });
+}
+
+function categoryByTitle(pullRequest) {
+  const title = pullRequest.title.toLowerCase();
+
+  if (/\b(security|advisories|advisory|vulnerabilit|dependabot|audit)\b/.test(title)) {
+    return CATEGORIES.find((category) => category.title === "Security");
+  }
+
+  if (/\b(fix|bug|failure|fail|regression|broken|compatibility)\b/.test(title)) {
+    return CATEGORIES.find((category) => category.title === "Bug Fixes");
+  }
+
+  if (/\b(test|tests|testing|coverage|ci)\b/.test(title)) {
+    return CATEGORIES.find((category) => category.title === "Testing");
+  }
+
+  if (
+    /\b(add|support|parallelize|perf|performance|typed|type-safety|enum|progress|diagnostics|completion|clickable)\b/.test(
+      title,
+    )
+  ) {
+    return CATEGORIES.find((category) => category.title === "Enhancements");
+  }
+
+  return undefined;
+}
+
+export function categoryForPullRequest(pullRequest) {
+  const override = CATEGORY_OVERRIDES.get(pullRequest.number);
+  if (override) {
+    return CATEGORIES.find((category) => category.title === override);
+  }
+
+  return (
+    categoryByLabel(pullRequest) ??
+    categoryByTitle(pullRequest) ??
+    CATEGORIES.find((category) => category.title === "Other Changes")
+  );
 }
 
 function streamDisplayName(stream) {
@@ -107,6 +172,9 @@ export function buildReleaseNotes({ stream, owner, repo, tag, previousTag, pullR
         continue;
       }
 
+      if (lines.at(-1) !== "## What's Changed") {
+        lines.push("");
+      }
       lines.push(`### ${category.title}`);
       for (const pullRequest of categoryPullRequests) {
         lines.push(
