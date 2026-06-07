@@ -21,6 +21,12 @@
     </extensions>
 
     <extensions defaultExtensionNs="com.intellij">
+        <!-- Associate konvoy.lock with the TOML language (the .toml manifest is
+             auto-associated by the TOML plugin, but the .lock extension is not),
+             so it parses via PSI — needed for dependency/plugin array tables and
+             for TOML editor features on the lockfile. -->
+        <fileType name="TOML" fileNames="konvoy.lock"/>
+
         <!-- SDK type for Konvoy toolchains -->
         <sdkType implementation="com.konvoy.ide.sdk.KonvoySdkType"/>
 

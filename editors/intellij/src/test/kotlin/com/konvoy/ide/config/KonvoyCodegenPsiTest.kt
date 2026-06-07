@@ -72,4 +72,55 @@ class KonvoyCodegenPsiTest : BasePlatformTestCase() {
         assertEquals("20.0.0", pin!!.version)
         assertEquals("abc123", pin.sha256)
     }
+
+    fun testKonvoyLockIsRecognizedAsToml() {
+        // The .lock extension isn't auto-associated with TOML; the plugin adds
+        // the association so the lockfile parses via PSI (and array tables work).
+        val file = myFixture.configureByText("konvoy.lock", "[toolchain]\nkonanc_version = \"2.2.0\"\n")
+        assertTrue(
+            "konvoy.lock must be parsed as a TOML file, was ${file.javaClass.simpleName}",
+            file is org.toml.lang.psi.TomlFile,
+        )
+    }
+
+    fun testParsesMavenDependencyLockViaPsi() {
+        val file = myFixture.configureByText(
+            "konvoy.lock",
+            """
+            [toolchain]
+            konanc_version = "2.2.0"
+
+            [[dependencies]]
+            name = "kotlinx-serialization-core"
+            source_type = "maven"
+            version = "1.7.3"
+            maven = "org.jetbrains.kotlinx:kotlinx-serialization-core"
+            source_hash = "abc"
+
+            [dependencies.targets]
+            macos_arm64 = "deadbeef"
+
+            [[dependencies]]
+            name = "kotlinx-serialization-json"
+            source_type = "maven"
+            version = "1.7.3"
+            maven = "org.jetbrains.kotlinx:kotlinx-serialization-json"
+            source_hash = "def"
+
+            [dependencies.targets]
+            macos_arm64 = "cafebabe"
+            """.trimIndent(),
+        )
+
+        val lock = KonvoyTomlParser.parseLockfile(project, file.virtualFile)
+        assertNotNull("lockfile should parse via PSI", lock)
+        assertEquals("expected 2 maven dependencies", 2, lock!!.dependencies.size)
+
+        val core = lock.dependencies.first { it.name == "kotlinx-serialization-core" }
+        val src = core.source
+        assertTrue("expected a Maven source, got $src", src is DepSource.Maven)
+        src as DepSource.Maven
+        assertEquals("1.7.3", src.version)
+        assertEquals("org.jetbrains.kotlinx:kotlinx-serialization-core", src.maven)
+    }
 }
