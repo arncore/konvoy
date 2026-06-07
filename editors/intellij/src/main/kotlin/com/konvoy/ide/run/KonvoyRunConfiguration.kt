@@ -61,6 +61,21 @@ enum class KonvoyCommand(val displayName: String, val subcommand: String) {
     LINT("Lint", "lint"),
 }
 
+internal fun createKonvoyCommandLine(
+    workDirectory: File,
+    command: KonvoyCommand,
+    extraArgs: String,
+): GeneralCommandLine {
+    val cmd = GeneralCommandLine("konvoy", command.subcommand)
+    if (extraArgs.isNotBlank()) {
+        cmd.addParameters(ParametersList.parse(extraArgs).toList())
+    }
+    cmd.workDirectory = workDirectory
+    cmd.withParentEnvironmentType(GeneralCommandLine.ParentEnvironmentType.CONSOLE)
+    cmd.withEnvironment("KONVOY_PROGRESS", "plain")
+    return cmd
+}
+
 /**
  * Executes the konvoy command as an OS process.
  */
@@ -70,12 +85,11 @@ class KonvoyCommandLineState(
 ) : CommandLineState(environment) {
 
     override fun startProcess(): ProcessHandler {
-        val cmd = GeneralCommandLine("konvoy", config.command.subcommand)
-        if (config.extraArgs.isNotBlank()) {
-            cmd.addParameters(com.intellij.execution.configurations.ParametersList.parse(config.extraArgs).toList())
-        }
-        cmd.workDirectory = File(config.project.basePath!!)
-        cmd.withParentEnvironmentType(GeneralCommandLine.ParentEnvironmentType.CONSOLE)
+        val cmd = createKonvoyCommandLine(
+            File(config.project.basePath!!),
+            config.command,
+            config.extraArgs,
+        )
         return ProcessHandlerFactory.getInstance().createColoredProcessHandler(cmd)
     }
 }

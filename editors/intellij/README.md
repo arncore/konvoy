@@ -60,6 +60,10 @@ Run configurations for all Konvoy commands:
 
 Right-click on `konvoy.toml` to create a run configuration, or use the run menu.
 
+The plugin runs Konvoy through IntelliJ's colored process handler and sets
+`KONVOY_PROGRESS=plain`, so downloads leave readable completed truck rows in
+the Run tool window without ANSI cursor-control redraws.
+
 ### Toolchain SDK
 
 Discovers Konvoy-managed toolchains from `~/.konvoy/toolchains/` and registers them as IntelliJ SDKs. If the Kotlin version specified in `konvoy.toml` doesn't have an installed toolchain, the plugin shows a notification with instructions to install it.
