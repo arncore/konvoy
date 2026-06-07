@@ -151,5 +151,59 @@ class KonvoyTomlAnnotator : Annotator {
                     .create()
             }
         }
+
+        if (tableName == "codegen.openapi" && value != null) {
+            annotateOpenApiValue(keyName, value, kv, holder)
+        }
+    }
+
+    // Mirrors the Rust manifest validator (validate_codegen) and the VS Code
+    // extension so all three agree with `konvoy build`.
+    private fun annotateOpenApiValue(
+        keyName: String,
+        value: String,
+        kv: TomlKeyValue,
+        holder: AnnotationHolder,
+    ) {
+        fun error(message: String) {
+            holder.newAnnotation(HighlightSeverity.ERROR, message)
+                .range(kv.value!!)
+                .create()
+        }
+
+        when (keyName) {
+            "version" -> {
+                val major = value.substringBefore('.').substringBefore('-').substringBefore('+').toIntOrNull()
+                when {
+                    value.isEmpty() -> error("Fabrikt version must not be empty")
+                    major == null -> error("version must be a valid Fabrikt version like \"20.0.0\"")
+                    major < MIN_FABRIKT_MAJOR -> error("Konvoy requires Fabrikt $MIN_FABRIKT_MAJOR.0.0 or newer")
+                }
+            }
+            "spec" -> {
+                val isAbsolute = value.startsWith("/") || ABSOLUTE_WINDOWS_PATH_RE.containsMatchIn(value)
+                when {
+                    value.isEmpty() -> error("spec must not be empty")
+                    isAbsolute -> error("spec must be a relative path inside the project")
+                    value.split('/', '\\').contains("..") ->
+                        error("spec must be a relative path inside the project (must not contain \"..\")")
+                    !(value.endsWith(".yaml") || value.endsWith(".yml") || value.endsWith(".json")) ->
+                        error("spec must point to an OpenAPI .yaml, .yml, or .json file")
+                }
+            }
+            "base_package" -> {
+                when {
+                    value.isEmpty() -> error("base_package must not be empty")
+                    !value.matches(PACKAGE_RE) ->
+                        error("base_package must be dot-separated identifiers like \"com.example.api\"")
+                }
+            }
+        }
+    }
+
+    private companion object {
+        const val MIN_FABRIKT_MAJOR = 18
+        val PACKAGE_RE = Regex("^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$")
+        val ABSOLUTE_WINDOWS_PATH_RE = Regex("^[A-Za-z]:[\\\\/]")
     }
 }

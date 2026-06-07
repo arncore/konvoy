@@ -519,6 +519,7 @@ pub(crate) fn build_single(
         cc.jre_home,
         cc.options.verbose,
         cc.options.locked,
+        cc.options.force,
     )?;
     let mut compile_sources = sources;
     compile_sources.extend(gen_sources);
@@ -704,8 +705,23 @@ fn compile(
 }
 
 /// Serialize lockfile content for cache key computation.
+///
+/// Codegen tool pins (`[codegen_tools.*]`) are intentionally excluded from the
+/// cache key: the tool *version* already feeds the key via `codegen_hashes`
+/// (see `OpenApiGenerator::config_hash_parts`), and the pinned JAR sha256 is a
+/// download-integrity value (enforced at fetch time), not a build-output
+/// determinant. Including it would also destabilize the first build's cache key,
+/// because the pin is written lazily *during* codegen (`run_codegen` →
+/// `persist_managed_tool_hash`) — the issue #133 class of spurious-rebuild bug.
 pub(crate) fn lockfile_toml_content(lockfile: &Lockfile) -> Result<String, EngineError> {
-    toml::to_string_pretty(lockfile).map_err(|source| EngineError::TomlSerialize {
+    let for_cache_key = if lockfile.codegen_tools.is_empty() {
+        std::borrow::Cow::Borrowed(lockfile)
+    } else {
+        let mut clone = lockfile.clone();
+        clone.codegen_tools.clear();
+        std::borrow::Cow::Owned(clone)
+    };
+    toml::to_string_pretty(for_cache_key.as_ref()).map_err(|source| EngineError::TomlSerialize {
         what: "konvoy.lock",
         source,
     })
@@ -1279,6 +1295,27 @@ mod tests {
         let lockfile = Lockfile::with_toolchain("2.1.0");
         let content = lockfile_toml_content(&lockfile).unwrap();
         assert!(content.contains("2.1.0"));
+    }
+
+    #[test]
+    fn lockfile_toml_content_ignores_codegen_tools() {
+        // Codegen tool pins are written lazily during the build, so they must
+        // NOT contribute to the cache-key content — otherwise the first build
+        // (no pin) and the second build (pin present) would key differently and
+        // miss the cache (issue #133 class bug).
+        let without = Lockfile::with_toolchain("2.1.0");
+        let mut with = Lockfile::with_toolchain("2.1.0");
+        with.set_codegen_tool("fabrikt", "20.0.0", "deadbeef");
+
+        let content_without = lockfile_toml_content(&without).unwrap();
+        let content_with = lockfile_toml_content(&with).unwrap();
+
+        assert_eq!(
+            content_without, content_with,
+            "codegen tool pins must not change the cache-key lockfile content"
+        );
+        assert!(!content_with.contains("codegen_tools"));
+        assert!(!content_with.contains("deadbeef"));
     }
 
     #[test]
@@ -2688,6 +2725,66 @@ mod tests {
 
         let result = check_lockfile_staleness(&manifest, &lockfile);
         assert!(result.is_ok(), "matching detekt should pass: {result:?}");
+    }
+
+    const CODEGEN_MANIFEST: &str = "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[codegen.openapi]\nversion = \"20.0.0\"\nspec = \"openapi.yaml\"\nbase_package = \"com.example.api\"\n";
+
+    #[test]
+    fn check_lockfile_staleness_missing_codegen_tool_errors() {
+        let manifest =
+            konvoy_config::manifest::Manifest::from_str(CODEGEN_MANIFEST, "konvoy.toml").unwrap();
+        // Lockfile has toolchain but no [codegen_tools.fabrikt] pin.
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("lockfile is out of date"),
+            "expected staleness error for missing codegen pin, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_wrong_codegen_tool_version_errors() {
+        let manifest =
+            konvoy_config::manifest::Manifest::from_str(CODEGEN_MANIFEST, "konvoy.toml").unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.set_codegen_tool("fabrikt", "19.0.0", "abc123");
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("lockfile is out of date"),
+            "expected staleness error for mismatched codegen pin, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_matching_codegen_tool_succeeds() {
+        let manifest =
+            konvoy_config::manifest::Manifest::from_str(CODEGEN_MANIFEST, "konvoy.toml").unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.set_codegen_tool("fabrikt", "20.0.0", "abc123");
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(result.is_ok(), "matching codegen pin should pass: {result:?}");
+    }
+
+    #[test]
+    fn check_lockfile_staleness_no_codegen_in_manifest_ignores_lockfile_codegen() {
+        // No [codegen] in the manifest — lockfile codegen pins are irrelevant.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.set_codegen_tool("fabrikt", "20.0.0", "abc123");
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(result.is_ok(), "unused codegen pin should be ignored: {result:?}");
     }
 
     #[test]

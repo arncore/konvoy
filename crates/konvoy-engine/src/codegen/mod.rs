@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 use konvoy_config::lockfile::{Lockfile, ToolchainLock};
 use konvoy_config::manifest::Codegen;
@@ -40,7 +41,12 @@ pub trait CodeGenerator {
     fn config_hash_parts(&self) -> Vec<String>;
 
     /// Project-relative input files read by this generator.
-    fn input_files(&self) -> Vec<PathBuf>;
+    ///
+    /// `project_root` is provided so generators can resolve transitive inputs
+    /// (e.g. OpenAPI specs that reference other files via `$ref`). The returned
+    /// paths are project-relative and their contents are folded into the
+    /// generator hash (and thus the build cache key).
+    fn input_files(&self, project_root: &Path) -> Vec<PathBuf>;
 
     /// Generate sources into `output_dir`.
     ///
@@ -119,6 +125,7 @@ pub fn run_codegen(
     jre_home: Option<&Path>,
     verbose: bool,
     locked: bool,
+    force: bool,
 ) -> Result<Vec<PathBuf>, EngineError> {
     let generators = active_generators(codegen);
     if generators.is_empty() {
@@ -132,9 +139,10 @@ pub fn run_codegen(
         let output_dir = generator_output_dir(project_root, generator.name());
         let input_hash_path = output_dir.join(".input_hash");
         let stored_hash = std::fs::read_to_string(&input_hash_path).ok();
-        let stale = stored_hash
-            .as_deref()
-            .is_none_or(|stored| stored.trim() != input_hash);
+        let stale = force
+            || stored_hash
+                .as_deref()
+                .is_none_or(|stored| stored.trim() != input_hash);
 
         let tool_spec = generator.managed_tool();
         let needs_tool = stale || locked || needs_tool_lock_update(lockfile, &tool_spec);
@@ -200,12 +208,9 @@ fn resolve_jre_home(
         return Ok(jre_home.to_path_buf());
     }
 
-    if !konvoy_konanc::toolchain::is_installed(kotlin_version)? {
-        eprintln!("    Installing Kotlin/Native {kotlin_version} (for codegen JRE)...");
-        konvoy_konanc::toolchain::install(kotlin_version)?;
-    }
-
-    Ok(konvoy_konanc::toolchain::jre_home_path(kotlin_version)?)
+    // Codegen only needs a JRE to run the tool JAR, so install just the managed
+    // JRE instead of downloading the full Kotlin/Native compiler toolchain.
+    Ok(konvoy_konanc::toolchain::ensure_jre(kotlin_version)?)
 }
 
 fn compute_generator_hash(
@@ -219,7 +224,7 @@ fn compute_generator_hash(
     ];
     parts.extend(generator.config_hash_parts());
 
-    for input in generator.input_files() {
+    for input in generator.input_files(project_root) {
         let full_path = project_root.join(&input);
         if !full_path.exists() {
             return Err(EngineError::CodegenInputNotFound {
@@ -276,6 +281,13 @@ fn needs_tool_lock_update(lockfile: &Lockfile, spec: &ManagedToolSpec) -> bool {
     !lockfile.has_codegen_tool(&spec.id, spec.version())
 }
 
+/// Serializes the read-modify-write of `konvoy.lock` across the codegen tool
+/// persistence path. Path-dependency builds run `build_single` (and therefore
+/// `run_codegen`) in parallel, and each generator may persist its tool pin into
+/// the shared root lockfile; without this guard two threads could lose each
+/// other's update or interleave a write.
+static CODEGEN_LOCK_PERSIST: Mutex<()> = Mutex::new(());
+
 fn persist_managed_tool_hash(
     lockfile_path: &Path,
     lockfile: &Lockfile,
@@ -283,6 +295,12 @@ fn persist_managed_tool_hash(
     spec: &ManagedToolSpec,
     hash: &str,
 ) -> Result<(), EngineError> {
+    // Hold the lock for the entire read-modify-write so concurrent persists are
+    // atomic with respect to one another. A poisoned lock only means another
+    // persist panicked; the data itself is still consistent, so recover it.
+    let _guard = CODEGEN_LOCK_PERSIST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut updated = if lockfile_path.exists() {
         Lockfile::from_path(lockfile_path)?
     } else {
@@ -349,8 +367,16 @@ pub fn run_java_jar(
     }
 
     if !output.status.success() {
-        let raw = format!("{stdout}{stderr}");
-        let hint = first_non_empty_line(&raw)
+        // JVM CLIs typically print the real error to stderr (and banners to
+        // stdout), so prefer stderr for the one-line hint and fall back to
+        // stdout. Never concatenate the streams — that can fuse an unrelated
+        // stdout line onto the first stderr line.
+        let hint_source = if stderr.trim().is_empty() {
+            stdout.as_ref()
+        } else {
+            stderr.as_ref()
+        };
+        let hint = first_non_empty_line(hint_source)
             .map(|line| format!(" first message: {line}"))
             .unwrap_or_default();
         return Err(EngineError::CodegenFailed {

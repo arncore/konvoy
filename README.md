@@ -119,7 +119,7 @@ hello/
 - `konvoy run [--target <triple|host>] [--release] [--force] [--locked] [-- <args…>]` — build and run
 - `konvoy test [--target <triple|host>] [--release] [--verbose] [--force] [--locked] [--filter <pattern>]` — build and run tests
 - `konvoy lint [--verbose] [--config <path>] [--locked]` — run detekt static analysis on Kotlin sources
-- `konvoy generate [--verbose] [--locked]` — run configured source generators without compiling
+- `konvoy generate [--verbose] [--locked] [--force]` — run configured source generators without compiling
 - `konvoy update` — resolve Maven dependencies (including transitives via POM) and update `konvoy.lock`
 - `konvoy clean` — remove build artifacts
 - `konvoy doctor` — check environment, toolchain, and dependency setup
@@ -272,7 +272,7 @@ spec = "specs/api.yaml"
 base_package = "com.example.api"
 ```
 
-Generated sources are included in `konvoy build` and `konvoy test` cache keys through the generator config and input-file hashes. Use `konvoy generate` to refresh generated files without compiling. Managed codegen tool hashes are pinned in `konvoy.lock` under `[codegen_tools.<tool>]`; `--locked` requires the pinned tool JAR to already be downloaded.
+Generated sources are included in `konvoy build` and `konvoy test` cache keys through the generator config and input-file hashes, including any files the spec pulls in via `$ref`. Use `konvoy generate` to refresh generated files without compiling, or `konvoy generate --force` to regenerate even when inputs are unchanged. Managed codegen tool hashes are pinned in `konvoy.lock` under `[codegen_tools.<tool>]`; `--locked` requires the pinned tool JAR to already be downloaded.
 
 Fabrikt is invoked with `KOTLINX_SERIALIZATION` output, so projects using generated `@Serializable` models should also declare the serialization compiler plugin and runtime dependencies.
 

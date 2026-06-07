@@ -53,9 +53,15 @@ impl ManagedToolSpec {
 
     /// Return the managed artifact path under `~/.konvoy/tools/`.
     ///
+    /// Validates the tool id/version/coordinate first so that no caller — e.g.
+    /// [`is_installed`](Self::is_installed) on the `--locked` path — ever builds
+    /// a filesystem path from an unvalidated, possibly traversal-laden value.
+    ///
     /// # Errors
-    /// Returns an error if the Konvoy home directory cannot be resolved.
+    /// Returns an error if the tool id/version is unsafe, or the Konvoy home
+    /// directory cannot be resolved.
     pub fn artifact_path(&self) -> Result<PathBuf, EngineError> {
+        self.validate()?;
         Ok(konvoy_util::fs::konvoy_home()?
             .join("tools")
             .join(&self.id)

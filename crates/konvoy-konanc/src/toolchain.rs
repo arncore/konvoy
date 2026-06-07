@@ -223,6 +223,25 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
     })
 }
 
+/// Ensure only the managed JRE for `version` is installed, returning its
+/// `JAVA_HOME`.
+///
+/// Unlike [`install`], this does **not** download the Kotlin/Native compiler —
+/// it is for callers (e.g. codegen running a tool JAR) that need a JRE but not
+/// `konanc`. If the JRE is already present, no download occurs.
+///
+/// # Errors
+/// Returns an error if the JRE download or extraction fails, or the Konvoy home
+/// directory cannot be resolved.
+pub fn ensure_jre(version: &str) -> Result<PathBuf, KonancError> {
+    // `install_jre` renames the extracted JRE into `<version_dir>/jre`, so the
+    // version directory must exist first (it normally does only after a konanc
+    // install, which we are intentionally skipping here).
+    konvoy_util::fs::ensure_dir(&version_dir(version)?)?;
+    let (home, _sha256) = install_jre(version)?;
+    Ok(home)
+}
+
 /// Download and install the bundled JRE for a toolchain version.
 ///
 /// Returns `(jre_home, tarball_sha256)`. The SHA-256 is `None` if the JRE was

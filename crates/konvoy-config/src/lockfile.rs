@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic counter making each `write_to` temp file name unique within the
+/// process, so concurrent writers never collide on a shared temp path.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The `konvoy.lock` lockfile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -159,7 +164,12 @@ impl Lockfile {
     pub fn write_to(&self, path: &Path) -> Result<(), LockfileError> {
         let content =
             toml::to_string_pretty(self).map_err(|e| LockfileError::Serialize { source: e })?;
-        let tmp_path = path.with_extension("lock.tmp");
+        // Use a process-and-counter-unique temp name so concurrent writers
+        // (e.g. parallel path-dependency builds that each persist a codegen
+        // tool pin) never write to the same temp file and corrupt it. The
+        // rename below is still the atomicity boundary for the final file.
+        let unique = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = path.with_extension(format!("lock.tmp.{}.{unique}", std::process::id()));
         std::fs::write(&tmp_path, &content).map_err(|e| LockfileError::Write {
             path: tmp_path.display().to_string(),
             source: e,
@@ -375,6 +385,26 @@ konanc_version = "2.1.0"
             .unwrap_or_else(|| panic!("missing fabrikt tool pin"));
         assert_eq!(pin.version, "20.0.0");
         assert_eq!(pin.sha256, "abc123");
+    }
+
+    #[test]
+    fn has_codegen_tool_predicate() {
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        // No pin at all.
+        assert!(!lockfile.has_codegen_tool("fabrikt", "20.0.0"));
+
+        // Matching version and non-empty hash.
+        lockfile.set_codegen_tool("fabrikt", "20.0.0", "abc123");
+        assert!(lockfile.has_codegen_tool("fabrikt", "20.0.0"));
+
+        // Version mismatch.
+        assert!(!lockfile.has_codegen_tool("fabrikt", "19.0.0"));
+        // Different tool id.
+        assert!(!lockfile.has_codegen_tool("grpc", "20.0.0"));
+
+        // Empty / whitespace-only hash must not count as pinned.
+        lockfile.set_codegen_tool("fabrikt", "20.0.0", "   ");
+        assert!(!lockfile.has_codegen_tool("fabrikt", "20.0.0"));
     }
 
     #[test]

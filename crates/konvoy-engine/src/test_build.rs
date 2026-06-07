@@ -137,6 +137,7 @@ pub fn build_tests(
         ctx.jre_home.as_deref(),
         options.verbose,
         options.locked,
+        options.force,
     )?;
     sources.extend(gen_sources);
 

@@ -107,6 +107,9 @@ enum Command {
         /// Require the lockfile to be up-to-date; error on any mismatch
         #[arg(long)]
         locked: bool,
+        /// Regenerate sources even when inputs are unchanged
+        #[arg(long)]
+        force: bool,
     },
     /// Resolve Maven dependencies and update konvoy.lock
     Update,
@@ -183,7 +186,11 @@ fn main() {
             config,
             locked,
         } => cmd_lint(verbose, config, locked),
-        Command::Generate { verbose, locked } => cmd_generate(verbose, locked),
+        Command::Generate {
+            verbose,
+            locked,
+            force,
+        } => cmd_generate(verbose, locked, force),
         Command::Update => cmd_update(),
         Command::Clean { all } => cmd_clean(all),
         Command::Doctor => cmd_doctor(),
@@ -410,7 +417,7 @@ fn cmd_lint(verbose: bool, config: Option<PathBuf>, locked: bool) -> CliResult {
     Err(format!("lint found {} issue(s)", result.finding_count).into())
 }
 
-fn cmd_generate(verbose: bool, locked: bool) -> CliResult {
+fn cmd_generate(verbose: bool, locked: bool, force: bool) -> CliResult {
     let root = project_root()?;
     let manifest = konvoy_config::Manifest::from_path(&root.join("konvoy.toml"))?;
     if !manifest.codegen.has_any() {
@@ -428,6 +435,7 @@ fn cmd_generate(verbose: bool, locked: bool) -> CliResult {
         None,
         verbose,
         locked,
+        force,
     )?;
 
     for summary in konvoy_engine::codegen::generator_summaries(&root, &manifest.codegen) {
@@ -547,9 +555,20 @@ fn check_detekt(manifest: &konvoy_config::Manifest) -> u32 {
     }
 }
 
-fn check_codegen(manifest: &konvoy_config::Manifest) -> u32 {
+fn check_codegen(manifest: &konvoy_config::Manifest, cwd: &std::path::Path) -> u32 {
+    let tools = konvoy_engine::codegen::managed_tools(&manifest.codegen);
+    if tools.is_empty() {
+        return 0;
+    }
+
     let mut issues: u32 = 0;
-    for tool in konvoy_engine::codegen::managed_tools(&manifest.codegen) {
+
+    // Load the lockfile once so we can verify each tool is pinned — `--locked`
+    // builds require a matching `[codegen_tools.<tool>]` entry, so doctor must
+    // surface a missing pin rather than only checking the on-disk JAR.
+    let lockfile = konvoy_config::lockfile::Lockfile::from_path(&cwd.join("konvoy.lock")).ok();
+
+    for tool in tools {
         match tool.is_installed() {
             Ok(true) => match tool.artifact_path() {
                 Ok(path) => {
@@ -574,6 +593,28 @@ fn check_codegen(manifest: &konvoy_config::Manifest) -> u32 {
             }
             Err(e) => {
                 eprintln!("  [!!] {}: {e}", tool.id);
+                issues = issues.saturating_add(1);
+            }
+        }
+
+        // Verify the lockfile pin (independent of whether the JAR is present).
+        match &lockfile {
+            Some(lockfile) if lockfile.has_codegen_tool(&tool.id, tool.version()) => {
+                eprintln!("  [ok] Lockfile pin: {}", tool.id);
+            }
+            Some(_) => {
+                eprintln!(
+                    "  [!!] Lockfile pin: '{}' {} not pinned in konvoy.lock — run 'konvoy generate' or 'konvoy build' (required for --locked)",
+                    tool.id,
+                    tool.version()
+                );
+                issues = issues.saturating_add(1);
+            }
+            None => {
+                eprintln!(
+                    "  [!!] Lockfile pin: no konvoy.lock found — run 'konvoy generate' or 'konvoy build' to pin {}",
+                    tool.id
+                );
                 issues = issues.saturating_add(1);
             }
         }
@@ -661,7 +702,7 @@ fn cmd_doctor() -> CliResult {
                 eprintln!("  [ok] Project: {}", manifest.package.name);
                 issues = issues.saturating_add(check_toolchain(&manifest));
                 issues = issues.saturating_add(check_detekt(&manifest));
-                issues = issues.saturating_add(check_codegen(&manifest));
+                issues = issues.saturating_add(check_codegen(&manifest, &cwd));
                 issues = issues.saturating_add(check_maven_deps(&manifest, &cwd));
             }
             Err(e) => {
@@ -1094,9 +1135,14 @@ mod tests {
     fn parse_generate_defaults() {
         let cli = Cli::try_parse_from(["konvoy", "generate"]).unwrap();
         match cli.command {
-            Command::Generate { verbose, locked } => {
+            Command::Generate {
+                verbose,
+                locked,
+                force,
+            } => {
                 assert!(!verbose);
                 assert!(!locked);
+                assert!(!force);
             }
             other => panic!("expected Generate, got {other:?}"),
         }
@@ -1106,9 +1152,14 @@ mod tests {
     fn parse_generate_verbose() {
         let cli = Cli::try_parse_from(["konvoy", "generate", "--verbose"]).unwrap();
         match cli.command {
-            Command::Generate { verbose, locked } => {
+            Command::Generate {
+                verbose,
+                locked,
+                force,
+            } => {
                 assert!(verbose);
                 assert!(!locked);
+                assert!(!force);
             }
             other => panic!("expected Generate, got {other:?}"),
         }
@@ -1118,9 +1169,31 @@ mod tests {
     fn parse_generate_locked() {
         let cli = Cli::try_parse_from(["konvoy", "generate", "--locked"]).unwrap();
         match cli.command {
-            Command::Generate { verbose, locked } => {
+            Command::Generate {
+                verbose,
+                locked,
+                force,
+            } => {
                 assert!(!verbose);
                 assert!(locked);
+                assert!(!force);
+            }
+            other => panic!("expected Generate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_generate_force() {
+        let cli = Cli::try_parse_from(["konvoy", "generate", "--force"]).unwrap();
+        match cli.command {
+            Command::Generate {
+                verbose,
+                locked,
+                force,
+            } => {
+                assert!(!verbose);
+                assert!(!locked);
+                assert!(force);
             }
             other => panic!("expected Generate, got {other:?}"),
         }
