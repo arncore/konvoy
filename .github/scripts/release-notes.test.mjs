@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import {
   buildReleaseNotes,
+  categoryForPullRequest,
   classifyPullRequest,
   extractPullRequestNumbers,
   filterPullRequests,
@@ -111,6 +112,56 @@ test("renders categorized release notes and full changelog for the selected stre
   assert.match(body, /### Other Changes/);
   assert.match(body, /\* Bump release versions by @arncore in https:\/\/github\.com\/arncore\/konvoy\/pull\/275/);
   assert.match(body, /\*\*Full Changelog\*\*: https:\/\/github\.com\/arncore\/konvoy\/compare\/v1\.2\.0\.\.\.v1\.2\.1/);
+});
+
+test("infers categories from unlabeled PR titles", () => {
+  assert.equal(
+    categoryForPullRequest(pr(274, "Fix Rust dependency advisories", ["Cargo.toml"])).title,
+    "Security",
+  );
+  assert.equal(
+    categoryForPullRequest(pr(256, "Fix dep resolution bug", ["crates/konvoy-engine/src/build.rs"]))
+      .title,
+    "Bug Fixes",
+  );
+  assert.equal(
+    categoryForPullRequest(pr(266, "Parallelize hashing/downloads", ["crates/konvoy-util/src/hash.rs"]))
+      .title,
+    "Enhancements",
+  );
+  assert.equal(
+    categoryForPullRequest(pr(265, "Add 15 smoke tests", ["tests/smoke/tests.sh"])).title,
+    "Testing",
+  );
+});
+
+test("label categories take precedence over title inference", () => {
+  assert.equal(
+    categoryForPullRequest(pr(300, "Fix flaky test output", ["crates/foo/src/lib.rs"], ["testing"]))
+      .title,
+    "Testing",
+  );
+});
+
+test("reviewed release PR overrides preserve deliberate category placement", () => {
+  assert.equal(
+    categoryForPullRequest(pr(251, "Add gutter run icons for main and test functions", [
+      "editors/intellij/src/main/kotlin/Main.kt",
+    ])).title,
+    "Enhancements",
+  );
+  assert.equal(
+    categoryForPullRequest(pr(260, "Add helper methods, deduplicate repeated patterns", [
+      "crates/konvoy-engine/src/build.rs",
+    ])).title,
+    "Other Changes",
+  );
+  assert.equal(
+    categoryForPullRequest(pr(271, "Support CLT-only macOS Kotlin/Native builds", [
+      "crates/konvoy-konanc/src/invoke.rs",
+    ])).title,
+    "Bug Fixes",
+  );
 });
 
 test("renders an explicit empty message when no PRs match the stream", () => {
