@@ -77,14 +77,25 @@ fn openapi_codegen_hash_changes_when_spec_content_changes() {
     let spec = dir.path().join("openapi.yaml");
     let codegen = openapi_codegen("20.0.0", "openapi.yaml", "com.example.api");
 
-    fs::write(&spec, "openapi: 3.1.0\ninfo:\n  title: A\n  version: 1.0.0\n").unwrap();
+    fs::write(
+        &spec,
+        "openapi: 3.1.0\ninfo:\n  title: A\n  version: 1.0.0\n",
+    )
+    .unwrap();
     let before = konvoy_engine::codegen::compute_codegen_hashes(dir.path(), &codegen).unwrap();
 
     // Same path, different bytes — the cache key MUST change.
-    fs::write(&spec, "openapi: 3.1.0\ninfo:\n  title: B\n  version: 2.0.0\n").unwrap();
+    fs::write(
+        &spec,
+        "openapi: 3.1.0\ninfo:\n  title: B\n  version: 2.0.0\n",
+    )
+    .unwrap();
     let after = konvoy_engine::codegen::compute_codegen_hashes(dir.path(), &codegen).unwrap();
 
-    assert_ne!(before, after, "editing the spec content must change the hash");
+    assert_ne!(
+        before, after,
+        "editing the spec content must change the hash"
+    );
 }
 
 #[test]

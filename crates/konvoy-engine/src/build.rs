@@ -2769,7 +2769,10 @@ mod tests {
         lockfile.set_codegen_tool("fabrikt", "20.0.0", "abc123");
 
         let result = check_lockfile_staleness(&manifest, &lockfile);
-        assert!(result.is_ok(), "matching codegen pin should pass: {result:?}");
+        assert!(
+            result.is_ok(),
+            "matching codegen pin should pass: {result:?}"
+        );
     }
 
     #[test]
@@ -2784,7 +2787,10 @@ mod tests {
         lockfile.set_codegen_tool("fabrikt", "20.0.0", "abc123");
 
         let result = check_lockfile_staleness(&manifest, &lockfile);
-        assert!(result.is_ok(), "unused codegen pin should be ignored: {result:?}");
+        assert!(
+            result.is_ok(),
+            "unused codegen pin should be ignored: {result:?}"
+        );
     }
 
     #[test]

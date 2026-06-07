@@ -251,7 +251,7 @@ fn validate_codegen(codegen: &Codegen, path: &str) -> Result<(), ManifestError> 
     let spec_path = Path::new(spec);
     if spec_path.is_absolute() {
         return Err(err(
-            "spec must be a relative path inside the project".to_owned(),
+            "spec must be a relative path inside the project".to_owned()
         ));
     }
     // Reject parent-directory traversal so the spec genuinely stays inside the
@@ -1188,7 +1188,11 @@ base_package = "com.example._internal.api2"
         );
         let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
         assert_eq!(
-            manifest.codegen.openapi.as_ref().map(|o| o.base_package.as_str()),
+            manifest
+                .codegen
+                .openapi
+                .as_ref()
+                .map(|o| o.base_package.as_str()),
             Some("com.example._internal.api2")
         );
     }

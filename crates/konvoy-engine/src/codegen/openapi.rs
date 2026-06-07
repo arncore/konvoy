@@ -214,9 +214,7 @@ fn extract_ref_targets(text: &str) -> Vec<String> {
             // Bare token: the first char plus everything up to a delimiter.
             Some(first) => std::iter::once(first)
                 .chain(
-                    chars.take_while(|&c| {
-                        !matches!(c, ' ' | '\t' | '\r' | '\n' | ',' | '}' | ']')
-                    }),
+                    chars.take_while(|&c| !matches!(c, ' ' | '\t' | '\r' | '\n' | ',' | '}' | ']')),
                 )
                 .collect(),
             None => continue,
