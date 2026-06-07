@@ -521,10 +521,20 @@ KOTLIN
     assert_file_contains konvoy.lock "maven ="
     assert_file_contains konvoy.lock "version ="
 
-    # --locked should succeed now that the lockfile has plugin entries.
-    # (May recompile due to lockfile content change — that's fine,
-    #  the key assertion is that --locked doesn't error out.)
-    konvoy build --locked 2>&1
+    # A second unchanged build MUST be a cache hit, not a recompile (issue #133
+    # class). The plugin lock entries are folded into the cache key on the first
+    # build, so the first and second builds compute the same key.
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "(cached)"
+    assert_not_contains "$out2" "Compiling"
+
+    # --locked should also be a cache hit now that the lockfile has plugin
+    # entries (and must not error out).
+    local out3
+    out3=$(konvoy build --locked 2>&1)
+    assert_contains "$out3" "(cached)"
+    assert_not_contains "$out3" "Compiling"
 }
 
 test_plugin_kotlin_placeholder_resolves() {
