@@ -213,8 +213,18 @@ fn extract_ref_targets(text: &str) -> Vec<String> {
         let Some(after) = text.get(idx + MARKER.len()..) else {
             continue;
         };
-        // Skip the closing quote of `"$ref"` (JSON), whitespace, and the colon.
-        let after = after.trim_start_matches(['"', '\'', ' ', '\t', ':']);
+        // Step over the key-side tokens only — the optional closing quote of a
+        // JSON `"$ref"` key, surrounding whitespace, and the `:` separator — but
+        // NOT the value's own opening quote (stripping that would turn
+        // `$ref: "x.yaml"` into the bare token `x.yaml"` with a trailing quote).
+        let after = after.trim_start_matches([' ', '\t']);
+        let after = after
+            .strip_prefix('"')
+            .or_else(|| after.strip_prefix('\''))
+            .unwrap_or(after);
+        let after = after.trim_start_matches([' ', '\t']);
+        let after = after.strip_prefix(':').unwrap_or(after);
+        let after = after.trim_start_matches([' ', '\t']);
         let mut chars = after.chars();
         let target: String = match chars.next() {
             // Quoted value: take everything up to the matching quote.

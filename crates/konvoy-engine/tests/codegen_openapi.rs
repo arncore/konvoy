@@ -5,6 +5,16 @@ use konvoy_config::manifest::{Codegen, OpenApiCodegen};
 use konvoy_engine::codegen::ManagedToolSpec;
 use konvoy_util::maven::MavenCoordinate;
 
+/// Removes a managed-tool version directory on drop, so tests that write fake
+/// JARs under the real `~/.konvoy/tools/` don't leave junk behind — even when an
+/// assertion panics mid-test.
+struct CleanupDir(std::path::PathBuf);
+impl Drop for CleanupDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn managed_tool_spec_formats_maven_jar_url_and_path() {
     let spec = ManagedToolSpec::maven_jar(
@@ -128,6 +138,41 @@ fn openapi_codegen_hash_tracks_transitive_ref_files() {
     assert_ne!(
         before, after,
         "editing a $ref-ed sub-spec must change the codegen hash"
+    );
+}
+
+#[test]
+fn openapi_codegen_hash_tracks_double_quoted_and_fragmentless_refs() {
+    // Regression: a double-quoted, fragment-less `$ref` previously slipped past
+    // the scanner (the value's opening quote was stripped, leaving a trailing
+    // quote so the file never resolved) and was silently dropped from the hash.
+    let dir = tempfile::tempdir().unwrap();
+    let components = dir.path().join("components");
+    fs::create_dir_all(&components).unwrap();
+    fs::write(
+        dir.path().join("openapi.yaml"),
+        "openapi: 3.1.0\ninfo:\n  title: Demo\n  version: 1.0.0\ncomponents:\n  schemas:\n    Pet:\n      $ref: \"components/pet.yaml\"\n",
+    )
+    .unwrap();
+    fs::write(
+        components.join("pet.yaml"),
+        "type: object\nproperties:\n  id:\n    type: integer\n",
+    )
+    .unwrap();
+
+    let codegen = openapi_codegen("20.0.0", "openapi.yaml", "com.example.api");
+    let before = konvoy_engine::codegen::compute_codegen_hashes(dir.path(), &codegen).unwrap();
+
+    fs::write(
+        components.join("pet.yaml"),
+        "type: object\nproperties:\n  id:\n    type: string\n",
+    )
+    .unwrap();
+    let after = konvoy_engine::codegen::compute_codegen_hashes(dir.path(), &codegen).unwrap();
+
+    assert_ne!(
+        before, after,
+        "a double-quoted, fragment-less $ref sub-spec must feed the codegen hash"
     );
 }
 
@@ -256,6 +301,11 @@ fn run_codegen_replaces_stale_generic_tool_pin_without_regenerating_sources() {
     if let Some(parent) = jar.parent() {
         fs::create_dir_all(parent).unwrap();
     }
+    let _cleanup = CleanupDir(
+        jar.parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default(),
+    );
     fs::write(&jar, b"fake fabrikt jar").unwrap();
     let real_hash = konvoy_util::hash::sha256_file(&jar).unwrap();
 
@@ -348,6 +398,11 @@ fn ensure_fabrikt_hash_mismatch_on_existing_jar() {
     if let Some(parent) = jar.parent() {
         fs::create_dir_all(parent).unwrap();
     }
+    let _cleanup = CleanupDir(
+        jar.parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default(),
+    );
     fs::write(&jar, b"not the expected jar").unwrap();
 
     let result = konvoy_engine::codegen::openapi::ensure_fabrikt(
@@ -368,6 +423,11 @@ fn ensure_fabrikt_accepts_matching_hash_on_existing_jar() {
     if let Some(parent) = jar.parent() {
         fs::create_dir_all(parent).unwrap();
     }
+    let _cleanup = CleanupDir(
+        jar.parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default(),
+    );
     fs::write(&jar, b"already cached").unwrap();
     let real_hash = konvoy_util::hash::sha256_file(&jar).unwrap();
 

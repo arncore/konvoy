@@ -122,5 +122,35 @@ class KonvoyCodegenPsiTest : BasePlatformTestCase() {
         src as DepSource.Maven
         assertEquals("1.7.3", src.version)
         assertEquals("org.jetbrains.kotlinx:kotlinx-serialization-core", src.maven)
+
+        // Each dep must get ITS OWN [dependencies.targets], not the merged union
+        // of all of them (regression for the targets-misattribution bug).
+        assertEquals("deadbeef", src.targets["macos_arm64"])
+        val json = lock.dependencies.first { it.name == "kotlinx-serialization-json" }
+        assertEquals("cafebabe", (json.source as DepSource.Maven).targets["macos_arm64"])
+    }
+
+    fun testIncompleteOpenApiCodegenDoesNotFailManifestParse() {
+        // A [codegen.openapi] section missing a key (e.g. mid-edit) must NOT abort
+        // the whole manifest parse — that would break IDE sync on every save.
+        val file = myFixture.configureByText(
+            "konvoy.toml",
+            """
+            [package]
+            name = "my-app"
+
+            [toolchain]
+            kotlin = "2.2.0"
+
+            [codegen.openapi]
+            version = "20.0.0"
+            spec = "specs/api.yaml"
+            """.trimIndent(),
+        )
+
+        val manifest = KonvoyTomlParser.parseManifest(project, file.virtualFile)
+        assertNotNull("incomplete codegen section must not fail the manifest parse", manifest)
+        assertEquals("my-app", manifest!!.`package`.name)
+        assertNull("incomplete codegen should yield no openapi config", manifest.codegen.openapi)
     }
 }

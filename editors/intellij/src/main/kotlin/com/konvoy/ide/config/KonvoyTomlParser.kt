@@ -55,7 +55,9 @@ object KonvoyTomlParser {
         val toolchainTable = tables.find { it.header.key?.text == "toolchain" }
         val depsTable = tables.find { it.header.key?.text == "dependencies" }
         val pluginsTable = tables.find { it.header.key?.text == "plugins" }
-        val openApiCodegenTable = tables.find { it.header.key?.text == "codegen.openapi" }
+        val openApiCodegenTable = tables.find {
+            it.header.key?.segments?.joinToString(".") { seg -> seg.text } == "codegen.openapi"
+        }
 
         if (pkgTable == null || toolchainTable == null) {
             LOG.warn("konvoy.toml missing required [package] or [toolchain] section")
@@ -76,13 +78,20 @@ object KonvoyTomlParser {
 
         val dependencies = parseDependencySpecs(tables, "dependencies")
         val plugins = parseDependencySpecs(tables, "plugins")
+        // An incomplete optional [codegen.openapi] section (e.g. mid-edit) must
+        // NOT fail the whole manifest parse — that would abort IDE sync and drop
+        // source roots/libraries on every save. Treat it as "no codegen" until
+        // all three keys are present; the annotator flags the missing ones.
         val codegen = KonvoyCodegen(
-            openapi = openApiCodegenTable?.let {
-                OpenApiCodegen(
-                    version = it.stringValue("version") ?: return null,
-                    spec = it.stringValue("spec") ?: return null,
-                    basePackage = it.stringValue("base_package") ?: return null,
-                )
+            openapi = openApiCodegenTable?.let { table ->
+                val version = table.stringValue("version")
+                val spec = table.stringValue("spec")
+                val basePackage = table.stringValue("base_package")
+                if (version != null && spec != null && basePackage != null) {
+                    OpenApiCodegen(version, spec, basePackage)
+                } else {
+                    null
+                }
             },
         )
 
@@ -164,7 +173,7 @@ object KonvoyTomlParser {
         for (arrayTable in arrayTables) {
             val headerText = arrayTable.header.key?.text ?: continue
             when (headerText) {
-                "dependencies" -> parseDependencyLock(arrayTable, tables)?.let { deps.add(it) }
+                "dependencies" -> parseDependencyLock(arrayTable)?.let { deps.add(it) }
                 "plugins" -> parsePluginLock(arrayTable)?.let { plugins.add(it) }
             }
         }
@@ -177,7 +186,7 @@ object KonvoyTomlParser {
         )
     }
 
-    private fun parseDependencyLock(table: TomlArrayTable, allTables: List<TomlTable>): DependencyLock? {
+    private fun parseDependencyLock(table: TomlArrayTable): DependencyLock? {
         val name = table.stringValue("name") ?: return null
         val sourceType = table.stringValue("source_type") ?: return null
         val sourceHash = table.stringValue("source_hash") ?: ""
@@ -185,16 +194,27 @@ object KonvoyTomlParser {
         val source = when (sourceType) {
             "path" -> DepSource.Path(path = table.stringValue("path") ?: "")
             "maven" -> {
-                // Targets may be in a sub-table [dependencies.targets]
+                // The engine emits one [dependencies.targets] sub-table directly
+                // after each [[dependencies]] entry, so attribute targets to THIS
+                // dep by taking the immediately-following sibling table (stopping
+                // at the next array-table) rather than merging every targets table.
                 val targets = mutableMapOf<String, String>()
-                for (t in allTables) {
-                    val segs = t.header.key?.segments ?: continue
-                    if (segs.size == 2 && segs[0].text == "dependencies" && segs[1].text == "targets") {
-                        for (entry in t.entries) {
-                            val v = (entry.value as? TomlLiteral)?.stringValue()
-                            if (v != null) targets[entry.key.text] = v
+                var sibling = table.nextSibling
+                while (sibling != null) {
+                    if (sibling is TomlArrayTable) break
+                    if (sibling is TomlTable) {
+                        val segs = sibling.header.key?.segments
+                        if (segs != null && segs.size == 2 &&
+                            segs[0].text == "dependencies" && segs[1].text == "targets"
+                        ) {
+                            for (entry in sibling.entries) {
+                                val v = (entry.value as? TomlLiteral)?.stringValue()
+                                if (v != null) targets[entry.key.text] = v
+                            }
                         }
+                        break
                     }
+                    sibling = sibling.nextSibling
                 }
                 DepSource.Maven(
                     version = table.stringValue("version") ?: "",
@@ -238,12 +258,17 @@ object KonvoyTomlParser {
             kotlin = toolchainSection["kotlin"] ?: return null,
             detekt = toolchainSection["detekt"],
         )
-        val openApiCodegen = sections["codegen.openapi"]?.let {
-            OpenApiCodegen(
-                version = it["version"] ?: return null,
-                spec = it["spec"] ?: return null,
-                basePackage = it["base_package"] ?: return null,
-            )
+        // Incomplete optional section must not fail the whole manifest parse
+        // (see parseManifestFromPsi); treat it as "no codegen" until complete.
+        val openApiCodegen = sections["codegen.openapi"]?.let { sec ->
+            val version = sec["version"]
+            val spec = sec["spec"]
+            val basePackage = sec["base_package"]
+            if (version != null && spec != null && basePackage != null) {
+                OpenApiCodegen(version, spec, basePackage)
+            } else {
+                null
+            }
         }
 
         val deps = mutableMapOf<String, DependencySpec>()

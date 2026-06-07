@@ -63,18 +63,20 @@
           "properties": {
             "version": {
               "type": "string",
-              "description": "Fabrikt version, e.g. '20.0.0'.",
+              "description": "Fabrikt version (18.0.0 or newer), e.g. '20.0.0'.",
+              "pattern": "^(1[89]|[2-9][0-9]|[0-9]{3,})(\\.|-|\\+|$)",
               "minLength": 1
             },
             "spec": {
               "type": "string",
-              "description": "Project-relative path to an OpenAPI .yaml, .yml, or .json file.",
-              "pattern": ".*\\.(yaml|yml|json)$",
+              "description": "Project-relative path (no leading '/' and no '..') to an OpenAPI .yaml, .yml, or .json file.",
+              "pattern": "^(?!/)(?!.*\\.\\.).*\\.(ya?ml|json)$",
               "minLength": 1
             },
             "base_package": {
               "type": "string",
-              "description": "Kotlin package for generated sources.",
+              "description": "Kotlin package for generated sources, e.g. 'com.example.api'.",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$",
               "minLength": 1
             }
           }

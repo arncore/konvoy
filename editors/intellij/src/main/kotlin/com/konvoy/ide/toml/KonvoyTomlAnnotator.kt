@@ -171,6 +171,11 @@ class KonvoyTomlAnnotator : Annotator {
                 .create()
         }
 
+        // Validate the trimmed value, matching the Rust validator (which trims)
+        // and the VS Code extension. Otherwise surrounding whitespace that
+        // `konvoy build` accepts would be flagged as a false-positive error.
+        val value = value.trim()
+
         when (keyName) {
             "version" -> {
                 val major = value.substringBefore('.').substringBefore('-').substringBefore('+').toIntOrNull()

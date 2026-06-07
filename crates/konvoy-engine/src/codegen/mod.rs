@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
-use konvoy_config::lockfile::{Lockfile, ToolchainLock};
+use konvoy_config::lockfile::Lockfile;
 use konvoy_config::manifest::Codegen;
 
 use crate::error::EngineError;
@@ -157,7 +157,6 @@ pub fn run_codegen(
                 persist_managed_tool_hash(
                     lockfile_path,
                     lockfile,
-                    kotlin_version,
                     &tool_spec,
                     &tool_resolution.sha256,
                 )?;
@@ -291,7 +290,6 @@ static CODEGEN_LOCK_PERSIST: Mutex<()> = Mutex::new(());
 fn persist_managed_tool_hash(
     lockfile_path: &Path,
     lockfile: &Lockfile,
-    kotlin_version: &str,
     spec: &ManagedToolSpec,
     hash: &str,
 ) -> Result<(), EngineError> {
@@ -306,15 +304,10 @@ fn persist_managed_tool_hash(
     } else {
         lockfile.clone()
     };
-    if updated.toolchain.is_none() {
-        updated.toolchain = Some(ToolchainLock {
-            konanc_version: kotlin_version.to_owned(),
-            konanc_tarball_sha256: None,
-            jre_tarball_sha256: None,
-            detekt_version: None,
-            detekt_jar_sha256: None,
-        });
-    }
+    // Persist only the codegen tool pin. The toolchain section (with its konanc/
+    // JRE tarball hashes) is owned by update_lockfile_if_needed, which runs after
+    // a successful build. Writing a stub toolchain here would leave null tarball
+    // hashes behind if the build then fails before that point.
     updated.set_codegen_tool(&spec.id, spec.version(), hash);
     updated.write_to(lockfile_path)?;
     Ok(())

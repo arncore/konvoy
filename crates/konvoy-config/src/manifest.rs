@@ -445,10 +445,19 @@ impl Manifest {
     /// Returns an error if the string contains invalid TOML, has unknown keys,
     /// or fails validation.
     pub fn from_str(content: &str, path: &str) -> Result<Self, ManifestError> {
-        let manifest: Manifest = toml::from_str(content).map_err(|e| ManifestError::Parse {
+        let mut manifest: Manifest = toml::from_str(content).map_err(|e| ManifestError::Parse {
             path: path.to_owned(),
             source: e,
         })?;
+        // Normalize codegen fields so the stored/used values match what
+        // validate_codegen checks (it validates the trimmed form). Otherwise a
+        // value like version = " 20.0.0 " passes validation but the untrimmed
+        // string flows into the Maven coordinate and 404s at download.
+        if let Some(openapi) = manifest.codegen.openapi.as_mut() {
+            openapi.version = openapi.version.trim().to_owned();
+            openapi.spec = openapi.spec.trim().to_owned();
+            openapi.base_package = openapi.base_package.trim().to_owned();
+        }
         validate(&manifest, path)?;
         Ok(manifest)
     }

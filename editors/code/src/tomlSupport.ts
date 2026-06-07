@@ -333,7 +333,10 @@ export function validateManifest(text: string): TomlDiagnostic[] {
         const versionKv = openapiKeys.get('version');
         if (versionKv) {
             const versionVal = stripQuotes(versionKv.value).trim();
-            const major = Number.parseInt(versionVal.split(/[.\-+]/)[0] ?? '', 10);
+            // Require the major segment to be entirely numeric, mirroring Rust's
+            // `str::parse::<u64>()` — `parseInt('20abc')` would leniently yield 20.
+            const majorSeg = versionVal.split(/[.\-+]/)[0] ?? '';
+            const major = /^[0-9]+$/.test(majorSeg) ? Number.parseInt(majorSeg, 10) : Number.NaN;
             if (versionVal.length === 0) {
                 diagnostics.push({
                     line: versionKv.line, col: versionKv.valueStart, endCol: versionKv.valueEnd,

@@ -563,60 +563,78 @@ fn check_codegen(manifest: &konvoy_config::Manifest, cwd: &std::path::Path) -> u
 
     let mut issues: u32 = 0;
 
-    // Load the lockfile once so we can verify each tool is pinned — `--locked`
-    // builds require a matching `[codegen_tools.<tool>]` entry, so doctor must
-    // surface a missing pin rather than only checking the on-disk JAR.
-    let lockfile = konvoy_config::lockfile::Lockfile::from_path(&cwd.join("konvoy.lock")).ok();
+    // Load the lockfile so we can verify each tool is pinned — `--locked` builds
+    // require a matching `[codegen_tools.<tool>]` entry. `Lockfile::from_path`
+    // returns Ok(default) for a missing file, so check existence explicitly to
+    // distinguish "no konvoy.lock" from "lockfile present but tool unpinned".
+    let lockfile_path = cwd.join("konvoy.lock");
+    let lockfile = if lockfile_path.exists() {
+        konvoy_config::lockfile::Lockfile::from_path(&lockfile_path).ok()
+    } else {
+        None
+    };
 
     for tool in tools {
-        match tool.is_installed() {
-            Ok(true) => match tool.artifact_path() {
-                Ok(path) => {
-                    eprintln!(
+        // Install status of the managed JAR.
+        let installed = match tool.is_installed() {
+            Ok(true) => {
+                match tool.artifact_path() {
+                    Ok(path) => eprintln!(
                         "  [ok] {}: {} ({})",
                         tool.id,
                         tool.version(),
                         path.display()
-                    );
+                    ),
+                    Err(e) => {
+                        eprintln!("  [!!] {}: {e}", tool.id);
+                        issues = issues.saturating_add(1);
+                    }
                 }
-                Err(e) => {
-                    eprintln!("  [!!] {}: {e}", tool.id);
-                    issues = issues.saturating_add(1);
-                }
-            },
+                true
+            }
             Ok(false) => {
                 eprintln!(
                     "  [--] {}: {} not downloaded — will download on first `konvoy generate` or `konvoy build`",
                     tool.id,
                     tool.version()
                 );
+                false
             }
             Err(e) => {
                 eprintln!("  [!!] {}: {e}", tool.id);
                 issues = issues.saturating_add(1);
+                false
             }
-        }
+        };
 
-        // Verify the lockfile pin (independent of whether the JAR is present).
-        match &lockfile {
-            Some(lockfile) if lockfile.has_codegen_tool(&tool.id, tool.version()) => {
-                eprintln!("  [ok] Lockfile pin: {}", tool.id);
-            }
-            Some(_) => {
+        // Lockfile pin status (what `--locked` requires).
+        if !lockfile_path.exists() {
+            eprintln!(
+                "  [!!] Lockfile pin: no konvoy.lock found — run 'konvoy generate' or 'konvoy build' to pin {}",
+                tool.id
+            );
+            issues = issues.saturating_add(1);
+        } else if lockfile
+            .as_ref()
+            .is_some_and(|l| l.has_codegen_tool(&tool.id, tool.version()))
+        {
+            eprintln!("  [ok] Lockfile pin: {}", tool.id);
+            // Pinned but the JAR isn't downloaded: a normal build fetches it, but
+            // `--locked` refuses to download and will fail. Surface that.
+            if !installed {
                 eprintln!(
-                    "  [!!] Lockfile pin: '{}' {} not pinned in konvoy.lock — run 'konvoy generate' or 'konvoy build' (required for --locked)",
-                    tool.id,
-                    tool.version()
-                );
-                issues = issues.saturating_add(1);
-            }
-            None => {
-                eprintln!(
-                    "  [!!] Lockfile pin: no konvoy.lock found — run 'konvoy generate' or 'konvoy build' to pin {}",
+                    "  [!!] {}: pinned in konvoy.lock but not downloaded — `konvoy build --locked` will fail; run `konvoy generate`",
                     tool.id
                 );
                 issues = issues.saturating_add(1);
             }
+        } else {
+            eprintln!(
+                "  [!!] Lockfile pin: '{}' {} not pinned in konvoy.lock — run 'konvoy generate' or 'konvoy build' (required for --locked)",
+                tool.id,
+                tool.version()
+            );
+            issues = issues.saturating_add(1);
         }
     }
     issues
