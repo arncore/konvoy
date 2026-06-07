@@ -40,7 +40,7 @@ jobs:
   build:
     name: Build & Test
     needs: [changes]
-    if: needs.changes.outputs.plugin == 'true'
+    if: startsWith(github.ref, 'refs/tags/intellij-v') || needs.changes.outputs.plugin == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
