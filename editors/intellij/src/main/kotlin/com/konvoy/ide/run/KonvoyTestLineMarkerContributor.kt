@@ -9,7 +9,7 @@ import org.jetbrains.kotlin.psi.KtNamedFunction
 
 /**
  * Adds a green play icon in the gutter next to `@Test` functions in `src/test/`.
- * Clicking it runs `konvoy test --filter=<name>`.
+ * Clicking it runs `konvoy test --filter=<qualified-name>`.
  */
 class KonvoyTestLineMarkerContributor : RunLineMarkerContributor() {
 
