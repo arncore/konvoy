@@ -17,7 +17,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
-use indicatif::MultiProgress;
 use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile};
@@ -269,7 +268,7 @@ pub fn update(project_root: &Path) -> Result<UpdateResult, EngineError> {
     // (`needs_download` order × `KNOWN_TARGETS` order) BEFORE any parallel
     // work starts so the on-screen rows stay fixed regardless of which
     // download finishes first.
-    let multi = MultiProgress::new();
+    let multi = konvoy_util::progress::new_multi_progress();
     let known_targets = konvoy_targets::KNOWN_TARGETS;
 
     // Build labels once, then reuse them to compute the max width AND to

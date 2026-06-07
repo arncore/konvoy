@@ -90,6 +90,20 @@ konvoy build
 konvoy run
 ```
 
+### Progress output
+
+Konvoy renders download progress bars on interactive terminals. When stderr is
+redirected to a file or pipe, progress is hidden so logs stay clean. IDEs or
+other wrappers can opt into progress output with `KONVOY_PROGRESS`:
+
+```bash
+# Dynamic terminal redraws with cursor movement.
+KONVOY_PROGRESS=ansi
+
+# Plain completed truck rows, suitable for IDE run consoles.
+KONVOY_PROGRESS=plain
+```
+
 ## Project layout
 
 Konvoy projects use:
