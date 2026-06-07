@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The `konvoy.lock` lockfile.
@@ -7,6 +8,8 @@ use std::path::Path;
 pub struct Lockfile {
     #[serde(default)]
     pub toolchain: Option<ToolchainLock>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub codegen_tools: BTreeMap<String, CodegenToolLock>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<DependencyLock>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -46,6 +49,16 @@ pub struct ToolchainLock {
     pub fabrikt_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fabrikt_jar_sha256: Option<String>,
+}
+
+/// A pinned managed code generation tool artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodegenToolLock {
+    /// Resolved tool version.
+    pub version: String,
+    /// Hex-encoded SHA-256 hash of the tool artifact.
+    pub sha256: String,
 }
 
 /// A locked dependency entry.
@@ -116,6 +129,7 @@ impl Lockfile {
                 fabrikt_version: None,
                 fabrikt_jar_sha256: None,
             }),
+            codegen_tools: BTreeMap::new(),
             dependencies: Vec::new(),
             plugins: Vec::new(),
         }
@@ -137,6 +151,7 @@ impl Lockfile {
                 fabrikt_version: None,
                 fabrikt_jar_sha256: None,
             }),
+            codegen_tools: BTreeMap::new(),
             dependencies: Vec::new(),
             plugins: Vec::new(),
         }
@@ -169,6 +184,44 @@ impl Lockfile {
         self.dependencies
             .iter()
             .any(|d| d.name == dep_name && matches!(&d.source, DepSource::Maven { .. }))
+    }
+
+    /// Return a pinned managed codegen tool, including legacy lockfile fields.
+    #[must_use]
+    pub fn codegen_tool(&self, id: &str) -> Option<CodegenToolLock> {
+        if let Some(pin) = self.codegen_tools.get(id) {
+            return Some(pin.clone());
+        }
+
+        if id == "fabrikt" {
+            let toolchain = self.toolchain.as_ref()?;
+            let version = toolchain.fabrikt_version.as_ref()?;
+            let sha256 = toolchain.fabrikt_jar_sha256.as_ref()?;
+            return Some(CodegenToolLock {
+                version: version.clone(),
+                sha256: sha256.clone(),
+            });
+        }
+
+        None
+    }
+
+    /// Insert or replace a pinned managed codegen tool.
+    pub fn set_codegen_tool(&mut self, id: &str, version: &str, sha256: &str) {
+        self.codegen_tools.insert(
+            id.to_owned(),
+            CodegenToolLock {
+                version: version.to_owned(),
+                sha256: sha256.to_owned(),
+            },
+        );
+    }
+
+    /// Return `true` if the lockfile pins `id` at `version` with a non-empty hash.
+    #[must_use]
+    pub fn has_codegen_tool(&self, id: &str, version: &str) -> bool {
+        self.codegen_tool(id)
+            .is_some_and(|pin| pin.version == version && !pin.sha256.trim().is_empty())
     }
 }
 
@@ -370,6 +423,55 @@ konanc_version = "2.1.0"
         let content = fs::read_to_string(&path).unwrap();
 
         assert!(!content.contains("fabrikt"), "content was: {content}");
+    }
+
+    #[test]
+    fn round_trip_with_generic_codegen_tool_pin() {
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.set_codegen_tool("fabrikt", "20.0.0", "abc123");
+
+        lockfile.write_to(&path).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let reparsed = Lockfile::from_path(&path).unwrap();
+
+        assert!(
+            content.contains("[codegen_tools.fabrikt]"),
+            "content was: {content}"
+        );
+        assert!(
+            !content.contains("fabrikt_version"),
+            "content was: {content}"
+        );
+        let pin = reparsed
+            .codegen_tool("fabrikt")
+            .unwrap_or_else(|| panic!("missing fabrikt tool pin"));
+        assert_eq!(pin.version, "20.0.0");
+        assert_eq!(pin.sha256, "abc123");
+    }
+
+    #[test]
+    fn legacy_fabrikt_toolchain_fields_resolve_as_codegen_tool_pin() {
+        let dir = make_test_dir();
+        let path = dir.path().join("konvoy.lock");
+        fs::write(
+            &path,
+            r#"
+[toolchain]
+konanc_version = "2.1.0"
+fabrikt_version = "20.0.0"
+fabrikt_jar_sha256 = "abc123"
+"#,
+        )
+        .unwrap();
+
+        let lockfile = Lockfile::from_path(&path).unwrap();
+        let pin = lockfile
+            .codegen_tool("fabrikt")
+            .unwrap_or_else(|| panic!("missing legacy fabrikt tool pin"));
+        assert_eq!(pin.version, "20.0.0");
+        assert_eq!(pin.sha256, "abc123");
     }
 
     #[test]

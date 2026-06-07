@@ -430,15 +430,17 @@ fn cmd_generate(verbose: bool, locked: bool) -> CliResult {
         locked,
     )?;
 
-    if manifest.codegen.openapi.is_some() {
-        let output_dir = konvoy_engine::codegen::generator_output_dir(&root, "openapi");
+    for summary in konvoy_engine::codegen::generator_summaries(&root, &manifest.codegen) {
+        let count = sources
+            .iter()
+            .filter(|source| source.starts_with(&summary.output_dir))
+            .count();
         eprintln!(
-            "    Generated openapi: {} file(s) ({})",
-            sources.len(),
-            output_dir.display()
+            "    Generated {}: {} file(s) ({})",
+            summary.name,
+            count,
+            summary.output_dir.display()
         );
-    } else {
-        eprintln!("    Generated {} file(s)", sources.len());
     }
 
     Ok(())
@@ -546,33 +548,37 @@ fn check_detekt(manifest: &konvoy_config::Manifest) -> u32 {
 }
 
 fn check_codegen(manifest: &konvoy_config::Manifest) -> u32 {
-    let Some(ref openapi) = manifest.codegen.openapi else {
-        return 0;
-    };
-
-    match konvoy_engine::codegen::openapi::is_installed(&openapi.version) {
-        Ok(true) => match konvoy_engine::codegen::openapi::fabrikt_jar_path(&openapi.version) {
-            Ok(path) => {
-                eprintln!("  [ok] fabrikt: {} ({})", openapi.version, path.display());
-                0
+    let mut issues: u32 = 0;
+    for tool in konvoy_engine::codegen::managed_tools(&manifest.codegen) {
+        match tool.is_installed() {
+            Ok(true) => match tool.artifact_path() {
+                Ok(path) => {
+                    eprintln!(
+                        "  [ok] {}: {} ({})",
+                        tool.id,
+                        tool.version(),
+                        path.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("  [!!] {}: {e}", tool.id);
+                    issues = issues.saturating_add(1);
+                }
+            },
+            Ok(false) => {
+                eprintln!(
+                    "  [--] {}: {} not downloaded — will download on first `konvoy generate` or `konvoy build`",
+                    tool.id,
+                    tool.version()
+                );
             }
             Err(e) => {
-                eprintln!("  [!!] fabrikt: {e}");
-                1
+                eprintln!("  [!!] {}: {e}", tool.id);
+                issues = issues.saturating_add(1);
             }
-        },
-        Ok(false) => {
-            eprintln!(
-                "  [--] fabrikt: {} not downloaded — will download on first `konvoy generate` or `konvoy build`",
-                openapi.version
-            );
-            0
-        }
-        Err(e) => {
-            eprintln!("  [!!] fabrikt: {e}");
-            1
         }
     }
+    issues
 }
 
 fn check_maven_deps(manifest: &konvoy_config::Manifest, cwd: &std::path::Path) -> u32 {

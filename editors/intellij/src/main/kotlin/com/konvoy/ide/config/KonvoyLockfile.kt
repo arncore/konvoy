@@ -6,6 +6,7 @@ package com.konvoy.ide.config
  */
 data class KonvoyLockfile(
     val toolchain: ToolchainLock? = null,
+    val codegenTools: Map<String, CodegenToolLock> = emptyMap(),
     val dependencies: List<DependencyLock> = emptyList(),
     val plugins: List<PluginLock> = emptyList(),
 )
@@ -18,6 +19,11 @@ data class ToolchainLock(
     val detektJarSha256: String? = null,
     val fabriktVersion: String? = null,
     val fabriktJarSha256: String? = null,
+)
+
+data class CodegenToolLock(
+    val version: String,
+    val sha256: String,
 )
 
 data class DependencyLock(

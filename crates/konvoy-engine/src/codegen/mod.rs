@@ -1,23 +1,28 @@
 //! Declarative source generation before Kotlin/Native compilation.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use konvoy_config::lockfile::Lockfile;
+use konvoy_config::lockfile::{Lockfile, ToolchainLock};
 use konvoy_config::manifest::Codegen;
 
 use crate::error::EngineError;
 
+mod managed_tool;
 pub mod openapi;
 
-/// Result of resolving a managed codegen tool.
-#[derive(Debug, Clone)]
-pub struct ToolResolution {
-    /// Path to the executable artifact, usually a JAR.
-    pub path: PathBuf,
-    /// SHA-256 hash of the tool artifact.
-    pub sha256: String,
-    /// Whether the hash should be persisted into `konvoy.lock`.
-    pub should_persist: bool,
+pub use managed_tool::{ManagedToolResolution, ManagedToolSpec};
+
+/// Display metadata for a configured generator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratorSummary {
+    /// Stable generator name used in paths and cache key tags.
+    pub name: String,
+    /// Human-readable generator label.
+    pub display_name: String,
+    /// Directory containing this generator's outputs.
+    pub output_dir: PathBuf,
 }
 
 /// A configured code generator.
@@ -25,34 +30,17 @@ pub trait CodeGenerator {
     /// Stable generator name used in paths and cache key tags.
     fn name(&self) -> &str;
 
-    /// Compute the hash of generator inputs, such as an OpenAPI spec file.
-    ///
-    /// # Errors
-    /// Returns an error if any configured input cannot be read.
-    fn compute_input_hash(&self, project_root: &Path) -> Result<String, EngineError>;
+    /// Human-readable generator label.
+    fn display_name(&self) -> &str;
 
-    /// Ensure the generator tool is available and hash-verified.
-    ///
-    /// # Errors
-    /// Returns an error if the tool is missing in locked mode, cannot be
-    /// downloaded, or does not match the lockfile hash.
-    fn ensure_tool(&self, lockfile: &Lockfile, locked: bool)
-        -> Result<ToolResolution, EngineError>;
+    /// Managed tool required by this generator.
+    fn managed_tool(&self) -> ManagedToolSpec;
 
-    /// Persist the verified tool hash to `konvoy.lock`.
-    ///
-    /// # Errors
-    /// Returns an error if the lockfile cannot be written.
-    fn persist_tool_hash(
-        &self,
-        lockfile_path: &Path,
-        lockfile: &Lockfile,
-        kotlin_version: &str,
-        hash: &str,
-    ) -> Result<(), EngineError>;
+    /// Stable config fields that affect generated sources.
+    fn config_hash_parts(&self) -> Vec<String>;
 
-    /// Return `true` if this generator needs a tool hash written to the lockfile.
-    fn needs_tool_lock_update(&self, lockfile: &Lockfile) -> bool;
+    /// Project-relative input files read by this generator.
+    fn input_files(&self) -> Vec<PathBuf>;
 
     /// Generate sources into `output_dir`.
     ///
@@ -77,7 +65,29 @@ pub fn active_generators(codegen: &Codegen) -> Vec<Box<dyn CodeGenerator>> {
     generators
 }
 
-/// Compute tagged input hashes for all active generators.
+/// Return display summaries for all active generators.
+#[must_use]
+pub fn generator_summaries(project_root: &Path, codegen: &Codegen) -> Vec<GeneratorSummary> {
+    active_generators(codegen)
+        .into_iter()
+        .map(|generator| GeneratorSummary {
+            name: generator.name().to_owned(),
+            display_name: generator.display_name().to_owned(),
+            output_dir: generator_output_dir(project_root, generator.name()),
+        })
+        .collect()
+}
+
+/// Return managed tools for all active generators.
+#[must_use]
+pub fn managed_tools(codegen: &Codegen) -> Vec<ManagedToolSpec> {
+    active_generators(codegen)
+        .into_iter()
+        .map(|generator| generator.managed_tool())
+        .collect()
+}
+
+/// Compute tagged hashes for all active generators.
 ///
 /// # Errors
 /// Returns an error if a configured generator input cannot be read.
@@ -88,7 +98,7 @@ pub fn compute_codegen_hashes(
     active_generators(codegen)
         .into_iter()
         .map(|generator| {
-            let hash = generator.compute_input_hash(project_root)?;
+            let hash = compute_generator_hash(generator.as_ref(), project_root)?;
             Ok(format!("{}:{hash}", generator.name()))
         })
         .collect()
@@ -118,7 +128,7 @@ pub fn run_codegen(
     let mut generated_sources = Vec::new();
 
     for generator in generators {
-        let input_hash = generator.compute_input_hash(project_root)?;
+        let input_hash = compute_generator_hash(generator.as_ref(), project_root)?;
         let output_dir = generator_output_dir(project_root, generator.name());
         let input_hash_path = output_dir.join(".input_hash");
         let stored_hash = std::fs::read_to_string(&input_hash_path).ok();
@@ -126,19 +136,21 @@ pub fn run_codegen(
             .as_deref()
             .is_none_or(|stored| stored.trim() != input_hash);
 
-        let needs_tool = stale || locked || generator.needs_tool_lock_update(lockfile);
+        let tool_spec = generator.managed_tool();
+        let needs_tool = stale || locked || needs_tool_lock_update(lockfile, &tool_spec);
         let tool = if needs_tool {
-            Some(generator.ensure_tool(lockfile, locked)?)
+            Some(resolve_managed_tool(&tool_spec, lockfile, locked)?)
         } else {
             None
         };
 
         if let Some(tool_resolution) = &tool {
             if tool_resolution.should_persist {
-                generator.persist_tool_hash(
+                persist_managed_tool_hash(
                     lockfile_path,
                     lockfile,
                     kotlin_version,
+                    &tool_spec,
                     &tool_resolution.sha256,
                 )?;
             }
@@ -194,4 +206,172 @@ fn resolve_jre_home(
     }
 
     Ok(konvoy_konanc::toolchain::jre_home_path(kotlin_version)?)
+}
+
+fn compute_generator_hash(
+    generator: &dyn CodeGenerator,
+    project_root: &Path,
+) -> Result<String, EngineError> {
+    let mut parts = vec![
+        "codegen-v1".to_owned(),
+        generator.name().to_owned(),
+        generator.display_name().to_owned(),
+    ];
+    parts.extend(generator.config_hash_parts());
+
+    for input in generator.input_files() {
+        let full_path = project_root.join(&input);
+        if !full_path.exists() {
+            return Err(EngineError::CodegenInputNotFound {
+                name: generator.name().to_owned(),
+                path: full_path.display().to_string(),
+            });
+        }
+        parts.push(format!("file:{}", input.display()));
+        parts.push(konvoy_util::hash::sha256_file(&full_path)?);
+    }
+
+    let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+    Ok(konvoy_util::hash::sha256_multi(&refs))
+}
+
+fn resolve_managed_tool(
+    spec: &ManagedToolSpec,
+    lockfile: &Lockfile,
+    locked: bool,
+) -> Result<ManagedToolResolution, EngineError> {
+    let pin = lockfile.codegen_tool(&spec.id);
+    let matching_pin = pin
+        .as_ref()
+        .filter(|candidate| candidate.version == spec.version());
+
+    if locked {
+        if matching_pin.is_none() {
+            return Err(EngineError::LockfileUpdateRequired);
+        }
+        if !spec.is_installed()? {
+            return Err(EngineError::CodegenToolNotFound {
+                name: spec.id.clone(),
+                version: spec.version().to_owned(),
+            });
+        }
+    }
+
+    let expected_hash = matching_pin.map(|candidate| candidate.sha256.as_str());
+    let (path, sha256) = spec.ensure(expected_hash)?;
+    let generic_pin_is_current = lockfile
+        .codegen_tools
+        .get(&spec.id)
+        .is_some_and(|generic_pin| {
+            generic_pin.version == spec.version() && !generic_pin.sha256.trim().is_empty()
+        });
+    Ok(ManagedToolResolution {
+        path,
+        sha256,
+        should_persist: !generic_pin_is_current,
+    })
+}
+
+fn needs_tool_lock_update(lockfile: &Lockfile, spec: &ManagedToolSpec) -> bool {
+    !lockfile.has_codegen_tool(&spec.id, spec.version())
+}
+
+fn persist_managed_tool_hash(
+    lockfile_path: &Path,
+    lockfile: &Lockfile,
+    kotlin_version: &str,
+    spec: &ManagedToolSpec,
+    hash: &str,
+) -> Result<(), EngineError> {
+    let mut updated = if lockfile_path.exists() {
+        Lockfile::from_path(lockfile_path)?
+    } else {
+        lockfile.clone()
+    };
+    if updated.toolchain.is_none() {
+        updated.toolchain = Some(ToolchainLock {
+            konanc_version: kotlin_version.to_owned(),
+            konanc_tarball_sha256: None,
+            jre_tarball_sha256: None,
+            detekt_version: None,
+            detekt_jar_sha256: None,
+            fabrikt_version: None,
+            fabrikt_jar_sha256: None,
+        });
+    }
+    updated.set_codegen_tool(&spec.id, spec.version(), hash);
+    updated.write_to(lockfile_path)?;
+    Ok(())
+}
+
+/// Run a managed Java JAR with normalized diagnostics.
+///
+/// # Errors
+/// Returns an error if Java is unavailable, the process cannot be spawned, or
+/// the process exits unsuccessfully.
+pub fn run_java_jar(
+    generator_name: &str,
+    tool_display_name: &str,
+    tool_path: &Path,
+    jre_home: &Path,
+    args: Vec<OsString>,
+    verbose: bool,
+) -> Result<(), EngineError> {
+    let java = java_bin(jre_home);
+    if !java.exists() {
+        return Err(EngineError::CodegenFailed {
+            name: generator_name.to_owned(),
+            message: format!(
+                "java not found at {} — run `konvoy toolchain install` to reinstall the managed JRE",
+                java.display()
+            ),
+        });
+    }
+
+    let output = Command::new(&java)
+        .arg("-jar")
+        .arg(tool_path)
+        .args(args)
+        .env("JAVA_HOME", jre_home)
+        .output()
+        .map_err(|e| EngineError::CodegenFailed {
+            name: generator_name.to_owned(),
+            message: e.to_string(),
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if verbose {
+        if !stdout.is_empty() {
+            eprintln!("{stdout}");
+        }
+        if !stderr.is_empty() {
+            eprintln!("{stderr}");
+        }
+    }
+
+    if !output.status.success() {
+        let raw = format!("{stdout}{stderr}");
+        let hint = first_non_empty_line(&raw)
+            .map(|line| format!(" first message: {line}"))
+            .unwrap_or_default();
+        return Err(EngineError::CodegenFailed {
+            name: generator_name.to_owned(),
+            message: format!(
+                "{tool_display_name} exited with status {}.{hint} Run with --verbose to see full output.",
+                output.status
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn java_bin(jre_home: &Path) -> PathBuf {
+    let binary = if cfg!(windows) { "java.exe" } else { "java" };
+    jre_home.join("bin").join(binary)
+}
+
+fn first_non_empty_line(output: &str) -> Option<&str> {
+    output.lines().map(str::trim).find(|line| !line.is_empty())
 }

@@ -272,7 +272,7 @@ spec = "specs/api.yaml"
 base_package = "com.example.api"
 ```
 
-Generated sources are included in `konvoy build` and `konvoy test` cache keys through the spec hash. Use `konvoy generate` to refresh generated files without compiling. The Fabrikt JAR hash is pinned in `konvoy.lock`; `--locked` requires the pinned JAR to already be downloaded.
+Generated sources are included in `konvoy build` and `konvoy test` cache keys through the generator config and input-file hashes. Use `konvoy generate` to refresh generated files without compiling. Managed codegen tool hashes are pinned in `konvoy.lock` under `[codegen_tools.<tool>]`; `--locked` requires the pinned tool JAR to already be downloaded.
 
 Fabrikt is invoked with `KOTLINX_SERIALIZATION` output, so projects using generated `@Serializable` models should also declare the serialization compiler plugin and runtime dependencies.
 

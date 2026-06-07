@@ -151,6 +151,17 @@ object KonvoyTomlParser {
 
         val deps = mutableListOf<DependencyLock>()
         val plugins = mutableListOf<PluginLock>()
+        val codegenTools = mutableMapOf<String, CodegenToolLock>()
+
+        for (table in tables) {
+            val segments = table.header.key?.segments ?: continue
+            if (segments.size == 2 && segments[0].text == "codegen_tools") {
+                val id = segments[1].text
+                val version = table.stringValue("version") ?: continue
+                val sha256 = table.stringValue("sha256") ?: continue
+                codegenTools[id] = CodegenToolLock(version = version, sha256 = sha256)
+            }
+        }
 
         for (arrayTable in arrayTables) {
             val headerText = arrayTable.header.key?.text ?: continue
@@ -160,7 +171,12 @@ object KonvoyTomlParser {
             }
         }
 
-        return KonvoyLockfile(toolchain, deps, plugins)
+        return KonvoyLockfile(
+            toolchain = toolchain,
+            codegenTools = codegenTools,
+            dependencies = deps,
+            plugins = plugins,
+        )
     }
 
     private fun parseDependencyLock(table: TomlArrayTable, allTables: List<TomlTable>): DependencyLock? {
@@ -270,8 +286,18 @@ object KonvoyTomlParser {
             )
         }
 
+        val codegenTools = sections
+            .filterKeys { it.startsWith("codegen_tools.") }
+            .mapNotNull { (section, values) ->
+                val id = section.removePrefix("codegen_tools.")
+                val version = values["version"] ?: return@mapNotNull null
+                val sha256 = values["sha256"] ?: return@mapNotNull null
+                id to CodegenToolLock(version = version, sha256 = sha256)
+            }
+            .toMap()
+
         // Text-based array-of-tables parsing is limited; prefer PSI path
-        return KonvoyLockfile(toolchain)
+        return KonvoyLockfile(toolchain = toolchain, codegenTools = codegenTools)
     }
 
     /**

@@ -166,8 +166,10 @@ class KonvoyTomlParserTest {
             konanc_version = "2.3.20"
             konanc_tarball_sha256 = "abc123"
             jre_tarball_sha256 = "def456"
-            fabrikt_version = "20.0.0"
-            fabrikt_jar_sha256 = "f00d"
+
+            [codegen_tools.fabrikt]
+            version = "20.0.0"
+            sha256 = "f00d"
         """.trimIndent())
 
         assertNotNull(lockfile)
@@ -175,6 +177,20 @@ class KonvoyTomlParserTest {
         assertEquals("2.3.20", lockfile.toolchain!!.konancVersion)
         assertEquals("abc123", lockfile.toolchain!!.konancTarballSha256)
         assertEquals("def456", lockfile.toolchain!!.jreTarballSha256)
+        assertEquals("20.0.0", lockfile.codegenTools["fabrikt"]!!.version)
+        assertEquals("f00d", lockfile.codegenTools["fabrikt"]!!.sha256)
+    }
+
+    @Test
+    fun `parse legacy lockfile fabrikt fields`() {
+        val lockfile = KonvoyTomlParser.parseLockfileFromText("""
+            [toolchain]
+            konanc_version = "2.3.20"
+            fabrikt_version = "20.0.0"
+            fabrikt_jar_sha256 = "f00d"
+        """.trimIndent())
+
+        assertNotNull(lockfile)
         assertEquals("20.0.0", lockfile.toolchain!!.fabriktVersion)
         assertEquals("f00d", lockfile.toolchain!!.fabriktJarSha256)
     }

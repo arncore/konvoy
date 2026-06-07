@@ -931,10 +931,8 @@ pub(crate) fn check_lockfile_staleness(
         }
     }
 
-    if let Some(openapi) = &manifest.codegen.openapi {
-        if tc.fabrikt_version.as_deref() != Some(openapi.version.as_str())
-            || tc.fabrikt_jar_sha256.is_none()
-        {
+    for tool in crate::codegen::managed_tools(&manifest.codegen) {
+        if !lockfile.has_codegen_tool(&tool.id, tool.version()) {
             return Err(EngineError::LockfileUpdateRequired);
         }
     }
@@ -1104,6 +1102,10 @@ fn update_lockfile_if_needed(
     }
     updated.dependencies = new_deps;
     updated.plugins = plugin_locks.to_vec();
+    updated.codegen_tools = latest_lockfile.codegen_tools.clone();
+    if updated.codegen_tools.is_empty() {
+        updated.codegen_tools = lockfile.codegen_tools.clone();
+    }
     updated.write_to(lockfile_path)?;
 
     Ok(())
