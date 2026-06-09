@@ -153,7 +153,7 @@ ${body}
 `.trim();
 
     test('valid openapi codegen passes', () => {
-        const text = withCodegen('version = "20.0.0"\nspec = "specs/api.yaml"\nbase_package = "com.example.api"');
+        const text = withCodegen('version = "20.0.0"\nspec = "specs/api.yaml"\nbase_package = "com.example.api"\nspec_dirs = []');
         const diags = validateManifest(text);
         assert.strictEqual(diags.length, 0, `Expected no errors, got: ${JSON.stringify(diags)}`);
     });
@@ -163,6 +163,19 @@ ${body}
         const diags = validateManifest(text);
         assert.ok(hasError(diags, '"spec"'));
         assert.ok(hasError(diags, '"base_package"'));
+        // spec_dirs is required too (may be empty), so its absence is flagged.
+        assert.ok(hasError(diags, '"spec_dirs"'));
+    });
+
+    test('openapi codegen missing spec_dirs is flagged', () => {
+        const text = withCodegen('version = "20.0.0"\nspec = "specs/api.yaml"\nbase_package = "com.example.api"');
+        assert.ok(hasError(validateManifest(text), '"spec_dirs"'));
+    });
+
+    test('openapi codegen empty spec_dirs is accepted', () => {
+        const text = withCodegen('version = "20.0.0"\nspec = "specs/api.yaml"\nbase_package = "com.example.api"\nspec_dirs = []');
+        const diags = validateManifest(text);
+        assert.strictEqual(diags.length, 0, `Expected no errors, got: ${JSON.stringify(diags)}`);
     });
 
     test('openapi codegen version below 18 is flagged', () => {

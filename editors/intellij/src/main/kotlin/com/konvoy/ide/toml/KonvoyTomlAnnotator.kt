@@ -82,7 +82,7 @@ class KonvoyTomlAnnotator : Annotator {
 
         if (sectionName == "codegen.openapi") {
             val entries = table.entries.associate { it.key.text to it }
-            for (requiredKey in listOf("version", "spec", "base_package")) {
+            for (requiredKey in listOf("version", "spec", "base_package", "spec_dirs")) {
                 if (!entries.containsKey(requiredKey)) {
                     holder.newAnnotation(HighlightSeverity.ERROR, "OpenAPI codegen must have \"$requiredKey\" set")
                         .range(table.header)

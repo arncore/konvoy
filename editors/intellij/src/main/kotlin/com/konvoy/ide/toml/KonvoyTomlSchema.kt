@@ -34,6 +34,10 @@ object KonvoyTomlSchema {
         "version" to KeyInfo("Fabrikt version", required = true),
         "spec" to KeyInfo("Project-relative OpenAPI spec path", required = true),
         "base_package" to KeyInfo("Kotlin package for generated sources", required = true),
+        "spec_dirs" to KeyInfo(
+            "Directories whose files feed the codegen cache key (required; may be empty: spec_dirs = [])",
+            required = true,
+        ),
     )
 
     /** Keys within a dependency sub-table (e.g., [dependencies.foo]). */

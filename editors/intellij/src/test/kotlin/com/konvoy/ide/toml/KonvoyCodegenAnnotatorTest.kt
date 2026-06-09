@@ -33,12 +33,30 @@ class KonvoyCodegenAnnotatorTest : BasePlatformTestCase() {
         )
     }
 
+    private fun warningsFor(codegenBody: String): List<String> {
+        val text = """
+            [package]
+            name = "my-app"
+
+            [toolchain]
+            kotlin = "2.1.0"
+
+            [codegen.openapi]
+            $codegenBody
+        """.trimIndent()
+        myFixture.configureByText("konvoy.toml", text)
+        return myFixture.doHighlighting()
+            .filter { it.severity == HighlightSeverity.WARNING }
+            .mapNotNull { it.description }
+    }
+
     fun testValidOpenApiCodegenHasNoErrors() {
         val errors = errorsFor(
             """
             version = "20.0.0"
             spec = "specs/api.yaml"
             base_package = "com.example.api"
+            spec_dirs = []
             """.trimIndent(),
         )
         assertTrue("expected no errors, got: $errors", errors.isEmpty())
@@ -48,6 +66,35 @@ class KonvoyCodegenAnnotatorTest : BasePlatformTestCase() {
         val errors = errorsFor("version = \"20.0.0\"")
         assertAnyError(errors, "\"spec\"")
         assertAnyError(errors, "\"base_package\"")
+        // spec_dirs is required too (may be empty), so its absence is flagged.
+        assertAnyError(errors, "\"spec_dirs\"")
+    }
+
+    fun testMissingSpecDirsFlagged() {
+        val errors = errorsFor(
+            """
+            version = "20.0.0"
+            spec = "specs/api.yaml"
+            base_package = "com.example.api"
+            """.trimIndent(),
+        )
+        assertAnyError(errors, "\"spec_dirs\"")
+    }
+
+    fun testSpecDirsNotFlaggedAsUnknownKey() {
+        // spec_dirs is a known key; it must not produce an "Unknown key" warning.
+        val warnings = warningsFor(
+            """
+            version = "20.0.0"
+            spec = "specs/api.yaml"
+            base_package = "com.example.api"
+            spec_dirs = ["specs"]
+            """.trimIndent(),
+        )
+        assertFalse(
+            "spec_dirs must not be flagged as unknown, got: $warnings",
+            warnings.any { it.contains("spec_dirs") },
+        )
     }
 
     fun testVersionBelowFloorFlagged() {

@@ -320,7 +320,7 @@ export function validateManifest(text: string): TomlDiagnostic[] {
         const openapiKvs = kvBySection.get('codegen.openapi') ?? [];
         const openapiKeys = new Map(openapiKvs.map(kv => [kv.key, kv]));
 
-        for (const required of ['version', 'spec', 'base_package']) {
+        for (const required of ['version', 'spec', 'base_package', 'spec_dirs']) {
             if (!openapiKeys.has(required)) {
                 diagnostics.push({
                     line: openapiSection.line, col: 0, endCol: lines[openapiSection.line].length,
@@ -447,6 +447,7 @@ const KEY_DOCS: Record<string, Record<string, string>> = {
         'version': 'Fabrikt version (18.0.0 or newer, e.g. `20.0.0`)',
         'spec': 'Project-relative path to the OpenAPI spec (`.yaml`, `.yml`, or `.json`)',
         'base_package': 'Kotlin package for generated sources (e.g. `com.example.api`)',
+        'spec_dirs': 'Directories whose files feed the codegen cache key. Required; use `spec_dirs = []` to track only the primary spec',
     },
 };
 
@@ -499,6 +500,7 @@ class TomlCompletionProvider implements vscode.CompletionItemProvider {
                 this.keyItem('version', 'Fabrikt version (required, 18.0.0+)'),
                 this.keyItem('spec', 'Project-relative OpenAPI spec path (required)'),
                 this.keyItem('base_package', 'Kotlin package for generated sources (required)'),
+                this.keyItem('spec_dirs', 'Spec dirs hashed for cache invalidation (required; may be [])'),
             ];
         }
 
