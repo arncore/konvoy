@@ -30,11 +30,6 @@ interface ParsedKeyValue {
 const SECTION_RE = /^\s*\[([^\]]+)\]\s*$/;
 const KEY_VALUE_RE = /^\s*(\w[\w-]*)\s*=\s*(.+)$/;
 const VALID_NAME_RE = /^[a-zA-Z_][a-zA-Z0-9_-]*$/;
-// Dot-separated Kotlin/Java package: each segment starts with a letter or
-// underscore and contains only ASCII alphanumerics or underscores.
-const PACKAGE_RE = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/;
-// Minimum supported Fabrikt major version (introduced --serialization-library).
-const MIN_FABRIKT_MAJOR = 18;
 
 // ── Pure validation logic (testable without VS Code) ───────────────────────
 
@@ -312,102 +307,6 @@ export function validateManifest(text: string): TomlDiagnostic[] {
         }
     }
 
-    // Validate [codegen.openapi] — mirrors the Rust manifest validator
-    // (validate_codegen) and the IntelliJ annotator so editors agree with
-    // `konvoy build`.
-    if (sectionNames.includes('codegen.openapi')) {
-        const openapiSection = sections.find(s => s.name === 'codegen.openapi')!;
-        const openapiKvs = kvBySection.get('codegen.openapi') ?? [];
-        const openapiKeys = new Map(openapiKvs.map(kv => [kv.key, kv]));
-
-        for (const required of ['version', 'spec', 'base_package', 'spec_dirs']) {
-            if (!openapiKeys.has(required)) {
-                diagnostics.push({
-                    line: openapiSection.line, col: 0, endCol: lines[openapiSection.line].length,
-                    message: `OpenAPI codegen must have "${required}" set.`,
-                    severity: vscode.DiagnosticSeverity.Error,
-                });
-            }
-        }
-
-        const versionKv = openapiKeys.get('version');
-        if (versionKv) {
-            const versionVal = stripQuotes(versionKv.value).trim();
-            // Require the major segment to be entirely numeric, mirroring Rust's
-            // `str::parse::<u64>()` — `parseInt('20abc')` would leniently yield 20.
-            const majorSeg = versionVal.split(/[.\-+]/)[0] ?? '';
-            const major = /^[0-9]+$/.test(majorSeg) ? Number.parseInt(majorSeg, 10) : Number.NaN;
-            if (versionVal.length === 0) {
-                diagnostics.push({
-                    line: versionKv.line, col: versionKv.valueStart, endCol: versionKv.valueEnd,
-                    message: 'Fabrikt version must not be empty.',
-                    severity: vscode.DiagnosticSeverity.Error,
-                });
-            } else if (Number.isNaN(major)) {
-                diagnostics.push({
-                    line: versionKv.line, col: versionKv.valueStart, endCol: versionKv.valueEnd,
-                    message: 'version must be a valid Fabrikt version like "20.0.0".',
-                    severity: vscode.DiagnosticSeverity.Error,
-                });
-            } else if (major < MIN_FABRIKT_MAJOR) {
-                diagnostics.push({
-                    line: versionKv.line, col: versionKv.valueStart, endCol: versionKv.valueEnd,
-                    message: `Konvoy requires Fabrikt ${MIN_FABRIKT_MAJOR}.0.0 or newer.`,
-                    severity: vscode.DiagnosticSeverity.Error,
-                });
-            }
-        }
-
-        const specKv = openapiKeys.get('spec');
-        if (specKv) {
-            const specVal = stripQuotes(specKv.value).trim();
-            const isAbsolute = specVal.startsWith('/') || /^[A-Za-z]:[\\/]/.test(specVal);
-            if (specVal.length === 0) {
-                diagnostics.push({
-                    line: specKv.line, col: specKv.valueStart, endCol: specKv.valueEnd,
-                    message: 'spec must not be empty.',
-                    severity: vscode.DiagnosticSeverity.Error,
-                });
-            } else if (isAbsolute) {
-                diagnostics.push({
-                    line: specKv.line, col: specKv.valueStart, endCol: specKv.valueEnd,
-                    message: 'spec must be a relative path inside the project.',
-                    severity: vscode.DiagnosticSeverity.Error,
-                });
-            } else if (specVal.split(/[\\/]/).includes('..')) {
-                diagnostics.push({
-                    line: specKv.line, col: specKv.valueStart, endCol: specKv.valueEnd,
-                    message: 'spec must be a relative path inside the project (must not contain "..").',
-                    severity: vscode.DiagnosticSeverity.Error,
-                });
-            } else if (!(specVal.endsWith('.yaml') || specVal.endsWith('.yml') || specVal.endsWith('.json'))) {
-                diagnostics.push({
-                    line: specKv.line, col: specKv.valueStart, endCol: specKv.valueEnd,
-                    message: 'spec must point to an OpenAPI .yaml, .yml, or .json file.',
-                    severity: vscode.DiagnosticSeverity.Error,
-                });
-            }
-        }
-
-        const basePackageKv = openapiKeys.get('base_package');
-        if (basePackageKv) {
-            const pkgVal = stripQuotes(basePackageKv.value).trim();
-            if (pkgVal.length === 0) {
-                diagnostics.push({
-                    line: basePackageKv.line, col: basePackageKv.valueStart, endCol: basePackageKv.valueEnd,
-                    message: 'base_package must not be empty.',
-                    severity: vscode.DiagnosticSeverity.Error,
-                });
-            } else if (!PACKAGE_RE.test(pkgVal)) {
-                diagnostics.push({
-                    line: basePackageKv.line, col: basePackageKv.valueStart, endCol: basePackageKv.valueEnd,
-                    message: 'base_package must be dot-separated identifiers like "com.example.api".',
-                    severity: vscode.DiagnosticSeverity.Error,
-                });
-            }
-        }
-    }
-
     return diagnostics;
 }
 
@@ -443,12 +342,6 @@ const KEY_DOCS: Record<string, Record<string, string>> = {
         'kotlin': 'Kotlin/Native version (e.g. `2.1.0`)',
         'detekt': 'Detekt version for linting (e.g. `1.23.7`). Enables `konvoy lint`',
     },
-    'codegen.openapi': {
-        'version': 'Fabrikt version (18.0.0 or newer, e.g. `20.0.0`)',
-        'spec': 'Project-relative path to the OpenAPI spec (`.yaml`, `.yml`, or `.json`)',
-        'base_package': 'Kotlin package for generated sources (e.g. `com.example.api`)',
-        'spec_dirs': 'Directories whose files feed the codegen cache key. Required; use `spec_dirs = []` to track only the primary spec',
-    },
 };
 
 // ── Providers ──────────────────────────────────────────────────────────────
@@ -468,7 +361,6 @@ class TomlCompletionProvider implements vscode.CompletionItemProvider {
                 this.sectionItem('[toolchain]', 'Toolchain versions'),
                 this.sectionItem('[dependencies]', 'Project dependencies'),
                 this.sectionItem('[plugins]', 'Compiler plugins'),
-                this.sectionItem('[codegen.openapi]', 'OpenAPI source generation (Fabrikt)'),
             ];
         }
 
@@ -492,15 +384,6 @@ class TomlCompletionProvider implements vscode.CompletionItemProvider {
             return [
                 this.keyItem('kotlin', 'Kotlin/Native version (required)'),
                 this.keyItem('detekt', 'Detekt version for linting'),
-            ];
-        }
-
-        if (section === 'codegen.openapi') {
-            return [
-                this.keyItem('version', 'Fabrikt version (required, 18.0.0+)'),
-                this.keyItem('spec', 'Project-relative OpenAPI spec path (required)'),
-                this.keyItem('base_package', 'Kotlin package for generated sources (required)'),
-                this.keyItem('spec_dirs', 'Spec dirs hashed for cache invalidation (required; may be [])'),
             ];
         }
 
