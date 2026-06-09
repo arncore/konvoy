@@ -436,6 +436,9 @@ fn cmd_generate(verbose: bool, locked: bool, force: bool) -> CliResult {
         verbose,
         locked,
         force,
+        // `generate` has no cache key to share a precomputed hash with, so let
+        // run_codegen compute it on demand.
+        None,
     )?;
 
     for summary in konvoy_engine::codegen::generator_summaries(&root, &manifest.codegen) {

@@ -65,8 +65,10 @@ pub fn build_tests(
         .filter(|p| !p.starts_with(&test_dir))
         .collect();
     sources.extend(test_sources);
-    let codegen_hashes =
-        crate::codegen::compute_codegen_hashes(project_root, &ctx.manifest.codegen)?;
+    // Computed once: feeds the cache key below and is threaded into run_codegen
+    // so a cache-miss test build does not recompute it (or re-read spec files).
+    let codegen_hash_pairs =
+        crate::codegen::compute_codegen_hash_pairs(project_root, &ctx.manifest.codegen)?;
 
     // Compute cache key. The test-binary build must produce a distinct cache
     // key from a regular build of the same source tree, so we tag the lockfile
@@ -84,7 +86,10 @@ pub fn build_tests(
         source_glob: "**/*.kt".to_owned(),
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
-        codegen_hashes,
+        codegen_hashes: codegen_hash_pairs
+            .iter()
+            .map(|(name, hash)| format!("{name}:{hash}"))
+            .collect(),
         dependency_hashes: ctx
             .library_inputs
             .iter()
@@ -138,6 +143,7 @@ pub fn build_tests(
         options.verbose,
         options.locked,
         options.force,
+        Some(&codegen_hash_pairs),
     )?;
     sources.extend(gen_sources);
 

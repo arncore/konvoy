@@ -275,6 +275,7 @@ fn run_codegen_locked_without_pin_requires_lockfile_update() {
         false,
         true, // locked
         false,
+        None,
     );
 
     assert!(matches!(
@@ -314,6 +315,7 @@ fn run_codegen_locked_with_pin_but_missing_jar_reports_tool_not_found() {
         false,
         true, // locked
         false,
+        None,
     );
 
     assert!(
@@ -382,6 +384,7 @@ fn run_codegen_replaces_stale_generic_tool_pin_without_regenerating_sources() {
         false,
         false,
         false,
+        None,
     )
     .unwrap();
 
@@ -394,6 +397,74 @@ fn run_codegen_replaces_stale_generic_tool_pin_without_regenerating_sources() {
     assert_eq!(pin.sha256, real_hash);
 
     let _ = fs::remove_file(&jar);
+}
+
+#[test]
+fn codegen_hash_pairs_match_tagged_hashes() {
+    // compute_codegen_hashes (cache-key form) must be exactly the tagged
+    // rendering of compute_codegen_hash_pairs, so threading the pairs into the
+    // build does not change the cache key bytes.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("openapi.yaml"),
+        "openapi: 3.1.0\ninfo:\n  title: Demo\n  version: 1.0.0\n",
+    )
+    .unwrap();
+    let codegen = openapi_codegen("20.0.0", "openapi.yaml", "com.example.api");
+
+    let pairs = konvoy_engine::codegen::compute_codegen_hash_pairs(dir.path(), &codegen).unwrap();
+    let tagged = konvoy_engine::codegen::compute_codegen_hashes(dir.path(), &codegen).unwrap();
+
+    let from_pairs: Vec<String> = pairs.iter().map(|(n, h)| format!("{n}:{h}")).collect();
+    assert_eq!(tagged, from_pairs);
+    assert!(pairs.iter().any(|(name, _)| name == "openapi"));
+}
+
+#[test]
+fn run_codegen_uses_threaded_precomputed_hash() {
+    // Proves run_codegen consumes the threaded hash instead of recomputing: we
+    // feed a sentinel that matches a pre-written .input_hash, making codegen a
+    // cache hit that never resolves the tool. If it (wrongly) recomputed, the
+    // real hash would differ, mark inputs stale, and force tool resolution —
+    // failing here since no JAR is present.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("openapi.yaml"),
+        "openapi: 3.1.0\ninfo:\n  title: Demo\n  version: 1.0.0\n",
+    )
+    .unwrap();
+    let codegen = openapi_codegen("20.0.0", "openapi.yaml", "com.example");
+
+    let output_dir = konvoy_engine::codegen::generator_output_dir(dir.path(), "openapi");
+    fs::create_dir_all(&output_dir).unwrap();
+    let sentinel = "sentinel-precomputed-hash";
+    fs::write(output_dir.join(".input_hash"), format!("{sentinel}\n")).unwrap();
+
+    let lockfile_path = dir.path().join("konvoy.lock");
+    let mut lockfile = Lockfile::with_toolchain("2.1.0");
+    // Pin present (matching the config version) so the cache-hit path needs no
+    // lockfile update and never touches the tool.
+    lockfile.set_codegen_tool("fabrikt", "20.0.0", "deadbeef");
+
+    let precomputed = vec![("openapi".to_owned(), sentinel.to_owned())];
+    let generated = konvoy_engine::codegen::run_codegen(
+        dir.path(),
+        &codegen,
+        &lockfile,
+        &lockfile_path,
+        "2.1.0",
+        None,
+        false,
+        false,
+        false,
+        Some(&precomputed),
+    )
+    .unwrap();
+
+    assert!(
+        generated.is_empty(),
+        "matching precomputed hash must be a cache hit (no generation)"
+    );
 }
 
 #[test]

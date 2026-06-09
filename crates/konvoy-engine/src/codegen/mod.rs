@@ -97,7 +97,31 @@ pub fn managed_tools(codegen: &Codegen) -> Vec<ManagedToolSpec> {
         .collect()
 }
 
-/// Compute tagged hashes for all active generators.
+/// Compute `(generator name, input hash)` pairs for all active generators, in
+/// stable order.
+///
+/// This is the single place generator hashes are computed. A build computes them
+/// once for the cache key and threads them into [`run_codegen`] (via its
+/// `precomputed_hashes` argument) so neither the hash nor any spec / `spec_dirs`
+/// file is read a second time on a cache-miss build.
+///
+/// # Errors
+/// Returns an error if a configured generator input cannot be read.
+pub fn compute_codegen_hash_pairs(
+    project_root: &Path,
+    codegen: &Codegen,
+) -> Result<Vec<(String, String)>, EngineError> {
+    active_generators(codegen)
+        .into_iter()
+        .map(|generator| {
+            let hash = compute_generator_hash(generator.as_ref(), project_root)?;
+            Ok((generator.name().to_owned(), hash))
+        })
+        .collect()
+}
+
+/// Compute tagged (`name:hash`) hashes for all active generators — the form
+/// folded into the build cache key.
 ///
 /// # Errors
 /// Returns an error if a configured generator input cannot be read.
@@ -105,16 +129,19 @@ pub fn compute_codegen_hashes(
     project_root: &Path,
     codegen: &Codegen,
 ) -> Result<Vec<String>, EngineError> {
-    active_generators(codegen)
+    Ok(compute_codegen_hash_pairs(project_root, codegen)?
         .into_iter()
-        .map(|generator| {
-            let hash = compute_generator_hash(generator.as_ref(), project_root)?;
-            Ok(format!("{}:{hash}", generator.name()))
-        })
-        .collect()
+        .map(|(name, hash)| format!("{name}:{hash}"))
+        .collect())
 }
 
 /// Run configured generators when their inputs are stale, then collect generated `.kt` files.
+///
+/// `precomputed_hashes`, when provided, supplies each generator's input hash
+/// (already computed once for the build cache key via
+/// [`compute_codegen_hash_pairs`]) so it is not recomputed here — avoiding a
+/// second read of every spec / `spec_dirs` file on a cache-miss build. Pass
+/// `None` (e.g. from `konvoy generate`) to compute the hash on demand.
 ///
 /// # Errors
 /// Returns an error if tool resolution, source generation, or generated source
@@ -130,6 +157,7 @@ pub fn run_codegen(
     verbose: bool,
     locked: bool,
     force: bool,
+    precomputed_hashes: Option<&[(String, String)]>,
 ) -> Result<Vec<PathBuf>, EngineError> {
     let generators = active_generators(codegen);
     if generators.is_empty() {
@@ -139,7 +167,16 @@ pub fn run_codegen(
     let mut generated_sources = Vec::new();
 
     for generator in generators {
-        let input_hash = compute_generator_hash(generator.as_ref(), project_root)?;
+        // Reuse the hash computed for the cache key when the caller threaded it
+        // in; otherwise compute it now. Match by name so order is irrelevant.
+        let input_hash = match precomputed_hashes.and_then(|pairs| {
+            pairs
+                .iter()
+                .find(|(name, _)| name.as_str() == generator.name())
+        }) {
+            Some((_, hash)) => hash.clone(),
+            None => compute_generator_hash(generator.as_ref(), project_root)?,
+        };
         let output_dir = generator_output_dir(project_root, generator.name());
         let input_hash_path = output_dir.join(".input_hash");
         let stored_hash = std::fs::read_to_string(&input_hash_path).ok();

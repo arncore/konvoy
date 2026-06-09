@@ -504,7 +504,11 @@ pub(crate) fn build_single(
     }
 
     let is_lib = manifest.package.kind == PackageKind::Lib;
-    let codegen_hashes = crate::codegen::compute_codegen_hashes(project_root, &manifest.codegen)?;
+    // Compute each generator's input hash once: it feeds the cache key below and
+    // is threaded into run_codegen so a cache-miss build does not recompute it
+    // (or re-read every spec / spec_dirs file).
+    let codegen_hash_pairs =
+        crate::codegen::compute_codegen_hash_pairs(project_root, &manifest.codegen)?;
 
     // Compute cache key.
     let manifest_content = manifest.to_toml()?;
@@ -519,7 +523,10 @@ pub(crate) fn build_single(
         source_glob: "**/*.kt".to_owned(),
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
-        codegen_hashes,
+        codegen_hashes: codegen_hash_pairs
+            .iter()
+            .map(|(name, hash)| format!("{name}:{hash}"))
+            .collect(),
         dependency_hashes: cc
             .library_inputs
             .iter()
@@ -577,6 +584,7 @@ pub(crate) fn build_single(
         cc.options.verbose,
         cc.options.locked,
         cc.options.force,
+        Some(&codegen_hash_pairs),
     )?;
     let mut compile_sources = sources;
     compile_sources.extend(gen_sources);
