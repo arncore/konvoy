@@ -332,6 +332,7 @@ mod tests {
         let manifest = Manifest {
             package: default_package(),
             toolchain: default_toolchain(),
+            codegen: Default::default(),
             dependencies: BTreeMap::new(),
             plugins,
         };
@@ -355,6 +356,7 @@ mod tests {
         let manifest = Manifest {
             package: default_package(),
             toolchain: default_toolchain(),
+            codegen: Default::default(),
             dependencies: BTreeMap::new(),
             plugins,
         };
@@ -438,6 +440,7 @@ mod tests {
         let manifest = Manifest {
             package: default_package(),
             toolchain: default_toolchain(),
+            codegen: Default::default(),
             dependencies: BTreeMap::new(),
             plugins: BTreeMap::new(),
         };
@@ -467,6 +470,7 @@ mod tests {
         let manifest = Manifest {
             package: default_package(),
             toolchain: default_toolchain(),
+            codegen: Default::default(),
             dependencies: BTreeMap::new(),
             plugins,
         };
@@ -528,6 +532,7 @@ mod tests {
         let manifest = Manifest {
             package: default_package(),
             toolchain: default_toolchain(),
+            codegen: Default::default(),
             dependencies: BTreeMap::new(),
             plugins,
         };
@@ -742,6 +747,7 @@ mod tests {
         let manifest = Manifest {
             package: default_package(),
             toolchain: default_toolchain(),
+            codegen: Default::default(),
             dependencies,
             plugins,
         };
@@ -803,6 +809,7 @@ mod tests {
         Manifest {
             package: default_package(),
             toolchain: default_toolchain(),
+            codegen: Default::default(),
             dependencies: BTreeMap::new(),
             plugins,
         }

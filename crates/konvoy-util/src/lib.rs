@@ -9,6 +9,7 @@ pub mod hash;
 pub mod maven;
 pub mod metadata;
 pub mod module_metadata;
+pub mod naming;
 pub mod pom;
 pub mod progress;
 
