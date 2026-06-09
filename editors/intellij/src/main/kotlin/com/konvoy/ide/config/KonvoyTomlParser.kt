@@ -9,40 +9,39 @@ import com.intellij.openapi.project.Project
 /**
  * Parses `konvoy.toml` and `konvoy.lock` files using the TOML PSI.
  *
- * Falls back to manual line parsing when the TOML plugin is unavailable,
- * but the PSI path is preferred for accuracy and IDE integration.
+ * Requires the IntelliJ TOML plugin: when a file is not recognized as TOML (or
+ * PSI parsing throws), parsing returns null rather than falling back to a
+ * hand-rolled line parser. `konvoy.lock` is associated with the TOML file type
+ * in plugin.xml so it parses via PSI like `konvoy.toml`.
  */
 object KonvoyTomlParser {
     private val LOG = Logger.getInstance(KonvoyTomlParser::class.java)
 
     fun parseManifest(project: Project, file: VirtualFile): KonvoyManifest? {
-        val text = file.contentsToByteArray().decodeToString()
+        val psi = PsiManager.getInstance(project).findFile(file) as? TomlFile
+        if (psi == null) {
+            LOG.warn("konvoy.toml is not recognized as a TOML file; cannot parse")
+            return null
+        }
         return try {
-            val psi = PsiManager.getInstance(project).findFile(file) as? TomlFile
-            val result = psi?.let { parseManifestFromPsi(it) }
-            if (result != null) {
-                LOG.info("Parsed konvoy.toml via PSI: ${result.`package`.name}")
-                return result
-            }
-            LOG.info("PSI parsing returned null, falling back to text")
-            parseManifestFromText(text)
+            parseManifestFromPsi(psi)
         } catch (e: Exception) {
-            LOG.warn("Failed to parse konvoy.toml via PSI, falling back to text", e)
-            parseManifestFromText(text)
+            LOG.warn("Failed to parse konvoy.toml", e)
+            null
         }
     }
 
     fun parseLockfile(project: Project, file: VirtualFile): KonvoyLockfile? {
-        val text = file.contentsToByteArray().decodeToString()
+        val psi = PsiManager.getInstance(project).findFile(file) as? TomlFile
+        if (psi == null) {
+            LOG.warn("konvoy.lock is not recognized as a TOML file; cannot parse")
+            return null
+        }
         return try {
-            val psi = PsiManager.getInstance(project).findFile(file) as? TomlFile
-            val result = psi?.let { parseLockfileFromPsi(it) }
-            if (result != null) return result
-            LOG.info("PSI lockfile parsing returned null, falling back to text")
-            parseLockfileFromText(text)
+            parseLockfileFromPsi(psi)
         } catch (e: Exception) {
-            LOG.warn("Failed to parse konvoy.lock via PSI, falling back to text", e)
-            parseLockfileFromText(text)
+            LOG.warn("Failed to parse konvoy.lock", e)
+            null
         }
     }
 
@@ -246,108 +245,6 @@ object KonvoyTomlParser {
             sha256 = table.stringValue("sha256") ?: "",
             url = table.stringValue("url") ?: "",
         )
-    }
-
-    // -- Text-based fallback parsing --
-
-    fun parseManifestFromText(content: String): KonvoyManifest? {
-        val sections = parseTomlSections(content)
-
-        val pkgSection = sections["package"] ?: return null
-        val toolchainSection = sections["toolchain"] ?: return null
-
-        val pkg = KonvoyPackage(
-            name = pkgSection["name"] ?: return null,
-            kind = pkgSection["kind"]?.let { PackageKind.fromString(it) } ?: PackageKind.BIN,
-            version = pkgSection["version"],
-            entrypoint = pkgSection["entrypoint"] ?: "src/main.kt",
-        )
-
-        val toolchain = KonvoyToolchain(
-            kotlin = toolchainSection["kotlin"] ?: return null,
-            detekt = toolchainSection["detekt"],
-        )
-        // Incomplete optional section must not fail the whole manifest parse
-        // (see parseManifestFromPsi); treat it as "no codegen" until complete.
-        val openApiCodegen = sections["codegen.openapi"]?.let { sec ->
-            openApiCodegenOf(sec["version"], sec["spec"], sec["base_package"])
-        }
-
-        val deps = mutableMapOf<String, DependencySpec>()
-        for ((key, values) in sections) {
-            if (key.startsWith("dependencies.")) {
-                val depName = key.removePrefix("dependencies.")
-                deps[depName] = DependencySpec(
-                    path = values["path"],
-                    version = values["version"],
-                    maven = values["maven"],
-                )
-            }
-        }
-        // Inline deps under [dependencies] need more complex parsing;
-        // for now we handle sub-table style which is the common case
-
-        return KonvoyManifest(
-            `package` = pkg,
-            toolchain = toolchain,
-            codegen = KonvoyCodegen(openapi = openApiCodegen),
-            dependencies = deps,
-        )
-    }
-
-    fun parseLockfileFromText(content: String): KonvoyLockfile {
-        val sections = parseTomlSections(content)
-
-        val toolchainSection = sections["toolchain"]
-        val toolchain = toolchainSection?.let {
-            ToolchainLock(
-                konancVersion = it["konanc_version"] ?: "",
-                konancTarballSha256 = it["konanc_tarball_sha256"],
-                jreTarballSha256 = it["jre_tarball_sha256"],
-                detektVersion = it["detekt_version"],
-                detektJarSha256 = it["detekt_jar_sha256"],
-            )
-        }
-
-        val codegenTools = sections
-            .filterKeys { it.startsWith("codegen_tools.") }
-            .mapNotNull { (section, values) ->
-                val id = section.removePrefix("codegen_tools.")
-                val version = values["version"] ?: return@mapNotNull null
-                val sha256 = values["sha256"] ?: return@mapNotNull null
-                id to CodegenToolLock(version = version, sha256 = sha256)
-            }
-            .toMap()
-
-        // Text-based array-of-tables parsing is limited; prefer PSI path
-        return KonvoyLockfile(toolchain = toolchain, codegenTools = codegenTools)
-    }
-
-    /**
-     * Minimal TOML section parser. Handles `[section]` headers and `key = "value"` entries.
-     * Does not handle inline tables or array-of-tables — use PSI parsing for those.
-     */
-    private fun parseTomlSections(content: String): Map<String, Map<String, String>> {
-        val sections = mutableMapOf<String, MutableMap<String, String>>()
-        var currentSection = ""
-
-        for (line in content.lines()) {
-            val trimmed = line.trim()
-            if (trimmed.startsWith('#') || trimmed.isEmpty()) continue
-
-            val sectionMatch = Regex("""\[([^\[\]]+)]""").matchEntire(trimmed)
-            if (sectionMatch != null) {
-                currentSection = sectionMatch.groupValues[1].trim()
-                sections.getOrPut(currentSection) { mutableMapOf() }
-                continue
-            }
-
-            val kvMatch = Regex("""(\S+)\s*=\s*"([^"]*)"""").find(trimmed)
-            if (kvMatch != null && currentSection.isNotEmpty()) {
-                sections.getOrPut(currentSection) { mutableMapOf() }[kvMatch.groupValues[1]] = kvMatch.groupValues[2]
-            }
-        }
-        return sections
     }
 
     // -- PSI helpers --

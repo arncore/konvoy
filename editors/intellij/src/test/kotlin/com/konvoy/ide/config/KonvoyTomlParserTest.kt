@@ -1,19 +1,35 @@
 package com.konvoy.ide.config
 
-import org.junit.Assert.*
-import org.junit.Test
+import com.intellij.testFramework.fixtures.BasePlatformTestCase
 
-class KonvoyTomlParserTest {
+/**
+ * Tests the real (PSI) manifest/lockfile parsing. These previously called the
+ * text-fallback parser directly; that fallback was removed (the PSI path is the
+ * only parser), so these now exercise `parseManifest`/`parseLockfile` via a
+ * configured TOML PSI file — i.e. what actually runs in the IDE.
+ */
+class KonvoyTomlParserTest : BasePlatformTestCase() {
 
-    @Test
-    fun `parse minimal manifest`() {
-        val manifest = KonvoyTomlParser.parseManifestFromText("""
+    private fun manifest(content: String): KonvoyManifest? {
+        val file = myFixture.configureByText("konvoy.toml", content)
+        return KonvoyTomlParser.parseManifest(project, file.virtualFile)
+    }
+
+    private fun lockfile(content: String): KonvoyLockfile? {
+        val file = myFixture.configureByText("konvoy.lock", content)
+        return KonvoyTomlParser.parseLockfile(project, file.virtualFile)
+    }
+
+    fun testParseMinimalManifest() {
+        val manifest = manifest(
+            """
             [package]
             name = "hello"
 
             [toolchain]
             kotlin = "2.3.20"
-        """.trimIndent())
+            """.trimIndent(),
+        )
 
         assertNotNull(manifest)
         assertEquals("hello", manifest!!.`package`.name)
@@ -24,9 +40,9 @@ class KonvoyTomlParserTest {
         assertTrue(manifest.dependencies.isEmpty())
     }
 
-    @Test
-    fun `parse manifest with all package fields`() {
-        val manifest = KonvoyTomlParser.parseManifestFromText("""
+    fun testParseManifestWithAllPackageFields() {
+        val manifest = manifest(
+            """
             [package]
             name = "mylib"
             kind = "lib"
@@ -36,7 +52,8 @@ class KonvoyTomlParserTest {
             [toolchain]
             kotlin = "2.2.0"
             detekt = "1.23.7"
-        """.trimIndent())
+            """.trimIndent(),
+        )
 
         assertNotNull(manifest)
         assertEquals("mylib", manifest!!.`package`.name)
@@ -47,9 +64,9 @@ class KonvoyTomlParserTest {
         assertEquals("1.23.7", manifest.toolchain.detekt)
     }
 
-    @Test
-    fun `parse manifest with path dependency`() {
-        val manifest = KonvoyTomlParser.parseManifestFromText("""
+    fun testParseManifestWithPathDependency() {
+        val manifest = manifest(
+            """
             [package]
             name = "app"
 
@@ -58,7 +75,8 @@ class KonvoyTomlParserTest {
 
             [dependencies.mylib]
             path = "../mylib"
-        """.trimIndent())
+            """.trimIndent(),
+        )
 
         assertNotNull(manifest)
         assertEquals(1, manifest!!.dependencies.size)
@@ -68,9 +86,9 @@ class KonvoyTomlParserTest {
         assertEquals("../mylib", dep.path)
     }
 
-    @Test
-    fun `parse manifest with maven dependency`() {
-        val manifest = KonvoyTomlParser.parseManifestFromText("""
+    fun testParseManifestWithMavenDependency() {
+        val manifest = manifest(
+            """
             [package]
             name = "app"
 
@@ -80,7 +98,8 @@ class KonvoyTomlParserTest {
             [dependencies.serialization-core]
             maven = "org.jetbrains.kotlinx:kotlinx-serialization-core"
             version = "1.7.3"
-        """.trimIndent())
+            """.trimIndent(),
+        )
 
         assertNotNull(manifest)
         val dep = manifest!!.dependencies["serialization-core"]
@@ -90,9 +109,9 @@ class KonvoyTomlParserTest {
         assertEquals("1.7.3", dep.version)
     }
 
-    @Test
-    fun `parse manifest with openapi codegen`() {
-        val manifest = KonvoyTomlParser.parseManifestFromText("""
+    fun testParseManifestWithOpenApiCodegen() {
+        val manifest = manifest(
+            """
             [package]
             name = "app"
 
@@ -103,7 +122,8 @@ class KonvoyTomlParserTest {
             version = "20.0.0"
             spec = "specs/api.yaml"
             base_package = "com.example.api"
-        """.trimIndent())
+            """.trimIndent(),
+        )
 
         assertNotNull(manifest)
         val openapi = manifest!!.codegen.openapi
@@ -113,55 +133,59 @@ class KonvoyTomlParserTest {
         assertEquals("com.example.api", openapi.basePackage)
     }
 
-    @Test
-    fun `returns null for missing package section`() {
-        val manifest = KonvoyTomlParser.parseManifestFromText("""
-            [toolchain]
-            kotlin = "2.3.20"
-        """.trimIndent())
-
-        assertNull(manifest)
+    fun testReturnsNullForMissingPackageSection() {
+        assertNull(
+            manifest(
+                """
+                [toolchain]
+                kotlin = "2.3.20"
+                """.trimIndent(),
+            ),
+        )
     }
 
-    @Test
-    fun `returns null for missing toolchain section`() {
-        val manifest = KonvoyTomlParser.parseManifestFromText("""
-            [package]
-            name = "hello"
-        """.trimIndent())
-
-        assertNull(manifest)
+    fun testReturnsNullForMissingToolchainSection() {
+        assertNull(
+            manifest(
+                """
+                [package]
+                name = "hello"
+                """.trimIndent(),
+            ),
+        )
     }
 
-    @Test
-    fun `returns null for missing name`() {
-        val manifest = KonvoyTomlParser.parseManifestFromText("""
-            [package]
-            kind = "bin"
+    fun testReturnsNullForMissingName() {
+        assertNull(
+            manifest(
+                """
+                [package]
+                kind = "bin"
 
-            [toolchain]
-            kotlin = "2.3.20"
-        """.trimIndent())
-
-        assertNull(manifest)
+                [toolchain]
+                kotlin = "2.3.20"
+                """.trimIndent(),
+            ),
+        )
     }
 
-    @Test
-    fun `returns null for missing kotlin version`() {
-        val manifest = KonvoyTomlParser.parseManifestFromText("""
-            [package]
-            name = "hello"
+    fun testReturnsNullForMissingKotlinVersion() {
+        assertNull(
+            manifest(
+                """
+                [package]
+                name = "hello"
 
-            [toolchain]
-            detekt = "1.23.7"
-        """.trimIndent())
-
-        assertNull(manifest)
+                [toolchain]
+                detekt = "1.23.7"
+                """.trimIndent(),
+            ),
+        )
     }
 
-    @Test
-    fun `parse lockfile text`() {
-        val lockfile = KonvoyTomlParser.parseLockfileFromText("""
+    fun testParseLockfile() {
+        val lock = lockfile(
+            """
             [toolchain]
             konanc_version = "2.3.20"
             konanc_tarball_sha256 = "abc123"
@@ -170,20 +194,21 @@ class KonvoyTomlParserTest {
             [codegen_tools.fabrikt]
             version = "20.0.0"
             sha256 = "f00d"
-        """.trimIndent())
+            """.trimIndent(),
+        )
 
-        assertNotNull(lockfile)
-        assertNotNull(lockfile.toolchain)
-        assertEquals("2.3.20", lockfile.toolchain!!.konancVersion)
-        assertEquals("abc123", lockfile.toolchain!!.konancTarballSha256)
-        assertEquals("def456", lockfile.toolchain!!.jreTarballSha256)
-        assertEquals("20.0.0", lockfile.codegenTools["fabrikt"]!!.version)
-        assertEquals("f00d", lockfile.codegenTools["fabrikt"]!!.sha256)
+        assertNotNull(lock)
+        assertNotNull(lock!!.toolchain)
+        assertEquals("2.3.20", lock.toolchain!!.konancVersion)
+        assertEquals("abc123", lock.toolchain!!.konancTarballSha256)
+        assertEquals("def456", lock.toolchain!!.jreTarballSha256)
+        assertEquals("20.0.0", lock.codegenTools["fabrikt"]!!.version)
+        assertEquals("f00d", lock.codegenTools["fabrikt"]!!.sha256)
     }
 
-    @Test
-    fun `ignores comments and blank lines`() {
-        val manifest = KonvoyTomlParser.parseManifestFromText("""
+    fun testIgnoresCommentsAndBlankLines() {
+        val manifest = manifest(
+            """
             # This is a comment
 
             [package]
@@ -192,21 +217,23 @@ class KonvoyTomlParserTest {
             # Another comment
             [toolchain]
             kotlin = "2.3.20"
-        """.trimIndent())
+            """.trimIndent(),
+        )
 
         assertNotNull(manifest)
         assertEquals("hello", manifest!!.`package`.name)
     }
 
-    @Test
-    fun `kind defaults to BIN`() {
-        val manifest = KonvoyTomlParser.parseManifestFromText("""
+    fun testKindDefaultsToBin() {
+        val manifest = manifest(
+            """
             [package]
             name = "app"
 
             [toolchain]
             kotlin = "2.3.20"
-        """.trimIndent())
+            """.trimIndent(),
+        )
 
         assertEquals(PackageKind.BIN, manifest!!.`package`.kind)
     }
