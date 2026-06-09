@@ -42,11 +42,15 @@ pub trait CodeGenerator {
 
     /// Project-relative input files read by this generator.
     ///
-    /// `project_root` is provided so generators can resolve transitive inputs
-    /// (e.g. OpenAPI specs that reference other files via `$ref`). The returned
-    /// paths are project-relative and their contents are folded into the
-    /// generator hash (and thus the build cache key).
-    fn input_files(&self, project_root: &Path) -> Vec<PathBuf>;
+    /// `project_root` lets generators enumerate inputs that live on disk (e.g.
+    /// every file under a configured spec directory). The returned paths are
+    /// project-relative and their contents are folded into the generator hash
+    /// (and thus the build cache key).
+    ///
+    /// # Errors
+    /// Returns an error if a configured input location (e.g. a spec directory)
+    /// is missing or cannot be read.
+    fn input_files(&self, project_root: &Path) -> Result<Vec<PathBuf>, EngineError>;
 
     /// Generate sources into `output_dir`.
     ///
@@ -223,7 +227,7 @@ fn compute_generator_hash(
     ];
     parts.extend(generator.config_hash_parts());
 
-    for input in generator.input_files(project_root) {
+    for input in generator.input_files(project_root)? {
         let full_path = project_root.join(&input);
         if !full_path.exists() {
             return Err(EngineError::CodegenInputNotFound {

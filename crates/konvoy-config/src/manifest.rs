@@ -93,6 +93,17 @@ pub struct OpenApiCodegen {
     pub spec: String,
     /// Kotlin package name for generated sources.
     pub base_package: String,
+    /// Project-relative directories whose files all feed the codegen cache key.
+    ///
+    /// Required, but may be empty. Fabrikt resolves `$ref`'d sibling files
+    /// internally but never reports which files it read, so Konvoy cannot
+    /// discover them. List the directories holding those files here: any change
+    /// to any file under them regenerates sources. This is fully user-defined —
+    /// Konvoy never assumes a directory. It deliberately over-approximates (a
+    /// change to an unrelated file in a listed directory also regenerates) rather
+    /// than re-parsing the spec. Use `spec_dirs = []` to track only the primary
+    /// `spec` file.
+    pub spec_dirs: Vec<String>,
 }
 
 impl DependencySpec {
@@ -204,6 +215,26 @@ fn validate_plugins(
     Ok(())
 }
 
+/// Ensure a configured path stays inside the project tree: relative and free of
+/// `..` traversal. `label` names the field for the error message.
+fn check_project_relative(value: &str, label: &str) -> Result<(), String> {
+    let candidate = Path::new(value);
+    if candidate.is_absolute() {
+        return Err(format!(
+            "{label} must be a relative path inside the project"
+        ));
+    }
+    if candidate
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "{label} must be a relative path inside the project (must not contain `..`)"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_codegen(codegen: &Codegen, path: &str) -> Result<(), ManifestError> {
     let Some(openapi) = &codegen.openapi else {
         return Ok(());
@@ -243,27 +274,28 @@ fn validate_codegen(codegen: &Codegen, path: &str) -> Result<(), ManifestError> 
     if spec.is_empty() {
         return Err(err("spec must not be empty".to_owned()));
     }
-    let spec_path = Path::new(spec);
-    if spec_path.is_absolute() {
-        return Err(err(
-            "spec must be a relative path inside the project".to_owned()
-        ));
-    }
-    // Reject parent-directory traversal so the spec genuinely stays inside the
-    // project (the error message above promises this) and so the cache key
-    // never depends on files outside the project tree.
-    if spec_path
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return Err(err(
-            "spec must be a relative path inside the project (must not contain `..`)".to_owned(),
-        ));
+    // Reject absolute paths and parent-directory traversal so the spec genuinely
+    // stays inside the project (the error messages promise this) and so the cache
+    // key never depends on files outside the project tree.
+    if let Err(reason) = check_project_relative(spec, "spec") {
+        return Err(err(reason));
     }
     if !(spec.ends_with(".yaml") || spec.ends_with(".yml") || spec.ends_with(".json")) {
         return Err(err(
             "spec must point to an OpenAPI .yaml, .yml, or .json file".to_owned(),
         ));
+    }
+
+    // Each spec directory feeds the codegen cache key, so it must also stay
+    // inside the project tree (same rules as `spec`).
+    for dir in &openapi.spec_dirs {
+        let dir = dir.trim();
+        if dir.is_empty() {
+            return Err(err("spec_dirs entries must not be empty".to_owned()));
+        }
+        if let Err(reason) = check_project_relative(dir, "spec_dir") {
+            return Err(err(reason));
+        }
     }
 
     let base_package = openapi.base_package.trim();
@@ -452,6 +484,9 @@ impl Manifest {
             openapi.version = openapi.version.trim().to_owned();
             openapi.spec = openapi.spec.trim().to_owned();
             openapi.base_package = openapi.base_package.trim().to_owned();
+            for dir in &mut openapi.spec_dirs {
+                *dir = dir.trim().to_owned();
+            }
         }
         validate(&manifest, path)?;
         Ok(manifest)
@@ -964,6 +999,7 @@ name = "my-app"
 version = "20.0.0"
 spec = "specs/api.yaml"
 base_package = "com.example.api"
+spec_dirs = []
 "#
         );
         let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
@@ -1020,6 +1056,7 @@ name = "my-app"
 version = ""
 spec = "specs/api.yaml"
 base_package = "com.example.api"
+spec_dirs = []
 "#
                 ),
             ),
@@ -1034,6 +1071,7 @@ name = "my-app"
 version = "20.0.0"
 spec = ""
 base_package = "com.example.api"
+spec_dirs = []
 "#
                 ),
             ),
@@ -1048,6 +1086,7 @@ name = "my-app"
 version = "20.0.0"
 spec = "specs/api.yaml"
 base_package = ""
+spec_dirs = []
 "#
                 ),
             ),
@@ -1070,6 +1109,7 @@ name = "my-app"
 version = "20.0.0"
 spec = "/tmp/api.yaml"
 base_package = "com.example.api"
+spec_dirs = []
 "#
         );
         let result = Manifest::from_str(&toml, "konvoy.toml");
@@ -1089,6 +1129,7 @@ name = "my-app"
 version = "20.0.0"
 spec = "specs/api.txt"
 base_package = "com.example.api"
+spec_dirs = []
 "#
         );
         let result = Manifest::from_str(&toml, "konvoy.toml");
@@ -1108,6 +1149,7 @@ name = "my-app"
 version = "20.0.0"
 spec = "../outside/api.yaml"
 base_package = "com.example.api"
+spec_dirs = []
 "#
         );
         let result = Manifest::from_str(&toml, "konvoy.toml");
@@ -1127,6 +1169,7 @@ name = "my-app"
 version = "17.0.0"
 spec = "specs/api.yaml"
 base_package = "com.example.api"
+spec_dirs = []
 "#
         );
         let result = Manifest::from_str(&toml, "konvoy.toml");
@@ -1146,6 +1189,7 @@ name = "my-app"
 version = "latest"
 spec = "specs/api.yaml"
 base_package = "com.example.api"
+spec_dirs = []
 "#
         );
         let result = Manifest::from_str(&toml, "konvoy.toml");
@@ -1166,6 +1210,7 @@ name = "my-app"
 version = "20.0.0"
 spec = "specs/api.yaml"
 base_package = "{bad}"
+spec_dirs = []
 "#
             );
             let result = Manifest::from_str(&toml, "konvoy.toml");
@@ -1186,6 +1231,7 @@ name = "my-app"
 version = "20.0.0"
 spec = "specs/api.yaml"
 base_package = "com.example._internal.api2"
+spec_dirs = []
 "#
         );
         let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
@@ -1210,11 +1256,190 @@ name = "with-codegen"
 version = "20.0.0"
 spec = "specs/api.json"
 base_package = "com.example.api"
+spec_dirs = []
 "#
         );
         let original = Manifest::from_str(&toml, "konvoy.toml").unwrap();
         let serialized = original.to_toml().unwrap();
         assert!(serialized.contains("[codegen.openapi]"));
+        let reparsed = Manifest::from_str(&serialized, "konvoy.toml").unwrap();
+        assert_eq!(original, reparsed);
+    }
+
+    #[test]
+    fn parse_manifest_with_openapi_spec_dirs() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.api"
+spec_dirs = ["specs", "shared/models"]
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        let openapi = manifest
+            .codegen
+            .openapi
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing openapi codegen config"));
+        assert_eq!(openapi.spec_dirs, vec!["specs", "shared/models"]);
+    }
+
+    #[test]
+    fn openapi_spec_dirs_empty_is_allowed_and_serialized() {
+        // spec_dirs is required but may be empty. An empty list tracks only the
+        // primary spec — and, being a required field, it round-trips explicitly
+        // (it is NOT omitted on serialization).
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.api"
+spec_dirs = []
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        assert!(manifest
+            .codegen
+            .openapi
+            .as_ref()
+            .map(|o| o.spec_dirs.is_empty())
+            .unwrap_or(false));
+        let serialized = manifest.to_toml().unwrap();
+        assert!(
+            serialized.contains("spec_dirs = []"),
+            "required spec_dirs must serialize even when empty: {serialized}"
+        );
+        let reparsed = Manifest::from_str(&serialized, "konvoy.toml").unwrap();
+        assert_eq!(manifest, reparsed);
+    }
+
+    #[test]
+    fn reject_openapi_codegen_missing_spec_dirs() {
+        // spec_dirs has no default: a [codegen.openapi] without it is rejected.
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.api"
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err(), "missing spec_dirs must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("spec_dirs"), "error was: {err}");
+    }
+
+    #[test]
+    fn openapi_spec_dirs_entries_are_trimmed() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.api"
+spec_dirs = ["  specs  "]
+"#
+        );
+        let manifest = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        assert_eq!(
+            manifest.codegen.openapi.as_ref().map(|o| &o.spec_dirs),
+            Some(&vec!["specs".to_owned()])
+        );
+    }
+
+    #[test]
+    fn reject_openapi_spec_dir_absolute() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.api"
+spec_dirs = ["/etc"]
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("relative"), "error was: {err}");
+    }
+
+    #[test]
+    fn reject_openapi_spec_dir_parent_traversal() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.api"
+spec_dirs = ["../outside"]
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains(".."), "error was: {err}");
+    }
+
+    #[test]
+    fn reject_openapi_spec_dir_empty() {
+        let toml = format!(
+            r#"
+[package]
+name = "my-app"
+{TOOLCHAIN}
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.api"
+spec_dirs = ["specs", ""]
+"#
+        );
+        let result = Manifest::from_str(&toml, "konvoy.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("must not be empty"), "error was: {err}");
+    }
+
+    #[test]
+    fn round_trip_with_openapi_spec_dirs() {
+        let toml = format!(
+            r#"
+[package]
+name = "with-codegen"
+{TOOLCHAIN}
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.api"
+spec_dirs = ["specs", "shared"]
+"#
+        );
+        let original = Manifest::from_str(&toml, "konvoy.toml").unwrap();
+        let serialized = original.to_toml().unwrap();
+        assert!(serialized.contains("spec_dirs"));
         let reparsed = Manifest::from_str(&serialized, "konvoy.toml").unwrap();
         assert_eq!(original, reparsed);
     }

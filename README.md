@@ -284,9 +284,14 @@ Konvoy can generate Kotlin sources before compilation. OpenAPI generation uses a
 version = "20.0.0"
 spec = "specs/api.yaml"
 base_package = "com.example.api"
+spec_dirs = ["specs"]   # hash every file under specs/ — any change regenerates
 ```
 
-Generated sources are included in `konvoy build` and `konvoy test` cache keys through the generator config and input-file hashes, including any files the spec pulls in via `$ref`. Use `konvoy generate` to refresh generated files without compiling, or `konvoy generate --force` to regenerate even when inputs are unchanged. Managed codegen tool hashes are pinned in `konvoy.lock` under `[codegen_tools.<tool>]`; `--locked` requires the pinned tool JAR to already be downloaded.
+All four keys are required. `spec_dirs` is required but may be empty (`spec_dirs = []`) to track only the primary `spec`; it is fully user-defined — Konvoy never assumes a directory.
+
+Generated sources are included in `konvoy build` and `konvoy test` cache keys through the generator config and input-file hashes. The primary `spec` file is always hashed. When a spec splits across multiple files via `$ref`, list the directories holding those files in `spec_dirs` so a change to any of them regenerates: Fabrikt resolves `$ref`s internally but does not report which files it read, so Konvoy tracks them by directory rather than re-parsing the spec. This intentionally over-approximates — a change to an unrelated file in a listed directory also triggers regeneration.
+
+Use `konvoy generate` to refresh generated files without compiling, or `konvoy generate --force` to regenerate even when inputs are unchanged. Managed codegen tool hashes are pinned in `konvoy.lock` under `[codegen_tools.<tool>]`; `--locked` requires the pinned tool JAR to already be downloaded.
 
 Fabrikt is invoked with `KOTLINX_SERIALIZATION` output, so projects using generated `@Serializable` models should also declare the serialization compiler plugin and runtime dependencies.
 

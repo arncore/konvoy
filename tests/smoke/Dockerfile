@@ -53,6 +53,7 @@ kotlin = "2.2.0"
 version = "20.0.0"
 spec = "specs/api.yaml"
 base_package = "com.example.api"
+spec_dirs = []
 
 [dependencies]
 kotlinx-serialization-core = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-core", version = "1.7.3" }

@@ -125,7 +125,18 @@ pub fn prepend_to_environment_path(
 /// Returns an error if `dir` cannot be read.
 pub fn collect_files(dir: &Path, extension: &str) -> Result<Vec<PathBuf>, UtilError> {
     let mut files = Vec::new();
-    collect_files_recursive(dir, extension, &mut files)?;
+    collect_files_recursive(dir, Some(extension), &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+/// Collect every file under `dir`, recursively, sorted by path (no extension filter).
+///
+/// # Errors
+/// Returns an error if `dir` cannot be read.
+pub fn collect_all_files(dir: &Path) -> Result<Vec<PathBuf>, UtilError> {
+    let mut files = Vec::new();
+    collect_files_recursive(dir, None, &mut files)?;
     files.sort();
     Ok(files)
 }
@@ -137,12 +148,16 @@ fn has_extension(path: &Path, ext: &str) -> bool {
         .is_some_and(|e| e == ext)
 }
 
+/// Recursively collect files under `dir`. When `extension` is `Some`, only files
+/// with that extension are collected; when `None`, every file is collected.
 fn collect_files_recursive(
     dir: &Path,
-    extension: &str,
+    extension: Option<&str>,
     out: &mut Vec<PathBuf>,
 ) -> Result<(), UtilError> {
     let entries = std::fs::read_dir(dir).map_err(io_err(dir))?;
+
+    let matches = |path: &Path| extension.is_none_or(|ext| has_extension(path, ext));
 
     for entry in entries {
         let entry = entry.map_err(io_err(dir))?;
@@ -163,7 +178,7 @@ fn collect_files_recursive(
 
             // Only include symlinked regular files; skip directory symlinks
             // to prevent infinite recursion from symlink cycles.
-            if target_meta.is_file() && has_extension(&path, extension) {
+            if target_meta.is_file() && matches(&path) {
                 out.push(path);
             }
             continue;
@@ -173,7 +188,7 @@ fn collect_files_recursive(
 
         if file_type.is_dir() {
             collect_files_recursive(&path, extension, out)?;
-        } else if has_extension(&path, extension) {
+        } else if matches(&path) {
             out.push(path);
         }
     }

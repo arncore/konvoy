@@ -2848,7 +2848,7 @@ mod tests {
         assert!(result.is_ok(), "matching detekt should pass: {result:?}");
     }
 
-    const CODEGEN_MANIFEST: &str = "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[codegen.openapi]\nversion = \"20.0.0\"\nspec = \"openapi.yaml\"\nbase_package = \"com.example.api\"\n";
+    const CODEGEN_MANIFEST: &str = "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[codegen.openapi]\nversion = \"20.0.0\"\nspec = \"openapi.yaml\"\nbase_package = \"com.example.api\"\nspec_dirs = []\n";
 
     #[test]
     fn check_lockfile_staleness_missing_codegen_tool_errors() {

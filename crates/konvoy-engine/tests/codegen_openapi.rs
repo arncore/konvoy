@@ -54,6 +54,7 @@ fn openapi_codegen_hash_includes_generator_config() {
             version: "20.0.0".to_owned(),
             spec: "openapi.yaml".to_owned(),
             base_package: "com.example.first".to_owned(),
+            spec_dirs: Vec::new(),
         }),
     };
     let second = Codegen {
@@ -61,6 +62,7 @@ fn openapi_codegen_hash_includes_generator_config() {
             version: "20.0.0".to_owned(),
             spec: "openapi.yaml".to_owned(),
             base_package: "com.example.second".to_owned(),
+            spec_dirs: Vec::new(),
         }),
     };
 
@@ -72,11 +74,21 @@ fn openapi_codegen_hash_includes_generator_config() {
 }
 
 fn openapi_codegen(version: &str, spec: &str, base_package: &str) -> Codegen {
+    openapi_codegen_with_dirs(version, spec, base_package, &[])
+}
+
+fn openapi_codegen_with_dirs(
+    version: &str,
+    spec: &str,
+    base_package: &str,
+    spec_dirs: &[&str],
+) -> Codegen {
     Codegen {
         openapi: Some(OpenApiCodegen {
             version: version.to_owned(),
             spec: spec.to_owned(),
             base_package: base_package.to_owned(),
+            spec_dirs: spec_dirs.iter().map(|d| (*d).to_owned()).collect(),
         }),
     }
 }
@@ -109,7 +121,10 @@ fn openapi_codegen_hash_changes_when_spec_content_changes() {
 }
 
 #[test]
-fn openapi_codegen_hash_tracks_transitive_ref_files() {
+fn openapi_codegen_hash_tracks_files_under_spec_dirs() {
+    // Fabrikt resolves `$ref`'d sibling files internally but never reports them,
+    // so Konvoy tracks them by directory: listing the sub-spec's directory in
+    // `spec_dirs` makes a change to ANY file under it invalidate the hash.
     let dir = tempfile::tempdir().unwrap();
     let components = dir.path().join("components");
     fs::create_dir_all(&components).unwrap();
@@ -124,10 +139,11 @@ fn openapi_codegen_hash_tracks_transitive_ref_files() {
     )
     .unwrap();
 
-    let codegen = openapi_codegen("20.0.0", "openapi.yaml", "com.example.api");
+    let codegen =
+        openapi_codegen_with_dirs("20.0.0", "openapi.yaml", "com.example.api", &["components"]);
     let before = konvoy_engine::codegen::compute_codegen_hashes(dir.path(), &codegen).unwrap();
 
-    // Changing ONLY the referenced sub-spec must still change the hash.
+    // Changing ONLY the referenced sub-spec must change the hash.
     fs::write(
         components.join("pet.yaml"),
         "Pet:\n  type: object\n  properties:\n    id:\n      type: string\n",
@@ -137,42 +153,64 @@ fn openapi_codegen_hash_tracks_transitive_ref_files() {
 
     assert_ne!(
         before, after,
-        "editing a $ref-ed sub-spec must change the codegen hash"
+        "editing a file under a spec_dir must change the codegen hash"
     );
 }
 
 #[test]
-fn openapi_codegen_hash_tracks_double_quoted_and_fragmentless_refs() {
-    // Regression: a double-quoted, fragment-less `$ref` previously slipped past
-    // the scanner (the value's opening quote was stripped, leaving a trailing
-    // quote so the file never resolved) and was silently dropped from the hash.
+fn openapi_codegen_hash_ignores_siblings_without_spec_dirs() {
+    // The flip side of the accepted tradeoff: without `spec_dirs`, only the
+    // primary spec is tracked. A change to a sibling `$ref`'d file is NOT picked
+    // up — users must opt in by listing the directory. This documents (and locks)
+    // that Konvoy does not parse the spec to discover `$ref` targets.
     let dir = tempfile::tempdir().unwrap();
     let components = dir.path().join("components");
     fs::create_dir_all(&components).unwrap();
     fs::write(
         dir.path().join("openapi.yaml"),
-        "openapi: 3.1.0\ninfo:\n  title: Demo\n  version: 1.0.0\ncomponents:\n  schemas:\n    Pet:\n      $ref: \"components/pet.yaml\"\n",
+        "openapi: 3.1.0\ninfo:\n  title: Demo\n  version: 1.0.0\ncomponents:\n  schemas:\n    Pet:\n      $ref: './components/pet.yaml#/Pet'\n",
     )
     .unwrap();
-    fs::write(
-        components.join("pet.yaml"),
-        "type: object\nproperties:\n  id:\n    type: integer\n",
-    )
-    .unwrap();
+    fs::write(components.join("pet.yaml"), "Pet:\n  type: object\n").unwrap();
 
     let codegen = openapi_codegen("20.0.0", "openapi.yaml", "com.example.api");
     let before = konvoy_engine::codegen::compute_codegen_hashes(dir.path(), &codegen).unwrap();
 
     fs::write(
         components.join("pet.yaml"),
-        "type: object\nproperties:\n  id:\n    type: string\n",
+        "Pet:\n  type: object\n  properties:\n    id:\n      type: string\n",
     )
     .unwrap();
     let after = konvoy_engine::codegen::compute_codegen_hashes(dir.path(), &codegen).unwrap();
 
-    assert_ne!(
+    assert_eq!(
         before, after,
-        "a double-quoted, fragment-less $ref sub-spec must feed the codegen hash"
+        "without spec_dirs, a sibling file change must not affect the hash"
+    );
+}
+
+#[test]
+fn openapi_codegen_hash_errors_when_spec_dir_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("openapi.yaml"),
+        "openapi: 3.1.0\ninfo:\n  title: Demo\n  version: 1.0.0\n",
+    )
+    .unwrap();
+    let codegen = openapi_codegen_with_dirs(
+        "20.0.0",
+        "openapi.yaml",
+        "com.example.api",
+        &["does-not-exist"],
+    );
+
+    let result = konvoy_engine::codegen::compute_codegen_hashes(dir.path(), &codegen);
+    assert!(
+        matches!(
+            result,
+            Err(konvoy_engine::EngineError::CodegenInputDirNotFound { .. })
+        ),
+        "expected CodegenInputDirNotFound, got {result:?}"
     );
 }
 
@@ -314,6 +352,7 @@ fn run_codegen_replaces_stale_generic_tool_pin_without_regenerating_sources() {
             version: version.clone(),
             spec: "openapi.yaml".to_owned(),
             base_package: "com.example".to_owned(),
+            spec_dirs: Vec::new(),
         }),
     };
     let tagged_hash = konvoy_engine::codegen::compute_codegen_hashes(dir.path(), &codegen)

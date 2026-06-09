@@ -643,6 +643,7 @@ kotlin = "2.2.0"
 version = "20.0.0"
 spec = "specs/api.yaml"
 base_package = "com.example.api"
+spec_dirs = []
 TOML
 }
 
@@ -660,6 +661,7 @@ kotlin = "2.2.0"
 version = "$1"
 spec = "$2"
 base_package = "$3"
+spec_dirs = []
 TOML
 }
 
@@ -761,6 +763,7 @@ kotlin = "2.2.0"
 version = "20.0.0"
 spec = "specs/api.yaml"
 base_package = "com.example.api"
+spec_dirs = []
 
 [dependencies]
 kotlinx-serialization-core = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-core", version = "1.7.3" }
@@ -824,9 +827,23 @@ YAML
     konvoy build --locked >/dev/null 2>&1 || { echo "    expected --locked build to succeed" >&2; return 1; }
 }
 
-# A change to a $ref'd sub-spec must feed the codegen hash and regenerate (M3).
-test_codegen_ref_change_regenerates() {
-    _codegen_write_generate_manifest
+# A change to a file under a configured spec_dir must feed the codegen hash and
+# regenerate. Fabrikt resolves the `$ref` internally; Konvoy tracks the sub-file
+# only because its directory is listed in spec_dirs (M3).
+test_codegen_spec_dir_change_regenerates() {
+    cat > konvoy.toml << 'TOML'
+[package]
+name = "codegen-gen"
+
+[toolchain]
+kotlin = "2.2.0"
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.api"
+spec_dirs = ["specs"]
+TOML
     mkdir -p specs
     cat > specs/api.yaml << 'YAML'
 openapi: 3.0.3
@@ -1884,7 +1901,7 @@ run_test test_issue_239_serialization_plugin_applied
 # codegen (OpenAPI)
 run_test test_codegen_generate_lifecycle
 run_test test_codegen_build_lifecycle
-run_test test_codegen_ref_change_regenerates
+run_test test_codegen_spec_dir_change_regenerates
 run_test test_codegen_locked_requires_pin
 run_test test_codegen_doctor_reports_pin
 run_test test_codegen_invalid_version_rejected

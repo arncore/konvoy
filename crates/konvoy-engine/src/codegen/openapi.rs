@@ -23,11 +23,6 @@ const FABRIKT_SERIALIZATION_LIBRARY: &str = "KOTLINX_SERIALIZATION";
 /// native-first, so validation annotations are disabled.
 const FABRIKT_VALIDATION_LIBRARY: &str = "NO_VALIDATION";
 
-/// Upper bound on the number of spec files (top-level + transitive `$ref`
-/// targets) hashed for a single generator. A safety cap against pathological
-/// or cyclic specs.
-const MAX_SPEC_FILES: usize = 256;
-
 /// OpenAPI generator backed by the Fabrikt CLI JAR.
 #[derive(Debug, Clone)]
 pub struct OpenApiGenerator {
@@ -101,6 +96,7 @@ impl CodeGenerator for OpenApiGenerator {
         vec![
             format!("tool_version={}", self.config.version),
             format!("spec={}", self.config.spec),
+            format!("spec_dirs=[{}]", self.config.spec_dirs.join(",")),
             format!("base_package={}", self.config.base_package),
             format!("targets={FABRIKT_TARGETS}"),
             format!("serialization_library={FABRIKT_SERIALIZATION_LIBRARY}"),
@@ -108,13 +104,36 @@ impl CodeGenerator for OpenApiGenerator {
         ]
     }
 
-    fn input_files(&self, project_root: &Path) -> Vec<PathBuf> {
-        let spec_rel = PathBuf::from(&self.config.spec);
-        let mut files = vec![spec_rel.clone()];
-        collect_ref_files(project_root, &spec_rel, &mut files);
+    /// Project-relative files whose contents feed the codegen cache key.
+    ///
+    /// Always includes the primary `spec`. When `spec_dirs` is configured, also
+    /// includes every file under those directories so a change to any `$ref`'d
+    /// sibling (which Fabrikt resolves internally but never reports) regenerates
+    /// sources. Fabrikt exposes no resolved-input list — via CLI, library, or its
+    /// Gradle plugins — so we deliberately over-approximate by directory rather
+    /// than re-parse the spec in Rust.
+    fn input_files(&self, project_root: &Path) -> Result<Vec<PathBuf>, EngineError> {
+        // Normalize the spec the same way dir-collected files are normalized so a
+        // spec written as `./specs/api.yaml` dedups against a listed `specs` dir
+        // entry (`specs/api.yaml`) instead of hashing the same file twice.
+        let mut files = vec![project_relative(project_root, Path::new(&self.config.spec))];
+
+        for dir in &self.config.spec_dirs {
+            let dir_abs = project_root.join(dir);
+            if !dir_abs.is_dir() {
+                return Err(EngineError::CodegenInputDirNotFound {
+                    name: GENERATOR_NAME.to_owned(),
+                    path: dir_abs.display().to_string(),
+                });
+            }
+            for file in konvoy_util::fs::collect_all_files(&dir_abs)? {
+                files.push(project_relative(project_root, &file));
+            }
+        }
+
         files.sort();
         files.dedup();
-        files
+        Ok(files)
     }
 
     fn generate(
@@ -155,122 +174,102 @@ impl CodeGenerator for OpenApiGenerator {
     }
 }
 
-/// Best-effort transitive `$ref` file collector.
-///
-/// Scans an OpenAPI spec (YAML or JSON) for `$ref` targets that point to local
-/// files and recursively follows them, appending every reachable spec file
-/// (project-relative, lexically normalized) to `acc`. This lets a change to a
-/// referenced sub-spec invalidate the codegen hash / build cache key.
-///
-/// Failures to read a file are skipped: hashing is best-effort, and the
-/// top-level spec is always included by the caller. Internal refs (`#/...`) and
-/// remote refs (`http(s)://`) are ignored.
-fn collect_ref_files(project_root: &Path, spec_rel: &Path, acc: &mut Vec<PathBuf>) {
-    let mut visited: std::collections::BTreeSet<PathBuf> =
-        std::collections::BTreeSet::from([spec_rel.to_path_buf()]);
-    let mut stack = vec![spec_rel.to_path_buf()];
-
-    while let Some(current_rel) = stack.pop() {
-        if acc.len() >= MAX_SPEC_FILES {
-            break;
-        }
-        let Ok(text) = std::fs::read_to_string(project_root.join(&current_rel)) else {
-            continue;
-        };
-        let base_dir = current_rel.parent().unwrap_or_else(|| Path::new(""));
-        for raw_ref in extract_ref_targets(&text) {
-            // Drop the JSON-pointer fragment; skip internal (`#/...`) refs.
-            let file_part = raw_ref.split('#').next().unwrap_or("");
-            if file_part.is_empty() || file_part.contains("://") {
-                continue;
-            }
-            let resolved = normalize_relative(base_dir, file_part);
-            if !visited.insert(resolved.clone()) {
-                continue;
-            }
-            if !project_root.join(&resolved).is_file() {
-                continue;
-            }
-            acc.push(resolved.clone());
-            stack.push(resolved);
-            if acc.len() >= MAX_SPEC_FILES {
-                break;
-            }
-        }
-    }
+/// Normalize a path to a clean project-relative form for stable, dedup-able
+/// hashing. Absolute inputs (dir-walk results under `project_root`) and relative
+/// inputs (the configured `spec`, possibly written with a leading `./`) both
+/// collapse to the same `specs/api.yaml`-style path. Joining onto `project_root`
+/// then stripping it also drops interior `.` components via `Path::components`.
+fn project_relative(project_root: &Path, path: &Path) -> PathBuf {
+    let joined = project_root.join(path);
+    joined
+        .strip_prefix(project_root)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Extract raw `$ref` target strings from YAML/JSON spec text (best-effort,
-/// format-agnostic). Handles quoted (`$ref: "x.yaml"`, `"$ref": "x.json"`) and
-/// bare (`$ref: x.yaml`) forms.
-fn extract_ref_targets(text: &str) -> Vec<String> {
-    const MARKER: &str = "$ref";
-    let mut refs = Vec::new();
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
 
-    for (idx, _) in text.match_indices(MARKER) {
-        // Everything after this `$ref` occurrence (`$ref` is ASCII, so the
-        // offset lands on a char boundary).
-        let Some(after) = text.get(idx + MARKER.len()..) else {
-            continue;
-        };
-        // Step over the key-side tokens only — the optional closing quote of a
-        // JSON `"$ref"` key, surrounding whitespace, and the `:` separator — but
-        // NOT the value's own opening quote (stripping that would turn
-        // `$ref: "x.yaml"` into the bare token `x.yaml"` with a trailing quote).
-        let after = after.trim_start_matches([' ', '\t']);
-        let after = after
-            .strip_prefix('"')
-            .or_else(|| after.strip_prefix('\''))
-            .unwrap_or(after);
-        let after = after.trim_start_matches([' ', '\t']);
-        let after = after.strip_prefix(':').unwrap_or(after);
-        let after = after.trim_start_matches([' ', '\t']);
-        let mut chars = after.chars();
-        let target: String = match chars.next() {
-            // Quoted value: take everything up to the matching quote.
-            Some(quote @ ('"' | '\'')) => chars.take_while(|&c| c != quote).collect(),
-            // Bare token: the first char plus everything up to a delimiter.
-            Some(first) => std::iter::once(first)
-                .chain(
-                    chars.take_while(|&c| !matches!(c, ' ' | '\t' | '\r' | '\n' | ',' | '}' | ']')),
-                )
-                .collect(),
-            None => continue,
-        };
-        let trimmed = target.trim();
-        if !trimmed.is_empty() {
-            refs.push(trimmed.to_owned());
-        }
+    fn generator(spec: &str, spec_dirs: &[&str]) -> OpenApiGenerator {
+        OpenApiGenerator::new(OpenApiCodegen {
+            version: "20.0.0".to_owned(),
+            spec: spec.to_owned(),
+            base_package: "com.example.api".to_owned(),
+            spec_dirs: spec_dirs.iter().map(|s| (*s).to_owned()).collect(),
+        })
     }
-    refs
-}
 
-/// Lexically resolve `rel` against `base_dir` (both project-relative),
-/// collapsing `.` and `..` without touching the filesystem. Leading `..` that
-/// would escape the project root are preserved as relative components (the path
-/// is never made absolute).
-fn normalize_relative(base_dir: &Path, rel: &str) -> PathBuf {
-    use std::ffi::OsStr;
-    use std::path::Component;
+    #[test]
+    fn input_files_without_spec_dirs_is_just_the_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = generator("specs/api.yaml", &[])
+            .input_files(tmp.path())
+            .unwrap();
+        assert_eq!(files, vec![PathBuf::from("specs/api.yaml")]);
+    }
 
-    let mut stack: Vec<OsString> = Vec::new();
-    for component in base_dir.components().chain(Path::new(rel).components()) {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => match stack.last() {
-                Some(last) if last.as_os_str() != OsStr::new("..") => {
-                    stack.pop();
-                }
-                _ => stack.push(OsString::from("..")),
-            },
-            Component::Normal(part) => stack.push(part.to_os_string()),
-            // An absolute ref drops its root; only the normal parts are kept.
-            Component::RootDir | Component::Prefix(_) => {}
-        }
+    #[test]
+    fn input_files_with_spec_dir_hashes_every_file_relative_and_sorted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let specs = tmp.path().join("specs");
+        std::fs::create_dir_all(specs.join("nested")).unwrap();
+        std::fs::write(specs.join("api.yaml"), "openapi").unwrap();
+        std::fs::write(specs.join("pet.yaml"), "Pet").unwrap();
+        std::fs::write(specs.join("nested").join("owner.yaml"), "Owner").unwrap();
+        // A non-spec file in the directory is also tracked (over-approximation).
+        std::fs::write(specs.join("README.md"), "notes").unwrap();
+
+        let files = generator("specs/api.yaml", &["specs"])
+            .input_files(tmp.path())
+            .unwrap();
+
+        // Project-relative, sorted, and the primary spec is not duplicated.
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("specs/README.md"),
+                PathBuf::from("specs/api.yaml"),
+                PathBuf::from("specs/nested/owner.yaml"),
+                PathBuf::from("specs/pet.yaml"),
+            ]
+        );
     }
-    let mut out = PathBuf::new();
-    for part in stack {
-        out.push(part);
+
+    #[test]
+    fn input_files_dedups_dot_slash_spec_against_listed_dir() {
+        // A spec written with a leading `./` must collapse to the same relative
+        // path as the dir-collected entry, so the file is hashed once, not twice.
+        let tmp = tempfile::tempdir().unwrap();
+        let specs = tmp.path().join("specs");
+        std::fs::create_dir_all(&specs).unwrap();
+        std::fs::write(specs.join("api.yaml"), "openapi").unwrap();
+
+        let files = generator("./specs/api.yaml", &["specs"])
+            .input_files(tmp.path())
+            .unwrap();
+        assert_eq!(files, vec![PathBuf::from("specs/api.yaml")]);
     }
-    out
+
+    #[test]
+    fn input_files_missing_spec_dir_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = generator("specs/api.yaml", &["does-not-exist"])
+            .input_files(tmp.path())
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::CodegenInputDirNotFound { .. }),
+            "expected CodegenInputDirNotFound, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn spec_dirs_participate_in_config_hash() {
+        let with = generator("specs/api.yaml", &["specs"]).config_hash_parts();
+        let without = generator("specs/api.yaml", &[]).config_hash_parts();
+        assert_ne!(with, without);
+        assert!(with.iter().any(|p| p == "spec_dirs=[specs]"));
+        assert!(without.iter().any(|p| p == "spec_dirs=[]"));
+    }
 }
