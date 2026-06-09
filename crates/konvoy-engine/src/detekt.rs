@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::EngineError;
+use crate::managed_tool::ManagedToolSpec;
 
 /// Map a `UtilError` from artifact operations to the corresponding `EngineError`.
 fn map_download_err(version: &str, e: konvoy_util::error::UtilError) -> EngineError {
@@ -59,14 +60,16 @@ pub struct DetektDiagnostic {
     pub line: Option<u32>,
 }
 
-/// Return the root directory for managed tools: `~/.konvoy/tools/`.
-fn tools_dir() -> Result<PathBuf, EngineError> {
-    Ok(konvoy_util::fs::konvoy_home()?.join("tools"))
-}
-
-/// Return the directory for a specific detekt version.
-fn detekt_dir(version: &str) -> Result<PathBuf, EngineError> {
-    Ok(tools_dir()?.join("detekt").join(version))
+/// The managed-JAR-tool spec for a detekt version — a GitHub release downloaded
+/// into `~/.konvoy/tools/detekt/<version>/`.
+fn detekt_tool(version: &str) -> ManagedToolSpec {
+    ManagedToolSpec::direct_url(
+        "detekt",
+        "detekt",
+        version,
+        detekt_download_url(version),
+        format!("detekt-cli-{version}-all.jar"),
+    )
 }
 
 /// Return the path to the detekt-cli JAR for a specific version.
@@ -74,7 +77,9 @@ fn detekt_dir(version: &str) -> Result<PathBuf, EngineError> {
 /// # Errors
 /// Returns an error if the home directory cannot be determined.
 pub fn detekt_jar_path(version: &str) -> Result<PathBuf, EngineError> {
-    Ok(detekt_dir(version)?.join(format!("detekt-cli-{version}-all.jar")))
+    detekt_tool(version)
+        .artifact_path()
+        .map_err(EngineError::from)
 }
 
 /// Construct the download URL for a detekt-cli release.
@@ -87,8 +92,9 @@ pub(crate) fn detekt_download_url(version: &str) -> String {
 /// # Errors
 /// Returns an error if the home directory cannot be determined.
 pub fn is_installed(version: &str) -> Result<bool, EngineError> {
-    let jar = detekt_jar_path(version)?;
-    Ok(jar.exists())
+    detekt_tool(version)
+        .is_installed()
+        .map_err(EngineError::from)
 }
 
 /// Download detekt-cli if not already present, returning the path to the JAR.
@@ -111,22 +117,9 @@ pub fn ensure_detekt(
         ),
     })?;
 
-    let jar = detekt_jar_path(version)?;
-    let url = detekt_download_url(version);
-
-    // Only show a download bar when the JAR isn't already cached — a
-    // cached re-verify completes in milliseconds and the flash of ⚙️ → ✅
-    // is more noise than information.
-    let progress = (!jar.exists())
-        .then(|| konvoy_util::progress::new_download_bar(format!("detekt {version}")));
-    let result =
-        konvoy_util::progress::fetch(&url, &jar, expected_sha256, "detekt", progress.as_ref())
-            .map_err(|e| map_download_err(version, e))?;
-    if progress.is_some() {
-        eprintln!();
-    }
-
-    Ok((result.path, result.sha256))
+    detekt_tool(version)
+        .ensure(expected_sha256)
+        .map_err(|e| map_download_err(version, e))
 }
 
 /// Resolve the expected detekt hash from the lockfile.

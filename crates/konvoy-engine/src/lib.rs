@@ -4,11 +4,13 @@
 pub mod artifact;
 pub mod build;
 pub mod cache;
+pub mod codegen;
 mod common;
 pub mod detekt;
 mod diagnostics;
 pub mod error;
 pub mod init;
+pub mod managed_tool;
 pub mod plugin;
 pub mod resolve;
 pub mod test_build;
