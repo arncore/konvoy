@@ -9,6 +9,7 @@ pub mod detekt;
 mod diagnostics;
 pub mod error;
 pub mod init;
+pub mod managed_tool;
 pub mod plugin;
 pub mod resolve;
 pub mod test_build;
@@ -22,6 +23,7 @@ pub use error::EngineError;
 pub use init::{
     init_project, init_project_in_place, init_project_with_kind, DEFAULT_KOTLIN_VERSION,
 };
+pub use managed_tool::{ManagedToolSpec, ToolOutput, ToolRuntime, ToolSource};
 pub use plugin::{
     ensure_plugin_artifacts, resolve_plugin_artifacts, PluginArtifactResult, ResolvedPluginArtifact,
 };
