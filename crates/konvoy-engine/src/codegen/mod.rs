@@ -1,8 +1,6 @@
 //! Declarative source generation before Kotlin/Native compilation.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use konvoy_config::manifest::Codegen;
 
@@ -10,8 +8,8 @@ use crate::error::EngineError;
 
 pub mod openapi;
 
-// The managed-JAR-tool abstraction is shared with the detekt linter, so it lives
-// at the engine root (`crate::managed_tool`); re-exported here for codegen callers.
+// The managed-tool abstraction is shared with the detekt linter, so it lives at
+// the engine root (`crate::managed_tool`); re-exported here for codegen callers.
 pub use crate::managed_tool::ManagedToolSpec;
 
 /// Display metadata for a configured generator.
@@ -53,14 +51,19 @@ pub trait CodeGenerator {
 
     /// Generate sources into `output_dir`.
     ///
+    /// The tool returned by [`managed_tool`](Self::managed_tool) must already be
+    /// downloaded; the generator runs it through
+    /// [`ManagedToolSpec::run`](crate::managed_tool::ManagedToolSpec::run). `jre_home`
+    /// is the managed JRE for JVM generators (e.g. Fabrikt) and `None` for a future
+    /// native generator — it is forwarded to `run` per the tool's runtime.
+    ///
     /// # Errors
     /// Returns an error if the generator process cannot be executed or fails.
     fn generate(
         &self,
         project_root: &Path,
         output_dir: &Path,
-        tool_path: &Path,
-        jre_home: &Path,
+        jre_home: Option<&Path>,
         verbose: bool,
     ) -> Result<(), EngineError>;
 }
@@ -178,84 +181,4 @@ fn compute_generator_hash(
 
     let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
     Ok(konvoy_util::hash::sha256_multi(&refs))
-}
-
-/// Run a managed Java JAR with normalized diagnostics.
-///
-/// # Errors
-/// Returns an error if Java is unavailable, the process cannot be spawned, or
-/// the process exits unsuccessfully.
-pub fn run_java_jar(
-    generator_name: &str,
-    tool_display_name: &str,
-    tool_path: &Path,
-    jre_home: &Path,
-    args: Vec<OsString>,
-    verbose: bool,
-) -> Result<(), EngineError> {
-    let java = java_bin(jre_home);
-    if !java.exists() {
-        return Err(EngineError::CodegenFailed {
-            name: generator_name.to_owned(),
-            message: format!(
-                "java not found at {} — run `konvoy toolchain install` to reinstall the managed JRE",
-                java.display()
-            ),
-        });
-    }
-
-    let output = Command::new(&java)
-        .arg("-jar")
-        .arg(tool_path)
-        .args(args)
-        .env("JAVA_HOME", jre_home)
-        .output()
-        .map_err(|e| EngineError::CodegenFailed {
-            name: generator_name.to_owned(),
-            message: e.to_string(),
-        })?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if verbose {
-        if !stdout.is_empty() {
-            eprintln!("{stdout}");
-        }
-        if !stderr.is_empty() {
-            eprintln!("{stderr}");
-        }
-    }
-
-    if !output.status.success() {
-        // JVM CLIs typically print the real error to stderr (and banners to
-        // stdout), so prefer stderr for the one-line hint and fall back to
-        // stdout. Never concatenate the streams — that can fuse an unrelated
-        // stdout line onto the first stderr line.
-        let hint_source = if stderr.trim().is_empty() {
-            stdout.as_ref()
-        } else {
-            stderr.as_ref()
-        };
-        let hint = first_non_empty_line(hint_source)
-            .map(|line| format!(" first message: {line}"))
-            .unwrap_or_default();
-        return Err(EngineError::CodegenFailed {
-            name: generator_name.to_owned(),
-            message: format!(
-                "{tool_display_name} exited with status {}.{hint} Run with --verbose to see full output.",
-                output.status
-            ),
-        });
-    }
-
-    Ok(())
-}
-
-fn java_bin(jre_home: &Path) -> PathBuf {
-    let binary = if cfg!(windows) { "java.exe" } else { "java" };
-    jre_home.join("bin").join(binary)
-}
-
-fn first_non_empty_line(output: &str) -> Option<&str> {
-    output.lines().map(str::trim).find(|line| !line.is_empty())
 }

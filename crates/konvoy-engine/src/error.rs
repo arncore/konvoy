@@ -101,9 +101,12 @@ pub enum EngineError {
     #[error("cannot download detekt {version}: {message}")]
     DetektDownload { version: String, message: String },
 
-    /// Failed to run detekt.
-    #[error("cannot run detekt: {message}")]
-    DetektExec { message: String },
+    /// A managed tool's process could not be executed (shared by detekt and
+    /// codegen). A non-zero exit is *not* this error — that outcome is reported
+    /// via [`ToolOutput::success`](crate::managed_tool::ToolOutput) and
+    /// interpreted by the caller.
+    #[error("cannot run tool `{tool}`: {message}")]
+    ToolExecFailed { tool: String, message: String },
 
     /// No JRE available to run detekt.
     #[error("jre not available for running detekt — run `konvoy toolchain install` first")]

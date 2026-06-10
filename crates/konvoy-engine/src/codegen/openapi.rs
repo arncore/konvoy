@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use konvoy_config::manifest::OpenApiCodegen;
 use konvoy_util::maven::MavenCoordinate;
 
-use crate::codegen::{run_java_jar, CodeGenerator, ManagedToolSpec};
+use crate::codegen::{CodeGenerator, ManagedToolSpec};
 use crate::error::EngineError;
 
 const GENERATOR_NAME: &str = "openapi";
@@ -188,8 +188,7 @@ impl CodeGenerator for OpenApiGenerator {
         &self,
         project_root: &Path,
         output_dir: &Path,
-        tool_path: &Path,
-        jre_home: &Path,
+        jre_home: Option<&Path>,
         verbose: bool,
     ) -> Result<(), EngineError> {
         let spec_path = project_root.join(&self.config.spec);
@@ -198,28 +197,54 @@ impl CodeGenerator for OpenApiGenerator {
             self.config.version
         );
 
-        run_java_jar(
-            GENERATOR_NAME,
-            TOOL_DISPLAY,
-            tool_path,
-            jre_home,
-            vec![
-                OsString::from("--api-file"),
-                spec_path.into_os_string(),
-                OsString::from("--base-package"),
-                OsString::from(&self.config.base_package),
-                OsString::from("--output-directory"),
-                output_dir.as_os_str().to_owned(),
-                OsString::from("--targets"),
-                OsString::from(FABRIKT_TARGETS),
-                OsString::from("--serialization-library"),
-                OsString::from(FABRIKT_SERIALIZATION_LIBRARY),
-                OsString::from("--validation-library"),
-                OsString::from(FABRIKT_VALIDATION_LIBRARY),
-            ],
-            verbose,
-        )
+        let args = [
+            OsString::from("--api-file"),
+            spec_path.into_os_string(),
+            OsString::from("--base-package"),
+            OsString::from(&self.config.base_package),
+            OsString::from("--output-directory"),
+            output_dir.as_os_str().to_owned(),
+            OsString::from("--targets"),
+            OsString::from(FABRIKT_TARGETS),
+            OsString::from("--serialization-library"),
+            OsString::from(FABRIKT_SERIALIZATION_LIBRARY),
+            OsString::from("--validation-library"),
+            OsString::from(FABRIKT_VALIDATION_LIBRARY),
+        ];
+
+        let output = self.managed_tool().run(jre_home, &args, verbose)?;
+
+        // A code generator treats a non-zero exit as a hard failure (unlike the
+        // linter, which reads it as "issues found").
+        if !output.success {
+            // JVM CLIs typically print the real error to stderr (and banners to
+            // stdout), so prefer stderr for the one-line hint and fall back to
+            // stdout. Never concatenate the streams — that can fuse an unrelated
+            // stdout line onto the first stderr line.
+            let hint_source = if output.stderr.trim().is_empty() {
+                &output.stdout
+            } else {
+                &output.stderr
+            };
+            let hint = first_non_empty_line(hint_source)
+                .map(|line| format!(" first message: {line}"))
+                .unwrap_or_default();
+            return Err(EngineError::CodegenFailed {
+                name: GENERATOR_NAME.to_owned(),
+                message: format!(
+                    "{TOOL_DISPLAY} failed.{hint} Run with --verbose to see full output."
+                ),
+            });
+        }
+
+        Ok(())
     }
+}
+
+/// First non-blank line of `output`, trimmed — used to surface a concise hint
+/// from a failed Fabrikt run without dumping its whole log.
+fn first_non_empty_line(output: &str) -> Option<&str> {
+    output.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
 /// Normalize a path to a clean project-relative form for stable, dedup-able

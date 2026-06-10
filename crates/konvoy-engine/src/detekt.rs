@@ -3,8 +3,8 @@
 //! Downloads `detekt-cli` fat JARs from GitHub releases and runs them
 //! against Kotlin source files using the JRE bundled with managed toolchains.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::error::EngineError;
 use crate::managed_tool::ManagedToolSpec;
@@ -167,10 +167,12 @@ fn persist_detekt_hash(
     Ok(())
 }
 
-/// Resolve the JRE `java` binary from the managed Kotlin toolchain.
+/// Resolve the managed Kotlin toolchain's JRE home (which contains `bin/java`).
 ///
-/// Auto-installs the toolchain if it is not yet present.
-fn resolve_java_bin(kotlin_version: &str) -> Result<(PathBuf, PathBuf), EngineError> {
+/// Auto-installs the toolchain if it is not yet present. The actual `java`
+/// invocation is delegated to [`ManagedToolSpec::run`], which derives the binary
+/// from this home.
+fn resolve_jre_home(kotlin_version: &str) -> Result<PathBuf, EngineError> {
     if !konvoy_konanc::toolchain::is_installed(kotlin_version)? {
         eprintln!("    Installing Kotlin/Native {kotlin_version} (for JRE)...");
         konvoy_konanc::toolchain::install(kotlin_version)?;
@@ -178,12 +180,11 @@ fn resolve_java_bin(kotlin_version: &str) -> Result<(PathBuf, PathBuf), EngineEr
 
     let jre_home = konvoy_konanc::toolchain::jre_home_path(kotlin_version)?;
 
-    let java_bin = jre_home.join("bin").join("java");
-    if !java_bin.exists() {
+    if !jre_home.join("bin").join("java").exists() {
         return Err(EngineError::DetektNoJre);
     }
 
-    Ok((java_bin, jre_home))
+    Ok(jre_home)
 }
 
 /// Resolve the detekt config file path.
@@ -216,56 +217,32 @@ fn resolve_config(root: &Path, explicit: Option<&Path>) -> Result<Option<PathBuf
 
 /// Execute the detekt process and build a `LintResult` from its output.
 fn run_detekt_process(
-    java_bin: &Path,
     jre_home: &Path,
-    jar_path: &Path,
     src_dir: &Path,
     config_path: Option<&Path>,
     detekt_version: &str,
     verbose: bool,
 ) -> Result<LintResult, EngineError> {
-    let mut args = vec![
-        "-jar".to_owned(),
-        jar_path.display().to_string(),
-        "--input".to_owned(),
-        src_dir.display().to_string(),
-    ];
+    let mut args = vec![OsString::from("--input"), src_dir.as_os_str().to_owned()];
 
     if let Some(cfg) = config_path {
-        args.push("--config".to_owned());
-        args.push(cfg.display().to_string());
-        args.push("--build-upon-default-config".to_owned());
+        args.push(OsString::from("--config"));
+        args.push(cfg.as_os_str().to_owned());
+        args.push(OsString::from("--build-upon-default-config"));
     }
 
     eprintln!("    Linting with detekt {detekt_version}...");
 
-    let output = Command::new(java_bin)
-        .args(&args)
-        .env("JAVA_HOME", jre_home)
-        .output()
-        .map_err(|e| EngineError::DetektExec {
-            message: e.to_string(),
-        })?;
+    let output = detekt_tool(detekt_version).run(Some(jre_home), &args, verbose)?;
 
-    let raw_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let raw_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let raw_output = format!("{raw_stdout}{raw_stderr}");
-
-    if verbose {
-        if !raw_stdout.is_empty() {
-            eprintln!("{raw_stdout}");
-        }
-        if !raw_stderr.is_empty() {
-            eprintln!("{raw_stderr}");
-        }
-    }
-
+    let raw_output = format!("{}{}", output.stdout, output.stderr);
     let diagnostics = parse_detekt_output(&raw_output);
     let finding_count = diagnostics.len();
-    let success = output.status.success();
 
+    // A non-zero detekt exit means "findings", not a tool failure, so the run's
+    // `success` flag maps straight onto the lint result.
     Ok(LintResult {
-        success,
+        success: output.success,
         diagnostics,
         raw_output,
         finding_count,
@@ -305,8 +282,9 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
         }
     }
 
-    // Ensure detekt jar is available and hash-verified.
-    let (jar_path, actual_hash) = ensure_detekt(detekt_version, expected_hash)?;
+    // Ensure detekt jar is available and hash-verified. The path is derived again
+    // (from the same spec) inside `run_detekt_process`, so it is discarded here.
+    let (_, actual_hash) = ensure_detekt(detekt_version, expected_hash)?;
 
     // Persist hash to lockfile if not already stored.
     if expected_hash.is_none() {
@@ -320,7 +298,7 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
     }
 
     // Resolve JRE.
-    let (java_bin, jre_home) = resolve_java_bin(&manifest.toolchain.kotlin)?;
+    let jre_home = resolve_jre_home(&manifest.toolchain.kotlin)?;
 
     // Check for sources.
     let src_dir = root.join("src");
@@ -337,9 +315,7 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
     // Resolve config and run detekt.
     let config_path = resolve_config(root, options.config.as_deref())?;
     run_detekt_process(
-        &java_bin,
         &jre_home,
-        &jar_path,
         &src_dir,
         config_path.as_deref(),
         detekt_version,
