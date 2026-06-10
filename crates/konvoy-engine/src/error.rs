@@ -140,6 +140,10 @@ pub enum EngineError {
     #[error("codegen spec directory for `{name}` not found at {path} — create the directory or fix `extra_spec_dirs` in [codegen.{name}]")]
     CodegenInputDirNotFound { name: String, path: String },
 
+    /// A codegen tool is not downloaded and `--locked` prevents downloading it.
+    #[error("codegen tool `{name}` {version} is not downloaded and --locked prevents downloads — run `konvoy build` (or `konvoy generate`) without --locked first")]
+    CodegenToolNotFound { name: String, version: String },
+
     /// A codegen tool download failed.
     #[error("cannot download codegen tool `{name}` {version}: {message}")]
     CodegenDownload {

@@ -90,6 +90,9 @@ pub fn build_tests(
                 None => konvoy_util::hash::sha256_file(&lib.path).map_err(EngineError::from),
             })
             .collect::<Result<Vec<_>, _>>()?,
+        // Codegen inputs (shared with the regular build) — a spec/config change
+        // rebuilds the test binary too. Empty when no `[codegen]` is configured.
+        codegen_hashes: ctx.codegen_hashes.clone(),
     };
     let cache_key = CacheKey::compute(&cache_inputs)?;
 
@@ -111,6 +114,18 @@ pub fn build_tests(
             output_path,
             compile_duration: start.elapsed(),
         });
+    }
+
+    // Cache miss: run code generators (tools were ensured in resolve_build_context)
+    // and add the emitted `.kt` to the source set so generated code is tested too.
+    if !ctx.generators.is_empty() {
+        let generated = crate::codegen::run_codegen(
+            project_root,
+            &ctx.generators,
+            ctx.jre_home.as_deref(),
+            options.verbose,
+        )?;
+        sources.extend(generated);
     }
 
     // Compile with test runner generation.
