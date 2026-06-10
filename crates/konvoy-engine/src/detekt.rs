@@ -3,10 +3,11 @@
 //! Downloads `detekt-cli` fat JARs from GitHub releases and runs them
 //! against Kotlin source files using the JRE bundled with managed toolchains.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::error::EngineError;
+use crate::managed_tool::ManagedToolSpec;
 
 /// Map a `UtilError` from artifact operations to the corresponding `EngineError`.
 fn map_download_err(version: &str, e: konvoy_util::error::UtilError) -> EngineError {
@@ -59,14 +60,16 @@ pub struct DetektDiagnostic {
     pub line: Option<u32>,
 }
 
-/// Return the root directory for managed tools: `~/.konvoy/tools/`.
-fn tools_dir() -> Result<PathBuf, EngineError> {
-    Ok(konvoy_util::fs::konvoy_home()?.join("tools"))
-}
-
-/// Return the directory for a specific detekt version.
-fn detekt_dir(version: &str) -> Result<PathBuf, EngineError> {
-    Ok(tools_dir()?.join("detekt").join(version))
+/// The managed-JAR-tool spec for a detekt version — a GitHub release downloaded
+/// into `~/.konvoy/tools/detekt/<version>/`.
+fn detekt_tool(version: &str) -> ManagedToolSpec {
+    ManagedToolSpec::direct_url(
+        "detekt",
+        "detekt",
+        version,
+        detekt_download_url(version),
+        format!("detekt-cli-{version}-all.jar"),
+    )
 }
 
 /// Return the path to the detekt-cli JAR for a specific version.
@@ -74,7 +77,9 @@ fn detekt_dir(version: &str) -> Result<PathBuf, EngineError> {
 /// # Errors
 /// Returns an error if the home directory cannot be determined.
 pub fn detekt_jar_path(version: &str) -> Result<PathBuf, EngineError> {
-    Ok(detekt_dir(version)?.join(format!("detekt-cli-{version}-all.jar")))
+    detekt_tool(version)
+        .artifact_path()
+        .map_err(EngineError::from)
 }
 
 /// Construct the download URL for a detekt-cli release.
@@ -87,8 +92,9 @@ pub(crate) fn detekt_download_url(version: &str) -> String {
 /// # Errors
 /// Returns an error if the home directory cannot be determined.
 pub fn is_installed(version: &str) -> Result<bool, EngineError> {
-    let jar = detekt_jar_path(version)?;
-    Ok(jar.exists())
+    detekt_tool(version)
+        .is_installed()
+        .map_err(EngineError::from)
 }
 
 /// Download detekt-cli if not already present, returning the path to the JAR.
@@ -104,29 +110,19 @@ pub fn ensure_detekt(
     version: &str,
     expected_sha256: Option<&str>,
 ) -> Result<(PathBuf, String), EngineError> {
-    konvoy_util::artifact::validate_version(version).map_err(|_| EngineError::DetektDownload {
+    // Use the same `validate_identifier` the spec uses (it rejects `..`), so a
+    // traversal-laden version yields this actionable, detekt-branded message
+    // rather than falling through to the generic download-error mapping.
+    konvoy_util::artifact::validate_identifier(version).map_err(|_| EngineError::DetektDownload {
         version: version.to_owned(),
         message: format!(
-            "invalid detekt version \"{version}\" — only alphanumeric characters, dots, hyphens, and underscores are allowed"
+            "invalid detekt version \"{version}\" — only alphanumeric characters, dots, hyphens, and underscores are allowed, and it cannot be `..`"
         ),
     })?;
 
-    let jar = detekt_jar_path(version)?;
-    let url = detekt_download_url(version);
-
-    // Only show a download bar when the JAR isn't already cached — a
-    // cached re-verify completes in milliseconds and the flash of ⚙️ → ✅
-    // is more noise than information.
-    let progress = (!jar.exists())
-        .then(|| konvoy_util::progress::new_download_bar(format!("detekt {version}")));
-    let result =
-        konvoy_util::progress::fetch(&url, &jar, expected_sha256, "detekt", progress.as_ref())
-            .map_err(|e| map_download_err(version, e))?;
-    if progress.is_some() {
-        eprintln!();
-    }
-
-    Ok((result.path, result.sha256))
+    detekt_tool(version)
+        .ensure(expected_sha256)
+        .map_err(|e| map_download_err(version, e))
 }
 
 /// Resolve the expected detekt hash from the lockfile.
@@ -174,11 +170,13 @@ fn persist_detekt_hash(
     Ok(())
 }
 
-/// Resolve the JRE `java` binary from the managed Kotlin toolchain.
+/// Resolve the managed Kotlin toolchain's JRE home (which contains `bin/java`).
 ///
-/// Auto-installs the toolchain if it is not yet present, unless `locked`
-/// is set — `--locked` forbids downloads, so a missing toolchain is an error.
-fn resolve_java_bin(kotlin_version: &str, locked: bool) -> Result<(PathBuf, PathBuf), EngineError> {
+/// Auto-installs the toolchain if it is not yet present, unless `locked` is set —
+/// `--locked` forbids downloads, so a missing toolchain is an error. The actual
+/// `java` invocation is delegated to [`ManagedToolSpec::run`], which derives the
+/// binary from this home.
+fn resolve_jre_home(kotlin_version: &str, locked: bool) -> Result<PathBuf, EngineError> {
     if !konvoy_konanc::toolchain::is_installed(kotlin_version)? {
         if locked {
             return Err(EngineError::DetektJreLocked {
@@ -191,12 +189,11 @@ fn resolve_java_bin(kotlin_version: &str, locked: bool) -> Result<(PathBuf, Path
 
     let jre_home = konvoy_konanc::toolchain::jre_home_path(kotlin_version)?;
 
-    let java_bin = jre_home.join("bin").join("java");
-    if !java_bin.exists() {
+    if !jre_home.join("bin").join("java").exists() {
         return Err(EngineError::DetektNoJre);
     }
 
-    Ok((java_bin, jre_home))
+    Ok(jre_home)
 }
 
 /// Resolve the detekt config file path.
@@ -229,56 +226,39 @@ fn resolve_config(root: &Path, explicit: Option<&Path>) -> Result<Option<PathBuf
 
 /// Execute the detekt process and build a `LintResult` from its output.
 fn run_detekt_process(
-    java_bin: &Path,
     jre_home: &Path,
-    jar_path: &Path,
     src_dir: &Path,
     config_path: Option<&Path>,
     detekt_version: &str,
     verbose: bool,
 ) -> Result<LintResult, EngineError> {
-    let mut args = vec![
-        "-jar".to_owned(),
-        jar_path.display().to_string(),
-        "--input".to_owned(),
-        src_dir.display().to_string(),
-    ];
+    let mut args = vec![OsString::from("--input"), src_dir.as_os_str().to_owned()];
 
     if let Some(cfg) = config_path {
-        args.push("--config".to_owned());
-        args.push(cfg.display().to_string());
-        args.push("--build-upon-default-config".to_owned());
+        args.push(OsString::from("--config"));
+        args.push(cfg.as_os_str().to_owned());
+        args.push(OsString::from("--build-upon-default-config"));
     }
 
     eprintln!("    Linting with detekt {detekt_version}...");
 
-    let output = Command::new(java_bin)
-        .args(&args)
-        .env("JAVA_HOME", jre_home)
-        .output()
-        .map_err(|e| EngineError::DetektExec {
-            message: e.to_string(),
-        })?;
+    let output = detekt_tool(detekt_version).run(Some(jre_home), &args, verbose)?;
 
-    let raw_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let raw_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let raw_output = format!("{raw_stdout}{raw_stderr}");
-
-    if verbose {
-        if !raw_stdout.is_empty() {
-            eprintln!("{raw_stdout}");
-        }
-        if !raw_stderr.is_empty() {
-            eprintln!("{raw_stderr}");
-        }
-    }
-
+    // Separate the streams with a newline: detekt's findings are line-oriented and
+    // `parse_detekt_output` scans per line, so concatenating directly would fuse a
+    // trailing (newline-less) stdout line onto the first stderr line and corrupt
+    // that finding's parsed `file` field.
+    let raw_output = format!("{}\n{}", output.stdout, output.stderr);
     let diagnostics = parse_detekt_output(&raw_output);
     let finding_count = diagnostics.len();
-    let success = output.status.success();
 
+    // `success` is true only when detekt exited 0 (no findings). NOTE: detekt also
+    // exits non-zero for real failures (1 = unexpected error, 3 = invalid config),
+    // not just for findings (2 = MaxIssuesReached). The shared ToolOutput exposes
+    // only a success bool by design, so those collapse together; raw_output still
+    // carries detekt's own message for the non-finding cases.
     Ok(LintResult {
-        success,
+        success: output.success,
         diagnostics,
         raw_output,
         finding_count,
@@ -318,8 +298,9 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
         }
     }
 
-    // Ensure detekt jar is available and hash-verified.
-    let (jar_path, actual_hash) = ensure_detekt(detekt_version, expected_hash)?;
+    // Ensure detekt jar is available and hash-verified. The path is derived again
+    // (from the same spec) inside `run_detekt_process`, so it is discarded here.
+    let (_, actual_hash) = ensure_detekt(detekt_version, expected_hash)?;
 
     // Persist hash to lockfile if not already stored.
     if expected_hash.is_none() {
@@ -333,7 +314,7 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
     }
 
     // Resolve JRE.
-    let (java_bin, jre_home) = resolve_java_bin(&manifest.toolchain.kotlin, options.locked)?;
+    let jre_home = resolve_jre_home(&manifest.toolchain.kotlin, options.locked)?;
 
     // Check for sources.
     let src_dir = root.join("src");
@@ -350,9 +331,7 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
     // Resolve config and run detekt.
     let config_path = resolve_config(root, options.config.as_deref())?;
     run_detekt_process(
-        &java_bin,
         &jre_home,
-        &jar_path,
         &src_dir,
         config_path.as_deref(),
         detekt_version,
@@ -664,6 +643,22 @@ src/main.kt:3:5: Magic number. [MagicNumber]
         let (path, hash) = result.unwrap();
         assert_eq!(hash, real_hash);
         assert!(path.display().to_string().contains(version));
+    }
+
+    /// A version that is charset-valid but contains `..` (e.g. a `1..2` typo) must
+    /// be rejected up front with the curated detekt message — not fall through to a
+    /// generic error. Regression guard for the `validate_version` -> `validate_identifier`
+    /// fix: the weaker `validate_version` would have let `..` pass (a plain `/` would
+    /// be caught by either, so it does not exercise the difference).
+    #[test]
+    fn ensure_detekt_rejects_dotdot_version() {
+        let err = super::ensure_detekt("1..2", None)
+            .expect_err("a `..` version must be rejected before any download");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid detekt version"),
+            "expected the curated detekt message, got: {msg}"
+        );
     }
 
     #[test]
