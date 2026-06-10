@@ -1,10 +1,12 @@
 //! OpenAPI source generation using Fabrikt.
 
 use std::ffi::OsString;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use konvoy_config::manifest::OpenApiCodegen;
 use konvoy_util::maven::MavenCoordinate;
+use konvoy_util::path::{has_hidden_component_under, relative_to};
+use konvoy_util::text::first_non_blank_line;
 
 use crate::codegen::{CodeGenerator, ManagedToolSpec};
 use crate::error::EngineError;
@@ -161,10 +163,10 @@ impl CodeGenerator for OpenApiGenerator {
     fn input_files(&self, project_root: &Path) -> Result<Vec<PathBuf>, EngineError> {
         // Just collect the inputs — the framework sorts + de-duplicates before
         // hashing, so this need not. Paths are normalized to project-relative form
-        // (via `project_relative`) so the same file referenced two ways (e.g. the
-        // spec written `./specs/api.yaml` and again as a `specs` dir entry) collapses
-        // to one when the framework de-duplicates, and so the cache key is portable.
-        let mut files = vec![project_relative(project_root, Path::new(&self.config.spec))];
+        // (via `relative_to`) so the same file referenced two ways (e.g. the spec
+        // written `./specs/api.yaml` and again as a `specs` dir entry) collapses to
+        // one when the framework de-duplicates, and so the cache key is portable.
+        let mut files = vec![relative_to(project_root, Path::new(&self.config.spec))];
 
         for dir in &self.config.extra_spec_dirs {
             let dir_abs = project_root.join(dir);
@@ -181,10 +183,10 @@ impl CodeGenerator for OpenApiGenerator {
                 // contains it (e.g. extra_spec_dirs = ["."]). These are never spec
                 // input, and folding them in would make the cache key depend on
                 // platform/editor state, breaking deterministic, stable hashing.
-                if has_hidden_component(&dir_abs, &file) {
+                if has_hidden_component_under(&dir_abs, &file) {
                     continue;
                 }
-                files.push(project_relative(project_root, &file));
+                files.push(relative_to(project_root, &file));
             }
         }
 
@@ -241,7 +243,7 @@ impl CodeGenerator for OpenApiGenerator {
             } else {
                 &output.stderr
             };
-            let hint = first_non_empty_line(hint_source)
+            let hint = first_non_blank_line(hint_source)
                 .map(|line| format!(" first message: {line}"))
                 .unwrap_or_default();
             // Only suggest --verbose when it wasn't already on (if it was, capture()
@@ -259,36 +261,6 @@ impl CodeGenerator for OpenApiGenerator {
 
         Ok(())
     }
-}
-
-/// First non-blank line of `output`, trimmed — used to surface a concise hint
-/// from a failed Fabrikt run without dumping its whole log.
-fn first_non_empty_line(output: &str) -> Option<&str> {
-    output.lines().map(str::trim).find(|line| !line.is_empty())
-}
-
-/// Whether `file` (a walk result under `base`) has any path component, below
-/// `base`, that is hidden (starts with `.`). Used to exclude OS/editor/VCS noise
-/// (`.DS_Store`, `.git/`, swap files) and the `.konvoy` output dir from the
-/// codegen input set, keeping the cache key deterministic and platform-stable.
-fn has_hidden_component(base: &Path, file: &Path) -> bool {
-    file.strip_prefix(base)
-        .unwrap_or(file)
-        .components()
-        .any(|c| matches!(c, Component::Normal(name) if name.to_string_lossy().starts_with('.')))
-}
-
-/// Normalize a path to a clean project-relative form for stable, dedup-able
-/// hashing. Absolute inputs (dir-walk results under `project_root`) and relative
-/// inputs (the configured `spec`, possibly written with a leading `./`) both
-/// collapse to the same `specs/api.yaml`-style path. Joining onto `project_root`
-/// then stripping it also drops interior `.` components via `Path::components`.
-fn project_relative(project_root: &Path, path: &Path) -> PathBuf {
-    let joined = project_root.join(path);
-    joined
-        .strip_prefix(project_root)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -408,17 +380,6 @@ mod tests {
                 "validation_library=NO_VALIDATION".to_owned(),
             ]
         );
-    }
-
-    #[test]
-    fn first_non_empty_line_skips_blanks_and_trims() {
-        assert_eq!(
-            first_non_empty_line("\n   \n  hello world \nmore"),
-            Some("hello world")
-        );
-        assert_eq!(first_non_empty_line("first\nsecond"), Some("first"));
-        assert_eq!(first_non_empty_line("   \n\t\n  "), None);
-        assert_eq!(first_non_empty_line(""), None);
     }
 
     #[test]
