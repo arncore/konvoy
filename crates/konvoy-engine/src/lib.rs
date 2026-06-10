@@ -4,6 +4,7 @@
 pub mod artifact;
 pub mod build;
 pub mod cache;
+pub mod codegen;
 mod common;
 pub mod detekt;
 mod diagnostics;
