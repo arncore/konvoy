@@ -136,6 +136,31 @@ pub enum EngineError {
     #[error("codegen input for `{name}` not found at {path} — create the file, or fix the inputs configured in [codegen.{name}]")]
     CodegenInputNotFound { name: String, path: String },
 
+    /// A configured codegen spec directory is missing.
+    #[error("codegen spec directory for `{name}` not found at {path} — create the directory or fix `extra_spec_dirs` in [codegen.{name}]")]
+    CodegenInputDirNotFound { name: String, path: String },
+
+    /// A codegen tool download failed.
+    #[error("cannot download codegen tool `{name}` {version}: {message}")]
+    CodegenDownload {
+        name: String,
+        version: String,
+        message: String,
+    },
+
+    /// A codegen tool artifact hash does not match the lockfile.
+    #[error("codegen tool `{name}` {version} hash mismatch — expected {expected}, got {actual}; delete ~/.konvoy/tools/{name}/{version}/ and re-run `konvoy generate`, or verify the artifact upstream")]
+    CodegenHashMismatch {
+        name: String,
+        version: String,
+        expected: String,
+        actual: String,
+    },
+
+    /// Code generation process failed.
+    #[error("cannot run codegen `{name}`: {message}")]
+    CodegenFailed { name: String, message: String },
+
     /// The project name supplied to `konvoy init` is invalid.
     #[error("invalid project name \"{name}\": {reason}")]
     InvalidProjectName { name: String, reason: String },

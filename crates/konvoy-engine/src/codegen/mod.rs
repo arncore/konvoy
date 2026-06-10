@@ -9,7 +9,11 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use konvoy_config::manifest::Codegen;
+
 use crate::error::EngineError;
+
+pub mod openapi;
 
 // The managed-tool abstraction is shared with the detekt linter, so it lives at
 // the engine root (`crate::managed_tool`); re-exported here for codegen callers.
@@ -77,6 +81,21 @@ pub trait CodeGenerator {
         jre_home: Option<&Path>,
         verbose: bool,
     ) -> Result<(), EngineError>;
+}
+
+/// Build the active generators for a manifest's `[codegen]` config, in stable
+/// order.
+///
+/// This is the registry — the single place that maps config to concrete generator
+/// types. The framework above stays generator-agnostic; a new generator is added
+/// here (and as a `CodeGenerator` impl), never by changing the hashing core.
+#[must_use]
+pub fn active_generators(codegen: &Codegen) -> Vec<Box<dyn CodeGenerator>> {
+    let mut generators: Vec<Box<dyn CodeGenerator>> = Vec::new();
+    if let Some(openapi) = &codegen.openapi {
+        generators.push(Box::new(openapi::OpenApiGenerator::new(openapi.clone())));
+    }
+    generators
 }
 
 /// Return display summaries for the given generators.
