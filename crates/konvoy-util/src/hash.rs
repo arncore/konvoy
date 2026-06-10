@@ -104,7 +104,10 @@ pub fn sha256_multi(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
     for part in parts {
         // Length-prefix each part to avoid collisions like ["ab","c"] vs ["a","bc"].
-        let len_bytes = part.len().to_le_bytes();
+        // Use a fixed 8-byte width (not `usize`, which is 4 bytes on 32-bit and 8 on
+        // 64-bit) so the digest — and any cache key built on it — is identical across
+        // architectures. On 64-bit this is byte-for-byte unchanged.
+        let len_bytes = (part.len() as u64).to_le_bytes();
         hasher.update(len_bytes);
         hasher.update(part.as_bytes());
     }

@@ -132,6 +132,10 @@ pub enum EngineError {
     #[error("detekt not configured — add `detekt = \"1.23.7\"` to [toolchain] in konvoy.toml")]
     LintNotConfigured,
 
+    /// A configured codegen input file is missing.
+    #[error("codegen input for `{name}` not found at {path} — create the file, or fix the inputs configured in [codegen.{name}]")]
+    CodegenInputNotFound { name: String, path: String },
+
     /// The project name supplied to `konvoy init` is invalid.
     #[error("invalid project name \"{name}\": {reason}")]
     InvalidProjectName { name: String, reason: String },

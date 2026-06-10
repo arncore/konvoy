@@ -4,6 +4,7 @@
 pub mod artifact;
 pub mod build;
 pub mod cache;
+pub mod codegen;
 mod common;
 pub mod detekt;
 mod diagnostics;
@@ -18,6 +19,10 @@ pub mod update;
 pub use artifact::{ArtifactStore, BuildMetadata};
 pub use build::{build, BuildOptions, BuildOutcome, BuildResult};
 pub use cache::{CacheInputs, CacheKey};
+pub use codegen::{
+    compute_codegen_hash_pairs, compute_codegen_hashes, generator_output_dir, generator_summaries,
+    managed_tools, CodeGenerator, GeneratorSummary,
+};
 pub use detekt::{lint, DetektDiagnostic, LintOptions, LintResult};
 pub use error::EngineError;
 pub use init::{
