@@ -7,6 +7,7 @@
 //! are assembled into a `&[Box<dyn CodeGenerator>]` by a registry that lives with
 //! the implementations, so adding a generator never touches this file.
 
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use konvoy_config::lockfile::CodegenToolLock;
@@ -167,15 +168,37 @@ pub fn generator_output_dir(project_root: &Path, name: &str) -> PathBuf {
     project_root.join(".konvoy").join("gen").join(name)
 }
 
-/// Download + SHA-verify every generator's managed tool, returning the resolved
-/// lockfile pins (one per generator, in order).
+/// The managed tools of `generators`, deduplicated by `(id, version)` and in
+/// stable sorted order.
+///
+/// A build graph (root + path-dependencies) may have several generators backed by
+/// the same tool+version — it is content-addressed under `~/.konvoy/tools`, so it
+/// need only be downloaded, verified, and pinned once. Sorting keeps the resulting
+/// lockfile pins deterministic regardless of the order generators were discovered.
+fn unique_codegen_tools(generators: &[Box<dyn CodeGenerator>]) -> Vec<ManagedToolSpec> {
+    let mut unique: BTreeMap<(String, String), ManagedToolSpec> = BTreeMap::new();
+    for generator in generators {
+        let tool = generator.managed_tool();
+        unique
+            .entry((tool.id().to_owned(), tool.version().to_owned()))
+            .or_insert(tool);
+    }
+    unique.into_values().collect()
+}
+
+/// Download + SHA-verify the codegen tools required by `generators`, returning the
+/// resolved lockfile pins — one per **distinct** `(name, version)`, sorted.
+///
+/// `generators` is the whole build graph's set (root + every path-dependency), so
+/// a tool shared across projects is fetched and pinned once (deduped by
+/// `(name, version)`); the returned union is what the build persists into the root
+/// `konvoy.lock`.
 ///
 /// Mirrors the detekt/plugin pattern: the expected SHA is read from `pinned` (by
 /// tool name + version); under `locked` a missing pin is a `LockfileUpdateRequired`
 /// and a not-yet-downloaded tool is a `CodegenToolNotFound`; otherwise the tool is
-/// fetched (or a cached copy re-verified) and its computed SHA returned for the
-/// caller to persist into `konvoy.lock`. This is generator-agnostic — it only uses
-/// the [`ManagedToolSpec`] each generator exposes.
+/// fetched (or a cached copy re-verified) and its computed SHA returned. This is
+/// generator-agnostic — it only uses the [`ManagedToolSpec`] each generator exposes.
 ///
 /// # Errors
 /// Returns an error if a tool can't be downloaded, a pinned hash doesn't match, or
@@ -185,9 +208,9 @@ pub fn ensure_codegen_tools(
     pinned: &[CodegenToolLock],
     locked: bool,
 ) -> Result<Vec<CodegenToolLock>, EngineError> {
-    let mut resolved = Vec::with_capacity(generators.len());
-    for generator in generators {
-        let tool = generator.managed_tool();
+    let tools = unique_codegen_tools(generators);
+    let mut resolved = Vec::with_capacity(tools.len());
+    for tool in tools {
         let (name, version) = (tool.id().to_owned(), tool.version().to_owned());
 
         let expected = pinned
@@ -809,6 +832,22 @@ mod tests {
             }
             other => panic!("expected CodegenToolNotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unique_codegen_tools_dedupes_by_name_version_and_sorts() {
+        // Across a build graph the same tool can back several generators (e.g. the
+        // root and a path-dep both use openapi/fabrikt); it must be pinned once.
+        // Order is stable (sorted) regardless of discovery order. The fake's tool
+        // id == its generator name and its version is fixed, so equal names collide.
+        let gens = vec![
+            fake("b", &[], &[]),
+            fake("a", &[], &[]),
+            fake("a", &["different-config"], &[]),
+        ];
+        let tools = unique_codegen_tools(&gens);
+        let ids: Vec<&str> = tools.iter().map(|t| t.id()).collect();
+        assert_eq!(ids, vec!["a", "b"], "deduped by (id, version), sorted");
     }
 
     // ---- run_codegen (generation + source collection) -----------------------

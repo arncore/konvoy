@@ -138,13 +138,8 @@ pub(crate) struct ResolvedBuildContext {
     pub plugin_jars: Vec<PathBuf>,
     /// Lockfile entries for resolved plugins (used by `update_lockfile_if_needed`).
     pub plugin_locks: Vec<konvoy_config::lockfile::PluginLock>,
-    /// Active code generators for the root project's `[codegen]` config (empty
-    /// when no codegen is configured). Run on a cache miss to produce sources.
-    pub generators: Vec<Box<dyn crate::codegen::CodeGenerator>>,
-    /// Tagged (`name:hash`) codegen input hashes folded into the root project's
-    /// cache key (empty when no codegen is configured).
-    pub codegen_hashes: Vec<String>,
-    /// Resolved codegen-tool lockfile pins (persisted by `update_lockfile_if_needed`).
+    /// Resolved codegen-tool lockfile pins — the deduped union across the root and
+    /// all path-deps (persisted to the root lock by `update_lockfile_if_needed`).
     pub codegen_locks: Vec<CodegenToolLock>,
     /// Resolved path-dependency graph in topological order.
     pub dep_graph: ResolvedGraph,
@@ -320,20 +315,32 @@ pub(crate) fn resolve_build_context(
         (Vec::new(), Vec::new())
     };
 
-    // 6b. Resolve codegen tools, mirroring plugins (issue #133 class). Each
-    //     generator's managed tool is downloaded + SHA-pinned up front so the
-    //     predicted lockfile — and therefore the cache key — is stable from the
-    //     first build, and the per-generator input hashes that feed the cache key
-    //     are computed here too. Generation itself is deferred to a cache miss in
-    //     `build_single`. Codegen is scoped to the root project; path-dependency
-    //     `[codegen]` config is not processed.
+    // 6b. Resolve the dependency graph up front. Codegen-tool pinning spans the
+    //     WHOLE graph (root + path-deps), so every dependency's manifest must be
+    //     known before the lockfile is predicted. `resolve_dependencies` only reads
+    //     dep manifests + source hashes (no toolchain/plugin state), so running it
+    //     here — earlier than the build loop below — is safe.
+    let dep_graph = resolve_dependencies(project_root, &manifest)?;
+
+    // 6c. Resolve codegen tools, mirroring plugins (issue #133 class). Tools are
+    //     downloaded + SHA-pinned up front so the predicted lockfile — and thus the
+    //     cache key — is stable from the first build. The pin set is the deduped
+    //     UNION of every codegen tool across the root and all path-deps, recorded
+    //     in the root `konvoy.lock` (just as the root lock aggregates the graph's
+    //     Maven deps). Each project's input hashing and the generation itself are
+    //     deferred to a cache miss in `build_single`, per project.
     //
     // On a warm cache the tools are already present and pinned, so
     // `ensure_codegen_tools` only re-verifies their hashes — it does not download.
-    let generators = crate::codegen::active_generators(&manifest.codegen);
-    let codegen_locks =
-        crate::codegen::ensure_codegen_tools(&generators, &lockfile.codegen_tools, options.locked)?;
-    let codegen_hashes = crate::codegen::compute_codegen_hashes(project_root, &generators)?;
+    let mut graph_generators = crate::codegen::active_generators(&manifest.codegen);
+    for dep in &dep_graph.order {
+        graph_generators.extend(crate::codegen::active_generators(&dep.manifest.codegen));
+    }
+    let codegen_locks = crate::codegen::ensure_codegen_tools(
+        &graph_generators,
+        &lockfile.codegen_tools,
+        options.locked,
+    )?;
 
     // We predict the lockfile content that will eventually be written, so the
     // cache key is the same in the first and second builds. In `--locked` mode
@@ -348,8 +355,7 @@ pub(crate) fn resolve_build_context(
         options.locked,
     );
 
-    // 7. Resolve dependencies and build them in topological order.
-    let dep_graph = resolve_dependencies(project_root, &manifest)?;
+    // 7. Build path dependencies in topological order.
     let lockfile_content = lockfile_toml_content(&effective_lockfile)?;
 
     let levels = parallel_levels(&dep_graph);
@@ -373,9 +379,6 @@ pub(crate) fn resolve_build_context(
                     options,
                     library_inputs: &lib_inputs,
                     plugin_jars: &[],
-                    // Codegen is root-scoped; path-deps don't generate.
-                    codegen_hashes: &[],
-                    generators: &[],
                 };
                 let (output, outcome) = build_single(
                     &dep.project_root,
@@ -424,8 +427,6 @@ pub(crate) fn resolve_build_context(
         library_inputs,
         plugin_jars,
         plugin_locks,
-        generators,
-        codegen_hashes,
         codegen_locks,
         dep_graph,
         store,
@@ -462,8 +463,6 @@ pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult,
         options,
         library_inputs: &ctx.library_inputs,
         plugin_jars: &ctx.plugin_jars,
-        codegen_hashes: &ctx.codegen_hashes,
-        generators: &ctx.generators,
     };
     let (output_path, outcome) = build_single(
         project_root,
@@ -516,13 +515,6 @@ pub(crate) struct CompileContext<'a> {
     pub library_inputs: &'a [LibraryInput],
     /// Compiler plugin JAR paths to pass as `-Xplugin` args.
     pub plugin_jars: &'a [PathBuf],
-    /// Tagged (`name:hash`) codegen input hashes folded into the cache key (empty
-    /// when the project has no `[codegen]` config).
-    pub codegen_hashes: &'a [String],
-    /// Code generators to run on a cache miss, producing `.kt` sources to compile
-    /// (empty when the project has no `[codegen]` config). Their tools must already
-    /// be ensured (see `resolve_build_context`).
-    pub generators: &'a [Box<dyn crate::codegen::CodeGenerator>],
 }
 
 /// Build a single project (either root or a dependency).
@@ -547,6 +539,14 @@ pub(crate) fn build_single(
         .collect();
 
     let is_lib = manifest.package.kind == PackageKind::Lib;
+
+    // Codegen is resolved per project from its OWN manifest — the root and every
+    // path-dep are treated identically. The tags (spec contents + config + tool
+    // version) feed this project's cache key; the generators run on a miss (below).
+    // Their tools were already downloaded + pinned graph-wide in
+    // `resolve_build_context`, so a miss here only runs them, never downloads.
+    let generators = crate::codegen::active_generators(&manifest.codegen);
+    let codegen_hashes = crate::codegen::compute_codegen_hashes(project_root, &generators)?;
 
     // Compute cache key.
     let manifest_content = manifest.to_toml()?;
@@ -573,7 +573,7 @@ pub(crate) fn build_single(
             .collect::<Result<Vec<_>, _>>()?,
         // Codegen inputs (spec files + generator config + tool version) — a change
         // here rebuilds. Empty when the project has no `[codegen]` config.
-        codegen_hashes: cc.codegen_hashes.to_vec(),
+        codegen_hashes,
     };
     let cache_key = CacheKey::compute(&cache_inputs)?;
 
@@ -599,14 +599,14 @@ pub(crate) fn build_single(
         return Ok((output_path, BuildOutcome::Cached));
     }
 
-    // Cache miss: run code generators (their tools were ensured up front in
-    // resolve_build_context) and add the emitted `.kt` to the source set. The
-    // generated output is NOT in the cache key directly — its inputs are, via
-    // `codegen_hashes` — so generation is deterministic w.r.t. the key.
-    if !cc.generators.is_empty() {
+    // Cache miss: run this project's code generators (their tools were ensured up
+    // front, graph-wide, in resolve_build_context) and add the emitted `.kt` to the
+    // source set. The generated output is NOT in the cache key directly — its
+    // inputs are, via `codegen_hashes` — so generation is deterministic w.r.t. the key.
+    if !generators.is_empty() {
         let generated = crate::codegen::run_codegen(
             project_root,
-            cc.generators,
+            &generators,
             cc.jre_home,
             cc.options.verbose,
         )?;
@@ -1734,8 +1734,6 @@ mod tests {
             options: &options,
             library_inputs: &[],
             plugin_jars: &[],
-            codegen_hashes: &[],
-            generators: &[],
         };
         let (output_path, outcome) =
             build_single(&project, &manifest, &cc, profile, &lockfile_content).unwrap();
@@ -1824,8 +1822,6 @@ mod tests {
             options: &options,
             library_inputs: &[],
             plugin_jars: &[],
-            codegen_hashes: &[],
-            generators: &[],
         };
         let (output_path, outcome) =
             build_single(&project, &manifest, &cc, profile, &lockfile_content).unwrap();
@@ -1940,8 +1936,6 @@ mod tests {
             options: &options,
             library_inputs: &[],
             plugin_jars: &[],
-            codegen_hashes: &[],
-            generators: &[],
         };
         let (output_path, outcome) =
             build_single(&project, &manifest, &cc, profile, &lockfile_content).unwrap();
@@ -2543,8 +2537,6 @@ mod tests {
             options: &options_no_force,
             library_inputs: &[],
             plugin_jars: &[],
-            codegen_hashes: &[],
-            generators: &[],
         };
         let (_, outcome) = build_single(
             &project,
@@ -2573,8 +2565,6 @@ mod tests {
             options: &options_force,
             library_inputs: &[],
             plugin_jars: &[],
-            codegen_hashes: &[],
-            generators: &[],
         };
         let result = build_single(&project, &manifest, &cc_force, profile, &lockfile_content);
 
