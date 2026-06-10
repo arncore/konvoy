@@ -261,7 +261,14 @@ pub(crate) fn resolve_build_context(
     let target = resolve_target(&options.target)?;
     let profile = options.profile;
 
-    // 5. Resolve managed konanc toolchain.
+    // 5. Resolve managed konanc toolchain. `resolve_konanc` auto-installs a
+    //    missing toolchain (a network download), which --locked forbids — fail
+    //    with an actionable error instead.
+    if options.locked && !konvoy_konanc::toolchain::is_installed(&manifest.toolchain.kotlin)? {
+        return Err(EngineError::ToolchainLocked {
+            version: manifest.toolchain.kotlin,
+        });
+    }
     let resolved = resolve_konanc(&manifest.toolchain.kotlin)?;
     let konanc = resolved.info;
     let jre_home = resolved.jre_home;
@@ -1253,6 +1260,48 @@ mod tests {
         };
         let result = build(tmp.path(), &options);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_locked_errors_when_toolchain_missing() {
+        // Manifest and lockfile agree on a Kotlin version that is never
+        // installed, so the build passes the staleness check and reaches
+        // toolchain resolution.
+        let kotlin_version = "0.0.0-locked-test";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("main.kt"), "fun main() {}\n").unwrap();
+        fs::write(
+            root.join("konvoy.toml"),
+            format!("[package]\nname = \"demo\"\n\n[toolchain]\nkotlin = \"{kotlin_version}\"\n"),
+        )
+        .unwrap();
+        Lockfile::with_toolchain(kotlin_version)
+            .write_to(&root.join("konvoy.lock"))
+            .unwrap();
+
+        let result = build(
+            root,
+            &BuildOptions {
+                target: None,
+                profile: Profile::Debug,
+                verbose: false,
+                force: false,
+                locked: true,
+            },
+        );
+
+        assert!(result.is_err(), "expected Err, got: {result:?}");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("--locked"),
+            "error should mention --locked: {err}"
+        );
+        assert!(
+            err.contains(kotlin_version),
+            "error should mention the toolchain version: {err}"
+        );
     }
 
     #[test]

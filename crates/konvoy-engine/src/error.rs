@@ -93,6 +93,10 @@ pub enum EngineError {
     )]
     LockfileUpdateRequired,
 
+    /// The Kotlin/Native toolchain is missing and --locked prevents installing it.
+    #[error("Kotlin/Native toolchain {version} is not installed and --locked prevents downloads — run `konvoy toolchain install` first")]
+    ToolchainLocked { version: String },
+
     /// No test source files found.
     #[error("no test source files found in {dir} — create test files in src/test/ using kotlin.test annotations")]
     NoTestSources { dir: String },
