@@ -109,6 +109,10 @@ pub enum EngineError {
     #[error("jre not available for running detekt — run `konvoy toolchain install` first")]
     DetektNoJre,
 
+    /// The toolchain providing detekt's JRE is missing and --locked prevents installing it.
+    #[error("Kotlin/Native toolchain {version} is not installed (detekt needs its JRE) and --locked prevents downloads — run `konvoy toolchain install` first")]
+    DetektJreLocked { version: String },
+
     /// Detekt jar hash mismatch.
     #[error("detekt {version} jar hash mismatch — expected {expected}, got {actual}; this may indicate a tampered or corrupted download — delete ~/.konvoy/tools/detekt/{version}/ and re-run `konvoy lint` to re-download, or verify the hash at the detekt release page")]
     DetektHashMismatch {

@@ -176,9 +176,15 @@ fn persist_detekt_hash(
 
 /// Resolve the JRE `java` binary from the managed Kotlin toolchain.
 ///
-/// Auto-installs the toolchain if it is not yet present.
-fn resolve_java_bin(kotlin_version: &str) -> Result<(PathBuf, PathBuf), EngineError> {
+/// Auto-installs the toolchain if it is not yet present, unless `locked`
+/// is set — `--locked` forbids downloads, so a missing toolchain is an error.
+fn resolve_java_bin(kotlin_version: &str, locked: bool) -> Result<(PathBuf, PathBuf), EngineError> {
     if !konvoy_konanc::toolchain::is_installed(kotlin_version)? {
+        if locked {
+            return Err(EngineError::DetektJreLocked {
+                version: kotlin_version.to_owned(),
+            });
+        }
         eprintln!("    Installing Kotlin/Native {kotlin_version} (for JRE)...");
         konvoy_konanc::toolchain::install(kotlin_version)?;
     }
@@ -327,7 +333,7 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
     }
 
     // Resolve JRE.
-    let (java_bin, jre_home) = resolve_java_bin(&manifest.toolchain.kotlin)?;
+    let (java_bin, jre_home) = resolve_java_bin(&manifest.toolchain.kotlin, options.locked)?;
 
     // Check for sources.
     let src_dir = root.join("src");
@@ -658,6 +664,65 @@ src/main.kt:3:5: Magic number. [MagicNumber]
         let (path, hash) = result.unwrap();
         assert_eq!(hash, real_hash);
         assert!(path.display().to_string().contains(version));
+    }
+
+    #[test]
+    fn lint_locked_errors_when_toolchain_missing() {
+        // Pre-install a fake detekt JAR with its hash pinned in the lockfile,
+        // so the JAR-side --locked checks pass and lint reaches JRE resolution.
+        let detekt_version = "99.0.2-test";
+        let jar = super::detekt_jar_path(detekt_version).unwrap();
+        std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
+        let content = b"fake jar for locked jre test";
+        std::fs::write(&jar, content).unwrap();
+        let jar_hash = konvoy_util::hash::sha256_bytes(content);
+
+        // Project manifest pins a Kotlin version that is never installed.
+        let kotlin_version = "0.0.0-locked-test";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("konvoy.toml"),
+            format!(
+                "[package]\nname = \"demo\"\n\n[toolchain]\nkotlin = \"{kotlin_version}\"\ndetekt = \"{detekt_version}\"\n"
+            ),
+        )
+        .unwrap();
+        let lockfile = konvoy_config::lockfile::Lockfile {
+            toolchain: Some(konvoy_config::lockfile::ToolchainLock {
+                konanc_version: kotlin_version.to_owned(),
+                konanc_tarball_sha256: None,
+                jre_tarball_sha256: None,
+                detekt_version: Some(detekt_version.to_owned()),
+                detekt_jar_sha256: Some(jar_hash),
+            }),
+            ..Default::default()
+        };
+        lockfile.write_to(&root.join("konvoy.lock")).unwrap();
+
+        let result = super::lint(
+            root,
+            &super::LintOptions {
+                verbose: false,
+                config: None,
+                locked: true,
+            },
+        );
+
+        // Clean up the fake JAR before asserting.
+        let _ = std::fs::remove_file(&jar);
+        let _ = std::fs::remove_dir(jar.parent().unwrap());
+
+        assert!(result.is_err(), "expected Err, got: {result:?}");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("--locked"),
+            "error should mention --locked: {err}"
+        );
+        assert!(
+            err.contains(kotlin_version),
+            "error should mention the toolchain version: {err}"
+        );
     }
 
     #[test]
