@@ -125,7 +125,26 @@ pub fn prepend_to_environment_path(
 /// Returns an error if `dir` cannot be read.
 pub fn collect_files(dir: &Path, extension: &str) -> Result<Vec<PathBuf>, UtilError> {
     let mut files = Vec::new();
-    collect_files_recursive(dir, extension, &mut files)?;
+    collect_files_recursive(dir, Some(extension), &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+/// Collect every file under `dir`, recursively, sorted by path (no extension filter).
+///
+/// Symlinks to files are followed and collected; symlinks to *directories* are NOT
+/// traversed (this is the cycle-safety guard — `read_dir` still follows `dir` itself
+/// if it is a symlink, so a symlinked top-level directory works; only a symlinked
+/// sub-directory encountered during the walk is skipped). A symlink whose target
+/// is missing is skipped; other resolution errors (permissions, I/O) propagate.
+/// Hidden/dotfiles are returned — filtering is the caller's responsibility.
+///
+/// # Errors
+/// Returns an error if `dir` (or a symlink target, other than a missing one)
+/// cannot be read.
+pub fn collect_all_files(dir: &Path) -> Result<Vec<PathBuf>, UtilError> {
+    let mut files = Vec::new();
+    collect_files_recursive(dir, None, &mut files)?;
     files.sort();
     Ok(files)
 }
@@ -137,12 +156,16 @@ fn has_extension(path: &Path, ext: &str) -> bool {
         .is_some_and(|e| e == ext)
 }
 
+/// Recursively collect files under `dir`. When `extension` is `Some`, only files
+/// with that extension are collected; when `None`, every file is collected.
 fn collect_files_recursive(
     dir: &Path,
-    extension: &str,
+    extension: Option<&str>,
     out: &mut Vec<PathBuf>,
 ) -> Result<(), UtilError> {
     let entries = std::fs::read_dir(dir).map_err(io_err(dir))?;
+
+    let matches = |path: &Path| extension.is_none_or(|ext| has_extension(path, ext));
 
     for entry in entries {
         let entry = entry.map_err(io_err(dir))?;
@@ -153,17 +176,22 @@ fn collect_files_recursive(
         let file_type = entry.file_type().map_err(io_err(&entry.path()))?;
 
         if file_type.is_symlink() {
-            // Follow the symlink to determine what it points to.
-            // std::fs::metadata follows symlinks, so it gives us the target type.
-            // If the symlink is broken, metadata() returns an error — skip silently.
+            // Follow the symlink to classify its target (std::fs::metadata follows).
+            // A genuinely broken symlink (target missing → NotFound) is skipped, but
+            // any OTHER error (permission, I/O, a path component that isn't a
+            // directory) is propagated — matching how an unreadable real directory
+            // fails loudly via read_dir, so the collected set never silently changes
+            // due to a transient/permission error (it feeds deterministic cache keys).
             let path = entry.path();
-            let Ok(target_meta) = std::fs::metadata(&path) else {
-                continue; // broken symlink
+            let target_meta = match std::fs::metadata(&path) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io_err(&path)(e)),
             };
 
             // Only include symlinked regular files; skip directory symlinks
             // to prevent infinite recursion from symlink cycles.
-            if target_meta.is_file() && has_extension(&path, extension) {
+            if target_meta.is_file() && matches(&path) {
                 out.push(path);
             }
             continue;
@@ -173,7 +201,7 @@ fn collect_files_recursive(
 
         if file_type.is_dir() {
             collect_files_recursive(&path, extension, out)?;
-        } else if has_extension(&path, extension) {
+        } else if matches(&path) {
             out.push(path);
         }
     }
@@ -270,6 +298,198 @@ mod tests {
         for i in 0..files.len().saturating_sub(1) {
             assert!(files.get(i) <= files.get(i + 1));
         }
+    }
+
+    #[test]
+    fn collect_all_files_returns_every_file_regardless_of_extension() {
+        // Unlike collect_files, collect_all_files has no extension filter — it must
+        // return files of any (or no) extension, recursively, sorted.
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("nested");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(tmp.path().join("api.yaml"), b"").unwrap();
+        fs::write(tmp.path().join("README"), b"").unwrap(); // no extension
+        fs::write(sub.join("pet.json"), b"").unwrap();
+
+        let files = collect_all_files(tmp.path()).unwrap();
+        assert_eq!(
+            files,
+            vec![
+                tmp.path().join("README"),
+                tmp.path().join("api.yaml"),
+                sub.join("pet.json"),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_all_files_empty_dir_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(collect_all_files(tmp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn collect_all_files_includes_hidden_files_and_descends_dot_dirs() {
+        // collect_all_files is intentionally UNFILTERED — callers (e.g. codegen)
+        // decide what to exclude. It must return dotfiles and descend into
+        // dot-directories; locking this in stops anyone "helpfully" adding hidden-
+        // file filtering to the shared util.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        fs::write(tmp.path().join(".env"), b"secret").unwrap();
+        fs::write(tmp.path().join(".git/config"), b"[core]").unwrap();
+        fs::write(tmp.path().join("normal.txt"), b"x").unwrap();
+
+        let files = collect_all_files(tmp.path()).unwrap();
+        assert_eq!(
+            files,
+            vec![
+                tmp.path().join(".env"),
+                tmp.path().join(".git/config"),
+                tmp.path().join("normal.txt"),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_all_files_does_not_treat_a_directory_as_a_file() {
+        // A directory whose name looks like a file is recursed into, not collected.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("looks_like.yaml")).unwrap();
+        fs::write(tmp.path().join("looks_like.yaml/inner.yaml"), b"x").unwrap();
+
+        let files = collect_all_files(tmp.path()).unwrap();
+        assert_eq!(files, vec![tmp.path().join("looks_like.yaml/inner.yaml")]);
+    }
+
+    #[test]
+    fn collect_all_files_errors_on_missing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = collect_all_files(&tmp.path().join("does-not-exist")).unwrap_err();
+        assert!(
+            matches!(err, UtilError::Io { .. }),
+            "expected Io, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn collect_all_files_sorts_results_lexically() {
+        // Files are CREATED in scrambled order; the result must come back in lexical
+        // (byte) order, proving the `.sort()` is applied rather than passing through
+        // whatever order `read_dir` happens to yield. The `a10` < `a2` pair pins
+        // lexical (not numeric) ordering. (Verified: reverting the sort fails this on
+        // a real filesystem, whose read_dir order is not coincidentally sorted.)
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["d", "c", "b", "a2", "a10", "a1", "a"] {
+            fs::write(tmp.path().join(name), b"x").unwrap();
+        }
+        let files = collect_all_files(tmp.path()).unwrap();
+        let expected: Vec<PathBuf> = ["a", "a1", "a10", "a2", "b", "c", "d"]
+            .iter()
+            .map(|n| tmp.path().join(n))
+            .collect();
+        assert_eq!(files, expected);
+    }
+
+    #[test]
+    fn collect_all_files_is_a_superset_of_collect_files() {
+        // Same tree, two modes: collect_files filters by extension; collect_all_files
+        // returns everything (sorted). Documents the generalization's two behaviors.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.kt"), b"x").unwrap();
+        fs::write(tmp.path().join("b.txt"), b"y").unwrap();
+        fs::write(tmp.path().join("README"), b"z").unwrap();
+
+        let kt = collect_files(tmp.path(), "kt").unwrap();
+        let all = collect_all_files(tmp.path()).unwrap();
+        assert_eq!(kt, vec![tmp.path().join("a.kt")]);
+        assert_eq!(
+            all,
+            vec![
+                tmp.path().join("README"),
+                tmp.path().join("a.kt"),
+                tmp.path().join("b.txt"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_all_files_skips_broken_symlinks() {
+        // A dangling symlink (target missing) must be silently skipped — neither
+        // collected nor surfaced as an error — or a stray broken link would poison a
+        // cache key built from the result, or abort the whole walk. Covers the
+        // `Err(metadata) => continue` branch, which no other test exercises.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("real.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("missing"), tmp.path().join("dangling"))
+            .unwrap();
+
+        let files = collect_all_files(tmp.path()).unwrap();
+        assert_eq!(files, vec![tmp.path().join("real.txt")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_all_files_propagates_non_missing_symlink_errors() {
+        // A symlink that fails to resolve for a reason OTHER than "missing target"
+        // must error, not be silently skipped like a genuinely-broken link. Here the
+        // target path traverses a regular file (`blocker/inner`), so resolution fails
+        // with ENOTDIR (not NotFound) — deterministically and independent of the test
+        // user (unlike a permission-based case, which root would bypass). This guards
+        // the determinism contract: transient/permission/IO errors fail loudly rather
+        // than silently dropping a file from a cache-key input set.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("blocker"), b"x").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("blocker/inner"), tmp.path().join("bad"))
+            .unwrap();
+
+        let result = collect_all_files(tmp.path());
+        assert!(
+            matches!(result, Err(UtilError::Io { .. })),
+            "a non-NotFound symlink-resolution error must propagate, got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_all_files_follows_file_symlinks_and_skips_dir_symlink_cycles() {
+        // The extension->Option generalization rewrote the symlink branch
+        // (`has_extension` -> `matches`); the existing symlink tests only cover the
+        // extension path via collect_files. This covers the None path: a symlinked
+        // (extension-less) FILE is followed and collected, while a directory-symlink
+        // cycle is skipped (no hang / stack overflow).
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_a = tmp.path().join("a");
+        let dir_b = tmp.path().join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        // Directory-symlink cycle a <-> b: must be skipped, not followed.
+        std::os::unix::fs::symlink(&dir_b, dir_a.join("to_b")).unwrap();
+        std::os::unix::fs::symlink(&dir_a, dir_b.join("to_a")).unwrap();
+
+        // A real extension-less file and an extension-less symlink to another file.
+        let target = tmp.path().join("real_target");
+        fs::write(&target, b"t").unwrap();
+        fs::write(dir_a.join("plain"), b"p").unwrap();
+        std::os::unix::fs::symlink(&target, dir_a.join("linked")).unwrap();
+
+        // Assert the EXACT set (not just presence): this catches over-collection
+        // (e.g. extra entries from a wrongly-followed dir symlink) and inherently
+        // proves the dir-symlink cycle contributed nothing — the prior `any()` +
+        // `!any(to_a/to_b)` checks couldn't catch either (the negative was a
+        // tautology, since dir symlinks are never pushed). If the cycle-skip itself
+        // regressed, the walk would loop (FilesystemLoop / overflow) before asserting.
+        let files = collect_all_files(tmp.path()).unwrap();
+        assert_eq!(
+            files,
+            vec![
+                dir_a.join("linked"), // symlink to a file -> followed
+                dir_a.join("plain"),  // real extension-less file
+                tmp.path().join("real_target"),
+            ]
+        );
     }
 
     #[test]
