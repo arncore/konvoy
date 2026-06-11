@@ -155,7 +155,10 @@ pub fn list_installed() -> Result<Vec<String>, KonancError> {
 /// # Errors
 /// Returns an error if the download fails, the tarball is corrupt, or the
 /// extraction fails.
-pub fn install(version: &str) -> Result<InstallResult, KonancError> {
+pub fn install(
+    version: &str,
+    net: &konvoy_util::net::NetworkClient,
+) -> Result<InstallResult, KonancError> {
     let dest = version_dir(version)?;
 
     // Check if konanc is already installed.
@@ -189,8 +192,9 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
         let (_tarball_guard, tmp_tarball) = temp_tarball(&toolchains_root, &prefix)?;
 
         let progress = konvoy_util::progress::new_download_bar(format!("Kotlin/Native {version}"));
-        let sha256 = konvoy_util::progress::stream_with_bar(&url, &tmp_tarball, Some(&progress))
-            .map_err(|e| map_download_err(version, e))?;
+        let sha256 =
+            konvoy_util::progress::stream_with_bar(net, &url, &tmp_tarball, Some(&progress))
+                .map_err(|e| map_download_err(version, e))?;
         eprintln!();
 
         let (_extract_guard, tmp_extract) = temp_extract_dir(&toolchains_root, &prefix)?;
@@ -213,7 +217,7 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
     };
 
     // --- Install JRE if needed ---
-    let (jre_home, jre_sha256) = install_jre(version)?;
+    let (jre_home, jre_sha256) = install_jre(version, net)?;
 
     Ok(InstallResult {
         konanc_path: dest.join("bin").join("konanc"),
@@ -227,7 +231,10 @@ pub fn install(version: &str) -> Result<InstallResult, KonancError> {
 ///
 /// Returns `(jre_home, tarball_sha256)`. The SHA-256 is `None` if the JRE was
 /// already installed and no download occurred.
-fn install_jre(version: &str) -> Result<(PathBuf, Option<String>), KonancError> {
+fn install_jre(
+    version: &str,
+    net: &konvoy_util::net::NetworkClient,
+) -> Result<(PathBuf, Option<String>), KonancError> {
     let jre_root = jre_dir(version)?;
 
     // Already installed — return existing path.
@@ -243,7 +250,7 @@ fn install_jre(version: &str) -> Result<(PathBuf, Option<String>), KonancError> 
     let (_tarball_guard, tmp_tarball) = temp_tarball(&toolchains_root, &prefix)?;
 
     let progress = konvoy_util::progress::new_download_bar(format!("JRE {version}"));
-    let sha256 = konvoy_util::progress::stream_with_bar(&url, &tmp_tarball, Some(&progress))
+    let sha256 = konvoy_util::progress::stream_with_bar(net, &url, &tmp_tarball, Some(&progress))
         .map_err(|e| map_download_err(version, e))?;
     eprintln!();
 

@@ -154,6 +154,7 @@ pub fn ensure_plugin_artifacts(
     artifacts: &[ResolvedPluginArtifact],
     lockfile: &Lockfile,
     locked: bool,
+    net: &konvoy_util::net::NetworkClient,
 ) -> Result<Vec<PluginArtifactResult>, EngineError> {
     use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
@@ -203,6 +204,7 @@ pub fn ensure_plugin_artifacts(
         .map(|(artifact, maybe_bar)| {
             let expected_hash = find_lockfile_hash(lockfile, &artifact.plugin_name);
             let util_result = konvoy_util::progress::fetch(
+                net,
                 &artifact.url,
                 &artifact.cache_path,
                 expected_hash,
@@ -826,7 +828,12 @@ mod tests {
         let artifacts = resolve_plugin_artifacts(&manifest).unwrap();
         let lockfile = Lockfile::default(); // no plugin hashes
 
-        let result = ensure_plugin_artifacts(&artifacts, &lockfile, true);
+        let result = ensure_plugin_artifacts(
+            &artifacts,
+            &lockfile,
+            true,
+            &konvoy_util::net::NetworkClient::new(false),
+        );
         assert!(
             result.is_err(),
             "expected error in locked mode without hash"
@@ -838,7 +845,13 @@ mod tests {
     #[test]
     fn ensure_plugin_artifacts_empty_input_returns_empty() {
         let lockfile = Lockfile::default();
-        let result = ensure_plugin_artifacts(&[], &lockfile, false).unwrap();
+        let result = ensure_plugin_artifacts(
+            &[],
+            &lockfile,
+            false,
+            &konvoy_util::net::NetworkClient::new(false),
+        )
+        .unwrap();
         assert!(result.is_empty());
     }
 
@@ -874,7 +887,12 @@ mod tests {
             },
         ];
 
-        let result = ensure_plugin_artifacts(&artifacts, &lockfile, true);
+        let result = ensure_plugin_artifacts(
+            &artifacts,
+            &lockfile,
+            true,
+            &konvoy_util::net::NetworkClient::new(false),
+        );
         assert!(matches!(result, Err(EngineError::LockfileUpdateRequired)));
     }
 
@@ -906,7 +924,13 @@ mod tests {
             cache_path: cache_path.clone(),
         }];
 
-        let result = ensure_plugin_artifacts(&artifacts, &lockfile, true).unwrap();
+        let result = ensure_plugin_artifacts(
+            &artifacts,
+            &lockfile,
+            true,
+            &konvoy_util::net::NetworkClient::new(false),
+        )
+        .unwrap();
         assert_eq!(result.len(), 1);
         let r = &result[0];
         assert_eq!(r.plugin_name, "test-plugin");
@@ -929,7 +953,12 @@ mod tests {
             cache_path: tmp.path().join("lib.jar"),
         };
         let lockfile = Lockfile::default();
-        let result = ensure_plugin_artifacts(&[artifact], &lockfile, false);
+        let result = ensure_plugin_artifacts(
+            &[artifact],
+            &lockfile,
+            false,
+            &konvoy_util::net::NetworkClient::new(false),
+        );
         assert!(result.is_err());
     }
 }

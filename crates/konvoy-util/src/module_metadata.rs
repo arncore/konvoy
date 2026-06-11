@@ -181,6 +181,7 @@ fn module_404_sentinel_path(body: &std::path::Path) -> Result<std::path::PathBuf
 /// error or the response body cannot be read. Returns `UtilError::InvalidVersion`
 /// if any of `group_id`/`artifact_id`/`version` fail validation.
 pub fn fetch_module_metadata(
+    net: &crate::net::NetworkClient,
     group_id: &str,
     artifact_id: &str,
     version: &str,
@@ -188,7 +189,8 @@ pub fn fetch_module_metadata(
     // 1. Try the disk cache. Check the body file first, then the 404 sentinel.
     // Body file wins over the 404 sentinel if both exist. This recovers
     // gracefully from the case where Maven Central publishes a previously
-    // missing artifact between two `konvoy update` runs.
+    // missing artifact between two `konvoy update` runs. No network is
+    // involved here, so cached metadata resolves offline too.
     let cache_path = module_cache_path(group_id, artifact_id, version)?;
     if cache_path.exists() {
         if let Ok(body) = std::fs::read_to_string(&cache_path) {
@@ -204,9 +206,8 @@ pub fn fetch_module_metadata(
 
     // 2. Cache miss — fetch from Maven Central.
     let url = module_metadata_url(group_id, artifact_id, version);
-    let agent = crate::download::http_agent(60);
 
-    match agent.get(&url).call() {
+    match net.get(&url, 60) {
         Ok(response) => {
             let body = response
                 .into_body()
@@ -226,7 +227,7 @@ pub fn fetch_module_metadata(
 
             Ok(Some(body))
         }
-        Err(ureq::Error::StatusCode(404)) => {
+        Err(crate::net::RequestError::Status { code: 404, .. }) => {
             // Persist the 404 so we don't re-hit the network on every run.
             if let Err(e) = crate::pom::write_cache_atomic(&sentinel_path, &[]) {
                 eprintln!(
@@ -236,8 +237,10 @@ pub fn fetch_module_metadata(
             }
             Ok(None)
         }
-        Err(e) => Err(UtilError::Download {
-            message: format!("failed to fetch module metadata from {url}: {e}"),
+        Err(crate::net::RequestError::Offline) => Err(UtilError::Offline { url }),
+        Err(crate::net::RequestError::Status { message, .. })
+        | Err(crate::net::RequestError::Transport { message }) => Err(UtilError::Download {
+            message: format!("failed to fetch module metadata from {url}: {message}"),
         }),
     }
 }
@@ -250,6 +253,11 @@ pub fn fetch_module_metadata(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// An online client for tests exercising fetch paths.
+    fn online() -> crate::net::NetworkClient {
+        crate::net::NetworkClient::new(false)
+    }
 
     /// Real-world `.module` JSON for kotlinx-coroutines-core-linuxx64 (trimmed).
     const COROUTINES_MODULE: &str = r#"{
@@ -622,13 +630,13 @@ mod tests {
 
     #[test]
     fn fetch_module_metadata_rejects_path_traversal_in_group_id() {
-        let result = fetch_module_metadata("../etc/passwd", "lib", "1.0.0");
+        let result = fetch_module_metadata(&online(), "../etc/passwd", "lib", "1.0.0");
         assert!(result.is_err());
     }
 
     #[test]
     fn fetch_module_metadata_rejects_invalid_version() {
-        let err = fetch_module_metadata("com.example", "lib", "1.0/0").unwrap_err();
+        let err = fetch_module_metadata(&online(), "com.example", "lib", "1.0/0").unwrap_err();
         assert!(
             matches!(err, UtilError::InvalidVersion { .. }),
             "expected InvalidVersion, got: {err:?}"
@@ -638,7 +646,12 @@ mod tests {
     #[test]
     fn fetch_module_metadata_nonexistent_returns_none() {
         // Use a non-existent artifact to test 404 handling.
-        let result = fetch_module_metadata("com.nonexistent.fake", "no-such-artifact", "0.0.0");
+        let result = fetch_module_metadata(
+            &online(),
+            "com.nonexistent.fake",
+            "no-such-artifact",
+            "0.0.0",
+        );
         // This may either return None (404) or Err (connection refused).
         // Both are acceptable for a non-existent artifact — we just verify no panic.
         match result {
@@ -807,7 +820,7 @@ mod tests {
             let expected = r#"{"variants":[{"name":"x"}]}"#;
             std::fs::write(&body_path, expected).unwrap();
 
-            let result = fetch_module_metadata(group, artifact, version).unwrap();
+            let result = fetch_module_metadata(&online(), group, artifact, version).unwrap();
             assert_eq!(
                 result.as_deref(),
                 Some(expected),
@@ -829,7 +842,7 @@ mod tests {
             std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
             std::fs::write(&sentinel, b"").unwrap();
 
-            let result = fetch_module_metadata(group, artifact, version).unwrap();
+            let result = fetch_module_metadata(&online(), group, artifact, version).unwrap();
             assert!(
                 result.is_none(),
                 "sentinel hit must return None (no .module published)"
@@ -853,11 +866,34 @@ mod tests {
             std::fs::write(&body_path, expected).unwrap();
             std::fs::write(&sentinel, b"").unwrap();
 
-            let result = fetch_module_metadata(group, artifact, version).unwrap();
+            let result = fetch_module_metadata(&online(), group, artifact, version).unwrap();
             assert_eq!(
                 result.as_deref(),
                 Some(expected),
                 "body file must take precedence over stale 404 sentinel"
+            );
+        });
+    }
+
+    #[test]
+    fn fetch_module_metadata_offline_cached_ok_uncached_refuses() {
+        // Offline policy: a cached body or 404 sentinel resolves from disk;
+        // an uncached coordinate is refused at the wire (UtilError::Offline),
+        // NOT silently treated as "no .module published" (Ok(None)).
+        with_fake_home(|_home| {
+            let offline = crate::net::NetworkClient::new(true);
+
+            let body_path = module_cache_path("com.example", "cached", "1.0.0").unwrap();
+            std::fs::create_dir_all(body_path.parent().unwrap()).unwrap();
+            std::fs::write(&body_path, r#"{"variants":[]}"#).unwrap();
+
+            let cached = fetch_module_metadata(&offline, "com.example", "cached", "1.0.0");
+            assert_eq!(cached.unwrap().as_deref(), Some(r#"{"variants":[]}"#));
+
+            let uncached = fetch_module_metadata(&offline, "com.example", "uncached", "1.0.0");
+            assert!(
+                matches!(uncached, Err(UtilError::Offline { .. })),
+                "uncached .module under offline must refuse, got: {uncached:?}"
             );
         });
     }

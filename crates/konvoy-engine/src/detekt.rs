@@ -109,6 +109,7 @@ pub fn is_installed(version: &str) -> Result<bool, EngineError> {
 pub fn ensure_detekt(
     version: &str,
     expected_sha256: Option<&str>,
+    net: &konvoy_util::net::NetworkClient,
 ) -> Result<(PathBuf, String), EngineError> {
     // Use the same `validate_identifier` the spec uses (it rejects `..`), so a
     // traversal-laden version yields this actionable, detekt-branded message
@@ -121,7 +122,7 @@ pub fn ensure_detekt(
     })?;
 
     detekt_tool(version)
-        .ensure(expected_sha256)
+        .ensure(expected_sha256, net)
         .map_err(|e| map_download_err(version, e))
 }
 
@@ -176,7 +177,11 @@ fn persist_detekt_hash(
 /// `--locked` forbids downloads, so a missing toolchain is an error. The actual
 /// `java` invocation is delegated to [`ManagedToolSpec::run`], which derives the
 /// binary from this home.
-fn resolve_jre_home(kotlin_version: &str, locked: bool) -> Result<PathBuf, EngineError> {
+fn resolve_jre_home(
+    kotlin_version: &str,
+    locked: bool,
+    net: &konvoy_util::net::NetworkClient,
+) -> Result<PathBuf, EngineError> {
     if !konvoy_konanc::toolchain::is_installed(kotlin_version)? {
         if locked {
             return Err(EngineError::DetektJreLocked {
@@ -184,7 +189,7 @@ fn resolve_jre_home(kotlin_version: &str, locked: bool) -> Result<PathBuf, Engin
             });
         }
         eprintln!("    Installing Kotlin/Native {kotlin_version} (for JRE)...");
-        konvoy_konanc::toolchain::install(kotlin_version)?;
+        konvoy_konanc::toolchain::install(kotlin_version, net)?;
     }
 
     let jre_home = konvoy_konanc::toolchain::jre_home_path(kotlin_version)?;
@@ -283,6 +288,12 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
     // Read lockfile and resolve expected hash.
     let lockfile_path = root.join("konvoy.lock");
     let lockfile = konvoy_config::lockfile::Lockfile::from_path(&lockfile_path)?;
+
+    // One client per lint invocation — the single funnel for the detekt JAR
+    // and JRE downloads below. Always online for now; --offline (#295) will
+    // feed this constructor when it lands.
+    let net = konvoy_util::net::NetworkClient::new(false);
+
     let expected_hash = resolve_lockfile_hash(&lockfile, detekt_version);
 
     // In --locked mode, require pinned hash and pre-downloaded JAR.
@@ -300,7 +311,7 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
 
     // Ensure detekt jar is available and hash-verified. The path is derived again
     // (from the same spec) inside `run_detekt_process`, so it is discarded here.
-    let (_, actual_hash) = ensure_detekt(detekt_version, expected_hash)?;
+    let (_, actual_hash) = ensure_detekt(detekt_version, expected_hash, &net)?;
 
     // Persist hash to lockfile if not already stored.
     if expected_hash.is_none() {
@@ -314,7 +325,7 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
     }
 
     // Resolve JRE.
-    let jre_home = resolve_jre_home(&manifest.toolchain.kotlin, options.locked)?;
+    let jre_home = resolve_jre_home(&manifest.toolchain.kotlin, options.locked, &net)?;
 
     // Check for sources.
     let src_dir = root.join("src");
@@ -609,6 +620,7 @@ src/main.kt:3:5: Magic number. [MagicNumber]
         let result = super::ensure_detekt(
             version,
             Some("0000000000000000000000000000000000000000000000000000000000000000"),
+            &konvoy_util::net::NetworkClient::new(false),
         );
         // Clean up before asserting.
         let _ = std::fs::remove_file(&jar);
@@ -634,7 +646,11 @@ src/main.kt:3:5: Magic number. [MagicNumber]
         std::fs::write(&jar, content).unwrap();
 
         let real_hash = konvoy_util::hash::sha256_bytes(content);
-        let result = super::ensure_detekt(version, Some(&real_hash));
+        let result = super::ensure_detekt(
+            version,
+            Some(&real_hash),
+            &konvoy_util::net::NetworkClient::new(false),
+        );
         // Clean up.
         let _ = std::fs::remove_file(&jar);
         let _ = std::fs::remove_dir(jar.parent().unwrap());
@@ -652,7 +668,7 @@ src/main.kt:3:5: Magic number. [MagicNumber]
     /// be caught by either, so it does not exercise the difference).
     #[test]
     fn ensure_detekt_rejects_dotdot_version() {
-        let err = super::ensure_detekt("1..2", None)
+        let err = super::ensure_detekt("1..2", None, &konvoy_util::net::NetworkClient::new(false))
             .expect_err("a `..` version must be rejected before any download");
         let msg = err.to_string();
         assert!(

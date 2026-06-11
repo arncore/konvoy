@@ -61,13 +61,14 @@ pub struct MetadataFile {
 ///
 /// Returns an error if both `.module` and POM fetching/parsing fail.
 pub fn fetch_artifact_metadata(
+    net: &crate::net::NetworkClient,
     group_id: &str,
     artifact_id: &str,
     version: &str,
     maven_suffix: &str,
 ) -> Result<ArtifactMetadata, UtilError> {
     // Try Gradle Module Metadata first.
-    match fetch_module_metadata(group_id, artifact_id, version) {
+    match fetch_module_metadata(net, group_id, artifact_id, version) {
         Ok(Some(json)) => {
             return parse_module_metadata(&json);
         }
@@ -75,12 +76,13 @@ pub fn fetch_artifact_metadata(
             // 404 — fall through to POM.
         }
         Err(_) => {
-            // Network error fetching .module — fall through to POM.
+            // Network error (or offline refusal) fetching .module — fall
+            // through to the POM, which may still be served from its cache.
         }
     }
 
     // Fall back to POM.
-    let pom_xml = fetch_pom(group_id, artifact_id, version)?;
+    let pom_xml = fetch_pom(net, group_id, artifact_id, version)?;
     let pom = parse_pom(&pom_xml, Some(group_id), Some(version))?;
     Ok(pom_to_metadata(&pom, maven_suffix))
 }
@@ -138,6 +140,7 @@ mod tests {
     fn fetch_artifact_metadata_nonexistent_fails() {
         // Both .module and POM will fail for a non-existent artifact.
         let result = fetch_artifact_metadata(
+            &crate::net::NetworkClient::new(false),
             "com.nonexistent.fake",
             "no-such-artifact",
             "0.0.0",

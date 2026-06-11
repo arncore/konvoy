@@ -200,7 +200,11 @@ impl ManagedToolSpec {
     /// # Errors
     /// Returns an error if the id/version/filename is unsafe, the artifact cannot
     /// be downloaded, or the expected SHA-256 does not match.
-    pub fn ensure(&self, expected_sha256: Option<&str>) -> Result<(PathBuf, String), UtilError> {
+    pub fn ensure(
+        &self,
+        expected_sha256: Option<&str>,
+        net: &konvoy_util::net::NetworkClient,
+    ) -> Result<(PathBuf, String), UtilError> {
         // Validate here (the only method that writes), so a traversal-laden
         // version/filename can never escape the tools dir during a download.
         self.validate()?;
@@ -219,6 +223,7 @@ impl ManagedToolSpec {
         // label — download_artifact embeds it in a temp filename, so a separator
         // in display_name would point the temp path at a missing directory.
         let result = konvoy_util::progress::fetch(
+            net,
             &self.download_url(),
             &artifact_path,
             expected_sha256,

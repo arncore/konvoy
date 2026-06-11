@@ -402,7 +402,8 @@ fn cmd_lint(verbose: bool, config: Option<PathBuf>, locked: bool) -> CliResult {
 
 fn cmd_update() -> CliResult {
     let root = project_root()?;
-    let result = konvoy_engine::update(&root)?;
+    // `konvoy update` is inherently online — resolving fetches POMs/klibs.
+    let result = konvoy_engine::update(&root, &konvoy_util::net::NetworkClient::new(false))?;
     eprintln!(
         "  Updated {} dependencies in konvoy.lock",
         result.updated_count
@@ -626,7 +627,10 @@ fn cmd_toolchain(action: ToolchainAction) -> CliResult {
             }
 
             eprintln!("    Installing Kotlin/Native {version}...");
-            let result = konvoy_konanc::toolchain::install(&version)?;
+            let result = konvoy_konanc::toolchain::install(
+                &version,
+                &konvoy_util::net::NetworkClient::new(false),
+            )?;
             eprintln!(
                 "    Installed Kotlin/Native {version} at {}",
                 result.konanc_path.display()

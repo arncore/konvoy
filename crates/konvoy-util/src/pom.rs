@@ -429,8 +429,13 @@ pub(crate) fn write_cache_atomic(dest: &std::path::Path, contents: &[u8]) -> Res
 /// Returns `UtilError::Download` if the HTTP request fails or the response
 /// body cannot be read. Returns `UtilError::InvalidVersion` if any of
 /// `group_id`/`artifact_id`/`version` fail validation.
-pub fn fetch_pom(group_id: &str, artifact_id: &str, version: &str) -> Result<String, UtilError> {
-    // 1. Try the on-disk cache.
+pub fn fetch_pom(
+    net: &crate::net::NetworkClient,
+    group_id: &str,
+    artifact_id: &str,
+    version: &str,
+) -> Result<String, UtilError> {
+    // 1. Try the on-disk cache (no network involvement — works offline too).
     let cache_path = pom_cache_path(group_id, artifact_id, version)?;
     if cache_path.exists() {
         if let Ok(body) = std::fs::read_to_string(&cache_path) {
@@ -443,10 +448,12 @@ pub fn fetch_pom(group_id: &str, artifact_id: &str, version: &str) -> Result<Str
     // 2. Cache miss — fetch from Maven Central.
     let url = pom_url(group_id, artifact_id, version);
 
-    let agent = crate::download::http_agent(60);
-
-    let response = agent.get(&url).call().map_err(|e| UtilError::Download {
-        message: format!("failed to fetch POM from {url}: {e}"),
+    let response = net.get(&url, 60).map_err(|e| match e {
+        crate::net::RequestError::Offline => UtilError::Offline { url: url.clone() },
+        crate::net::RequestError::Status { message, .. }
+        | crate::net::RequestError::Transport { message } => UtilError::Download {
+            message: format!("failed to fetch POM from {url}: {message}"),
+        },
     })?;
 
     let body = response
@@ -515,6 +522,11 @@ pub fn pom_to_metadata(pom: &Pom, maven_suffix: &str) -> ArtifactMetadata {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// An online client for tests exercising fetch paths.
+    fn online() -> crate::net::NetworkClient {
+        crate::net::NetworkClient::new(false)
+    }
 
     /// A trimmed-down POM based on kotlinx-coroutines-core-macosarm64.
     const COROUTINES_POM: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -957,7 +969,12 @@ mod tests {
         // We can't easily test fetch_pom against real Maven Central in unit tests,
         // but we can verify it returns an error for unreachable hosts by using
         // a coordinate that doesn't exist.
-        let result = fetch_pom("com.nonexistent.fake", "no-such-artifact", "0.0.0");
+        let result = fetch_pom(
+            &online(),
+            "com.nonexistent.fake",
+            "no-such-artifact",
+            "0.0.0",
+        );
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("download failed"), "error was: {msg}");
@@ -967,13 +984,13 @@ mod tests {
     fn fetch_pom_rejects_path_traversal_in_group_id() {
         // Path-traversal in the group must be caught before any HTTP work or
         // cache-path construction.
-        let result = fetch_pom("../etc/passwd", "lib", "1.0.0");
+        let result = fetch_pom(&online(), "../etc/passwd", "lib", "1.0.0");
         assert!(result.is_err());
     }
 
     #[test]
     fn fetch_pom_rejects_invalid_version() {
-        let err = fetch_pom("com.example", "lib", "1.0/0").unwrap_err();
+        let err = fetch_pom(&online(), "com.example", "lib", "1.0/0").unwrap_err();
         assert!(
             matches!(err, UtilError::InvalidVersion { .. }),
             "expected InvalidVersion, got: {err:?}"
@@ -1410,7 +1427,7 @@ mod tests {
         let expected_body = "<project><artifactId>cached-lib</artifactId></project>";
         std::fs::write(&cache_path, expected_body).unwrap();
 
-        let result = fetch_pom(group, artifact, version);
+        let result = fetch_pom(&online(), group, artifact, version);
 
         // Restore HOME/USERPROFILE before asserting so a panic leaves the
         // environment clean for other tests.
@@ -1425,5 +1442,46 @@ mod tests {
 
         let body = result.unwrap();
         assert_eq!(body, expected_body, "cache hit must return the disk bytes");
+    }
+
+    #[test]
+    fn fetch_pom_offline_cached_ok_uncached_refuses() {
+        // Offline policy at the POM fetcher: a cached POM is served from disk
+        // (the cache check precedes any network involvement); a cache miss is
+        // refused at the wire with UtilError::Offline.
+        let _guard = crate::test_util::ENV_LOCK.lock().unwrap();
+
+        let saved_home = std::env::var("HOME").ok();
+        let saved_profile = std::env::var("USERPROFILE").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("USERPROFILE");
+
+        let offline = crate::net::NetworkClient::new(true);
+
+        // Pre-populate one POM in the cache.
+        let cache_path = pom_cache_path("com.example", "cached-lib", "1.2.3").unwrap();
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::write(&cache_path, "<project/>").unwrap();
+
+        let cached = fetch_pom(&offline, "com.example", "cached-lib", "1.2.3");
+        let uncached = fetch_pom(&offline, "com.example", "never-cached", "9.9.9");
+
+        // Restore HOME/USERPROFILE before asserting so a panic leaves the
+        // environment clean for other tests.
+        if let Some(v) = saved_home {
+            std::env::set_var("HOME", v);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(v) = saved_profile {
+            std::env::set_var("USERPROFILE", v);
+        }
+
+        assert_eq!(cached.unwrap(), "<project/>");
+        assert!(
+            matches!(uncached, Err(UtilError::Offline { .. })),
+            "uncached POM under offline must refuse, got: {uncached:?}"
+        );
     }
 }
