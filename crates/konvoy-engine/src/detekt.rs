@@ -298,8 +298,7 @@ pub fn lint(
     // (issue #295: every command fails for the same reasons). This catches
     // konanc/detekt VERSION drift up-front; the per-artifact gates below only
     // see the detekt JAR's hash pin, not the toolchain version.
-    resolver
-        .verify_current_lockfile(|| crate::build::check_lockfile_staleness(&manifest, &lockfile))?;
+    resolver.require_manifest_artifacts_resolvable(&manifest, &lockfile)?;
 
     let expected_hash = resolve_lockfile_hash(&lockfile, detekt_version);
 

@@ -1,6 +1,7 @@
 //! Small shared helpers used across multiple engine modules.
 
 use crate::error::EngineError;
+use konvoy_config::{lockfile::Lockfile, Manifest};
 
 /// Per-command resolver for managed artifacts.
 ///
@@ -47,48 +48,61 @@ impl<'a> ArtifactResolver<'a> {
         self.require_available(is_present, offline_error)
     }
 
-    /// Run a lockfile-updating resolution path only when policy and network
-    /// mode allow it.
-    pub(crate) fn resolve_lockfile_update<T>(
+    /// Resolve missing Maven dependency state by running update when policy and
+    /// network mode allow it.
+    pub(crate) fn resolve_missing_maven_dependencies(
         self,
-        offline_error: impl FnOnce() -> EngineError,
-        resolve: impl FnOnce() -> Result<T, EngineError>,
-    ) -> Result<T, EngineError> {
+        project_root: &std::path::Path,
+        lockfile_path: &std::path::Path,
+        name: String,
+    ) -> Result<Lockfile, EngineError> {
         self.lockfiles.require_update_allowed()?;
-        self.require_available(false, offline_error)?;
-        resolve()
+        self.require_available(false, || EngineError::MissingLockfileEntry { name })?;
+        eprintln!("  Maven dependencies not resolved - running update automatically...");
+        crate::update::update(project_root, self)?;
+        Ok(Lockfile::from_path(lockfile_path)?)
     }
 
-    /// Run a lockfile staleness check only when locked policy requires it.
-    pub(crate) fn verify_current_lockfile(
+    /// Require the manifest's managed artifacts to be resolvable under the
+    /// command's policy.
+    pub(crate) fn require_manifest_artifacts_resolvable(
         self,
-        check: impl FnOnce() -> Result<(), EngineError>,
+        manifest: &Manifest,
+        lockfile: &Lockfile,
     ) -> Result<(), EngineError> {
-        self.lockfiles.verify_current_lockfile(check)
+        self.lockfiles
+            .verify_current_lockfile(|| crate::build::check_lockfile_staleness(manifest, lockfile))
     }
 
-    /// Reject a lockfile-changing condition when locked policy forbids writes.
-    pub(crate) fn reject_lockfile_change(
+    /// Resolve a changed path dependency source under the command's policy.
+    pub(crate) fn resolve_changed_dependency_source(
         self,
-        err: impl FnOnce() -> EngineError,
+        name: &str,
+        expected: &str,
+        actual: &str,
     ) -> Result<(), EngineError> {
-        self.lockfiles.reject_if_locked(err)
+        self.lockfiles
+            .reject_if_locked(|| EngineError::DependencyHashMismatch {
+                name: name.to_owned(),
+                expected: expected.to_owned(),
+                actual: actual.to_owned(),
+            })
     }
 
-    /// Return the candidate lockfile content that should feed cache keys.
-    pub(crate) fn effective_lockfile(
+    /// Return the resolved artifact state that should feed cache keys.
+    pub(crate) fn cache_key_artifact_state(
         self,
-        current: &konvoy_config::lockfile::Lockfile,
-        unlocked: impl FnOnce() -> konvoy_config::lockfile::Lockfile,
-    ) -> konvoy_config::lockfile::Lockfile {
+        current: &Lockfile,
+        unlocked: impl FnOnce() -> Lockfile,
+    ) -> Lockfile {
         self.lockfiles.effective_lockfile(current, unlocked)
     }
 
-    /// Write a changed lockfile candidate, or reject the write when locked.
-    pub(crate) fn write_updated_lockfile(
+    /// Persist resolved artifact state, or fail when policy forbids changes.
+    pub(crate) fn persist_resolved_artifacts(
         self,
-        current: &konvoy_config::lockfile::Lockfile,
-        updated: konvoy_config::lockfile::Lockfile,
+        current: &Lockfile,
+        updated: Lockfile,
         lockfile_path: &std::path::Path,
     ) -> Result<(), EngineError> {
         self.lockfiles
@@ -186,7 +200,7 @@ impl LockfileManager {
     }
 
     /// Run a lockfile staleness check only when locked policy requires it.
-    pub(crate) fn verify_current_lockfile(
+    fn verify_current_lockfile(
         self,
         check: impl FnOnce() -> Result<(), EngineError>,
     ) -> Result<(), EngineError> {
@@ -198,10 +212,7 @@ impl LockfileManager {
     }
 
     /// Reject a lockfile-changing condition when locked policy forbids writes.
-    pub(crate) fn reject_if_locked(
-        self,
-        err: impl FnOnce() -> EngineError,
-    ) -> Result<(), EngineError> {
+    fn reject_if_locked(self, err: impl FnOnce() -> EngineError) -> Result<(), EngineError> {
         if self.locked {
             Err(err())
         } else {
@@ -210,7 +221,7 @@ impl LockfileManager {
     }
 
     /// Return the candidate lockfile content that should feed cache keys.
-    pub(crate) fn effective_lockfile(
+    fn effective_lockfile(
         self,
         current: &konvoy_config::lockfile::Lockfile,
         unlocked: impl FnOnce() -> konvoy_config::lockfile::Lockfile,
@@ -223,7 +234,7 @@ impl LockfileManager {
     }
 
     /// Write a changed lockfile candidate, or reject the write when locked.
-    pub(crate) fn write_updated_lockfile(
+    fn write_updated_lockfile(
         self,
         current: &konvoy_config::lockfile::Lockfile,
         updated: konvoy_config::lockfile::Lockfile,
@@ -307,23 +318,20 @@ mod tests {
     }
 
     #[test]
-    fn lockfile_update_resolves_only_when_allowed_and_online() {
+    fn changed_dependency_source_resolves_only_when_policy_allows_changes() {
         let online = konvoy_util::net::NetworkClient::new(false);
         let resolver = ArtifactResolver::new(&online, LockfileManager::new(false));
 
-        let result = resolver.resolve_lockfile_update(
-            || EngineError::LintNotConfigured,
-            || Ok::<_, EngineError>("resolved"),
-        );
-
-        assert_eq!(result.unwrap(), "resolved");
+        let result = resolver.resolve_changed_dependency_source("dep", "expected", "actual");
+        assert!(result.is_ok());
 
         let locked = ArtifactResolver::new(&online, LockfileManager::new(true))
-            .resolve_lockfile_update(
-                || EngineError::LintNotConfigured,
-                || Ok::<_, EngineError>("resolved"),
-            );
-        assert!(matches!(locked, Err(EngineError::LockfileUpdateRequired)));
+            .resolve_changed_dependency_source("dep", "expected", "actual");
+        assert!(matches!(
+            locked,
+            Err(EngineError::DependencyHashMismatch { name, expected, actual })
+                if name == "dep" && expected == "expected" && actual == "actual"
+        ));
     }
 
     #[test]

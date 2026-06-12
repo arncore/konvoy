@@ -190,7 +190,7 @@ fn predicted_effective_lockfile(
     plugin_locks: &[PluginLock],
     resolver: crate::common::ArtifactResolver<'_>,
 ) -> Lockfile {
-    resolver.effective_lockfile(lockfile, || {
+    resolver.cache_key_artifact_state(lockfile, || {
         let mut effective = match &lockfile.toolchain {
             // Lockfile already has the correct version — use as-is (preserves any
             // existing tarball hashes and detekt info).
@@ -258,23 +258,15 @@ pub(crate) fn resolve_build_context(
     //      fetches POMs and klibs from Maven Central, so an unresolved dep is
     //      a hard error here instead of a silent network access.
     let lockfile = match first_unresolved_maven_dep(&manifest, &lockfile) {
-        Some(name) => resolver.resolve_lockfile_update(
-            || EngineError::MissingLockfileEntry { name },
-            || {
-                eprintln!(
-                    "  Maven dependencies not resolved \u{2014} running update automatically..."
-                );
-                crate::update::update(project_root, resolver)?;
-                // Re-read the lockfile after update wrote it.
-                Ok(Lockfile::from_path(&lockfile_path)?)
-            },
-        )?,
+        Some(name) => {
+            resolver.resolve_missing_maven_dependencies(project_root, &lockfile_path, name)?
+        }
         _ => lockfile,
     };
 
     // In --locked mode, verify the lockfile is complete and consistent
     // with what konvoy.toml specifies before doing any work.
-    resolver.verify_current_lockfile(|| check_lockfile_staleness(&manifest, &lockfile))?;
+    resolver.require_manifest_artifacts_resolvable(&manifest, &lockfile)?;
 
     // 4. Resolve target.
     let target = resolve_target(&options.target)?;
@@ -1123,11 +1115,11 @@ fn update_lockfile_if_needed(
     for dep in &dep_graph.order {
         if let Some(locked_dep) = lockfile.dependencies.iter().find(|d| d.name == dep.name) {
             if locked_dep.source_hash != dep.source_hash && !dep.source_hash.is_empty() {
-                resolver.reject_lockfile_change(|| EngineError::DependencyHashMismatch {
-                    name: dep.name.clone(),
-                    expected: locked_dep.source_hash.clone(),
-                    actual: dep.source_hash.clone(),
-                })?;
+                resolver.resolve_changed_dependency_source(
+                    &dep.name,
+                    &locked_dep.source_hash,
+                    &dep.source_hash,
+                )?;
                 eprintln!(
                     "warning: dependency `{}` source has changed (locked: {}, current: {})",
                     dep.name,
@@ -1239,7 +1231,7 @@ fn update_lockfile_if_needed(
         updated_tc.detekt_jar_sha256 = orig_tc.detekt_jar_sha256.clone();
     }
 
-    resolver.write_updated_lockfile(lockfile, updated, lockfile_path)
+    resolver.persist_resolved_artifacts(lockfile, updated, lockfile_path)
 }
 
 /// Verify freshly-downloaded toolchain tarball SHAs against the lockfile pins.
