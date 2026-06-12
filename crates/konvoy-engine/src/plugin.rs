@@ -156,8 +156,7 @@ fn map_download_err(name: &str, e: konvoy_util::error::UtilError) -> EngineError
 pub fn ensure_plugin_artifacts(
     artifacts: &[ResolvedPluginArtifact],
     lockfile: &Lockfile,
-    locked: bool,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<Vec<PluginArtifactResult>, EngineError> {
     use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
@@ -166,16 +165,13 @@ pub fn ensure_plugin_artifacts(
     // decisions and no repeated I/O.
     let present: Vec<bool> = artifacts.iter().map(|a| a.cache_path.exists()).collect();
 
-    // Fail fast before spawning any downloads: apply the shared --locked /
-    // --offline policy per artifact.
-    if locked || net.is_offline() {
-        for (artifact, is_present) in artifacts.iter().zip(present.iter().copied()) {
-            let has_pin = find_lockfile_hash(lockfile, &artifact.plugin_name).is_some();
-            crate::common::gate_artifact(has_pin, is_present, locked, net.is_offline())
-                .into_result(|| EngineError::PluginOffline {
-                    name: artifact.plugin_name.clone(),
-                })?;
-        }
+    // Fail fast before spawning any downloads: ask the command resolver to
+    // resolve each plugin artifact against the current lockfile/cache state.
+    for (artifact, is_present) in artifacts.iter().zip(present.iter().copied()) {
+        let has_pin = find_lockfile_hash(lockfile, &artifact.plugin_name).is_some();
+        resolver.resolve_artifact(has_pin, is_present, || EngineError::PluginOffline {
+            name: artifact.plugin_name.clone(),
+        })?;
     }
 
     if artifacts.is_empty() {
@@ -209,15 +205,15 @@ pub fn ensure_plugin_artifacts(
         .zip(aligned_bars.par_iter())
         .map(|(artifact, maybe_bar)| {
             let expected_hash = find_lockfile_hash(lockfile, &artifact.plugin_name);
-            let util_result = konvoy_util::progress::fetch(
-                net,
-                &artifact.url,
-                &artifact.cache_path,
-                expected_hash,
-                &artifact.plugin_name,
-                *maybe_bar,
-            )
-            .map_err(|e| map_download_err(&artifact.plugin_name, e))?;
+            let util_result = resolver
+                .fetch_artifact(
+                    &artifact.url,
+                    &artifact.cache_path,
+                    expected_hash,
+                    &artifact.plugin_name,
+                    *maybe_bar,
+                )
+                .map_err(|e| map_download_err(&artifact.plugin_name, e))?;
 
             Ok(PluginArtifactResult {
                 plugin_name: artifact.plugin_name.clone(),
@@ -837,8 +833,10 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &artifacts,
             &lockfile,
-            true,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                true,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         );
         assert!(
             result.is_err(),
@@ -854,8 +852,10 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &[],
             &lockfile,
-            false,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                false,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         )
         .unwrap();
         assert!(result.is_empty());
@@ -886,8 +886,10 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &artifacts,
             &lockfile,
-            false,
-            &konvoy_util::net::NetworkClient::new(true),
+            crate::common::ArtifactResolver::new(
+                false,
+                &konvoy_util::net::NetworkClient::new(true),
+            ),
         );
         match result {
             Err(EngineError::PluginOffline { name }) => assert_eq!(name, "ser"),
@@ -925,8 +927,10 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &artifacts,
             &lockfile,
-            false,
-            &konvoy_util::net::NetworkClient::new(true),
+            crate::common::ArtifactResolver::new(
+                false,
+                &konvoy_util::net::NetworkClient::new(true),
+            ),
         )
         .unwrap();
         assert_eq!(result.len(), 1);
@@ -961,8 +965,10 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &artifacts,
             &lockfile,
-            true,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                true,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         );
         assert!(
             result.is_err(),
@@ -1009,8 +1015,10 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &artifacts,
             &lockfile,
-            true,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                true,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         );
         assert!(matches!(result, Err(EngineError::LockfileUpdateRequired)));
     }
@@ -1046,8 +1054,10 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &artifacts,
             &lockfile,
-            true,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                true,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         )
         .unwrap();
         assert_eq!(result.len(), 1);
@@ -1075,8 +1085,10 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &[artifact],
             &lockfile,
-            false,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                false,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         );
         assert!(result.is_err());
     }

@@ -64,6 +64,118 @@ pub(crate) fn gate_artifact(
     }
 }
 
+/// Per-command resolver for managed artifacts.
+///
+/// This keeps the reproducibility checks and the shared network client behind
+/// one command-scoped construct. Callers ask it to resolve artifacts; they do
+/// not need to branch on the individual command flags.
+#[derive(Debug, Clone, Copy)]
+pub struct ArtifactResolver<'a> {
+    locked: bool,
+    net: &'a konvoy_util::net::NetworkClient,
+}
+
+impl<'a> ArtifactResolver<'a> {
+    /// Create an artifact resolver for one command invocation.
+    #[must_use]
+    pub const fn new(locked: bool, net: &'a konvoy_util::net::NetworkClient) -> Self {
+        Self { locked, net }
+    }
+
+    /// Resolve whether an artifact may be used or fetched.
+    pub(crate) fn resolve_artifact(
+        self,
+        has_pin: bool,
+        is_present: bool,
+        offline_error: impl FnOnce() -> EngineError,
+    ) -> Result<(), EngineError> {
+        gate_artifact(has_pin, is_present, self.locked, self.net.is_offline())
+            .into_result(offline_error)
+    }
+
+    /// Resolve a lockfile drift path: fail under locked/offline policy, or run
+    /// the supplied resolver when the command is allowed to update/fetch.
+    pub(crate) fn resolve_lockfile_drift<T>(
+        self,
+        offline_error: impl FnOnce() -> EngineError,
+        resolve: impl FnOnce() -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        if self.locked {
+            Err(EngineError::LockfileUpdateRequired)
+        } else if self.net.is_offline() {
+            Err(offline_error())
+        } else {
+            resolve()
+        }
+    }
+
+    /// Run a lockfile staleness check only when locked policy requires it.
+    pub(crate) fn verify_current_lockfile(
+        self,
+        check: impl FnOnce() -> Result<(), EngineError>,
+    ) -> Result<(), EngineError> {
+        if self.locked {
+            check()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Resolve and, if necessary, install the managed Kotlin/Native toolchain.
+    pub(crate) fn resolve_konanc(
+        self,
+        version: &str,
+    ) -> Result<konvoy_konanc::detect::ResolvedKonanc, konvoy_konanc::error::KonancError> {
+        konvoy_konanc::detect::resolve_konanc(version, self.net)
+    }
+
+    /// Install the managed Kotlin/Native toolchain.
+    pub(crate) fn install_toolchain(
+        self,
+        version: &str,
+    ) -> Result<konvoy_konanc::toolchain::InstallResult, konvoy_konanc::error::KonancError> {
+        konvoy_konanc::toolchain::install(version, self.net)
+    }
+
+    /// Ensure a managed tool artifact exists and is verified.
+    pub(crate) fn ensure_managed_tool(
+        self,
+        tool: &crate::managed_tool::ManagedToolSpec,
+        expected_sha256: Option<&str>,
+    ) -> Result<(std::path::PathBuf, String), konvoy_util::error::UtilError> {
+        tool.ensure(expected_sha256, self.net)
+    }
+
+    /// Fetch or verify a managed artifact.
+    pub(crate) fn fetch_artifact(
+        self,
+        url: &str,
+        dest: &std::path::Path,
+        expected_sha256: Option<&str>,
+        label: &str,
+        bar: Option<&konvoy_util::progress::DownloadBar>,
+    ) -> Result<konvoy_util::artifact::ArtifactResult, konvoy_util::error::UtilError> {
+        konvoy_util::progress::fetch(self.net, url, dest, expected_sha256, label, bar)
+    }
+
+    /// Fetch artifact metadata for Maven dependency resolution.
+    pub(crate) fn fetch_artifact_metadata(
+        self,
+        group_id: &str,
+        artifact_id: &str,
+        version: &str,
+        maven_suffix: &str,
+    ) -> Result<konvoy_util::metadata::ArtifactMetadata, konvoy_util::error::UtilError> {
+        konvoy_util::metadata::fetch_artifact_metadata(
+            self.net,
+            group_id,
+            artifact_id,
+            version,
+            maven_suffix,
+        )
+    }
+}
+
 /// Split a `groupId:artifactId` string into its two parts.
 ///
 /// # Errors
@@ -238,6 +350,54 @@ mod tests {
             ArtifactGate::Proceed,
             "locked + pinned + present must proceed (and write nothing)"
         );
+    }
+
+    #[test]
+    fn artifact_resolver_gates_lockfile_drift_before_offline() {
+        let net = konvoy_util::net::NetworkClient::new(true);
+        let resolver = ArtifactResolver::new(true, &net);
+
+        let result = resolver.resolve_artifact(false, false, || EngineError::LintNotConfigured);
+
+        assert!(matches!(result, Err(EngineError::LockfileUpdateRequired)));
+    }
+
+    #[test]
+    fn artifact_resolver_maps_offline_unavailable() {
+        let net = konvoy_util::net::NetworkClient::new(true);
+        let resolver = ArtifactResolver::new(false, &net);
+
+        let result = resolver.resolve_artifact(true, false, || EngineError::LintNotConfigured);
+
+        assert!(matches!(result, Err(EngineError::LintNotConfigured)));
+    }
+
+    #[test]
+    fn artifact_resolver_resolves_lockfile_drift_only_when_allowed() {
+        let online = konvoy_util::net::NetworkClient::new(false);
+        let resolver = ArtifactResolver::new(false, &online);
+
+        let result = resolver.resolve_lockfile_drift(
+            || EngineError::LintNotConfigured,
+            || Ok::<_, EngineError>("resolved"),
+        );
+
+        assert_eq!(result.unwrap(), "resolved");
+    }
+
+    #[test]
+    fn artifact_resolver_verifies_current_lockfile_only_when_locked() {
+        let online = konvoy_util::net::NetworkClient::new(false);
+        let unlocked = ArtifactResolver::new(false, &online);
+        let locked = ArtifactResolver::new(true, &online);
+
+        assert!(unlocked
+            .verify_current_lockfile(|| Err(EngineError::LintNotConfigured))
+            .is_ok());
+        assert!(matches!(
+            locked.verify_current_lockfile(|| Err(EngineError::LintNotConfigured)),
+            Err(EngineError::LintNotConfigured)
+        ));
     }
 
     #[test]

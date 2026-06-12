@@ -9,7 +9,7 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile, PluginLock};
 use konvoy_config::manifest::{Manifest, PackageKind};
 use konvoy_config::Profile;
-use konvoy_konanc::detect::{resolve_konanc, KonancInfo};
+use konvoy_konanc::detect::KonancInfo;
 use konvoy_konanc::invoke::{KonancCommand, ProduceKind};
 use konvoy_targets::{host_target, Target};
 
@@ -33,11 +33,10 @@ pub struct BuildOptions {
     /// Downloading pinned artifacts is still allowed; only lockfile drift
     /// (a missing/mismatched pin) is an error.
     ///
-    /// The orthogonal `--offline` flag (Cargo's `--frozen` is both) lives on the
-    /// threaded [`NetworkClient`](konvoy_util::net::NetworkClient), not here:
-    /// network access is the client's concern, the lockfile is the build's. The
-    /// per-artifact gates read `net.is_offline()`; the client's wire-level
-    /// refusal is the floor beneath them.
+    /// The orthogonal `--offline` flag (Cargo's `--frozen` is both) is carried
+    /// by the command-scoped [`ArtifactResolver`](crate::ArtifactResolver).
+    /// Build code asks the resolver to resolve artifacts instead of branching
+    /// on the individual flags.
     pub locked: bool,
 }
 
@@ -250,7 +249,7 @@ fn predicted_effective_lockfile(
 pub(crate) fn resolve_build_context(
     project_root: &Path,
     options: &BuildOptions,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<ResolvedBuildContext, EngineError> {
     // 1. Read konvoy.toml.
     let manifest_path = project_root.join("konvoy.toml");
@@ -260,10 +259,9 @@ pub(crate) fn resolve_build_context(
     let lockfile_path = project_root.join("konvoy.lock");
     let lockfile = Lockfile::from_path(&lockfile_path)?;
 
-    // `net` is the process-wide outbound-HTTP funnel, constructed once at the
-    // program entry point and threaded in here (see konvoy_util::net) — every
-    // fetch below routes through it, and it is the single source of the offline
-    // policy (the gates below read `net.is_offline()`).
+    // `resolver` is the command-scoped artifact resolver, constructed once at
+    // the program entry point next to the process-wide NetworkClient and
+    // threaded through everything that may fetch or reject artifact resolution.
 
     // 3. Auto-resolve Maven deps if needed (unless --locked or --offline).
     //    When the manifest declares Maven deps that aren't in the lockfile,
@@ -274,23 +272,23 @@ pub(crate) fn resolve_build_context(
     //      fetches POMs and klibs from Maven Central, so an unresolved dep is
     //      a hard error here instead of a silent network access.
     let lockfile = match first_unresolved_maven_dep(&manifest, &lockfile) {
-        Some(name) if !options.locked => {
-            if net.is_offline() {
-                return Err(EngineError::MissingLockfileEntry { name });
-            }
-            eprintln!("  Maven dependencies not resolved \u{2014} running update automatically...");
-            crate::update::update(project_root, net)?;
-            // Re-read the lockfile after update wrote it.
-            Lockfile::from_path(&lockfile_path)?
-        }
+        Some(name) => resolver.resolve_lockfile_drift(
+            || EngineError::MissingLockfileEntry { name },
+            || {
+                eprintln!(
+                    "  Maven dependencies not resolved \u{2014} running update automatically..."
+                );
+                crate::update::update(project_root, resolver)?;
+                // Re-read the lockfile after update wrote it.
+                Ok(Lockfile::from_path(&lockfile_path)?)
+            },
+        )?,
         _ => lockfile,
     };
 
     // In --locked mode, verify the lockfile is complete and consistent
     // with what konvoy.toml specifies before doing any work.
-    if options.locked {
-        check_lockfile_staleness(&manifest, &lockfile)?;
-    }
+    resolver.verify_current_lockfile(|| check_lockfile_staleness(&manifest, &lockfile))?;
 
     // 4. Resolve target.
     let target = resolve_target(&options.target)?;
@@ -311,16 +309,12 @@ pub(crate) fn resolve_build_context(
     let toolchain_installed = konvoy_konanc::toolchain::is_installed(&manifest.toolchain.kotlin)?;
     let toolchain_pinned =
         has_required_toolchain_artifact_pins(&lockfile, &manifest.toolchain.kotlin)?;
-    crate::common::gate_artifact(
-        toolchain_pinned,
-        toolchain_installed,
-        options.locked,
-        net.is_offline(),
-    )
-    .into_result(|| EngineError::ToolchainOffline {
-        version: manifest.toolchain.kotlin.clone(),
+    resolver.resolve_artifact(toolchain_pinned, toolchain_installed, || {
+        EngineError::ToolchainOffline {
+            version: manifest.toolchain.kotlin.clone(),
+        }
     })?;
-    let resolved = resolve_konanc(&manifest.toolchain.kotlin, net)?;
+    let resolved = resolver.resolve_konanc(&manifest.toolchain.kotlin)?;
     let konanc = resolved.info;
     let jre_home = resolved.jre_home;
     let konanc_tarball_sha256 = resolved.konanc_tarball_sha256;
@@ -368,12 +362,8 @@ pub(crate) fn resolve_build_context(
     // `ensure_plugin_artifacts` only re-verifies hashes — it does not download.
     let (plugin_jars, plugin_locks) = if !manifest.plugins.is_empty() {
         let resolved_artifacts = crate::plugin::resolve_plugin_artifacts(&manifest)?;
-        let results = crate::plugin::ensure_plugin_artifacts(
-            &resolved_artifacts,
-            &lockfile,
-            options.locked,
-            net,
-        )?;
+        let results =
+            crate::plugin::ensure_plugin_artifacts(&resolved_artifacts, &lockfile, resolver)?;
         let locks = crate::plugin::build_plugin_locks(&results);
         let jars: Vec<PathBuf> = results.iter().map(|r| r.path.clone()).collect();
         (jars, locks)
@@ -446,7 +436,7 @@ pub(crate) fn resolve_build_context(
     // 7a. Resolve and download Maven dependency klibs for the current target.
     //     Each Maven klib comes back with a precomputed sha256 from
     //     `download_artifact`, which the cache-key code reuses to skip rehashing.
-    let maven_klibs = resolve_maven_deps(&effective_lockfile, &target, net)?;
+    let maven_klibs = resolve_maven_deps(&effective_lockfile, &target, resolver)?;
     library_inputs.extend(maven_klibs);
 
     let store = ArtifactStore::new(project_root);
@@ -492,10 +482,10 @@ pub(crate) fn resolve_build_context(
 pub fn build(
     project_root: &Path,
     options: &BuildOptions,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<BuildResult, EngineError> {
     let start = Instant::now();
-    let ctx = resolve_build_context(project_root, options, net)?;
+    let ctx = resolve_build_context(project_root, options, resolver)?;
 
     // 8. Build the root project.
     let cc = CompileContext {
@@ -872,7 +862,7 @@ struct PreparedKlib<'a> {
 pub(crate) fn resolve_maven_deps(
     lockfile: &Lockfile,
     target: &Target,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<Vec<LibraryInput>, EngineError> {
     use rayon::prelude::IndexedParallelIterator;
 
@@ -943,18 +933,13 @@ pub(crate) fn resolve_maven_deps(
             })
             .collect::<Result<Vec<_>, EngineError>>()?;
 
-    // --offline forbids fetching a pinned-but-uncached klib. This is the same
-    // policy `gate_artifact` applies to the toolchain/plugins/detekt, but klibs
-    // have no drift/`--locked` dimension to gate — they are always SHA-pinned by
-    // their lockfile entry (a missing pin is `MissingTargetHash`, raised above)
-    // — so only the offline/presence branch is relevant, inlined here. Fail fast
-    // naming the first absent dependency, before any network fetch.
-    if net.is_offline() {
-        if let Some(p) = prepared.iter().find(|p| p.needs_download) {
-            return Err(EngineError::LibraryOffline {
-                name: p.entry.name.to_owned(),
-            });
-        }
+    // Klibs are always SHA-pinned by their lockfile entry (a missing pin is
+    // `MissingTargetHash`, raised above). Ask the command resolver to fail fast
+    // for any artifact it cannot resolve before spawning downloads.
+    for p in &prepared {
+        resolver.resolve_artifact(true, !p.needs_download, || EngineError::LibraryOffline {
+            name: p.entry.name.to_owned(),
+        })?;
     }
 
     // Only allocate bars for entries that actually need a network fetch;
@@ -986,7 +971,7 @@ pub(crate) fn resolve_maven_deps(
     let klib_inputs: Vec<Result<LibraryInput, EngineError>> = prepared
         .par_iter()
         .zip(aligned_bars.par_iter())
-        .map(|(p, maybe_bar)| download_one_klib(p, *maybe_bar, net))
+        .map(|(p, maybe_bar)| download_one_klib(p, *maybe_bar, resolver))
         .collect();
 
     // Trailing newline only if we actually rendered any bars.
@@ -1003,22 +988,22 @@ pub(crate) fn resolve_maven_deps(
 fn download_one_klib(
     p: &PreparedKlib<'_>,
     maybe_bar: Option<&konvoy_util::progress::DownloadBar>,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<LibraryInput, EngineError> {
     let dep_name = p.entry.name.to_owned();
-    let result = konvoy_util::progress::fetch(
-        net,
-        &p.url,
-        &p.dest,
-        Some(p.expected_sha256),
-        &dep_name,
-        maybe_bar,
-    )
-    .map_err(|e| EngineError::LibraryDownloadFailed {
-        name: dep_name,
-        url: p.url.clone(),
-        message: e.to_string(),
-    })?;
+    let result = resolver
+        .fetch_artifact(
+            &p.url,
+            &p.dest,
+            Some(p.expected_sha256),
+            &dep_name,
+            maybe_bar,
+        )
+        .map_err(|e| EngineError::LibraryDownloadFailed {
+            name: dep_name,
+            url: p.url.clone(),
+            message: e.to_string(),
+        })?;
     // `progress::fetch` already enforces `expected_sha256` (via
     // `check_cached` on hit, `download_artifact` on miss), so `result.sha256`
     // is guaranteed to match. Carry the freshly-verified hash through so
@@ -1444,7 +1429,10 @@ mod tests {
         let result = build(
             tmp.path(),
             &options,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                false,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         );
         assert!(result.is_err());
     }
@@ -1471,7 +1459,10 @@ mod tests {
         let result = build(
             root,
             &BuildOptions::default(),
-            &konvoy_util::net::NetworkClient::new(true),
+            crate::common::ArtifactResolver::new(
+                false,
+                &konvoy_util::net::NetworkClient::new(true),
+            ),
         );
 
         assert!(result.is_err(), "expected Err, got: {result:?}");
@@ -1513,7 +1504,10 @@ mod tests {
                 locked: true,
                 ..Default::default()
             },
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                true,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         );
 
         assert!(
@@ -1547,7 +1541,10 @@ mod tests {
                 locked: true,
                 ..Default::default()
             },
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                true,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         );
 
         assert!(
@@ -1583,7 +1580,10 @@ mod tests {
         let result = build(
             tmp.path(),
             &BuildOptions::default(),
-            &konvoy_util::net::NetworkClient::new(true),
+            crate::common::ArtifactResolver::new(
+                false,
+                &konvoy_util::net::NetworkClient::new(true),
+            ),
         );
 
         match result {
@@ -1607,7 +1607,7 @@ mod tests {
                 locked: true,
                 ..Default::default()
             },
-            &konvoy_util::net::NetworkClient::new(true),
+            crate::common::ArtifactResolver::new(true, &konvoy_util::net::NetworkClient::new(true)),
         );
 
         assert!(
@@ -1638,7 +1638,10 @@ mod tests {
         let result = build(
             &project,
             &options,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                false,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -3625,7 +3628,10 @@ mod tests {
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                false,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         )
         .unwrap();
         assert!(
@@ -3644,7 +3650,10 @@ mod tests {
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                false,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         )
         .unwrap();
         assert!(
@@ -3673,7 +3682,10 @@ mod tests {
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                false,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -3707,7 +3719,10 @@ mod tests {
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            &konvoy_util::net::NetworkClient::new(true),
+            crate::common::ArtifactResolver::new(
+                false,
+                &konvoy_util::net::NetworkClient::new(true),
+            ),
         );
         match result {
             Err(EngineError::LibraryOffline { name }) => assert_eq!(name, "phantom-lib"),
@@ -3754,7 +3769,10 @@ mod tests {
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            &konvoy_util::net::NetworkClient::new(true),
+            crate::common::ArtifactResolver::new(
+                false,
+                &konvoy_util::net::NetworkClient::new(true),
+            ),
         );
         // Clean up before asserting: remove the whole fake-group subtree
         // (`com/example/offlinetest/...`) we created under the real cache,
@@ -3903,7 +3921,10 @@ linux_x64 = "1111"
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                false,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();

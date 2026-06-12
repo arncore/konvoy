@@ -30,14 +30,6 @@ pub struct LintOptions {
     pub verbose: bool,
     /// Optional path to a custom detekt configuration file.
     pub config: Option<PathBuf>,
-    /// Require the lockfile to be up-to-date: never modify `konvoy.lock`.
-    /// The pinned detekt JAR may still be downloaded; only lockfile drift
-    /// (a missing/mismatched pin) is an error.
-    ///
-    /// The orthogonal `--offline` flag lives on the threaded
-    /// [`NetworkClient`](konvoy_util::net::NetworkClient), not here — the JAR/JRE
-    /// gates read `net.is_offline()`.
-    pub locked: bool,
 }
 
 /// Result of running detekt.
@@ -115,7 +107,7 @@ pub fn is_installed(version: &str) -> Result<bool, EngineError> {
 pub fn ensure_detekt(
     version: &str,
     expected_sha256: Option<&str>,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<(PathBuf, String), EngineError> {
     // Use the same `validate_identifier` the spec uses (it rejects `..`), so a
     // traversal-laden version yields this actionable, detekt-branded message
@@ -127,8 +119,8 @@ pub fn ensure_detekt(
         ),
     })?;
 
-    detekt_tool(version)
-        .ensure(expected_sha256, net)
+    resolver
+        .ensure_managed_tool(&detekt_tool(version), expected_sha256)
         .map_err(|e| map_download_err(version, e))
 }
 
@@ -186,22 +178,19 @@ fn persist_detekt_hash(
 /// derives the binary from this home.
 fn resolve_jre_home(
     kotlin_version: &str,
-    locked: bool,
     lockfile: &konvoy_config::lockfile::Lockfile,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<PathBuf, EngineError> {
     if !konvoy_konanc::toolchain::is_installed(kotlin_version)? {
         // The detekt JRE rides along with the managed toolchain. If installing
         // would download any missing toolchain artifact under --locked, the
         // relevant tarball hash must already be pinned in konvoy.lock.
         let has_pin = crate::build::has_required_toolchain_artifact_pins(lockfile, kotlin_version)?;
-        crate::common::gate_artifact(has_pin, false, locked, net.is_offline()).into_result(
-            || EngineError::DetektJreOffline {
-                version: kotlin_version.to_owned(),
-            },
-        )?;
+        resolver.resolve_artifact(has_pin, false, || EngineError::DetektJreOffline {
+            version: kotlin_version.to_owned(),
+        })?;
         eprintln!("    Installing Kotlin/Native {kotlin_version} (for JRE)...");
-        konvoy_konanc::toolchain::install(kotlin_version, net)?;
+        resolver.install_toolchain(kotlin_version)?;
     }
 
     let jre_home = konvoy_konanc::toolchain::jre_home_path(kotlin_version)?;
@@ -291,7 +280,7 @@ fn run_detekt_process(
 pub fn lint(
     root: &Path,
     options: &LintOptions,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<LintResult, EngineError> {
     let manifest = konvoy_config::Manifest::from_path(&root.join("konvoy.toml"))?;
 
@@ -309,31 +298,23 @@ pub fn lint(
     // (issue #295: every command fails for the same reasons). This catches
     // konanc/detekt VERSION drift up-front; the per-artifact gates below only
     // see the detekt JAR's hash pin, not the toolchain version.
-    if options.locked {
-        crate::build::check_lockfile_staleness(&manifest, &lockfile)?;
-    }
+    resolver
+        .verify_current_lockfile(|| crate::build::check_lockfile_staleness(&manifest, &lockfile))?;
 
     let expected_hash = resolve_lockfile_hash(&lockfile, detekt_version);
 
-    // Gate the detekt JAR through the shared --locked / --offline policy before
-    // any download. has_pin: the lockfile pins this detekt version's JAR hash;
-    // is_present: the JAR is already on disk. (Skipped when neither flag is set.)
-    if options.locked || net.is_offline() {
-        let jar_present = is_installed(detekt_version)?;
-        crate::common::gate_artifact(
-            expected_hash.is_some(),
-            jar_present,
-            options.locked,
-            net.is_offline(),
-        )
-        .into_result(|| EngineError::DetektJarOffline {
+    // Resolve the detekt JAR before any download. has_pin: the lockfile pins
+    // this detekt version's JAR hash; is_present: the JAR is already on disk.
+    let jar_present = is_installed(detekt_version)?;
+    resolver.resolve_artifact(expected_hash.is_some(), jar_present, || {
+        EngineError::DetektJarOffline {
             version: detekt_version.to_owned(),
-        })?;
-    }
+        }
+    })?;
 
     // Ensure detekt jar is available and hash-verified. The path is derived again
     // (from the same spec) inside `run_detekt_process`, so it is discarded here.
-    let (_, actual_hash) = ensure_detekt(detekt_version, expected_hash, net)?;
+    let (_, actual_hash) = ensure_detekt(detekt_version, expected_hash, resolver)?;
 
     // Persist hash to lockfile if not already stored.
     if expected_hash.is_none() {
@@ -347,7 +328,7 @@ pub fn lint(
     }
 
     // Resolve JRE.
-    let jre_home = resolve_jre_home(&manifest.toolchain.kotlin, options.locked, &lockfile, net)?;
+    let jre_home = resolve_jre_home(&manifest.toolchain.kotlin, &lockfile, resolver)?;
 
     // Check for sources.
     let src_dir = root.join("src");
@@ -642,7 +623,10 @@ src/main.kt:3:5: Magic number. [MagicNumber]
         let result = super::ensure_detekt(
             version,
             Some("0000000000000000000000000000000000000000000000000000000000000000"),
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                true,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         );
         // Clean up before asserting.
         let _ = std::fs::remove_file(&jar);
@@ -671,7 +655,10 @@ src/main.kt:3:5: Magic number. [MagicNumber]
         let result = super::ensure_detekt(
             version,
             Some(&real_hash),
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                true,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         );
         // Clean up.
         let _ = std::fs::remove_file(&jar);
@@ -690,8 +677,15 @@ src/main.kt:3:5: Magic number. [MagicNumber]
     /// be caught by either, so it does not exercise the difference).
     #[test]
     fn ensure_detekt_rejects_dotdot_version() {
-        let err = super::ensure_detekt("1..2", None, &konvoy_util::net::NetworkClient::new(false))
-            .expect_err("a `..` version must be rejected before any download");
+        let err = super::ensure_detekt(
+            "1..2",
+            None,
+            crate::common::ArtifactResolver::new(
+                true,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
+        )
+        .expect_err("a `..` version must be rejected before any download");
         let msg = err.to_string();
         assert!(
             msg.contains("invalid detekt version"),
@@ -740,9 +734,11 @@ src/main.kt:3:5: Magic number. [MagicNumber]
             &super::LintOptions {
                 verbose: false,
                 config: None,
-                locked: false,
             },
-            &konvoy_util::net::NetworkClient::new(true),
+            crate::common::ArtifactResolver::new(
+                false,
+                &konvoy_util::net::NetworkClient::new(true),
+            ),
         );
 
         // Clean up the fake JAR before asserting.
@@ -800,9 +796,11 @@ src/main.kt:3:5: Magic number. [MagicNumber]
             &super::LintOptions {
                 verbose: false,
                 config: None,
-                locked: false,
             },
-            &konvoy_util::net::NetworkClient::new(true),
+            crate::common::ArtifactResolver::new(
+                false,
+                &konvoy_util::net::NetworkClient::new(true),
+            ),
         );
 
         match result {
@@ -839,9 +837,11 @@ src/main.kt:3:5: Magic number. [MagicNumber]
             &super::LintOptions {
                 verbose: false,
                 config: None,
-                locked: true,
             },
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                true,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         );
 
         assert!(
@@ -888,9 +888,11 @@ src/main.kt:3:5: Magic number. [MagicNumber]
             &super::LintOptions {
                 verbose: false,
                 config: None,
-                locked: true,
             },
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                true,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         );
 
         assert!(
@@ -942,9 +944,11 @@ src/main.kt:3:5: Magic number. [MagicNumber]
             &super::LintOptions {
                 verbose: false,
                 config: None,
-                locked: true,
             },
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::ArtifactResolver::new(
+                true,
+                &konvoy_util::net::NetworkClient::new(false),
+            ),
         );
 
         let _ = std::fs::remove_file(&jar);
