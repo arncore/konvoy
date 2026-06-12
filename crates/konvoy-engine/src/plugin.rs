@@ -120,18 +120,24 @@ pub fn resolve_plugin_artifacts(
 // Download / verification
 // ---------------------------------------------------------------------------
 
-/// Look up the expected SHA-256 for a plugin from the lockfile.
-#[cfg(test)]
-fn find_lockfile_hash<'a>(lockfile: &'a Lockfile, plugin_name: &str) -> Option<&'a str> {
+/// Look up the pinned SHA-256 for a plugin from the lockfile.
+///
+/// An empty string is treated as "no pin", so a malformed or half-written entry
+/// falls back to download-and-record instead of being verified against an empty
+/// hash. Shared by the resolver's pin gate (`prepare_plugin_artifacts`) and its
+/// hash lookup (`resolve_plugin_artifact`) so the two agree on what "pinned"
+/// means.
+pub(crate) fn find_lockfile_hash<'a>(lockfile: &'a Lockfile, plugin_name: &str) -> Option<&'a str> {
     lockfile
         .plugins
         .iter()
         .find(|p| p.name == plugin_name)
         .map(|p| p.sha256.as_str())
+        .filter(|s| !s.is_empty())
 }
 
-#[cfg(test)]
-fn map_download_err(name: &str, e: konvoy_util::error::UtilError) -> EngineError {
+/// Map a `UtilError` from a plugin download into the matching `EngineError`.
+pub(crate) fn map_download_err(name: &str, e: konvoy_util::error::UtilError) -> EngineError {
     crate::error::map_artifact_download_err(
         name,
         e,
@@ -364,6 +370,26 @@ mod tests {
         let lockfile = Lockfile::default();
         let hash = find_lockfile_hash(&lockfile, "kotlin-serialization");
         assert!(hash.is_none());
+    }
+
+    #[test]
+    fn find_lockfile_hash_empty_string_is_not_a_pin() {
+        // An empty `sha256` is treated as "no pin" so a malformed/half-written
+        // entry falls back to download-and-record instead of being verified
+        // against an empty hash (which would always mismatch).
+        let lockfile = Lockfile {
+            plugins: vec![PluginLock {
+                name: "kotlin-serialization".to_owned(),
+                maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+                version: "2.1.0".to_owned(),
+                sha256: String::new(),
+                url: "https://example.com/plugin.jar".to_owned(),
+            }],
+            ..Lockfile::default()
+        };
+
+        let hash = find_lockfile_hash(&lockfile, "kotlin-serialization");
+        assert!(hash.is_none(), "empty sha256 must not count as a pin");
     }
 
     #[test]

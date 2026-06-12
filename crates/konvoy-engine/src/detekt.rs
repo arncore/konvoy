@@ -250,21 +250,24 @@ pub fn lint(
     // see the detekt JAR's hash pin, not the toolchain version.
     resolver.require_manifest_artifacts_resolvable(&manifest, &lockfile)?;
 
-    let detekt_jar = resolver.resolve_detekt_jar(detekt_version, &lockfile)?;
+    let detekt_hash_to_persist = resolver.resolve_detekt_jar(detekt_version, &lockfile)?;
 
-    // Persist hash to lockfile if not already stored.
-    if !detekt_jar.was_pinned {
+    // Resolve the JRE BEFORE persisting. Resolving it can fail (e.g. --offline
+    // with the toolchain absent), and a failed lint must not leave a rewritten
+    // konvoy.lock behind. This is also the last read of `lockfile`, so the
+    // persist below can consume it without a clone.
+    let jre_home = resolver.resolve_detekt_jre(&manifest.toolchain.kotlin, &lockfile)?;
+
+    // Persist the freshly-resolved hash to the lockfile if it was not pinned.
+    if let Some(actual_sha256) = detekt_hash_to_persist {
         persist_detekt_hash(
             &lockfile_path,
-            lockfile.clone(),
+            lockfile,
             &manifest.toolchain.kotlin,
             detekt_version,
-            detekt_jar.actual_sha256,
+            actual_sha256,
         )?;
     }
-
-    // Resolve JRE.
-    let jre_home = resolver.resolve_detekt_jre(&manifest.toolchain.kotlin, &lockfile)?;
 
     // Check for sources.
     let src_dir = root.join("src");
@@ -749,9 +752,11 @@ src/main.kt:3:5: Magic number. [MagicNumber]
 
     #[test]
     fn lint_locked_errors_on_detekt_drift() {
-        // --locked's real failure mode is lockfile drift: the manifest configures
-        // detekt but the lockfile has no pinned JAR hash, so the JAR gate reports
-        // `LockfileUpdateRequired` before any download.
+        // Exercises the detekt JAR PIN GATE specifically (not the up-front
+        // staleness check): the lockfile's detekt VERSION matches the manifest —
+        // so `require_manifest_artifacts_resolvable` passes — but the JAR hash is
+        // unpinned, so `resolve_detekt_jar`'s pin gate is what reports
+        // `LockfileUpdateRequired` under --locked, before any download.
         let detekt_version = "99.0.4-drift";
         let kotlin_version = "0.0.0-drift-test";
         let tmp = tempfile::tempdir().unwrap();
@@ -763,10 +768,19 @@ src/main.kt:3:5: Magic number. [MagicNumber]
             ),
         )
         .unwrap();
-        // Lockfile pins the toolchain but has NO detekt hash → drift under --locked.
-        konvoy_config::lockfile::Lockfile::with_toolchain(kotlin_version)
-            .write_to(&root.join("konvoy.lock"))
-            .unwrap();
+        // detekt VERSION matches the manifest (staleness check passes) but the
+        // JAR hash is absent → drift surfaces at the JAR pin gate under --locked.
+        let lockfile = konvoy_config::lockfile::Lockfile {
+            toolchain: Some(konvoy_config::lockfile::ToolchainLock {
+                konanc_version: kotlin_version.to_owned(),
+                konanc_tarball_sha256: None,
+                jre_tarball_sha256: None,
+                detekt_version: Some(detekt_version.to_owned()),
+                detekt_jar_sha256: None,
+            }),
+            ..Default::default()
+        };
+        lockfile.write_to(&root.join("konvoy.lock")).unwrap();
 
         let result = super::lint(
             root,

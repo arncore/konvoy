@@ -206,6 +206,11 @@ fn predicted_effective_lockfile(
                     jre_tarball_sha256,
                 );
                 stabilized.dependencies = lockfile.dependencies.clone();
+                // Mirror the detekt carry-forward that `update_lockfile_if_needed`
+                // applies to the WRITTEN lockfile, or the predicted cache-key
+                // lockfile would drop detekt and diverge from what gets written
+                // (one spurious recompile for detekt projects — issue #133 class).
+                carry_forward_detekt(&mut stabilized, lockfile);
                 stabilized
             }
         };
@@ -1003,9 +1008,12 @@ pub(crate) fn check_lockfile_staleness(
         }
     }
 
-    // Each declared plugin must have a matching lockfile entry.
+    // Each declared plugin must have a *pinned* lockfile entry. Use the same
+    // `find_lockfile_hash` the resolver gate uses, so this fast-fail and the
+    // per-artifact gate agree that an empty `sha256` is "no pin" — otherwise a
+    // malformed entry would slip past this check only to fail deeper in.
     for plugin_name in manifest.plugins.keys() {
-        if !lockfile.plugins.iter().any(|p| p.name == *plugin_name) {
+        if crate::plugin::find_lockfile_hash(lockfile, plugin_name).is_none() {
             return Err(EngineError::LockfileUpdateRequired);
         }
     }
@@ -1145,21 +1153,28 @@ fn update_lockfile_if_needed(
     );
     updated.dependencies = new_deps;
     updated.plugins = plugin_locks.to_vec();
+    carry_forward_detekt(&mut updated, lockfile);
 
-    // Carry the existing detekt pin forward. `konvoy build` does not manage
-    // detekt (it is written by `konvoy lint`), but `with_managed_toolchain`
-    // produces a toolchain section with no detekt fields — so without this a
-    // toolchain-changing build would silently wipe the detekt entry, and the
-    // `updated == *lockfile` short-circuit below could never fire for projects
-    // that use detekt.
-    if let (Some(updated_tc), Some(orig_tc)) =
-        (updated.toolchain.as_mut(), lockfile.toolchain.as_ref())
+    resolver.persist_resolved_artifacts(lockfile, &updated, lockfile_path)
+}
+
+/// Carry the detekt pin from `original` onto a freshly-rebuilt toolchain section.
+///
+/// `Lockfile::with_managed_toolchain` produces a toolchain section with no detekt
+/// fields. `konvoy build` does not manage detekt (it is written by `konvoy lint`),
+/// so every site that rebuilds the toolchain for a (possibly new) konanc version
+/// must restore the existing detekt pin. Otherwise a toolchain-changing build
+/// silently wipes detekt from the written lockfile AND the predicted cache-key
+/// lockfile and the written lockfile disagree, forcing a spurious recompile for
+/// detekt projects (issue #133 class). Centralized here so both call sites —
+/// `predicted_effective_lockfile` and `update_lockfile_if_needed` — stay in lockstep.
+fn carry_forward_detekt(rebuilt: &mut Lockfile, original: &Lockfile) {
+    if let (Some(rebuilt_tc), Some(orig_tc)) =
+        (rebuilt.toolchain.as_mut(), original.toolchain.as_ref())
     {
-        updated_tc.detekt_version = orig_tc.detekt_version.clone();
-        updated_tc.detekt_jar_sha256 = orig_tc.detekt_jar_sha256.clone();
+        rebuilt_tc.detekt_version = orig_tc.detekt_version.clone();
+        rebuilt_tc.detekt_jar_sha256 = orig_tc.detekt_jar_sha256.clone();
     }
-
-    resolver.persist_resolved_artifacts(lockfile, updated, lockfile_path)
 }
 
 /// Verify freshly-downloaded toolchain tarball SHAs against the lockfile pins.
@@ -2806,6 +2821,54 @@ mod tests {
     }
 
     #[test]
+    fn predicted_effective_lockfile_preserves_detekt_on_version_change() {
+        // Regression: the cache-key (predicted) lockfile and the WRITTEN lockfile
+        // must agree on detekt across a toolchain-version bump. The version-change
+        // branch of `predicted_effective_lockfile` rebuilds from
+        // `with_managed_toolchain` (no detekt fields); without carrying detekt
+        // forward it dropped the pin, so build #1 keyed on a detekt-less lockfile
+        // while the written lockfile kept detekt — a different key on build #2,
+        // forcing one spurious recompile for detekt projects (issue #133 class).
+        let lockfile = Lockfile {
+            toolchain: Some(konvoy_config::lockfile::ToolchainLock {
+                konanc_version: "2.0.0".to_owned(),
+                konanc_tarball_sha256: Some("old1".to_owned()),
+                jre_tarball_sha256: Some("old2".to_owned()),
+                detekt_version: Some("1.23.7".to_owned()),
+                detekt_jar_sha256: Some("detektsha".to_owned()),
+            }),
+            ..Default::default()
+        };
+
+        // Resolve a NEW konanc version (the user bumped `kotlin` in konvoy.toml),
+        // so the version-mismatch branch runs.
+        let effective = predicted_effective_lockfile(
+            &lockfile,
+            "2.1.0",
+            Some("new1"),
+            Some("new2"),
+            &[],
+            crate::common::ArtifactResolver::new(
+                &konvoy_util::net::NetworkClient::new(false),
+                crate::common::LockfileManager::new(false),
+            ),
+        );
+
+        let tc = effective.toolchain.as_ref().unwrap();
+        assert_eq!(tc.konanc_version, "2.1.0");
+        assert_eq!(
+            tc.detekt_version.as_deref(),
+            Some("1.23.7"),
+            "predicted lockfile must preserve detekt version across a toolchain bump"
+        );
+        assert_eq!(
+            tc.detekt_jar_sha256.as_deref(),
+            Some("detektsha"),
+            "predicted lockfile must preserve detekt hash across a toolchain bump"
+        );
+    }
+
+    #[test]
     fn build_single_force_bypasses_cache() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("myapp");
@@ -3299,6 +3362,35 @@ mod tests {
         assert!(
             result.is_ok(),
             "matching plugin entries should pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_empty_plugin_sha_is_drift() {
+        // A plugin entry present by name but with an empty `sha256` is NOT a pin
+        // (the resolver gate treats it as unpinned). The up-front staleness check
+        // must agree and fast-fail, instead of passing here and tripping the
+        // per-artifact gate deeper in the build.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: String::new(), // present by name but unpinned
+            url: "https://example.com/plugin.jar".to_owned(),
+        });
+
+        assert!(
+            matches!(
+                check_lockfile_staleness(&manifest, &lockfile),
+                Err(EngineError::LockfileUpdateRequired)
+            ),
+            "an empty plugin sha256 must fail the staleness check"
         );
     }
 

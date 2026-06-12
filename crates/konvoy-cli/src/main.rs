@@ -147,6 +147,23 @@ enum ToolchainAction {
     List,
 }
 
+/// Build a command-scoped `ArtifactResolver` from the `--offline`/`--locked`
+/// flags and hand it to `f`.
+///
+/// The resolver borrows a `NetworkClient` that lives only for this call, so it is
+/// threaded through a closure rather than returned. Every fetching command builds
+/// its resolver this way, keeping the net/lockfile wiring in one place.
+fn with_resolver<T>(
+    offline: bool,
+    locked: bool,
+    f: impl FnOnce(konvoy_engine::ArtifactResolver<'_>) -> T,
+) -> T {
+    let net = konvoy_util::net::NetworkClient::new(offline);
+    let resolver =
+        konvoy_engine::ArtifactResolver::new(&net, konvoy_engine::LockfileManager::new(locked));
+    f(resolver)
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -164,12 +181,9 @@ fn main() {
             force,
             locked,
             offline,
-        } => {
-            let net = konvoy_util::net::NetworkClient::new(offline);
-            let lockfiles = konvoy_engine::LockfileManager::new(locked);
-            let resolver = konvoy_engine::ArtifactResolver::new(&net, lockfiles);
+        } => with_resolver(offline, locked, |resolver| {
             cmd_build(target, profile_from_flag(release), verbose, force, resolver)
-        }
+        }),
         Command::Run {
             target,
             release,
@@ -178,10 +192,7 @@ fn main() {
             locked,
             offline,
             args,
-        } => {
-            let net = konvoy_util::net::NetworkClient::new(offline);
-            let lockfiles = konvoy_engine::LockfileManager::new(locked);
-            let resolver = konvoy_engine::ArtifactResolver::new(&net, lockfiles);
+        } => with_resolver(offline, locked, |resolver| {
             cmd_run(
                 target,
                 profile_from_flag(release),
@@ -190,7 +201,7 @@ fn main() {
                 &args,
                 resolver,
             )
-        }
+        }),
         Command::Test {
             target,
             release,
@@ -199,10 +210,7 @@ fn main() {
             locked,
             offline,
             filter,
-        } => {
-            let net = konvoy_util::net::NetworkClient::new(offline);
-            let lockfiles = konvoy_engine::LockfileManager::new(locked);
-            let resolver = konvoy_engine::ArtifactResolver::new(&net, lockfiles);
+        } => with_resolver(offline, locked, |resolver| {
             cmd_test(
                 target,
                 profile_from_flag(release),
@@ -211,26 +219,18 @@ fn main() {
                 &filter,
                 resolver,
             )
-        }
+        }),
         Command::Lint {
             verbose,
             config,
             locked,
             offline,
-        } => {
-            let net = konvoy_util::net::NetworkClient::new(offline);
-            let lockfiles = konvoy_engine::LockfileManager::new(locked);
-            let resolver = konvoy_engine::ArtifactResolver::new(&net, lockfiles);
+        } => with_resolver(offline, locked, |resolver| {
             cmd_lint(verbose, config, resolver)
-        }
-        Command::Update => {
-            let net = konvoy_util::net::NetworkClient::new(false);
-            let resolver = konvoy_engine::ArtifactResolver::new(
-                &net,
-                konvoy_engine::LockfileManager::new(false),
-            );
-            cmd_update(resolver)
-        }
+        }),
+        // `konvoy update` is inherently online and never locked: it exists to
+        // (re)resolve dependencies and rewrite konvoy.lock.
+        Command::Update => with_resolver(false, false, cmd_update),
         Command::Clean { all } => cmd_clean(all),
         Command::Doctor => cmd_doctor(),
         Command::Toolchain { action } => {

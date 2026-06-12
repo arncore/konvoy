@@ -1,12 +1,7 @@
 //! Small shared helpers used across multiple engine modules.
 
-use crate::error::{map_artifact_download_err, EngineError};
+use crate::error::EngineError;
 use konvoy_config::{lockfile::Lockfile, Manifest};
-
-pub(crate) struct ResolvedDetektJar {
-    pub actual_sha256: String,
-    pub was_pinned: bool,
-}
 
 /// Per-command resolver for managed artifacts.
 ///
@@ -42,10 +37,12 @@ impl<'a> ArtifactResolver<'a> {
     /// Resolve whether a managed artifact may be used or fetched.
     ///
     /// Lockfile drift is checked first so `--locked --offline` reports the
-    /// lockfile problem before reporting a cache miss.
+    /// lockfile problem before reporting a cache miss. `has_pin` is a closure so
+    /// that any cost of computing it (e.g. stat-ing the install location) is
+    /// skipped entirely when the command is not `--locked`.
     fn resolve_artifact(
         self,
-        has_pin: bool,
+        has_pin: impl FnOnce() -> Result<bool, EngineError>,
         is_present: bool,
         offline_error: impl FnOnce() -> EngineError,
     ) -> Result<(), EngineError> {
@@ -60,34 +57,47 @@ impl<'a> ArtifactResolver<'a> {
         lockfile: &Lockfile,
     ) -> Result<konvoy_konanc::detect::ResolvedKonanc, EngineError> {
         let is_present = konvoy_konanc::toolchain::is_installed(version)?;
-        let has_pin = has_required_toolchain_artifact_pins(lockfile, version)?;
-        self.resolve_artifact(has_pin, is_present, || EngineError::ToolchainOffline {
-            version: version.to_owned(),
-        })?;
+        // `has_pin` stats the install location; passed lazily so the probe only
+        // runs under --locked (the offline gate uses `is_present`, not the pin).
+        self.resolve_artifact(
+            || has_required_toolchain_artifact_pins(lockfile, version),
+            is_present,
+            || EngineError::ToolchainOffline {
+                version: version.to_owned(),
+            },
+        )?;
         Ok(konvoy_konanc::detect::resolve_konanc(version, self.net)?)
     }
 
-    /// Resolve the detekt CLI JAR and return the hash that was verified.
+    /// Resolve the detekt CLI JAR.
+    ///
+    /// Returns `Some(hash)` — the freshly-verified hash to persist into the
+    /// lockfile — when the JAR was not already pinned, or `None` when the
+    /// lockfile already pins it (nothing to write).
     pub(crate) fn resolve_detekt_jar(
         self,
         version: &str,
         lockfile: &Lockfile,
-    ) -> Result<ResolvedDetektJar, EngineError> {
+    ) -> Result<Option<String>, EngineError> {
         let expected_sha256 = lockfile.toolchain.as_ref().and_then(|tc| {
             (tc.detekt_version.as_deref() == Some(version))
-                .then(|| tc.detekt_jar_sha256.as_deref())
+                .then_some(tc.detekt_jar_sha256.as_deref())
                 .flatten()
+                // An empty string is not a pin: download-and-record rather than
+                // verify the JAR against an empty hash.
+                .filter(|s| !s.is_empty())
         });
         let was_pinned = expected_sha256.is_some();
         let is_present = crate::detekt::is_installed(version)?;
-        self.resolve_artifact(was_pinned, is_present, || EngineError::DetektJarOffline {
-            version: version.to_owned(),
-        })?;
+        self.resolve_artifact(
+            || Ok(was_pinned),
+            is_present,
+            || EngineError::DetektJarOffline {
+                version: version.to_owned(),
+            },
+        )?;
         let (_, actual_sha256) = crate::detekt::ensure_detekt(version, expected_sha256, self)?;
-        Ok(ResolvedDetektJar {
-            actual_sha256,
-            was_pinned,
-        })
+        Ok((!was_pinned).then_some(actual_sha256))
     }
 
     /// Resolve the JRE used to run detekt.
@@ -97,10 +107,13 @@ impl<'a> ArtifactResolver<'a> {
         lockfile: &Lockfile,
     ) -> Result<std::path::PathBuf, EngineError> {
         if !konvoy_konanc::toolchain::is_installed(kotlin_version)? {
-            let has_pin = has_required_toolchain_artifact_pins(lockfile, kotlin_version)?;
-            self.resolve_artifact(has_pin, false, || EngineError::DetektJreOffline {
-                version: kotlin_version.to_owned(),
-            })?;
+            self.resolve_artifact(
+                || has_required_toolchain_artifact_pins(lockfile, kotlin_version),
+                false,
+                || EngineError::DetektJreOffline {
+                    version: kotlin_version.to_owned(),
+                },
+            )?;
             eprintln!("    Installing Kotlin/Native {kotlin_version} (for JRE)...");
             konvoy_konanc::toolchain::install(kotlin_version, self.net)?;
         }
@@ -119,13 +132,9 @@ impl<'a> ArtifactResolver<'a> {
         lockfile: &Lockfile,
         bar: Option<&konvoy_util::progress::DownloadBar>,
     ) -> Result<crate::plugin::PluginArtifactResult, EngineError> {
-        let expected_sha256 = lockfile
-            .plugins
-            .iter()
-            .find(|p| p.name == artifact.plugin_name)
-            .map(|p| p.sha256.as_str());
+        let expected_sha256 = crate::plugin::find_lockfile_hash(lockfile, &artifact.plugin_name);
         self.resolve_artifact(
-            expected_sha256.is_some(),
+            || Ok(expected_sha256.is_some()),
             artifact.cache_path.exists(),
             || EngineError::PluginOffline {
                 name: artifact.plugin_name.clone(),
@@ -139,18 +148,7 @@ impl<'a> ArtifactResolver<'a> {
                 &artifact.plugin_name,
                 bar,
             )
-            .map_err(|e| {
-                map_artifact_download_err(
-                    &artifact.plugin_name,
-                    e,
-                    |name, message| EngineError::PluginDownload { name, message },
-                    |name, expected, actual| EngineError::PluginHashMismatch {
-                        name,
-                        expected,
-                        actual,
-                    },
-                )
-            })?;
+            .map_err(|e| crate::plugin::map_download_err(&artifact.plugin_name, e))?;
 
         Ok(crate::plugin::PluginArtifactResult {
             plugin_name: artifact.plugin_name.clone(),
@@ -171,13 +169,13 @@ impl<'a> ArtifactResolver<'a> {
     ) -> Result<Vec<bool>, EngineError> {
         let present: Vec<bool> = artifacts.iter().map(|a| a.cache_path.exists()).collect();
         for (artifact, is_present) in artifacts.iter().zip(present.iter().copied()) {
-            let has_pin = lockfile
-                .plugins
-                .iter()
-                .any(|p| p.name == artifact.plugin_name);
-            self.resolve_artifact(has_pin, is_present, || EngineError::PluginOffline {
-                name: artifact.plugin_name.clone(),
-            })?;
+            self.resolve_artifact(
+                || Ok(crate::plugin::find_lockfile_hash(lockfile, &artifact.plugin_name).is_some()),
+                is_present,
+                || EngineError::PluginOffline {
+                    name: artifact.plugin_name.clone(),
+                },
+            )?;
         }
         Ok(present)
     }
@@ -191,9 +189,13 @@ impl<'a> ArtifactResolver<'a> {
         expected_sha256: &str,
         bar: Option<&konvoy_util::progress::DownloadBar>,
     ) -> Result<crate::build::LibraryInput, EngineError> {
-        self.resolve_artifact(true, dest.exists(), || EngineError::LibraryOffline {
-            name: name.to_owned(),
-        })?;
+        self.resolve_artifact(
+            || Ok(true),
+            dest.exists(),
+            || EngineError::LibraryOffline {
+                name: name.to_owned(),
+            },
+        )?;
         let result = self
             .fetch_artifact(url, dest, Some(expected_sha256), name, bar)
             .map_err(|e| EngineError::LibraryDownloadFailed {
@@ -261,7 +263,7 @@ impl<'a> ArtifactResolver<'a> {
     pub(crate) fn persist_resolved_artifacts(
         self,
         current: &Lockfile,
-        updated: Lockfile,
+        updated: &Lockfile,
         lockfile_path: &std::path::Path,
     ) -> Result<(), EngineError> {
         self.lockfiles
@@ -354,8 +356,15 @@ impl LockfileManager {
     }
 
     /// Require a lockfile pin when locked policy forbids lockfile updates.
-    fn require_artifact_pin(self, has_pin: bool) -> Result<(), EngineError> {
-        if self.locked && !has_pin {
+    ///
+    /// `has_pin` is evaluated only under `--locked`, so callers can pass a
+    /// closure whose cost (e.g. stat-ing an install location) is skipped
+    /// entirely when the command is unlocked.
+    fn require_artifact_pin(
+        self,
+        has_pin: impl FnOnce() -> Result<bool, EngineError>,
+    ) -> Result<(), EngineError> {
+        if self.locked && !has_pin()? {
             Err(EngineError::LockfileUpdateRequired)
         } else {
             Ok(())
@@ -409,10 +418,10 @@ impl LockfileManager {
     fn write_updated_lockfile(
         self,
         current: &konvoy_config::lockfile::Lockfile,
-        updated: konvoy_config::lockfile::Lockfile,
+        updated: &konvoy_config::lockfile::Lockfile,
         lockfile_path: &std::path::Path,
     ) -> Result<(), EngineError> {
-        if updated == *current {
+        if updated == current {
             return Ok(());
         }
         if self.locked {
@@ -516,9 +525,31 @@ mod tests {
         let net = konvoy_util::net::NetworkClient::new(true);
         let resolver = ArtifactResolver::new(&net, LockfileManager::new(true));
 
-        let result = resolver.resolve_artifact(false, false, || EngineError::LintNotConfigured);
+        let result =
+            resolver.resolve_artifact(|| Ok(false), false, || EngineError::LintNotConfigured);
 
         assert!(matches!(result, Err(EngineError::LockfileUpdateRequired)));
+    }
+
+    #[test]
+    fn resolve_artifact_skips_pin_check_when_unlocked() {
+        // The pin closure is evaluated only under --locked. When unlocked its
+        // cost (e.g. stat-ing the install location) must be skipped entirely.
+        let net = konvoy_util::net::NetworkClient::new(false);
+        let resolver = ArtifactResolver::new(&net, LockfileManager::new(false));
+        let called = Cell::new(false);
+
+        let result = resolver.resolve_artifact(
+            || {
+                called.set(true);
+                Ok(true)
+            },
+            true,
+            || EngineError::LintNotConfigured,
+        );
+
+        assert!(result.is_ok());
+        assert!(!called.get(), "pin check must be skipped when unlocked");
     }
 
     #[test]
@@ -526,7 +557,8 @@ mod tests {
         let net = konvoy_util::net::NetworkClient::new(true);
         let resolver = ArtifactResolver::new(&net, LockfileManager::new(false));
 
-        let result = resolver.resolve_artifact(true, false, || EngineError::LintNotConfigured);
+        let result =
+            resolver.resolve_artifact(|| Ok(true), false, || EngineError::LintNotConfigured);
 
         assert!(matches!(result, Err(EngineError::LintNotConfigured)));
     }
@@ -536,7 +568,8 @@ mod tests {
         let net = konvoy_util::net::NetworkClient::new(false);
         let resolver = ArtifactResolver::new(&net, LockfileManager::new(true));
 
-        let result = resolver.resolve_artifact(true, false, || EngineError::LintNotConfigured);
+        let result =
+            resolver.resolve_artifact(|| Ok(true), false, || EngineError::LintNotConfigured);
 
         assert!(result.is_ok());
     }
@@ -827,7 +860,7 @@ mod tests {
         let updated = Lockfile::with_toolchain("9.9.9");
 
         let result = with_resolver(false, true, |resolver| {
-            resolver.persist_resolved_artifacts(&current, updated, &path)
+            resolver.persist_resolved_artifacts(&current, &updated, &path)
         });
 
         assert!(matches!(result, Err(EngineError::LockfileUpdateRequired)));
@@ -843,7 +876,7 @@ mod tests {
 
         with_resolver(false, false, |resolver| {
             resolver
-                .persist_resolved_artifacts(&current, updated, &path)
+                .persist_resolved_artifacts(&current, &updated, &path)
                 .unwrap()
         });
 
