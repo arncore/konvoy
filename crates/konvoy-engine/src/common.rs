@@ -458,6 +458,58 @@ pub(crate) fn now_epoch_secs() -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use konvoy_config::lockfile::{PluginLock, ToolchainLock};
+    use konvoy_util::maven::MavenCoordinate;
+    use std::cell::Cell;
+    use std::path::PathBuf;
+
+    fn with_resolver<T>(
+        offline: bool,
+        locked: bool,
+        f: impl FnOnce(ArtifactResolver<'_>) -> T,
+    ) -> T {
+        let net = konvoy_util::net::NetworkClient::new(offline);
+        f(ArtifactResolver::new(&net, LockfileManager::new(locked)))
+    }
+
+    fn plugin_artifact(name: &str, cache_path: PathBuf) -> crate::plugin::ResolvedPluginArtifact {
+        crate::plugin::ResolvedPluginArtifact {
+            plugin_name: name.to_owned(),
+            maven_coord: MavenCoordinate::new("org.example", name, "1.0.0"),
+            url: format!("http://127.0.0.1:1/{name}.jar"),
+            cache_path,
+        }
+    }
+
+    fn lockfile_with_plugin(name: &str, sha256: String) -> Lockfile {
+        Lockfile {
+            plugins: vec![PluginLock {
+                name: name.to_owned(),
+                maven: format!("org.example:{name}"),
+                version: "1.0.0".to_owned(),
+                sha256,
+                url: format!("http://example.com/{name}.jar"),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn lockfile_with_toolchain(
+        version: &str,
+        konanc_sha256: Option<&str>,
+        jre_sha256: Option<&str>,
+    ) -> Lockfile {
+        Lockfile {
+            toolchain: Some(ToolchainLock {
+                konanc_version: version.to_owned(),
+                konanc_tarball_sha256: konanc_sha256.map(str::to_owned),
+                jre_tarball_sha256: jre_sha256.map(str::to_owned),
+                detekt_version: None,
+                detekt_jar_sha256: None,
+            }),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn managed_artifact_reports_lockfile_drift_before_offline() {
@@ -518,6 +570,305 @@ mod tests {
             locked.verify_current_lockfile(|| Err(EngineError::LintNotConfigured)),
             Err(EngineError::LintNotConfigured)
         ));
+    }
+
+    #[test]
+    fn resolve_toolchain_reports_locked_drift_before_offline_absence() {
+        let lockfile = Lockfile::default();
+
+        let result = with_resolver(true, true, |resolver| {
+            resolver.resolve_toolchain("0.0.0-resolver-toolchain-drift", &lockfile)
+        });
+
+        assert!(matches!(result, Err(EngineError::LockfileUpdateRequired)));
+    }
+
+    #[test]
+    fn resolve_toolchain_reports_offline_when_pinned_but_absent() {
+        let version = "0.0.0-resolver-toolchain-offline";
+        let lockfile = lockfile_with_toolchain(version, Some("konanc-sha"), Some("jre-sha"));
+
+        let result = with_resolver(true, false, |resolver| {
+            resolver.resolve_toolchain(version, &lockfile)
+        });
+
+        assert!(matches!(
+            result,
+            Err(EngineError::ToolchainOffline { version: got }) if got == version
+        ));
+    }
+
+    #[test]
+    fn resolve_detekt_jar_reports_locked_drift_when_unpinned() {
+        let lockfile = Lockfile::default();
+
+        let result = with_resolver(false, true, |resolver| {
+            resolver.resolve_detekt_jar("99.99.99-resolver-unpinned", &lockfile)
+        });
+
+        assert!(matches!(result, Err(EngineError::LockfileUpdateRequired)));
+    }
+
+    #[test]
+    fn resolve_detekt_jar_reports_offline_when_pinned_but_absent() {
+        let version = "99.99.99-resolver-offline";
+        let lockfile = Lockfile {
+            toolchain: Some(ToolchainLock {
+                konanc_version: "2.1.0".to_owned(),
+                konanc_tarball_sha256: None,
+                jre_tarball_sha256: None,
+                detekt_version: Some(version.to_owned()),
+                detekt_jar_sha256: Some("0".repeat(64)),
+            }),
+            ..Default::default()
+        };
+
+        let result = with_resolver(true, false, |resolver| {
+            resolver.resolve_detekt_jar(version, &lockfile)
+        });
+
+        assert!(matches!(
+            result,
+            Err(EngineError::DetektJarOffline { version: got }) if got == version
+        ));
+    }
+
+    #[test]
+    fn resolve_detekt_jre_reports_locked_drift_when_toolchain_hashes_missing() {
+        let version = "0.0.0-resolver-detekt-jre-drift";
+        let lockfile = lockfile_with_toolchain(version, None, None);
+
+        let result = with_resolver(false, true, |resolver| {
+            resolver.resolve_detekt_jre(version, &lockfile)
+        });
+
+        assert!(matches!(result, Err(EngineError::LockfileUpdateRequired)));
+    }
+
+    #[test]
+    fn resolve_detekt_jre_reports_offline_when_pinned_but_absent() {
+        let version = "0.0.0-resolver-detekt-jre-offline";
+        let lockfile = lockfile_with_toolchain(version, Some("konanc-sha"), Some("jre-sha"));
+
+        let result = with_resolver(true, false, |resolver| {
+            resolver.resolve_detekt_jre(version, &lockfile)
+        });
+
+        assert!(matches!(
+            result,
+            Err(EngineError::DetektJreOffline { version: got }) if got == version
+        ));
+    }
+
+    #[test]
+    fn prepare_plugin_artifacts_reports_missing_pin_before_offline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifacts = vec![plugin_artifact(
+            "missing-pin",
+            tmp.path().join("missing.jar"),
+        )];
+        let lockfile = Lockfile::default();
+
+        let result = with_resolver(true, true, |resolver| {
+            resolver.prepare_plugin_artifacts(&artifacts, &lockfile)
+        });
+
+        assert!(matches!(result, Err(EngineError::LockfileUpdateRequired)));
+    }
+
+    #[test]
+    fn prepare_plugin_artifacts_reports_offline_for_pinned_absent_plugin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifacts = vec![plugin_artifact(
+            "offline-plugin",
+            tmp.path().join("plugin.jar"),
+        )];
+        let lockfile = lockfile_with_plugin("offline-plugin", "0".repeat(64));
+
+        let result = with_resolver(true, false, |resolver| {
+            resolver.prepare_plugin_artifacts(&artifacts, &lockfile)
+        });
+
+        assert!(matches!(
+            result,
+            Err(EngineError::PluginOffline { name }) if name == "offline-plugin"
+        ));
+    }
+
+    #[test]
+    fn prepare_plugin_artifacts_returns_cache_presence_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let present_path = tmp.path().join("present.jar");
+        let absent_path = tmp.path().join("absent.jar");
+        std::fs::write(&present_path, b"cached plugin").unwrap();
+        let artifacts = vec![
+            plugin_artifact("present-plugin", present_path),
+            plugin_artifact("absent-plugin", absent_path),
+        ];
+        let mut lockfile = lockfile_with_plugin("present-plugin", "0".repeat(64));
+        lockfile.plugins.push(PluginLock {
+            name: "absent-plugin".to_owned(),
+            maven: "org.example:absent-plugin".to_owned(),
+            version: "1.0.0".to_owned(),
+            sha256: "1".repeat(64),
+            url: "http://example.com/absent-plugin.jar".to_owned(),
+        });
+
+        let present = with_resolver(false, true, |resolver| {
+            resolver
+                .prepare_plugin_artifacts(&artifacts, &lockfile)
+                .unwrap()
+        });
+
+        assert_eq!(present, vec![true, false]);
+    }
+
+    #[test]
+    fn resolve_plugin_artifact_returns_cached_hash_under_offline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_path = tmp.path().join("cached-plugin.jar");
+        let content = b"cached plugin bytes";
+        std::fs::write(&cache_path, content).unwrap();
+        let expected_hash = konvoy_util::hash::sha256_bytes(content);
+        let artifact = plugin_artifact("cached-plugin", cache_path.clone());
+        let lockfile = lockfile_with_plugin("cached-plugin", expected_hash.clone());
+
+        let result = with_resolver(true, false, |resolver| {
+            resolver
+                .resolve_plugin_artifact(&artifact, &lockfile, None)
+                .unwrap()
+        });
+
+        assert_eq!(result.path, cache_path);
+        assert_eq!(result.sha256, expected_hash);
+        assert!(!result.freshly_downloaded);
+    }
+
+    #[test]
+    fn resolve_maven_klib_reports_offline_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("missing.klib");
+
+        let result = with_resolver(true, false, |resolver| {
+            resolver.resolve_maven_klib(
+                "missing-lib",
+                "http://127.0.0.1:1/missing.klib",
+                &dest,
+                &"0".repeat(64),
+                None,
+            )
+        });
+
+        assert!(matches!(
+            result,
+            Err(EngineError::LibraryOffline { name }) if name == "missing-lib"
+        ));
+    }
+
+    #[test]
+    fn resolve_maven_klib_returns_cached_hash_under_offline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("cached.klib");
+        let content = b"cached klib bytes";
+        std::fs::write(&dest, content).unwrap();
+        let expected_hash = konvoy_util::hash::sha256_bytes(content);
+
+        let input = with_resolver(true, false, |resolver| {
+            resolver
+                .resolve_maven_klib(
+                    "cached-lib",
+                    "http://127.0.0.1:1/cached.klib",
+                    &dest,
+                    &expected_hash,
+                    None,
+                )
+                .unwrap()
+        });
+
+        assert_eq!(input.path, dest);
+        assert_eq!(
+            input.precomputed_sha256.as_deref(),
+            Some(expected_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn cache_key_artifact_state_locked_does_not_compute_candidate() {
+        let current = Lockfile::with_toolchain("2.1.0");
+        let called = Cell::new(false);
+
+        let effective = with_resolver(false, true, |resolver| {
+            resolver.cache_key_artifact_state(&current, || {
+                called.set(true);
+                Lockfile::with_toolchain("9.9.9")
+            })
+        });
+
+        assert_eq!(effective.toolchain.unwrap().konanc_version, "2.1.0");
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn cache_key_artifact_state_unlocked_uses_candidate() {
+        let current = Lockfile::with_toolchain("2.1.0");
+
+        let effective = with_resolver(false, false, |resolver| {
+            resolver.cache_key_artifact_state(&current, || Lockfile::with_toolchain("9.9.9"))
+        });
+
+        assert_eq!(effective.toolchain.unwrap().konanc_version, "9.9.9");
+    }
+
+    #[test]
+    fn persist_resolved_artifacts_rejects_locked_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("konvoy.lock");
+        let current = Lockfile::with_toolchain("2.1.0");
+        let updated = Lockfile::with_toolchain("9.9.9");
+
+        let result = with_resolver(false, true, |resolver| {
+            resolver.persist_resolved_artifacts(&current, updated, &path)
+        });
+
+        assert!(matches!(result, Err(EngineError::LockfileUpdateRequired)));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn persist_resolved_artifacts_writes_unlocked_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("konvoy.lock");
+        let current = Lockfile::with_toolchain("2.1.0");
+        let updated = Lockfile::with_toolchain("9.9.9");
+
+        with_resolver(false, false, |resolver| {
+            resolver
+                .persist_resolved_artifacts(&current, updated, &path)
+                .unwrap()
+        });
+
+        let reparsed = Lockfile::from_path(&path).unwrap();
+        assert_eq!(reparsed.toolchain.unwrap().konanc_version, "9.9.9");
+    }
+
+    #[test]
+    fn require_manifest_artifacts_resolvable_only_checks_when_locked() {
+        let manifest = Manifest::from_str(
+            "[package]\nname = \"demo\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let lockfile = Lockfile::default();
+
+        let unlocked = with_resolver(false, false, |resolver| {
+            resolver.require_manifest_artifacts_resolvable(&manifest, &lockfile)
+        });
+        let locked = with_resolver(false, true, |resolver| {
+            resolver.require_manifest_artifacts_resolvable(&manifest, &lockfile)
+        });
+
+        assert!(unlocked.is_ok());
+        assert!(matches!(locked, Err(EngineError::LockfileUpdateRequired)));
     }
 
     #[test]
