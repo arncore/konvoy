@@ -170,7 +170,7 @@ pub fn ensure_plugin_artifacts(
     // resolve each plugin artifact against the current lockfile/cache state.
     for (artifact, is_present) in artifacts.iter().zip(present.iter().copied()) {
         let has_pin = find_lockfile_hash(lockfile, &artifact.plugin_name).is_some();
-        lockfiles.resolve_artifact(resolver, has_pin, is_present, || {
+        crate::common::resolve_managed_artifact(lockfiles, resolver, has_pin, is_present, || {
             EngineError::PluginOffline {
                 name: artifact.plugin_name.clone(),
             }

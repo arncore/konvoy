@@ -259,7 +259,8 @@ pub(crate) fn resolve_build_context(
     //      fetches POMs and klibs from Maven Central, so an unresolved dep is
     //      a hard error here instead of a silent network access.
     let lockfile = match first_unresolved_maven_dep(&manifest, &lockfile) {
-        Some(name) => lockfiles.resolve_lockfile_drift(
+        Some(name) => crate::common::resolve_lockfile_update(
+            lockfiles,
             resolver,
             || EngineError::MissingLockfileEntry { name },
             || {
@@ -297,11 +298,15 @@ pub(crate) fn resolve_build_context(
     let toolchain_installed = konvoy_konanc::toolchain::is_installed(&manifest.toolchain.kotlin)?;
     let toolchain_pinned =
         has_required_toolchain_artifact_pins(&lockfile, &manifest.toolchain.kotlin)?;
-    lockfiles.resolve_artifact(resolver, toolchain_pinned, toolchain_installed, || {
-        EngineError::ToolchainOffline {
+    crate::common::resolve_managed_artifact(
+        lockfiles,
+        resolver,
+        toolchain_pinned,
+        toolchain_installed,
+        || EngineError::ToolchainOffline {
             version: manifest.toolchain.kotlin.clone(),
-        }
-    })?;
+        },
+    )?;
     let resolved = resolver.resolve_konanc(&manifest.toolchain.kotlin)?;
     let konanc = resolved.info;
     let jre_home = resolved.jre_home;
@@ -931,11 +936,15 @@ pub(crate) fn resolve_maven_deps(
     // `MissingTargetHash`, raised above). Ask the command resolver to fail fast
     // for any artifact it cannot resolve before spawning downloads.
     for p in &prepared {
-        lockfiles.resolve_artifact(resolver, true, !p.needs_download, || {
-            EngineError::LibraryOffline {
+        crate::common::resolve_managed_artifact(
+            lockfiles,
+            resolver,
+            true,
+            !p.needs_download,
+            || EngineError::LibraryOffline {
                 name: p.entry.name.to_owned(),
-            }
-        })?;
+            },
+        )?;
     }
 
     // Only allocate bars for entries that actually need a network fetch;
@@ -1561,7 +1570,7 @@ mod tests {
         // --locked --offline with an unresolved Maven dep: drift is the
         // actionable root cause (the lockfile must be regenerated either way),
         // so the staleness check's LockfileUpdateRequired wins over the
-        // offline error — mirroring gate_artifact's drift-first precedence.
+        // offline error.
         let tmp = tempfile::tempdir().unwrap();
         project_with_unresolved_maven_dep(tmp.path());
 

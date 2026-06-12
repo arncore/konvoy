@@ -187,8 +187,10 @@ fn resolve_jre_home(
         // would download any missing toolchain artifact under --locked, the
         // relevant tarball hash must already be pinned in konvoy.lock.
         let has_pin = crate::build::has_required_toolchain_artifact_pins(lockfile, kotlin_version)?;
-        lockfiles.resolve_artifact(resolver, has_pin, false, || EngineError::DetektJreOffline {
-            version: kotlin_version.to_owned(),
+        crate::common::resolve_managed_artifact(lockfiles, resolver, has_pin, false, || {
+            EngineError::DetektJreOffline {
+                version: kotlin_version.to_owned(),
+            }
         })?;
         eprintln!("    Installing Kotlin/Native {kotlin_version} (for JRE)...");
         resolver.install_toolchain(kotlin_version)?;
@@ -308,11 +310,15 @@ pub fn lint(
     // Resolve the detekt JAR before any download. has_pin: the lockfile pins
     // this detekt version's JAR hash; is_present: the JAR is already on disk.
     let jar_present = is_installed(detekt_version)?;
-    lockfiles.resolve_artifact(resolver, expected_hash.is_some(), jar_present, || {
-        EngineError::DetektJarOffline {
+    crate::common::resolve_managed_artifact(
+        lockfiles,
+        resolver,
+        expected_hash.is_some(),
+        jar_present,
+        || EngineError::DetektJarOffline {
             version: detekt_version.to_owned(),
-        }
-    })?;
+        },
+    )?;
 
     // Ensure detekt jar is available and hash-verified. The path is derived again
     // (from the same spec) inside `run_detekt_process`, so it is discarded here.
