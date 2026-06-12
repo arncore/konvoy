@@ -93,9 +93,9 @@ pub enum EngineError {
     )]
     LockfileUpdateRequired,
 
-    /// The Kotlin/Native toolchain is missing and --locked prevents installing it.
-    #[error("Kotlin/Native toolchain {version} is not installed and --locked prevents downloads — run `konvoy toolchain install` first")]
-    ToolchainLocked { version: String },
+    /// The Kotlin/Native toolchain is missing and --offline prevents installing it.
+    #[error("Kotlin/Native toolchain {version} is not installed and --offline prevents downloads — run `konvoy toolchain install` first, or drop --offline")]
+    ToolchainOffline { version: String },
 
     /// No test source files found.
     #[error("no test source files found in {dir} — create test files in src/test/ using kotlin.test annotations")]
@@ -104,6 +104,10 @@ pub enum EngineError {
     /// Failed to download detekt.
     #[error("cannot download detekt {version}: {message}")]
     DetektDownload { version: String, message: String },
+
+    /// The pinned detekt JAR is absent locally and --offline prevents fetching it.
+    #[error("detekt {version} is not downloaded and --offline prevents downloads — run `konvoy lint` once without --offline, or drop --offline")]
+    DetektJarOffline { version: String },
 
     /// A managed tool's process could not be executed (shared by detekt and
     /// codegen). A non-zero exit is *not* this error — that outcome is reported
@@ -116,9 +120,9 @@ pub enum EngineError {
     #[error("jre not available for running detekt — run `konvoy toolchain install` first")]
     DetektNoJre,
 
-    /// The toolchain providing detekt's JRE is missing and --locked prevents installing it.
-    #[error("Kotlin/Native toolchain {version} is not installed (detekt needs its JRE) and --locked prevents downloads — run `konvoy toolchain install` first")]
-    DetektJreLocked { version: String },
+    /// The toolchain providing detekt's JRE is missing and --offline prevents installing it.
+    #[error("Kotlin/Native toolchain {version} is not installed (detekt needs its JRE) and --offline prevents downloads — run `konvoy toolchain install` first, or drop --offline")]
+    DetektJreOffline { version: String },
 
     /// Detekt jar hash mismatch.
     #[error("detekt {version} jar hash mismatch — expected {expected}, got {actual}; this may indicate a tampered or corrupted download — delete ~/.konvoy/tools/detekt/{version}/ and re-run `konvoy lint` to re-download, or verify the hash at the detekt release page")]
@@ -173,6 +177,10 @@ pub enum EngineError {
     #[error("invalid plugin `{name}` configuration: {reason}")]
     InvalidPluginConfig { name: String, reason: String },
 
+    /// A pinned plugin artifact is absent locally and --offline prevents fetching it.
+    #[error("plugin `{name}` is not downloaded and --offline prevents downloads — run `konvoy build` once without --offline, or drop --offline")]
+    PluginOffline { name: String },
+
     /// Plugin artifact download failed.
     #[error("cannot download plugin `{name}` artifact: {message}")]
     PluginDownload { name: String, message: String },
@@ -193,8 +201,14 @@ pub enum EngineError {
         message: String,
     },
 
-    /// A dependency is not in the lockfile (user should run `konvoy update`).
-    #[error("dependency `{name}` not in lockfile — run `konvoy update` to resolve")]
+    /// A pinned Maven library klib is absent locally and --offline forbids fetching it.
+    #[error("library `{name}` is not downloaded and --offline prevents downloads — run `konvoy build` once without --offline, or drop --offline")]
+    LibraryOffline { name: String },
+
+    /// A dependency is declared in the manifest but not resolved in the lockfile.
+    /// Resolving it requires the network, so this is what `--offline` reports
+    /// instead of silently auto-running `konvoy update`.
+    #[error("dependency `{name}` is not resolved in konvoy.lock — run `konvoy update` to resolve it (needs network access; not available under --offline)")]
     MissingLockfileEntry { name: String },
 
     /// A target hash is missing from the lockfile for a Maven dependency.

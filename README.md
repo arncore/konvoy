@@ -128,10 +128,10 @@ hello/
 ## Commands
 
 - `konvoy init [--name <name>] [--lib]` — create a new binary or library project
-- `konvoy build [--target <triple|host>] [--release] [--verbose] [--force] [--locked]` — compile the project
-- `konvoy run [--target <triple|host>] [--release] [--force] [--locked] [-- <args…>]` — build and run
-- `konvoy test [--target <triple|host>] [--release] [--verbose] [--force] [--locked] [--filter <pattern>]` — build and run tests
-- `konvoy lint [--verbose] [--config <path>] [--locked]` — run detekt static analysis on Kotlin sources
+- `konvoy build [--target <triple|host>] [--release] [--verbose] [--force] [--locked] [--offline]` — compile the project
+- `konvoy run [--target <triple|host>] [--release] [--force] [--locked] [--offline] [-- <args…>]` — build and run
+- `konvoy test [--target <triple|host>] [--release] [--verbose] [--force] [--locked] [--offline] [--filter <pattern>]` — build and run tests
+- `konvoy lint [--verbose] [--config <path>] [--locked] [--offline]` — run detekt static analysis on Kotlin sources
 - `konvoy update` — resolve Maven dependencies (including transitives via POM) and update `konvoy.lock`
 - `konvoy clean` — remove build artifacts
 - `konvoy doctor` — check environment, toolchain, and dependency setup
@@ -254,7 +254,16 @@ macos_arm64 = "sha256:..."
 
 Transitive dependencies are tracked automatically with a `required_by` field listing which direct dependency pulled them in.
 
-Use `--locked` on build/test/run to error if the lockfile is out of date instead of silently updating.
+### Reproducible builds: `--locked` and `--offline`
+
+`build`, `run`, `test`, and `lint` accept two **orthogonal** reproducibility flags, mirroring Cargo:
+
+- **`--locked`** — *reproducible install.* Never modify `konvoy.lock`. Pinned artifacts (the toolchain, plugins, the detekt JAR) are still **downloaded and verified against their pinned SHA-256** when missing from the local cache; the only failure is **lockfile drift** — a missing or mismatched pin — which errors with `lockfile is out of date`. This is the flag for clean-CI builds: check out the repo (with its committed `konvoy.lock`) and `konvoy build --locked` reproducibly, downloading whatever the lockfile pins.
+- **`--offline`** — *no network.* Every managed artifact must already be present under `~/.konvoy`; an absent artifact is a hard error (e.g. `… is not installed and --offline prevents downloads`). Nothing is fetched.
+
+The two combine freely. `--locked --offline` together is the strictest mode (Cargo's `--frozen`): no lockfile changes **and** no network. When both are set and the lockfile is also drifting, the drift is reported first — it is the actionable root cause.
+
+All managed artifacts — the konanc toolchain, Maven dependency klibs, compiler plugins, and the detekt JAR + its JRE — obey these two flags identically. (`--offline` also refuses the automatic `konvoy update` that resolves missing Maven deps, since that fetches from Maven Central.)
 
 ### Plugins
 
