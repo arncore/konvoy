@@ -75,7 +75,7 @@ fn download_dep(
     dep: &ResolvedMavenDep,
     cache_root: &Path,
     bars: &[konvoy_util::progress::DownloadBar],
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<DependencyLock, EngineError> {
     let known_targets = konvoy_targets::KNOWN_TARGETS;
     let maven_coord = dep.key();
@@ -83,7 +83,7 @@ fn download_dep(
     let target_results: Vec<Result<(konvoy_targets::Target, String), EngineError>> = known_targets
         .par_iter()
         .zip(bars.par_iter())
-        .map(|(&target, bar)| download_target_klib(dep, target, cache_root, bar, net))
+        .map(|(&target, bar)| download_target_klib(dep, target, cache_root, bar, resolver))
         .collect();
 
     let mut targets_map: BTreeMap<String, String> = BTreeMap::new();
@@ -122,7 +122,7 @@ fn download_target_klib(
     target: konvoy_targets::Target,
     cache_root: &Path,
     progress: &konvoy_util::progress::DownloadBar,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<(konvoy_targets::Target, String), EngineError> {
     let maven_suffix = target.to_maven_suffix();
     let per_target_artifact_id = format!("{}-{}", dep.artifact_id, maven_suffix);
@@ -140,7 +140,8 @@ fn download_target_klib(
     let dest = coord.cache_path(cache_root);
     let label = format!("{}:{}", dep.name, target);
 
-    let result = konvoy_util::progress::fetch(net, &url, &dest, None, &label, Some(progress))
+    let result = resolver
+        .fetch_artifact(&url, &dest, None, &label, Some(progress))
         .map_err(|e| match e {
             konvoy_util::error::UtilError::Download { message } => {
                 EngineError::LibraryDownloadFailed {
@@ -175,7 +176,7 @@ pub struct UpdateResult {
 /// detected, a download fails, or the lockfile cannot be written.
 pub fn update(
     project_root: &Path,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<UpdateResult, EngineError> {
     // 1. Read konvoy.toml and konvoy.lock.
     let manifest_path = project_root.join("konvoy.toml");
@@ -224,7 +225,7 @@ pub fn update(
     }
 
     // 4. Resolve transitive dependencies via BFS on POM files.
-    let all_deps = resolve_transitive(&direct_deps, net)?;
+    let all_deps = resolve_transitive(&direct_deps, resolver)?;
 
     eprintln!(
         "  Resolved {} dependencies ({} direct, {} transitive)",
@@ -303,7 +304,7 @@ pub fn update(
         .par_iter()
         .zip(dep_bars.par_iter())
         .map(|((idx, dep), bars)| {
-            let lock = download_dep(dep, &cache_root, bars, net)?;
+            let lock = download_dep(dep, &cache_root, bars, resolver)?;
             Ok((*idx, lock))
         })
         .collect();
@@ -554,7 +555,7 @@ fn finalize_required_by(
 /// cycle is found.
 fn resolve_transitive(
     direct_deps: &[ResolvedMavenDep],
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<Vec<ResolvedMavenDep>, EngineError> {
     // Use the first known target for metadata fetching — the transitive graph is
     // identical across targets since every Kotlin/Native artifact publishes
@@ -637,14 +638,14 @@ fn resolve_transitive(
         let fetched: Vec<Result<(String, ArtifactMetadata), EngineError>> = to_fetch
             .par_iter()
             .map(|(group_id, per_target_artifact_id, version, cache_key)| {
-                let metadata = konvoy_util::metadata::fetch_artifact_metadata(
-                    net,
-                    group_id,
-                    per_target_artifact_id,
-                    version,
-                    maven_suffix,
-                )
-                .map_err(EngineError::Util)?;
+                let metadata = resolver
+                    .fetch_artifact_metadata(
+                        group_id,
+                        per_target_artifact_id,
+                        version,
+                        maven_suffix,
+                    )
+                    .map_err(EngineError::Util)?;
                 Ok((cache_key.clone(), metadata))
             })
             .collect();
@@ -866,7 +867,7 @@ my-utils = { path = "../my-utils" }
             .write_to(&project.path().join("konvoy.lock"))
             .unwrap();
 
-        let result = update(project.path(), &konvoy_util::net::NetworkClient::new(false)).unwrap();
+        let result = update(project.path(), crate::common::test_resolver(false, false)).unwrap();
         assert_eq!(result.updated_count, 0);
 
         // Verify the lockfile still has the path dep.
@@ -902,7 +903,7 @@ my-utils = { path = "../my-utils" }
             .write_to(&project.path().join("konvoy.lock"))
             .unwrap();
 
-        let result = update(project.path(), &konvoy_util::net::NetworkClient::new(false)).unwrap();
+        let result = update(project.path(), crate::common::test_resolver(false, false)).unwrap();
         assert_eq!(result.updated_count, 0);
 
         let reparsed = Lockfile::from_path(&project.path().join("konvoy.lock")).unwrap();
@@ -932,7 +933,7 @@ kotlin = "2.1.0"
             .write_to(&project.path().join("konvoy.lock"))
             .unwrap();
 
-        let result = update(project.path(), &konvoy_util::net::NetworkClient::new(false)).unwrap();
+        let result = update(project.path(), crate::common::test_resolver(false, false)).unwrap();
         assert_eq!(result.updated_count, 0);
 
         let reparsed = Lockfile::from_path(&project.path().join("konvoy.lock")).unwrap();
@@ -954,7 +955,7 @@ kotlin = "2.1.0"
 "#,
         );
 
-        let result = update(project.path(), &konvoy_util::net::NetworkClient::new(false)).unwrap();
+        let result = update(project.path(), crate::common::test_resolver(false, false)).unwrap();
         assert_eq!(result.updated_count, 0);
 
         // Lockfile should exist (possibly empty/default).
@@ -1069,7 +1070,7 @@ kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", 
 
     #[test]
     fn resolve_transitive_empty_direct_deps() {
-        let result = resolve_transitive(&[], &konvoy_util::net::NetworkClient::new(false)).unwrap();
+        let result = resolve_transitive(&[], crate::common::test_resolver(false, false)).unwrap();
         assert!(result.is_empty());
     }
 
@@ -1121,7 +1122,7 @@ kotlin = "2.1.0"
 "#,
         );
         // No konvoy.lock on disk — `update` creates it from scratch.
-        let result = update(project.path(), &konvoy_util::net::NetworkClient::new(false)).unwrap();
+        let result = update(project.path(), crate::common::test_resolver(false, false)).unwrap();
         assert_eq!(result.updated_count, 0);
 
         let reparsed = Lockfile::from_path(&project.path().join("konvoy.lock")).unwrap();
@@ -1150,7 +1151,7 @@ kotlin = "2.1.0"
             .write_to(&project.path().join("konvoy.lock"))
             .unwrap();
 
-        let result = update(project.path(), &konvoy_util::net::NetworkClient::new(false)).unwrap();
+        let result = update(project.path(), crate::common::test_resolver(false, false)).unwrap();
         assert_eq!(result.updated_count, 0);
 
         let reparsed = Lockfile::from_path(&project.path().join("konvoy.lock")).unwrap();
@@ -1225,7 +1226,7 @@ kotlin = "2.1.0"
 
     #[test]
     fn resolve_transitive_no_direct_deps_returns_empty() {
-        let result = resolve_transitive(&[], &konvoy_util::net::NetworkClient::new(false)).unwrap();
+        let result = resolve_transitive(&[], crate::common::test_resolver(false, false)).unwrap();
         assert!(result.is_empty());
     }
 
@@ -1465,7 +1466,7 @@ atomicfu = { maven = "org.jetbrains.kotlinx:atomicfu", version = "0.23.1" }
 
         // Running update should detect these as already locked (same version
         // and classifier) and skip re-downloading.
-        let result = update(project.path(), &konvoy_util::net::NetworkClient::new(false)).unwrap();
+        let result = update(project.path(), crate::common::test_resolver(false, false)).unwrap();
         // updated_count reflects total resolved deps (already-locked or new).
         assert!(
             result.updated_count >= 2,

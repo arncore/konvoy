@@ -30,8 +30,6 @@ pub struct LintOptions {
     pub verbose: bool,
     /// Optional path to a custom detekt configuration file.
     pub config: Option<PathBuf>,
-    /// Require the lockfile to be up-to-date; error on any mismatch or missing hash.
-    pub locked: bool,
 }
 
 /// Result of running detekt.
@@ -109,7 +107,7 @@ pub fn is_installed(version: &str) -> Result<bool, EngineError> {
 pub fn ensure_detekt(
     version: &str,
     expected_sha256: Option<&str>,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<(PathBuf, String), EngineError> {
     // Use the same `validate_identifier` the spec uses (it rejects `..`), so a
     // traversal-laden version yields this actionable, detekt-branded message
@@ -121,26 +119,9 @@ pub fn ensure_detekt(
         ),
     })?;
 
-    detekt_tool(version)
-        .ensure(expected_sha256, net)
+    resolver
+        .ensure_managed_tool(&detekt_tool(version), expected_sha256)
         .map_err(|e| map_download_err(version, e))
-}
-
-/// Resolve the expected detekt hash from the lockfile.
-///
-/// Returns `None` if the lockfile has no hash or the pinned version doesn't
-/// match `detekt_version` (stale entry).
-fn resolve_lockfile_hash<'a>(
-    lockfile: &'a konvoy_config::lockfile::Lockfile,
-    detekt_version: &str,
-) -> Option<&'a str> {
-    let tc = lockfile.toolchain.as_ref()?;
-    let pinned_version = tc.detekt_version.as_deref()?;
-    if pinned_version == detekt_version {
-        tc.detekt_jar_sha256.as_deref()
-    } else {
-        None
-    }
 }
 
 /// Persist the detekt version and JAR hash into the lockfile.
@@ -169,36 +150,6 @@ fn persist_detekt_hash(
     }
     updated.write_to(lockfile_path)?;
     Ok(())
-}
-
-/// Resolve the managed Kotlin toolchain's JRE home (which contains `bin/java`).
-///
-/// Auto-installs the toolchain if it is not yet present, unless `locked` is set —
-/// `--locked` forbids downloads, so a missing toolchain is an error. The actual
-/// `java` invocation is delegated to [`ManagedToolSpec::run`], which derives the
-/// binary from this home.
-fn resolve_jre_home(
-    kotlin_version: &str,
-    locked: bool,
-    net: &konvoy_util::net::NetworkClient,
-) -> Result<PathBuf, EngineError> {
-    if !konvoy_konanc::toolchain::is_installed(kotlin_version)? {
-        if locked {
-            return Err(EngineError::DetektJreLocked {
-                version: kotlin_version.to_owned(),
-            });
-        }
-        eprintln!("    Installing Kotlin/Native {kotlin_version} (for JRE)...");
-        konvoy_konanc::toolchain::install(kotlin_version, net)?;
-    }
-
-    let jre_home = konvoy_konanc::toolchain::jre_home_path(kotlin_version)?;
-
-    if !jre_home.join("bin").join("java").exists() {
-        return Err(EngineError::DetektNoJre);
-    }
-
-    Ok(jre_home)
 }
 
 /// Resolve the detekt config file path.
@@ -279,7 +230,7 @@ fn run_detekt_process(
 pub fn lint(
     root: &Path,
     options: &LintOptions,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<LintResult, EngineError> {
     let manifest = konvoy_config::Manifest::from_path(&root.join("konvoy.toml"))?;
 
@@ -293,42 +244,30 @@ pub fn lint(
     let lockfile_path = root.join("konvoy.lock");
     let lockfile = konvoy_config::lockfile::Lockfile::from_path(&lockfile_path)?;
 
-    // `net` is the process-wide outbound-HTTP funnel, constructed once at the
-    // program entry point and threaded in — the detekt JAR and JRE downloads
-    // below route through it.
+    // In --locked mode, run the same fast staleness check `konvoy build` does
+    // (issue #295: every command fails for the same reasons). This catches
+    // konanc/detekt VERSION drift up-front; the per-artifact gates below only
+    // see the detekt JAR's hash pin, not the toolchain version.
+    resolver.require_manifest_artifacts_resolvable(&manifest, &lockfile)?;
 
-    let expected_hash = resolve_lockfile_hash(&lockfile, detekt_version);
+    let detekt_hash_to_persist = resolver.resolve_detekt_jar(detekt_version, &lockfile)?;
 
-    // In --locked mode, require pinned hash and pre-downloaded JAR.
-    if options.locked {
-        if expected_hash.is_none() {
-            return Err(EngineError::LockfileUpdateRequired);
-        }
-        if !is_installed(detekt_version)? {
-            return Err(EngineError::DetektDownload {
-                version: detekt_version.to_owned(),
-                message: "detekt JAR not downloaded and --locked prevents downloads".to_owned(),
-            });
-        }
-    }
+    // Resolve the JRE BEFORE persisting. Resolving it can fail (e.g. --offline
+    // with the toolchain absent), and a failed lint must not leave a rewritten
+    // konvoy.lock behind. This is also the last read of `lockfile`, so the
+    // persist below can consume it without a clone.
+    let jre_home = resolver.resolve_detekt_jre(&manifest.toolchain.kotlin, &lockfile)?;
 
-    // Ensure detekt jar is available and hash-verified. The path is derived again
-    // (from the same spec) inside `run_detekt_process`, so it is discarded here.
-    let (_, actual_hash) = ensure_detekt(detekt_version, expected_hash, net)?;
-
-    // Persist hash to lockfile if not already stored.
-    if expected_hash.is_none() {
+    // Persist the freshly-resolved hash to the lockfile if it was not pinned.
+    if let Some(actual_sha256) = detekt_hash_to_persist {
         persist_detekt_hash(
             &lockfile_path,
             lockfile,
             &manifest.toolchain.kotlin,
             detekt_version,
-            actual_hash,
+            actual_sha256,
         )?;
     }
-
-    // Resolve JRE.
-    let jre_home = resolve_jre_home(&manifest.toolchain.kotlin, options.locked, net)?;
 
     // Check for sources.
     let src_dir = root.join("src");
@@ -623,7 +562,7 @@ src/main.kt:3:5: Magic number. [MagicNumber]
         let result = super::ensure_detekt(
             version,
             Some("0000000000000000000000000000000000000000000000000000000000000000"),
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::test_resolver(false, false),
         );
         // Clean up before asserting.
         let _ = std::fs::remove_file(&jar);
@@ -652,7 +591,7 @@ src/main.kt:3:5: Magic number. [MagicNumber]
         let result = super::ensure_detekt(
             version,
             Some(&real_hash),
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::test_resolver(false, false),
         );
         // Clean up.
         let _ = std::fs::remove_file(&jar);
@@ -671,7 +610,7 @@ src/main.kt:3:5: Magic number. [MagicNumber]
     /// be caught by either, so it does not exercise the difference).
     #[test]
     fn ensure_detekt_rejects_dotdot_version() {
-        let err = super::ensure_detekt("1..2", None, &konvoy_util::net::NetworkClient::new(false))
+        let err = super::ensure_detekt("1..2", None, crate::common::test_resolver(false, false))
             .expect_err("a `..` version must be rejected before any download");
         let msg = err.to_string();
         assert!(
@@ -681,18 +620,20 @@ src/main.kt:3:5: Magic number. [MagicNumber]
     }
 
     #[test]
-    fn lint_locked_errors_when_toolchain_missing() {
-        // Pre-install a fake detekt JAR with its hash pinned in the lockfile,
-        // so the JAR-side --locked checks pass and lint reaches JRE resolution.
+    fn lint_offline_errors_when_toolchain_missing() {
+        // --offline is the NEW home for "the JRE's toolchain isn't installed".
+        // Pre-install a fake detekt JAR pinned in the lockfile so the JAR gate
+        // passes and lint reaches JRE resolution, where the absent toolchain
+        // becomes a hard error.
         let detekt_version = "99.0.2-test";
         let jar = super::detekt_jar_path(detekt_version).unwrap();
         std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
-        let content = b"fake jar for locked jre test";
+        let content = b"fake jar for offline jre test";
         std::fs::write(&jar, content).unwrap();
         let jar_hash = konvoy_util::hash::sha256_bytes(content);
 
         // Project manifest pins a Kotlin version that is never installed.
-        let kotlin_version = "0.0.0-locked-test";
+        let kotlin_version = "0.0.0-offline-test";
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::write(
@@ -719,24 +660,228 @@ src/main.kt:3:5: Magic number. [MagicNumber]
             &super::LintOptions {
                 verbose: false,
                 config: None,
-                locked: true,
             },
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::test_resolver(true, false),
         );
 
         // Clean up the fake JAR before asserting.
         let _ = std::fs::remove_file(&jar);
         let _ = std::fs::remove_dir(jar.parent().unwrap());
 
-        assert!(result.is_err(), "expected Err, got: {result:?}");
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::EngineError::DetektJreOffline { .. })
+            ),
+            "expected DetektJreOffline, got: {result:?}"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("--locked"),
-            "error should mention --locked: {err}"
+            err.contains("--offline"),
+            "error should mention --offline: {err}"
         );
         assert!(
             err.contains(kotlin_version),
             "error should mention the toolchain version: {err}"
+        );
+    }
+
+    #[test]
+    fn lint_offline_errors_when_detekt_jar_missing() {
+        // --offline + a pinned-but-not-downloaded detekt JAR: hard error from the
+        // JAR gate, before any JRE resolution. The version is never installed, so
+        // there is no JAR on disk and nothing to clean up.
+        let detekt_version = "99.0.3-offline-absent";
+        let kotlin_version = "0.0.0-offline-jar-test";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("konvoy.toml"),
+            format!(
+                "[package]\nname = \"demo\"\n\n[toolchain]\nkotlin = \"{kotlin_version}\"\ndetekt = \"{detekt_version}\"\n"
+            ),
+        )
+        .unwrap();
+        let lockfile = konvoy_config::lockfile::Lockfile {
+            toolchain: Some(konvoy_config::lockfile::ToolchainLock {
+                konanc_version: kotlin_version.to_owned(),
+                konanc_tarball_sha256: None,
+                jre_tarball_sha256: None,
+                detekt_version: Some(detekt_version.to_owned()),
+                detekt_jar_sha256: Some("0".repeat(64)),
+            }),
+            ..Default::default()
+        };
+        lockfile.write_to(&root.join("konvoy.lock")).unwrap();
+
+        let result = super::lint(
+            root,
+            &super::LintOptions {
+                verbose: false,
+                config: None,
+            },
+            crate::common::test_resolver(true, false),
+        );
+
+        match result {
+            Err(crate::error::EngineError::DetektJarOffline { version }) => {
+                assert_eq!(version, detekt_version);
+            }
+            other => panic!("expected DetektJarOffline, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lint_locked_errors_on_detekt_drift() {
+        // Exercises the detekt JAR PIN GATE specifically (not the up-front
+        // staleness check): the lockfile's detekt VERSION matches the manifest —
+        // so `require_manifest_artifacts_resolvable` passes — but the JAR hash is
+        // unpinned, so `resolve_detekt_jar`'s pin gate is what reports
+        // `LockfileUpdateRequired` under --locked, before any download.
+        let detekt_version = "99.0.4-drift";
+        let kotlin_version = "0.0.0-drift-test";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("konvoy.toml"),
+            format!(
+                "[package]\nname = \"demo\"\n\n[toolchain]\nkotlin = \"{kotlin_version}\"\ndetekt = \"{detekt_version}\"\n"
+            ),
+        )
+        .unwrap();
+        // detekt VERSION matches the manifest (staleness check passes) but the
+        // JAR hash is absent → drift surfaces at the JAR pin gate under --locked.
+        let lockfile = konvoy_config::lockfile::Lockfile {
+            toolchain: Some(konvoy_config::lockfile::ToolchainLock {
+                konanc_version: kotlin_version.to_owned(),
+                konanc_tarball_sha256: None,
+                jre_tarball_sha256: None,
+                detekt_version: Some(detekt_version.to_owned()),
+                detekt_jar_sha256: None,
+            }),
+            ..Default::default()
+        };
+        lockfile.write_to(&root.join("konvoy.lock")).unwrap();
+
+        let result = super::lint(
+            root,
+            &super::LintOptions {
+                verbose: false,
+                config: None,
+            },
+            crate::common::test_resolver(false, true),
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::EngineError::LockfileUpdateRequired)
+            ),
+            "expected LockfileUpdateRequired, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn lint_locked_errors_on_toolchain_drift() {
+        // lint --locked must fail fast on konanc-version drift, matching
+        // `build --locked` (issue #295: every command behaves identically).
+        // The detekt JAR pin itself is consistent — only the toolchain version
+        // disagrees between manifest and lockfile.
+        let detekt_version = "99.0.5-tc-drift";
+        let manifest_kotlin = "0.0.0-lint-drift";
+        let lockfile_kotlin = "9.9.9-stale";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("konvoy.toml"),
+            format!(
+                "[package]\nname = \"demo\"\n\n[toolchain]\nkotlin = \"{manifest_kotlin}\"\ndetekt = \"{detekt_version}\"\n"
+            ),
+        )
+        .unwrap();
+        let lockfile = konvoy_config::lockfile::Lockfile {
+            toolchain: Some(konvoy_config::lockfile::ToolchainLock {
+                konanc_version: lockfile_kotlin.to_owned(),
+                konanc_tarball_sha256: None,
+                jre_tarball_sha256: None,
+                detekt_version: Some(detekt_version.to_owned()),
+                detekt_jar_sha256: Some("0".repeat(64)),
+            }),
+            ..Default::default()
+        };
+        lockfile.write_to(&root.join("konvoy.lock")).unwrap();
+
+        let result = super::lint(
+            root,
+            &super::LintOptions {
+                verbose: false,
+                config: None,
+            },
+            crate::common::test_resolver(false, true),
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::EngineError::LockfileUpdateRequired)
+            ),
+            "expected LockfileUpdateRequired, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn lint_locked_errors_when_jre_toolchain_tarball_hashes_missing() {
+        // The detekt JRE comes from the managed Kotlin/Native toolchain. Under
+        // --locked, a clean-machine install is only allowed when the toolchain
+        // tarballs are pinned; a version-only lockfile entry must fail before
+        // installing anything.
+        let detekt_version = "99.0.6-locked-jre";
+        let jar = super::detekt_jar_path(detekt_version).unwrap();
+        std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
+        let content = b"fake jar for locked jre test";
+        std::fs::write(&jar, content).unwrap();
+        let jar_hash = konvoy_util::hash::sha256_bytes(content);
+
+        let kotlin_version = "0.0.0-locked-jre-test";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("konvoy.toml"),
+            format!(
+                "[package]\nname = \"demo\"\n\n[toolchain]\nkotlin = \"{kotlin_version}\"\ndetekt = \"{detekt_version}\"\n"
+            ),
+        )
+        .unwrap();
+        let lockfile = konvoy_config::lockfile::Lockfile {
+            toolchain: Some(konvoy_config::lockfile::ToolchainLock {
+                konanc_version: kotlin_version.to_owned(),
+                konanc_tarball_sha256: None,
+                jre_tarball_sha256: None,
+                detekt_version: Some(detekt_version.to_owned()),
+                detekt_jar_sha256: Some(jar_hash),
+            }),
+            ..Default::default()
+        };
+        lockfile.write_to(&root.join("konvoy.lock")).unwrap();
+
+        let result = super::lint(
+            root,
+            &super::LintOptions {
+                verbose: false,
+                config: None,
+            },
+            crate::common::test_resolver(false, true),
+        );
+
+        let _ = std::fs::remove_file(&jar);
+        let _ = std::fs::remove_dir(jar.parent().unwrap());
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::EngineError::LockfileUpdateRequired)
+            ),
+            "expected LockfileUpdateRequired before JRE install, got: {result:?}"
         );
     }
 

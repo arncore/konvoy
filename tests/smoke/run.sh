@@ -6,6 +6,7 @@
 #
 # Usage:
 #   bash tests/smoke/run.sh
+#   SMOKE_FILTER='<regex>' bash tests/smoke/run.sh   # run only matching tests
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -74,6 +75,7 @@ info "Running smoke tests..."
 echo ""
 
 docker run --rm \
+    -e SMOKE_FILTER \
     "$IMAGE_NAME" \
     bash /build/tests/smoke/tests.sh
 

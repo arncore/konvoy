@@ -9,7 +9,7 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use konvoy_config::lockfile::{DepSource, DependencyLock, Lockfile, PluginLock};
 use konvoy_config::manifest::{Manifest, PackageKind};
 use konvoy_config::Profile;
-use konvoy_konanc::detect::{resolve_konanc, KonancInfo};
+use konvoy_konanc::detect::KonancInfo;
 use konvoy_konanc::invoke::{KonancCommand, ProduceKind};
 use konvoy_targets::{host_target, Target};
 
@@ -29,14 +29,23 @@ pub struct BuildOptions {
     pub verbose: bool,
     /// Force a rebuild, bypassing the cache.
     pub force: bool,
-    /// Require the lockfile to be up-to-date; error on any mismatch.
-    pub locked: bool,
 }
 
 impl BuildOptions {
     /// Returns `true` when the build is in release mode.
     pub fn is_release(&self) -> bool {
         matches!(self.profile, Profile::Release)
+    }
+}
+
+impl Default for BuildOptions {
+    fn default() -> Self {
+        Self {
+            target: None,
+            profile: Profile::Debug,
+            verbose: false,
+            force: false,
+        }
     }
 }
 
@@ -179,39 +188,40 @@ fn predicted_effective_lockfile(
     konanc_tarball_sha256: Option<&str>,
     jre_tarball_sha256: Option<&str>,
     plugin_locks: &[PluginLock],
-    locked: bool,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Lockfile {
-    // In --locked mode the lockfile must not change. It already contains the
-    // plugin entries (the staleness check enforces this), so no fold is needed.
-    if locked {
-        return lockfile.clone();
-    }
+    resolver.cache_key_artifact_state(lockfile, || {
+        let mut effective = match &lockfile.toolchain {
+            // Lockfile already has the correct version — use as-is (preserves any
+            // existing tarball hashes and detekt info).
+            Some(tc) if tc.konanc_version == konanc_version => lockfile.clone(),
+            // Lockfile is missing or has a different version. Build the same
+            // lockfile that will eventually be written so the cache key is stable
+            // from the first build. Preserve existing dependencies (e.g. Maven deps
+            // written by `konvoy update`).
+            _ => {
+                let mut stabilized = Lockfile::with_managed_toolchain(
+                    konanc_version,
+                    konanc_tarball_sha256,
+                    jre_tarball_sha256,
+                );
+                stabilized.dependencies = lockfile.dependencies.clone();
+                // Mirror the detekt carry-forward that `update_lockfile_if_needed`
+                // applies to the WRITTEN lockfile, or the predicted cache-key
+                // lockfile would drop detekt and diverge from what gets written
+                // (one spurious recompile for detekt projects — issue #133 class).
+                carry_forward_detekt(&mut stabilized, lockfile);
+                stabilized
+            }
+        };
 
-    let mut effective = match &lockfile.toolchain {
-        // Lockfile already has the correct version — use as-is (preserves any
-        // existing tarball hashes and detekt info).
-        Some(tc) if tc.konanc_version == konanc_version => lockfile.clone(),
-        // Lockfile is missing or has a different version. Build the same
-        // lockfile that will eventually be written so the cache key is stable
-        // from the first build. Preserve existing dependencies (e.g. Maven deps
-        // written by `konvoy update`).
-        _ => {
-            let mut stabilized = Lockfile::with_managed_toolchain(
-                konanc_version,
-                konanc_tarball_sha256,
-                jre_tarball_sha256,
-            );
-            stabilized.dependencies = lockfile.dependencies.clone();
-            stabilized
-        }
-    };
-
-    // Fold the predicted [[plugins]] entries into the effective lockfile in
-    // BOTH branches above, matching what `update_lockfile_if_needed` writes
-    // (`updated.plugins = plugin_locks`). This keeps the cache key identical
-    // across the first and second builds of a project with plugins.
-    effective.plugins = plugin_locks.to_vec();
-    effective
+        // Fold the predicted [[plugins]] entries into the effective lockfile in
+        // BOTH branches above, matching what `update_lockfile_if_needed` writes
+        // (`updated.plugins = plugin_locks`). This keeps the cache key identical
+        // across the first and second builds of a project with plugins.
+        effective.plugins = plugin_locks.to_vec();
+        effective
+    })
 }
 
 /// Resolve the common build pipeline state (steps 1–7a).
@@ -230,7 +240,7 @@ fn predicted_effective_lockfile(
 pub(crate) fn resolve_build_context(
     project_root: &Path,
     options: &BuildOptions,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<ResolvedBuildContext, EngineError> {
     // 1. Read konvoy.toml.
     let manifest_path = project_root.join("konvoy.toml");
@@ -240,45 +250,70 @@ pub(crate) fn resolve_build_context(
     let lockfile_path = project_root.join("konvoy.lock");
     let lockfile = Lockfile::from_path(&lockfile_path)?;
 
-    // `net` is the process-wide outbound-HTTP funnel, constructed once at the
-    // program entry point and threaded in here (see konvoy_util::net) — every
-    // fetch below routes through it.
+    // `resolver` is the command-scoped artifact resolver, constructed once at
+    // the program entry point next to the process-wide NetworkClient and
+    // threaded through everything that may fetch or reject artifact resolution.
 
-    // 3. Auto-resolve Maven deps if needed (unless --locked).
+    // 3. Auto-resolve Maven deps if needed (unless --locked or --offline).
     //    When the manifest declares Maven deps that aren't in the lockfile,
     //    run `konvoy update` automatically so users don't have to.
-    let lockfile = if !options.locked && has_unresolved_maven_deps(&manifest, &lockfile) {
-        eprintln!("  Maven dependencies not resolved \u{2014} running update automatically...");
-        crate::update::update(project_root, net)?;
-        // Re-read the lockfile after update wrote it.
-        Lockfile::from_path(&lockfile_path)?
-    } else {
-        lockfile
+    //    - Under --locked the branch is skipped and the staleness check below
+    //      reports the drift (this also makes drift win under --frozen).
+    //    - Under --offline auto-resolving is forbidden outright: `update`
+    //      fetches POMs and klibs from Maven Central, so an unresolved dep is
+    //      a hard error here instead of a silent network access.
+    let lockfile = match first_unresolved_maven_dep(&manifest, &lockfile) {
+        Some(name) => {
+            resolver.resolve_missing_maven_dependencies(project_root, &lockfile_path, name)?
+        }
+        _ => lockfile,
     };
 
     // In --locked mode, verify the lockfile is complete and consistent
     // with what konvoy.toml specifies before doing any work.
-    if options.locked {
-        check_lockfile_staleness(&manifest, &lockfile)?;
-    }
+    resolver.require_manifest_artifacts_resolvable(&manifest, &lockfile)?;
 
     // 4. Resolve target.
     let target = resolve_target(&options.target)?;
     let profile = options.profile;
 
-    // 5. Resolve managed konanc toolchain. `resolve_konanc` auto-installs a
-    //    missing toolchain (a network download), which --locked forbids — fail
-    //    with an actionable error instead.
-    if options.locked && !konvoy_konanc::toolchain::is_installed(&manifest.toolchain.kotlin)? {
-        return Err(EngineError::ToolchainLocked {
-            version: manifest.toolchain.kotlin,
-        });
-    }
-    let resolved = resolve_konanc(&manifest.toolchain.kotlin, net)?;
+    // 5. Resolve the managed konanc toolchain. `resolve_konanc` auto-installs a
+    //    missing toolchain (a network download); gate that download through the
+    //    shared --locked/--offline policy. Under --locked a pinned-but-absent
+    //    toolchain is downloaded (and its tarball SHA verified); only --offline
+    //    turns an absent toolchain into a hard error.
+    //
+    //    `has_pin` here is "the lockfile pins this toolchain's version". Version
+    //    drift is already caught up-front by `check_lockfile_staleness` under
+    //    --locked, so the `LockfileDrift` arm is defensive. The konanc *tarball*
+    //    SHA is a separate integrity pin, verified just below (and in
+    //    `update_lockfile_if_needed`); it cannot gate a cached toolchain — see
+    //    #296.
+    let resolved = resolver.resolve_toolchain(&manifest.toolchain.kotlin, &lockfile)?;
     let konanc = resolved.info;
     let jre_home = resolved.jre_home;
     let konanc_tarball_sha256 = resolved.konanc_tarball_sha256;
     let jre_tarball_sha256 = resolved.jre_tarball_sha256;
+
+    // Fast-fail tarball integrity check: if the toolchain was freshly downloaded
+    // (`Some(sha)`) and the lockfile pins a different SHA *for this same
+    // version*, fail now — before any heavy build work — instead of after
+    // compiling at the lockfile-write step. `--force` defers entirely to
+    // `update_lockfile_if_needed`, which warns and rewrites.
+    //
+    // NOTE: a CACHED toolchain (resolve_konanc returns `None`) cannot be verified
+    // against its pin here — the Kotlin/Native tarball is discarded after
+    // extraction, so there is nothing left to hash. Verifying a cached toolchain
+    // against its pinned SHA is tracked as a follow-up (issue #296).
+    if !options.force {
+        verify_toolchain_tarball_pins(
+            &lockfile,
+            &konanc.version,
+            konanc_tarball_sha256.as_deref(),
+            jre_tarball_sha256.as_deref(),
+            false,
+        )?;
+    }
 
     // 6. Resolve plugin artifacts, then pre-stabilize the lockfile for
     //    cache-key consistency (issue #133).
@@ -302,12 +337,8 @@ pub(crate) fn resolve_build_context(
     // `ensure_plugin_artifacts` only re-verifies hashes — it does not download.
     let (plugin_jars, plugin_locks) = if !manifest.plugins.is_empty() {
         let resolved_artifacts = crate::plugin::resolve_plugin_artifacts(&manifest)?;
-        let results = crate::plugin::ensure_plugin_artifacts(
-            &resolved_artifacts,
-            &lockfile,
-            options.locked,
-            net,
-        )?;
+        let results =
+            crate::plugin::ensure_plugin_artifacts(&resolved_artifacts, &lockfile, resolver)?;
         let locks = crate::plugin::build_plugin_locks(&results);
         let jars: Vec<PathBuf> = results.iter().map(|r| r.path.clone()).collect();
         (jars, locks)
@@ -324,7 +355,7 @@ pub(crate) fn resolve_build_context(
         konanc_tarball_sha256.as_deref(),
         jre_tarball_sha256.as_deref(),
         &plugin_locks,
-        options.locked,
+        resolver,
     );
 
     // 7. Resolve dependencies and build them in topological order.
@@ -380,7 +411,7 @@ pub(crate) fn resolve_build_context(
     // 7a. Resolve and download Maven dependency klibs for the current target.
     //     Each Maven klib comes back with a precomputed sha256 from
     //     `download_artifact`, which the cache-key code reuses to skip rehashing.
-    let maven_klibs = resolve_maven_deps(&effective_lockfile, &target, net)?;
+    let maven_klibs = resolve_maven_deps(&effective_lockfile, &target, resolver)?;
     library_inputs.extend(maven_klibs);
 
     let store = ArtifactStore::new(project_root);
@@ -426,10 +457,10 @@ pub(crate) fn resolve_build_context(
 pub fn build(
     project_root: &Path,
     options: &BuildOptions,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<BuildResult, EngineError> {
     let start = Instant::now();
-    let ctx = resolve_build_context(project_root, options, net)?;
+    let ctx = resolve_build_context(project_root, options, resolver)?;
 
     // 8. Build the root project.
     let cc = CompileContext {
@@ -461,7 +492,7 @@ pub fn build(
         project_root,
         &lockfile_path,
         options.force,
-        options.locked,
+        resolver,
     )?;
 
     Ok(BuildResult {
@@ -482,7 +513,7 @@ pub(crate) struct CompileContext<'a> {
     pub jre_home: Option<&'a Path>,
     /// Kotlin/Native compilation target.
     pub target: &'a Target,
-    /// Build options (release, verbose, force, locked).
+    /// Build options (release, verbose, force).
     pub options: &'a BuildOptions,
     /// Dependency `.klib` inputs (path + optional pre-computed hash).
     ///
@@ -806,7 +837,7 @@ struct PreparedKlib<'a> {
 pub(crate) fn resolve_maven_deps(
     lockfile: &Lockfile,
     target: &Target,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<Vec<LibraryInput>, EngineError> {
     use rayon::prelude::IndexedParallelIterator;
 
@@ -906,7 +937,7 @@ pub(crate) fn resolve_maven_deps(
     let klib_inputs: Vec<Result<LibraryInput, EngineError>> = prepared
         .par_iter()
         .zip(aligned_bars.par_iter())
-        .map(|(p, maybe_bar)| download_one_klib(p, *maybe_bar, net))
+        .map(|(p, maybe_bar)| download_one_klib(p, *maybe_bar, resolver))
         .collect();
 
     // Trailing newline only if we actually rendered any bars.
@@ -923,36 +954,24 @@ pub(crate) fn resolve_maven_deps(
 fn download_one_klib(
     p: &PreparedKlib<'_>,
     maybe_bar: Option<&konvoy_util::progress::DownloadBar>,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<LibraryInput, EngineError> {
-    let dep_name = p.entry.name.to_owned();
-    let result = konvoy_util::progress::fetch(
-        net,
-        &p.url,
-        &p.dest,
-        Some(p.expected_sha256),
-        &dep_name,
-        maybe_bar,
-    )
-    .map_err(|e| EngineError::LibraryDownloadFailed {
-        name: dep_name,
-        url: p.url.clone(),
-        message: e.to_string(),
-    })?;
-    // `progress::fetch` already enforces `expected_sha256` (via
-    // `check_cached` on hit, `download_artifact` on miss), so `result.sha256`
-    // is guaranteed to match. Carry the freshly-verified hash through so
-    // `build_single` can reuse it for the cache key without re-reading.
-    Ok(LibraryInput::with_hash(result.path, result.sha256))
+    resolver.resolve_maven_klib(p.entry.name, &p.url, &p.dest, p.expected_sha256, maybe_bar)
 }
 
-/// Returns `true` if the manifest declares Maven deps that have no matching
-/// lockfile entry. Used to trigger automatic `konvoy update` during build.
-pub(crate) fn has_unresolved_maven_deps(manifest: &Manifest, lockfile: &Lockfile) -> bool {
+/// Returns the name of the first manifest Maven dep that has no matching
+/// lockfile entry, or `None` when everything is resolved. Used to trigger the
+/// automatic `konvoy update` during build — or, under `--offline`, to refuse
+/// it with the offending dependency named in the error.
+pub(crate) fn first_unresolved_maven_dep(
+    manifest: &Manifest,
+    lockfile: &Lockfile,
+) -> Option<String> {
     manifest
         .dependencies
         .iter()
-        .any(|(name, spec)| spec.is_maven() && !lockfile.has_maven_entry(name))
+        .find(|(name, spec)| spec.is_maven() && !lockfile.has_maven_entry(name))
+        .map(|(name, _)| name.clone())
 }
 
 /// Check that the lockfile is complete and consistent with the manifest.
@@ -989,9 +1008,12 @@ pub(crate) fn check_lockfile_staleness(
         }
     }
 
-    // Each declared plugin must have a matching lockfile entry.
+    // Each declared plugin must have a *pinned* lockfile entry. Use the same
+    // `find_lockfile_hash` the resolver gate uses, so this fast-fail and the
+    // per-artifact gate agree that an empty `sha256` is "no pin" — otherwise a
+    // malformed entry would slip past this check only to fail deeper in.
     for plugin_name in manifest.plugins.keys() {
-        if !lockfile.plugins.iter().any(|p| p.name == *plugin_name) {
+        if crate::plugin::find_lockfile_hash(lockfile, plugin_name).is_none() {
             return Err(EngineError::LockfileUpdateRequired);
         }
     }
@@ -1022,20 +1044,18 @@ fn update_lockfile_if_needed(
     project_root: &Path,
     lockfile_path: &Path,
     force: bool,
-    locked: bool,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<(), EngineError> {
     // Check for dependency source hash mismatches.
     // In --locked mode this is a hard error; otherwise warn and continue.
     for dep in &dep_graph.order {
         if let Some(locked_dep) = lockfile.dependencies.iter().find(|d| d.name == dep.name) {
             if locked_dep.source_hash != dep.source_hash && !dep.source_hash.is_empty() {
-                if locked {
-                    return Err(EngineError::DependencyHashMismatch {
-                        name: dep.name.clone(),
-                        expected: locked_dep.source_hash.clone(),
-                        actual: dep.source_hash.clone(),
-                    });
-                }
+                resolver.resolve_changed_dependency_source(
+                    &dep.name,
+                    &locked_dep.source_hash,
+                    &dep.source_hash,
+                )?;
                 eprintln!(
                     "warning: dependency `{}` source has changed (locked: {}, current: {})",
                     dep.name,
@@ -1047,16 +1067,18 @@ fn update_lockfile_if_needed(
     }
 
     // Build new dependency lock entries from path deps in the dep graph.
+    // Dep roots come back canonicalized (absolute) from `resolve_dep_path`;
+    // canonicalize the project root too so the relative computation is between
+    // like paths even when the cwd contains symlinks (e.g. /tmp on macOS).
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
     let mut new_deps: Vec<DependencyLock> = dep_graph
         .order
         .iter()
         .filter(|dep| !dep.source_hash.is_empty())
         .map(|dep| {
-            let rel_path = dep
-                .project_root
-                .strip_prefix(project_root)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| dep.project_root.display().to_string());
+            let rel_path = portable_dep_path(&canonical_root, &dep.project_root);
             DependencyLock {
                 name: dep.name.clone(),
                 source: DepSource::Path { path: rel_path },
@@ -1089,30 +1111,20 @@ fn update_lockfile_if_needed(
 
     // When the same version is re-downloaded and the lockfile already has hashes,
     // verify they match. A mismatch could indicate a tampered or rotated tarball.
-    // This is a hard error unless --force is used. When the version changed,
-    // different hashes are expected, so skip the check.
-    if !toolchain_changed {
-        if let Some(tc) = &lockfile.toolchain {
-            verify_tarball_hash(
-                "konanc",
-                &tc.konanc_tarball_sha256,
-                konanc_tarball_sha256,
-                force,
-            )?;
-            verify_tarball_hash("jre", &tc.jre_tarball_sha256, jre_tarball_sha256, force)?;
-        }
-    }
+    // This is a hard error unless --force is used (the helper skips the compare
+    // when the version changed — different hashes are expected then).
+    verify_toolchain_tarball_pins(
+        lockfile,
+        &konanc.version,
+        konanc_tarball_sha256,
+        jre_tarball_sha256,
+        force,
+    )?;
 
-    // In --locked mode, the lockfile must not be modified. If we reach here,
-    // something has changed (toolchain, deps, or hashes) that would require a write.
-    if locked {
-        return Err(EngineError::LockfileUpdateRequired);
-    }
-
-    // Build the updated lockfile. When the version hasn't changed, preserve
-    // existing hashes if no fresh download occurred. When the version changed,
-    // only use hashes from the fresh download (old hashes are for a different
-    // version's tarball and must not carry forward).
+    // Build the candidate lockfile that a write would produce. When the version
+    // hasn't changed, preserve existing hashes if no fresh download occurred.
+    // When the version changed, only use hashes from the fresh download (old
+    // hashes are for a different version's tarball and must not carry forward).
     let (final_konanc_sha, final_jre_sha) = if toolchain_changed {
         (
             konanc_tarball_sha256.map(str::to_owned),
@@ -1143,8 +1155,89 @@ fn update_lockfile_if_needed(
     );
     updated.dependencies = new_deps;
     updated.plugins = plugin_locks.to_vec();
-    updated.write_to(lockfile_path)?;
+    carry_forward_detekt(&mut updated, lockfile);
 
+    resolver.persist_resolved_artifacts(lockfile, &updated, lockfile_path)
+}
+
+/// Carry the detekt pin from `original` onto a freshly-rebuilt toolchain section.
+///
+/// `Lockfile::with_managed_toolchain` produces a toolchain section with no detekt
+/// fields. `konvoy build` does not manage detekt (it is written by `konvoy lint`),
+/// so every site that rebuilds the toolchain for a (possibly new) konanc version
+/// must restore the existing detekt pin. Otherwise a toolchain-changing build
+/// silently wipes detekt from the written lockfile AND the predicted cache-key
+/// lockfile and the written lockfile disagree, forcing a spurious recompile for
+/// detekt projects (issue #133 class). Centralized here so both call sites —
+/// `predicted_effective_lockfile` and `update_lockfile_if_needed` — stay in lockstep.
+fn carry_forward_detekt(rebuilt: &mut Lockfile, original: &Lockfile) {
+    if let (Some(rebuilt_tc), Some(orig_tc)) =
+        (rebuilt.toolchain.as_mut(), original.toolchain.as_ref())
+    {
+        rebuilt_tc.detekt_version = orig_tc.detekt_version.clone();
+        rebuilt_tc.detekt_jar_sha256 = orig_tc.detekt_jar_sha256.clone();
+    }
+}
+
+/// Render a dependency's root as a path RELATIVE to the project root for the
+/// lockfile, walking up with `..` when the dep lives outside the project tree
+/// (e.g. a sibling `path = "../my-lib"` dependency).
+///
+/// The lockfile is committed and compared byte-for-byte under `--locked`
+/// (`write_updated_lockfile`), so the stored path must be machine-independent.
+/// The old `strip_prefix` fallback wrote the dep's ABSOLUTE path whenever it
+/// wasn't under the project root, making the lockfile differ across checkout
+/// locations and `--locked` report spurious drift on any other machine.
+///
+/// Both arguments must be canonicalized for the component walk to line up;
+/// `resolve_dep_path` canonicalizes dep roots, and the caller canonicalizes
+/// the project root.
+fn portable_dep_path(project_root: &Path, dep_root: &Path) -> String {
+    let base: Vec<_> = project_root.components().collect();
+    let target: Vec<_> = dep_root.components().collect();
+    let common = base
+        .iter()
+        .zip(target.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let mut rel = PathBuf::new();
+    for _ in common..base.len() {
+        rel.push("..");
+    }
+    for component in target.iter().skip(common) {
+        rel.push(component);
+    }
+    if rel.as_os_str().is_empty() {
+        // dep_root == project_root; can't happen for a real dep (cycle
+        // detection rejects self-deps) but render something sensible.
+        return ".".to_owned();
+    }
+    rel.display().to_string()
+}
+
+/// Verify freshly-downloaded toolchain tarball SHAs against the lockfile pins.
+///
+/// Single authority for the konanc/JRE tarball integrity check, shared by the
+/// fast-fail in `resolve_build_context` and the pre-write check in
+/// `update_lockfile_if_needed`. Only compares when the lockfile pins the SAME
+/// toolchain version as the one just resolved: pins for a different version
+/// belong to a different tarball (e.g. the user bumped `kotlin` in konvoy.toml)
+/// and are replaced by the lockfile write, not validated here. `None` actuals
+/// (cached install, no fresh download) are skipped by `verify_tarball_hash`.
+fn verify_toolchain_tarball_pins(
+    lockfile: &Lockfile,
+    resolved_version: &str,
+    konanc_sha: Option<&str>,
+    jre_sha: Option<&str>,
+    force: bool,
+) -> Result<(), EngineError> {
+    if let Some(tc) = &lockfile.toolchain {
+        if tc.konanc_version == resolved_version {
+            verify_tarball_hash("konanc", &tc.konanc_tarball_sha256, konanc_sha, force)?;
+            verify_tarball_hash("jre", &tc.jre_tarball_sha256, jre_sha, force)?;
+        }
+    }
     Ok(())
 }
 
@@ -1272,22 +1365,93 @@ mod tests {
             profile: Profile::Debug,
             verbose: false,
             force: false,
-            locked: false,
         };
         let result = build(
             tmp.path(),
             &options,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::test_resolver(false, false),
         );
         assert!(result.is_err());
     }
 
     #[test]
-    fn build_locked_errors_when_toolchain_missing() {
-        // Manifest and lockfile agree on a Kotlin version that is never
-        // installed, so the build passes the staleness check and reaches
-        // toolchain resolution.
-        let kotlin_version = "0.0.0-locked-test";
+    fn build_offline_errors_when_toolchain_missing() {
+        // --offline (the NEW home for "absent artifact is a hard error"): the
+        // manifest/lockfile agree on a Kotlin version that is never installed,
+        // so toolchain resolution fails fast without any network attempt.
+        let kotlin_version = "0.0.0-offline-test";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("main.kt"), "fun main() {}\n").unwrap();
+        fs::write(
+            root.join("konvoy.toml"),
+            format!("[package]\nname = \"demo\"\n\n[toolchain]\nkotlin = \"{kotlin_version}\"\n"),
+        )
+        .unwrap();
+        Lockfile::with_toolchain(kotlin_version)
+            .write_to(&root.join("konvoy.lock"))
+            .unwrap();
+
+        let result = build(
+            root,
+            &BuildOptions::default(),
+            crate::common::test_resolver(true, false),
+        );
+
+        assert!(result.is_err(), "expected Err, got: {result:?}");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("--offline"),
+            "error should mention --offline: {err}"
+        );
+        assert!(
+            err.contains(kotlin_version),
+            "error should mention the toolchain version: {err}"
+        );
+    }
+
+    #[test]
+    fn build_locked_errors_on_toolchain_drift() {
+        // --locked's real failure mode is lockfile drift, NOT a missing download.
+        // The manifest pins one Kotlin version, the lockfile pins another, so the
+        // staleness check fails fast with `LockfileUpdateRequired` — before any
+        // toolchain resolution or network access.
+        let manifest_version = "0.0.0-locked-test";
+        let lockfile_version = "9.9.9-stale";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("main.kt"), "fun main() {}\n").unwrap();
+        fs::write(
+            root.join("konvoy.toml"),
+            format!("[package]\nname = \"demo\"\n\n[toolchain]\nkotlin = \"{manifest_version}\"\n"),
+        )
+        .unwrap();
+        Lockfile::with_toolchain(lockfile_version)
+            .write_to(&root.join("konvoy.lock"))
+            .unwrap();
+
+        let result = build(
+            root,
+            &BuildOptions {
+                ..Default::default()
+            },
+            crate::common::test_resolver(false, true),
+        );
+
+        assert!(
+            matches!(result, Err(EngineError::LockfileUpdateRequired)),
+            "expected LockfileUpdateRequired, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn build_locked_errors_when_toolchain_tarball_hashes_missing() {
+        // A version-only toolchain entry is not enough to download under
+        // --locked: installing on a clean machine would fetch artifacts whose
+        // tarball hashes are not pinned in konvoy.lock.
+        let kotlin_version = "0.0.0-unpinned-locked-test";
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         fs::create_dir_all(root.join("src")).unwrap();
@@ -1304,24 +1468,73 @@ mod tests {
         let result = build(
             root,
             &BuildOptions {
-                target: None,
-                profile: Profile::Debug,
-                verbose: false,
-                force: false,
-                locked: true,
+                ..Default::default()
             },
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::test_resolver(false, true),
         );
 
-        assert!(result.is_err(), "expected Err, got: {result:?}");
-        let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("--locked"),
-            "error should mention --locked: {err}"
+            matches!(result, Err(EngineError::LockfileUpdateRequired)),
+            "expected LockfileUpdateRequired before any install, got: {result:?}"
         );
+    }
+
+    /// Manifest + lockfile fixture with one Maven dep that the lockfile does
+    /// NOT resolve — the state that triggers the automatic `konvoy update`.
+    fn project_with_unresolved_maven_dep(root: &Path) {
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("main.kt"), "fun main() {}\n").unwrap();
+        fs::write(
+            root.join("konvoy.toml"),
+            "[package]\nname = \"demo\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n\
+             [dependencies]\nmissing-dep = { maven = \"org.example:missing\", version = \"1.0.0\" }\n",
+        )
+        .unwrap();
+        Lockfile::with_toolchain("2.1.0")
+            .write_to(&root.join("konvoy.lock"))
+            .unwrap();
+    }
+
+    #[test]
+    fn build_offline_errors_on_unresolved_maven_deps() {
+        // --offline must NOT auto-run `konvoy update` — update fetches POMs and
+        // klibs from Maven Central. An unresolved Maven dep fails fast with the
+        // missing entry instead of touching the network.
+        let tmp = tempfile::tempdir().unwrap();
+        project_with_unresolved_maven_dep(tmp.path());
+
+        let result = build(
+            tmp.path(),
+            &BuildOptions::default(),
+            crate::common::test_resolver(true, false),
+        );
+
+        match result {
+            Err(EngineError::MissingLockfileEntry { name }) => assert_eq!(name, "missing-dep"),
+            other => panic!("expected MissingLockfileEntry, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_frozen_unresolved_maven_dep_reports_drift() {
+        // --locked --offline with an unresolved Maven dep: drift is the
+        // actionable root cause (the lockfile must be regenerated either way),
+        // so the staleness check's LockfileUpdateRequired wins over the
+        // offline error.
+        let tmp = tempfile::tempdir().unwrap();
+        project_with_unresolved_maven_dep(tmp.path());
+
+        let result = build(
+            tmp.path(),
+            &BuildOptions {
+                ..Default::default()
+            },
+            crate::common::test_resolver(true, true),
+        );
+
         assert!(
-            err.contains(kotlin_version),
-            "error should mention the toolchain version: {err}"
+            matches!(result, Err(EngineError::LockfileUpdateRequired)),
+            "expected LockfileUpdateRequired, got: {result:?}"
         );
     }
 
@@ -1342,12 +1555,11 @@ mod tests {
             profile: Profile::Debug,
             verbose: false,
             force: false,
-            locked: false,
         };
         let result = build(
             &project,
             &options,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::test_resolver(false, false),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1431,7 +1643,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
         assert!(lockfile_path.exists());
@@ -1464,7 +1676,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
     }
@@ -1493,7 +1705,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
         let content = fs::read_to_string(&lockfile_path).unwrap();
@@ -1522,7 +1734,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -1538,19 +1750,12 @@ mod tests {
 
     #[test]
     fn build_options_defaults() {
-        let opts = BuildOptions {
-            target: None,
-            profile: Profile::Debug,
-            verbose: false,
-            force: false,
-            locked: false,
-        };
+        let opts = BuildOptions::default();
         assert!(opts.target.is_none());
         assert_eq!(opts.profile, Profile::Debug);
         assert!(!opts.is_release());
         assert!(!opts.verbose);
         assert!(!opts.force);
-        assert!(!opts.locked);
     }
 
     #[test]
@@ -1587,7 +1792,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
         let content = fs::read_to_string(&lockfile_path).unwrap();
@@ -1634,7 +1839,6 @@ mod tests {
             profile: Profile::Debug,
             verbose: false,
             force: false,
-            locked: false,
         };
 
         // Compute the cache key that build_single would compute.
@@ -1721,7 +1925,6 @@ mod tests {
             profile: Profile::Debug,
             verbose: false,
             force: false,
-            locked: false,
         };
 
         // Compute cache key the same way build_single does (without test sources).
@@ -1803,7 +2006,6 @@ mod tests {
             profile: Profile::Debug,
             verbose: false,
             force: false,
-            locked: false,
         };
 
         // Compute cache key before adding the outside file.
@@ -1911,7 +2113,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -1950,7 +2152,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -1988,7 +2190,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -2022,7 +2224,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::test_resolver(false, false),
         );
 
         assert!(result.is_err());
@@ -2063,7 +2265,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             true,
-            false,
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -2100,7 +2302,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -2136,7 +2338,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -2193,7 +2395,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            true, // locked = true
+            crate::common::test_resolver(false, true), // locked = true
         );
 
         assert!(result.is_err());
@@ -2254,7 +2456,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false, // locked = false
+            crate::common::test_resolver(false, false), // locked = false
         );
 
         assert!(result.is_ok());
@@ -2282,9 +2484,14 @@ mod tests {
             fingerprint: "abc".to_owned(),
         };
 
+        // Dep roots are canonicalized in production (`resolve_dep_path`), so
+        // mirror that here — the candidate lockfile's relative path must come
+        // out as exactly "my-lib" to match the stored entry.
+        let lib_dir = tmp.path().join("my-lib");
+        fs::create_dir_all(&lib_dir).unwrap();
         let dep = crate::resolve::ResolvedDep {
             name: "my-lib".to_owned(),
-            project_root: tmp.path().join("my-lib"),
+            project_root: lib_dir.canonicalize().unwrap(),
             manifest: konvoy_config::manifest::Manifest::from_str(
                 "[package]\nname = \"my-lib\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
                 "konvoy.toml",
@@ -2306,7 +2513,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            true, // locked = true
+            crate::common::test_resolver(false, true), // locked = true
         );
 
         assert!(result.is_ok());
@@ -2385,7 +2592,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            true, // locked = true
+            crate::common::test_resolver(false, true), // locked = true
         );
 
         assert!(result.is_err());
@@ -2393,6 +2600,425 @@ mod tests {
         assert!(
             err.contains("lockfile is out of date"),
             "expected lockfile update error, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_toolchain_tarball_pins
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn verify_toolchain_pins_skips_on_version_change() {
+        // The lockfile pins 2.0.0's tarball SHAs; a fresh 2.1.0 download (user
+        // bumped `kotlin` in konvoy.toml) must NOT be compared against them —
+        // different version, different tarball. Comparing would spuriously
+        // report TarballHashMismatch on every legitimate toolchain upgrade.
+        let lockfile = Lockfile::with_managed_toolchain("2.0.0", Some("old-sha"), Some("old-jre"));
+        verify_toolchain_tarball_pins(&lockfile, "2.1.0", Some("new-sha"), Some("new-jre"), false)
+            .unwrap();
+    }
+
+    #[test]
+    fn verify_toolchain_pins_errors_on_same_version_mismatch() {
+        // Same version, fresh download disagrees with the pin: tampered or
+        // rotated upstream tarball — hard error without --force.
+        let lockfile =
+            Lockfile::with_managed_toolchain("2.1.0", Some("pinned"), Some("pinned-jre"));
+        let result =
+            verify_toolchain_tarball_pins(&lockfile, "2.1.0", Some("tampered"), None, false);
+        assert!(
+            matches!(result, Err(EngineError::TarballHashMismatch { .. })),
+            "expected TarballHashMismatch, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_toolchain_pins_ok_on_match_and_on_cached() {
+        let lockfile =
+            Lockfile::with_managed_toolchain("2.1.0", Some("pinned"), Some("pinned-jre"));
+        // Fresh download matches the pin.
+        verify_toolchain_tarball_pins(
+            &lockfile,
+            "2.1.0",
+            Some("pinned"),
+            Some("pinned-jre"),
+            false,
+        )
+        .unwrap();
+        // Cached install (no fresh SHAs) — nothing to compare.
+        verify_toolchain_tarball_pins(&lockfile, "2.1.0", None, None, false).unwrap();
+        // No toolchain section at all.
+        verify_toolchain_tarball_pins(&Lockfile::default(), "2.1.0", Some("x"), None, false)
+            .unwrap();
+    }
+
+    #[test]
+    fn update_lockfile_locked_same_pin_redownload_is_ok() {
+        // A --locked build that re-downloads the already-pinned toolchain gets
+        // fresh tarball SHAs back. When those SHAs are identical to what the
+        // lockfile already pins, nothing actually changes — so this must NOT be
+        // treated as lockfile drift. (Regression: the old `if locked { Err }`
+        // guard fired before checking whether the candidate lockfile differed.)
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile = Lockfile::with_managed_toolchain("2.1.0", Some("pinned1"), Some("pinned2"));
+        lockfile.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        // Fresh download returns the SAME SHAs the lockfile already pins.
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        let result = update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            Some("pinned1"),
+            Some("pinned2"),
+            &empty_graph,
+            &[],
+            tmp.path(),
+            &lockfile_path,
+            false,
+            crate::common::test_resolver(false, true), // locked = true
+        );
+
+        assert!(
+            result.is_ok(),
+            "re-downloading the already-pinned toolchain under --locked must not be drift: {result:?}"
+        );
+        // The lockfile content must be byte-identical (no spurious rewrite).
+        let after = fs::read_to_string(&lockfile_path).unwrap();
+        let expected = toml::to_string_pretty(&lockfile).unwrap();
+        assert_eq!(after, expected, "lockfile should be unchanged");
+    }
+
+    #[test]
+    fn update_lockfile_locked_none_to_some_pin_is_drift() {
+        // Edge case the fix must preserve: the lockfile pins the version but has
+        // no tarball SHA (None), and a fresh download yields one (Some). The
+        // candidate lockfile genuinely differs from disk, so under --locked this
+        // stays `LockfileUpdateRequired` (it is real drift — the lockfile would
+        // gain a hash).
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile = Lockfile::with_toolchain("2.1.0"); // konanc_tarball_sha256 = None
+        lockfile.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        let result = update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            Some("freshhash1"),
+            Some("freshhash2"),
+            &empty_graph,
+            &[],
+            tmp.path(),
+            &lockfile_path,
+            false,
+            crate::common::test_resolver(false, true), // locked = true
+        );
+
+        assert!(matches!(result, Err(EngineError::LockfileUpdateRequired)));
+    }
+
+    #[test]
+    fn update_lockfile_build_preserves_detekt_info() {
+        // `konvoy build` does not manage detekt, but a toolchain change forces a
+        // lockfile rewrite. The rewrite must carry the existing detekt pin
+        // forward instead of dropping it (the candidate is built from
+        // `with_managed_toolchain`, which has no detekt fields).
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile = Lockfile {
+            toolchain: Some(konvoy_config::lockfile::ToolchainLock {
+                konanc_version: "2.0.0".to_owned(),
+                konanc_tarball_sha256: Some("old1".to_owned()),
+                jre_tarball_sha256: Some("old2".to_owned()),
+                detekt_version: Some("1.23.7".to_owned()),
+                detekt_jar_sha256: Some("detektsha".to_owned()),
+            }),
+            ..Default::default()
+        };
+        lockfile.write_to(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(), // toolchain version changed
+            fingerprint: "abc".to_owned(),
+        };
+
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            &[],
+            tmp.path(),
+            &lockfile_path,
+            false,
+            crate::common::test_resolver(false, false),
+        )
+        .unwrap();
+
+        let reparsed = Lockfile::from_path(&lockfile_path).unwrap();
+        let tc = reparsed.toolchain.as_ref().unwrap();
+        assert_eq!(tc.konanc_version, "2.1.0");
+        assert_eq!(
+            tc.detekt_version.as_deref(),
+            Some("1.23.7"),
+            "detekt version must survive a toolchain-changing build"
+        );
+        assert_eq!(
+            tc.detekt_jar_sha256.as_deref(),
+            Some("detektsha"),
+            "detekt jar hash must survive a toolchain-changing build"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // portable_dep_path / lockfile path-dep portability
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn portable_dep_path_in_tree() {
+        assert_eq!(
+            portable_dep_path(Path::new("/w/app"), Path::new("/w/app/libs/x")),
+            "libs/x"
+        );
+    }
+
+    #[test]
+    fn portable_dep_path_sibling() {
+        assert_eq!(
+            portable_dep_path(Path::new("/w/app"), Path::new("/w/my-lib")),
+            "../my-lib"
+        );
+    }
+
+    #[test]
+    fn portable_dep_path_two_levels_up() {
+        assert_eq!(
+            portable_dep_path(Path::new("/w/nested/app"), Path::new("/w/my-lib")),
+            "../../my-lib"
+        );
+    }
+
+    #[test]
+    fn portable_dep_path_same_dir() {
+        assert_eq!(
+            portable_dep_path(Path::new("/w/app"), Path::new("/w/app")),
+            "."
+        );
+    }
+
+    /// Build a lib-manifest `ResolvedDep` rooted at `root` for the path-dep
+    /// lockfile tests.
+    fn resolved_path_dep(
+        name: &str,
+        root: PathBuf,
+        source_hash: &str,
+    ) -> crate::resolve::ResolvedDep {
+        crate::resolve::ResolvedDep {
+            name: name.to_owned(),
+            project_root: root,
+            manifest: konvoy_config::manifest::Manifest::from_str(
+                &format!(
+                    "[package]\nname = \"{name}\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n"
+                ),
+                "konvoy.toml",
+            )
+            .unwrap(),
+            dep_names: Vec::new(),
+            source_hash: source_hash.to_owned(),
+        }
+    }
+
+    #[test]
+    fn update_lockfile_sibling_dep_writes_relative_path() {
+        // A sibling `../my-lib` dep must be recorded as a RELATIVE path. The
+        // old strip_prefix fallback wrote the dep's absolute path, making the
+        // committed lockfile machine-specific.
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        let lib = tmp.path().join("my-lib");
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(&lib).unwrap();
+        let lockfile_path = app.join("konvoy.lock");
+        Lockfile::with_toolchain("2.1.0")
+            .write_to(&lockfile_path)
+            .unwrap();
+        let lockfile = Lockfile::from_path(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+        let graph = crate::resolve::ResolvedGraph {
+            order: vec![resolved_path_dep(
+                "my-lib",
+                lib.canonicalize().unwrap(),
+                "hash1",
+            )],
+        };
+
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &graph,
+            &[],
+            &app,
+            &lockfile_path,
+            false,
+            crate::common::test_resolver(false, false),
+        )
+        .unwrap();
+
+        let written = Lockfile::from_path(&lockfile_path).unwrap();
+        let dep = written.dependencies.first().unwrap();
+        match &dep.source {
+            DepSource::Path { path } => {
+                assert_eq!(path, "../my-lib", "sibling dep must be stored relative");
+                assert!(
+                    !Path::new(path).is_absolute(),
+                    "lockfile path must not be machine-specific: {path}"
+                );
+            }
+            other => panic!("expected Path source, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn locked_build_with_sibling_dep_is_portable_across_checkouts() {
+        // THE portability property --locked exists for: a lockfile written at
+        // one checkout location must not report drift when the same project
+        // (same layout, same sources) builds --locked at a DIFFERENT location.
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        // Checkout A writes the lockfile.
+        let a = tempfile::tempdir().unwrap();
+        let a_app = a.path().join("app");
+        let a_lib = a.path().join("my-lib");
+        fs::create_dir_all(&a_app).unwrap();
+        fs::create_dir_all(&a_lib).unwrap();
+        let a_lock = a_app.join("konvoy.lock");
+        Lockfile::with_toolchain("2.1.0").write_to(&a_lock).unwrap();
+        let a_graph = crate::resolve::ResolvedGraph {
+            order: vec![resolved_path_dep(
+                "my-lib",
+                a_lib.canonicalize().unwrap(),
+                "hash1",
+            )],
+        };
+        update_lockfile_if_needed(
+            &Lockfile::from_path(&a_lock).unwrap(),
+            &konanc,
+            None,
+            None,
+            &a_graph,
+            &[],
+            &a_app,
+            &a_lock,
+            false,
+            crate::common::test_resolver(false, false),
+        )
+        .unwrap();
+
+        // Checkout B: same layout elsewhere, committed lockfile carried over.
+        let b = tempfile::tempdir().unwrap();
+        let b_app = b.path().join("app");
+        let b_lib = b.path().join("my-lib");
+        fs::create_dir_all(&b_app).unwrap();
+        fs::create_dir_all(&b_lib).unwrap();
+        let b_lock = b_app.join("konvoy.lock");
+        fs::copy(&a_lock, &b_lock).unwrap();
+        let b_graph = crate::resolve::ResolvedGraph {
+            order: vec![resolved_path_dep(
+                "my-lib",
+                b_lib.canonicalize().unwrap(),
+                "hash1",
+            )],
+        };
+
+        let result = update_lockfile_if_needed(
+            &Lockfile::from_path(&b_lock).unwrap(),
+            &konanc,
+            None,
+            None,
+            &b_graph,
+            &[],
+            &b_app,
+            &b_lock,
+            false,
+            crate::common::test_resolver(false, true), // locked = true
+        );
+
+        assert!(
+            result.is_ok(),
+            "a committed lockfile with a sibling path dep must not drift at a \
+             different checkout location: {result:?}"
+        );
+    }
+
+    #[test]
+    fn predicted_effective_lockfile_preserves_detekt_on_version_change() {
+        // Regression: the cache-key (predicted) lockfile and the WRITTEN lockfile
+        // must agree on detekt across a toolchain-version bump. The version-change
+        // branch of `predicted_effective_lockfile` rebuilds from
+        // `with_managed_toolchain` (no detekt fields); without carrying detekt
+        // forward it dropped the pin, so build #1 keyed on a detekt-less lockfile
+        // while the written lockfile kept detekt — a different key on build #2,
+        // forcing one spurious recompile for detekt projects (issue #133 class).
+        let lockfile = Lockfile {
+            toolchain: Some(konvoy_config::lockfile::ToolchainLock {
+                konanc_version: "2.0.0".to_owned(),
+                konanc_tarball_sha256: Some("old1".to_owned()),
+                jre_tarball_sha256: Some("old2".to_owned()),
+                detekt_version: Some("1.23.7".to_owned()),
+                detekt_jar_sha256: Some("detektsha".to_owned()),
+            }),
+            ..Default::default()
+        };
+
+        // Resolve a NEW konanc version (the user bumped `kotlin` in konvoy.toml),
+        // so the version-mismatch branch runs.
+        let effective = predicted_effective_lockfile(
+            &lockfile,
+            "2.1.0",
+            Some("new1"),
+            Some("new2"),
+            &[],
+            crate::common::test_resolver(false, false),
+        );
+
+        let tc = effective.toolchain.as_ref().unwrap();
+        assert_eq!(tc.konanc_version, "2.1.0");
+        assert_eq!(
+            tc.detekt_version.as_deref(),
+            Some("1.23.7"),
+            "predicted lockfile must preserve detekt version across a toolchain bump"
+        );
+        assert_eq!(
+            tc.detekt_jar_sha256.as_deref(),
+            Some("detektsha"),
+            "predicted lockfile must preserve detekt hash across a toolchain bump"
         );
     }
 
@@ -2458,7 +3084,6 @@ mod tests {
             profile: Profile::Debug,
             verbose: false,
             force: false,
-            locked: false,
         };
         let cc_no_force = CompileContext {
             konanc: &konanc,
@@ -2486,7 +3111,6 @@ mod tests {
             profile: Profile::Debug,
             verbose: false,
             force: true,
-            locked: false,
         };
         let cc_force = CompileContext {
             konanc: &konanc,
@@ -2600,7 +3224,7 @@ mod tests {
             None,
             None,
             &plugin_locks,
-            false,
+            crate::common::test_resolver(false, false),
         );
 
         // After the first build, `update_lockfile_if_needed` writes a lockfile
@@ -2616,7 +3240,7 @@ mod tests {
             None,
             None,
             &plugin_locks,
-            false,
+            crate::common::test_resolver(false, false),
         );
 
         let content_first = lockfile_toml_content(&effective_first).unwrap();
@@ -2700,16 +3324,14 @@ mod tests {
         let lockfile = Lockfile::default(); // No toolchain
         let konanc_version = "2.1.0";
 
-        // Simulate --locked mode: use the lockfile as-is.
-        let locked = true;
-        let effective = if locked {
-            lockfile.clone()
-        } else {
-            match &lockfile.toolchain {
-                Some(tc) if tc.konanc_version == konanc_version => lockfile.clone(),
-                _ => Lockfile::with_managed_toolchain(konanc_version, None, None),
-            }
-        };
+        let effective = predicted_effective_lockfile(
+            &lockfile,
+            konanc_version,
+            None,
+            None,
+            &[],
+            crate::common::test_resolver(false, true),
+        );
 
         // In locked mode, the empty lockfile is used without modification.
         assert!(
@@ -2889,6 +3511,35 @@ mod tests {
     }
 
     #[test]
+    fn check_lockfile_staleness_empty_plugin_sha_is_drift() {
+        // A plugin entry present by name but with an empty `sha256` is NOT a pin
+        // (the resolver gate treats it as unpinned). The up-front staleness check
+        // must agree and fast-fail, instead of passing here and tripping the
+        // per-artifact gate deeper in the build.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nkotlin-serialization = { maven = \"org.jetbrains.kotlin:kotlin-serialization-compiler-plugin\", version = \"{kotlin}\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "kotlin-serialization".to_owned(),
+            maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+            version: "2.1.0".to_owned(),
+            sha256: String::new(), // present by name but unpinned
+            url: "https://example.com/plugin.jar".to_owned(),
+        });
+
+        assert!(
+            matches!(
+                check_lockfile_staleness(&manifest, &lockfile),
+                Err(EngineError::LockfileUpdateRequired)
+            ),
+            "an empty plugin sha256 must fail the staleness check"
+        );
+    }
+
+    #[test]
     fn check_lockfile_staleness_no_plugins_in_manifest_ignores_lockfile_plugins() {
         // If manifest doesn't declare plugins, lockfile having plugin entries is fine.
         let manifest = konvoy_config::manifest::Manifest::from_str(
@@ -3030,7 +3681,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -3086,7 +3737,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -3157,7 +3808,7 @@ mod tests {
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
         assert!(
@@ -3176,7 +3827,7 @@ mod tests {
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
         assert!(
@@ -3205,7 +3856,7 @@ mod tests {
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::test_resolver(false, false),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -3213,6 +3864,90 @@ mod tests {
             err.contains("no hash for target"),
             "expected missing target hash error, got: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_maven_deps_offline_absent_errors() {
+        // --offline + a pinned-but-uncached Maven klib must hard-error
+        // (LibraryOffline) BEFORE any network fetch. The fake coordinate is never
+        // cached under ~/.konvoy, so `needs_download` is true.
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), "0".repeat(64));
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.dependencies.push(DependencyLock {
+            name: "phantom-lib".to_owned(),
+            source: DepSource::Maven {
+                version: "0.0.0-offline-absent".to_owned(),
+                maven: "com.example.offlinetest:phantom-lib".to_owned(),
+                targets,
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "hash".to_owned(),
+        });
+        let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
+
+        let result = resolve_maven_deps(
+            &lockfile,
+            &target,
+            crate::common::test_resolver(true, false),
+        );
+        match result {
+            Err(EngineError::LibraryOffline { name }) => assert_eq!(name, "phantom-lib"),
+            other => panic!("expected LibraryOffline, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_maven_deps_offline_cached_ok() {
+        // --offline + a present, hash-matching klib: re-verify the cached copy
+        // with no network and return it. Pre-seeds the real cache path the
+        // function derives, then cleans up.
+        let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
+        let suffix = target.to_maven_suffix();
+        let group = "com.example.offlinetest";
+        let artifact = "cached-lib";
+        let version = "9.9.9-offline-cached";
+
+        let cache_root = crate::plugin::maven_cache_root().unwrap();
+        let per_target = format!("{artifact}-{suffix}");
+        let coord = konvoy_util::maven::MavenCoordinate::new(group, &per_target, version)
+            .with_packaging("klib");
+        let dest = coord.cache_path(&cache_root);
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let content = b"cached klib content";
+        fs::write(&dest, content).unwrap();
+        let hash = konvoy_util::hash::sha256_bytes(content);
+
+        let mut targets = std::collections::BTreeMap::new();
+        targets.insert("linux_x64".to_owned(), hash.clone());
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.dependencies.push(DependencyLock {
+            name: "cached-lib".to_owned(),
+            source: DepSource::Maven {
+                version: version.to_owned(),
+                maven: format!("{group}:{artifact}"),
+                targets,
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "hash".to_owned(),
+        });
+
+        let result = resolve_maven_deps(
+            &lockfile,
+            &target,
+            crate::common::test_resolver(true, false),
+        );
+        // Clean up before asserting: remove the whole fake-group subtree
+        // (`com/example/offlinetest/...`) we created under the real cache,
+        // not just the leaf file. The group is unique to this test, so the
+        // recursive remove can't touch a real cached artifact.
+        let _ = fs::remove_dir_all(cache_root.join("com").join("example").join("offlinetest"));
+
+        let inputs = result.expect("cached klib should resolve under --offline");
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].precomputed_sha256.as_deref(), Some(hash.as_str()));
     }
 
     #[test]
@@ -3351,7 +4086,7 @@ linux_x64 = "1111"
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::test_resolver(false, false),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -3466,7 +4201,7 @@ linux_x64 = "1111"
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -3525,7 +4260,7 @@ linux_x64 = "1111"
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -3614,7 +4349,7 @@ linux_x64 = "1111"
             tmp.path(),
             &lockfile_path,
             false,
-            true, // locked = true
+            crate::common::test_resolver(false, true), // locked = true
         );
 
         assert!(result.is_err());
@@ -3668,7 +4403,7 @@ linux_x64 = "1111"
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -4159,7 +4894,7 @@ url = "https://example.com/plugin.jar"
             dir.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -4387,7 +5122,7 @@ url = "https://example.com/plugin.jar"
             dir.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -4472,7 +5207,7 @@ kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-comp
             dir.path(),
             &lockfile_path,
             false,
-            true, // locked = true
+            crate::common::test_resolver(false, true), // locked = true
         );
         assert!(
             result.is_err(),
@@ -4651,33 +5386,33 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
     }
 
     // -----------------------------------------------------------------------
-    // has_unresolved_maven_deps
+    // first_unresolved_maven_dep
     // -----------------------------------------------------------------------
 
     #[test]
-    fn has_unresolved_maven_deps_no_deps() {
+    fn first_unresolved_maven_dep_no_deps() {
         let manifest = konvoy_config::manifest::Manifest::from_str(
             "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
             "konvoy.toml",
         )
         .unwrap();
         let lockfile = Lockfile::with_toolchain("2.1.0");
-        assert!(!has_unresolved_maven_deps(&manifest, &lockfile));
+        assert!(first_unresolved_maven_dep(&manifest, &lockfile).is_none());
     }
 
     #[test]
-    fn has_unresolved_maven_deps_path_only() {
+    fn first_unresolved_maven_dep_path_only() {
         let manifest = konvoy_config::manifest::Manifest::from_str(
             "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nutils = { path = \"../utils\" }\n",
             "konvoy.toml",
         )
         .unwrap();
         let lockfile = Lockfile::with_toolchain("2.1.0");
-        assert!(!has_unresolved_maven_deps(&manifest, &lockfile));
+        assert!(first_unresolved_maven_dep(&manifest, &lockfile).is_none());
     }
 
     #[test]
-    fn has_unresolved_maven_deps_maven_present_in_lockfile() {
+    fn first_unresolved_maven_dep_maven_present_in_lockfile() {
         let manifest = konvoy_config::manifest::Manifest::from_str(
             "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-datetime = { maven = \"org.jetbrains.kotlinx:kotlinx-datetime\", version = \"0.6.0\" }\n",
             "konvoy.toml",
@@ -4695,22 +5430,25 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
             },
             source_hash: "hash".to_owned(),
         });
-        assert!(!has_unresolved_maven_deps(&manifest, &lockfile));
+        assert!(first_unresolved_maven_dep(&manifest, &lockfile).is_none());
     }
 
     #[test]
-    fn has_unresolved_maven_deps_maven_missing_from_lockfile() {
+    fn first_unresolved_maven_dep_maven_missing_from_lockfile() {
         let manifest = konvoy_config::manifest::Manifest::from_str(
             "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-datetime = { maven = \"org.jetbrains.kotlinx:kotlinx-datetime\", version = \"0.6.0\" }\n",
             "konvoy.toml",
         )
         .unwrap();
         let lockfile = Lockfile::with_toolchain("2.1.0");
-        assert!(has_unresolved_maven_deps(&manifest, &lockfile));
+        assert_eq!(
+            first_unresolved_maven_dep(&manifest, &lockfile).as_deref(),
+            Some("kotlinx-datetime")
+        );
     }
 
     #[test]
-    fn has_unresolved_maven_deps_path_entry_same_name_as_maven_dep() {
+    fn first_unresolved_maven_dep_path_entry_same_name_as_maven_dep() {
         // Lockfile has a path dep named "kotlinx-datetime" but manifest
         // declares it as a Maven dep — should detect as unresolved.
         let manifest = konvoy_config::manifest::Manifest::from_str(
@@ -4726,11 +5464,14 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
             },
             source_hash: "hash".to_owned(),
         });
-        assert!(has_unresolved_maven_deps(&manifest, &lockfile));
+        assert_eq!(
+            first_unresolved_maven_dep(&manifest, &lockfile).as_deref(),
+            Some("kotlinx-datetime")
+        );
     }
 
     #[test]
-    fn has_unresolved_maven_deps_one_resolved_one_not() {
+    fn first_unresolved_maven_dep_one_resolved_one_not() {
         let manifest = konvoy_config::manifest::Manifest::from_str(
             "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nkotlinx-datetime = { maven = \"org.jetbrains.kotlinx:kotlinx-datetime\", version = \"0.6.0\" }\nkotlinx-coroutines = { maven = \"org.jetbrains.kotlinx:kotlinx-coroutines-core\", version = \"1.8.0\" }\n",
             "konvoy.toml",
@@ -4749,7 +5490,10 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
             source_hash: "hash".to_owned(),
         });
         // kotlinx-coroutines is missing from lockfile.
-        assert!(has_unresolved_maven_deps(&manifest, &lockfile));
+        assert_eq!(
+            first_unresolved_maven_dep(&manifest, &lockfile).as_deref(),
+            Some("kotlinx-coroutines")
+        );
     }
 
     // ── normalize_konanc_output ─────────────────────────────────────────
@@ -4881,7 +5625,7 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
             tmp.path(),
             &lockfile_path,
             false,
-            true, // locked
+            crate::common::test_resolver(false, true), // locked
         );
         assert!(result.is_err());
     }
@@ -4910,7 +5654,7 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
             tmp.path(),
             &lockfile_path,
             false, // not force
-            false,
+            crate::common::test_resolver(false, false),
         );
         assert!(result.is_err(), "should detect tampered konanc hash");
     }
@@ -4939,7 +5683,7 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
             tmp.path(),
             &lockfile_path,
             true, // force
-            false,
+            crate::common::test_resolver(false, false),
         );
         assert!(result.is_ok(), "force should bypass hash mismatch");
     }

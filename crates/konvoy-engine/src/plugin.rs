@@ -120,17 +120,24 @@ pub fn resolve_plugin_artifacts(
 // Download / verification
 // ---------------------------------------------------------------------------
 
-/// Look up the expected SHA-256 for a plugin from the lockfile.
-fn find_lockfile_hash<'a>(lockfile: &'a Lockfile, plugin_name: &str) -> Option<&'a str> {
+/// Look up the pinned SHA-256 for a plugin from the lockfile.
+///
+/// An empty string is treated as "no pin", so a malformed or half-written entry
+/// falls back to download-and-record instead of being verified against an empty
+/// hash. Shared by the resolver's pin gate (`prepare_plugin_artifacts`) and its
+/// hash lookup (`resolve_plugin_artifact`) so the two agree on what "pinned"
+/// means.
+pub(crate) fn find_lockfile_hash<'a>(lockfile: &'a Lockfile, plugin_name: &str) -> Option<&'a str> {
     lockfile
         .plugins
         .iter()
         .find(|p| p.name == plugin_name)
         .map(|p| p.sha256.as_str())
+        .filter(|s| !s.is_empty())
 }
 
-/// Map a `UtilError::Download` to `EngineError::PluginDownload`.
-fn map_download_err(name: &str, e: konvoy_util::error::UtilError) -> EngineError {
+/// Map a `UtilError` from a plugin download into the matching `EngineError`.
+pub(crate) fn map_download_err(name: &str, e: konvoy_util::error::UtilError) -> EngineError {
     crate::error::map_artifact_download_err(
         name,
         e,
@@ -145,27 +152,24 @@ fn map_download_err(name: &str, e: konvoy_util::error::UtilError) -> EngineError
 
 /// Ensure all plugin artifacts are downloaded, hash-verified, and return results.
 ///
-/// In `--locked` mode, every artifact must already have a hash in the lockfile.
+/// Each artifact is gated through the shared `--locked` / `--offline` policy:
+/// under `--locked` a pinned-but-absent plugin is downloaded (only a missing pin
+/// is drift); under `--offline` an absent plugin is a hard error.
 ///
 /// # Errors
-/// Returns an error if an artifact is missing from the lockfile in locked mode,
-/// if a download fails, or if a hash does not match.
+/// Returns [`EngineError::LockfileUpdateRequired`] when a plugin has no lockfile
+/// pin under `--locked`, [`EngineError::PluginOffline`] when a pinned plugin is
+/// absent under `--offline`, or a download/hash error otherwise.
 pub fn ensure_plugin_artifacts(
     artifacts: &[ResolvedPluginArtifact],
     lockfile: &Lockfile,
-    locked: bool,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<Vec<PluginArtifactResult>, EngineError> {
     use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
-    // Fail fast in --locked mode before spawning any downloads.
-    if locked {
-        for artifact in artifacts {
-            if find_lockfile_hash(lockfile, &artifact.plugin_name).is_none() {
-                return Err(EngineError::LockfileUpdateRequired);
-            }
-        }
-    }
+    // Resolve artifact state once; the resolver owns locked/offline policy, and
+    // the returned cache snapshot drives progress-bar layout below.
+    let present = resolver.prepare_plugin_artifacts(artifacts, lockfile)?;
 
     if artifacts.is_empty() {
         return Ok(Vec::new());
@@ -177,8 +181,9 @@ pub fn ensure_plugin_artifacts(
     // downloaded.
     let download_labels: Vec<String> = artifacts
         .iter()
-        .filter(|a| !a.cache_path.exists())
-        .map(|a| format!("{} {}", a.plugin_name, a.maven_coord.version))
+        .zip(present.iter().copied())
+        .filter(|&(_, is_present)| !is_present)
+        .map(|(a, _)| format!("{} {}", a.plugin_name, a.maven_coord.version))
         .collect();
     let any_downloads = !download_labels.is_empty();
     let bars: Vec<konvoy_util::progress::DownloadBar> = if any_downloads {
@@ -187,41 +192,16 @@ pub fn ensure_plugin_artifacts(
         Vec::new()
     };
     let mut bar_iter = bars.iter();
-    let aligned_bars: Vec<Option<&konvoy_util::progress::DownloadBar>> = artifacts
+    let aligned_bars: Vec<Option<&konvoy_util::progress::DownloadBar>> = present
         .iter()
-        .map(|a| {
-            if a.cache_path.exists() {
-                None
-            } else {
-                bar_iter.next()
-            }
-        })
+        .map(|&is_present| if is_present { None } else { bar_iter.next() })
         .collect();
 
     let results: Vec<Result<PluginArtifactResult, EngineError>> = artifacts
         .par_iter()
         .zip(aligned_bars.par_iter())
         .map(|(artifact, maybe_bar)| {
-            let expected_hash = find_lockfile_hash(lockfile, &artifact.plugin_name);
-            let util_result = konvoy_util::progress::fetch(
-                net,
-                &artifact.url,
-                &artifact.cache_path,
-                expected_hash,
-                &artifact.plugin_name,
-                *maybe_bar,
-            )
-            .map_err(|e| map_download_err(&artifact.plugin_name, e))?;
-
-            Ok(PluginArtifactResult {
-                plugin_name: artifact.plugin_name.clone(),
-                path: util_result.path,
-                sha256: util_result.sha256,
-                url: artifact.url.clone(),
-                freshly_downloaded: util_result.freshly_downloaded,
-                maven: artifact.maven_coord.group_artifact(),
-                version: artifact.maven_coord.version.clone(),
-            })
+            resolver.resolve_plugin_artifact(artifact, lockfile, *maybe_bar)
         })
         .collect();
 
@@ -390,6 +370,26 @@ mod tests {
         let lockfile = Lockfile::default();
         let hash = find_lockfile_hash(&lockfile, "kotlin-serialization");
         assert!(hash.is_none());
+    }
+
+    #[test]
+    fn find_lockfile_hash_empty_string_is_not_a_pin() {
+        // An empty `sha256` is treated as "no pin" so a malformed/half-written
+        // entry falls back to download-and-record instead of being verified
+        // against an empty hash (which would always mismatch).
+        let lockfile = Lockfile {
+            plugins: vec![PluginLock {
+                name: "kotlin-serialization".to_owned(),
+                maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+                version: "2.1.0".to_owned(),
+                sha256: String::new(),
+                url: "https://example.com/plugin.jar".to_owned(),
+            }],
+            ..Lockfile::default()
+        };
+
+        let hash = find_lockfile_hash(&lockfile, "kotlin-serialization");
+        assert!(hash.is_none(), "empty sha256 must not count as a pin");
     }
 
     #[test]
@@ -831,8 +831,7 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &artifacts,
             &lockfile,
-            true,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::test_resolver(false, true),
         );
         assert!(
             result.is_err(),
@@ -845,14 +844,120 @@ mod tests {
     #[test]
     fn ensure_plugin_artifacts_empty_input_returns_empty() {
         let lockfile = Lockfile::default();
+        let result =
+            ensure_plugin_artifacts(&[], &lockfile, crate::common::test_resolver(false, false))
+                .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn ensure_plugin_artifacts_offline_absent_errors() {
+        // --offline + a pinned-but-absent plugin: hard error (PluginOffline),
+        // and the unreachable URL is never contacted (the precheck fires first).
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile = Lockfile {
+            plugins: vec![PluginLock {
+                name: "ser".to_owned(),
+                maven: "org.example:ser".to_owned(),
+                version: "1.0.0".to_owned(),
+                sha256: "0".repeat(64),
+                url: "http://example.com".to_owned(),
+            }],
+            ..Lockfile::default()
+        };
+        let artifacts = vec![ResolvedPluginArtifact {
+            plugin_name: "ser".to_owned(),
+            maven_coord: MavenCoordinate::new("org.example", "ser", "1.0.0"),
+            url: "http://127.0.0.1:1/ser.jar".to_owned(),
+            cache_path: tmp.path().join("ser.jar"), // does not exist
+        }];
+
         let result = ensure_plugin_artifacts(
-            &[],
+            &artifacts,
             &lockfile,
-            false,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::test_resolver(true, false),
+        );
+        match result {
+            Err(EngineError::PluginOffline { name }) => assert_eq!(name, "ser"),
+            other => panic!("expected PluginOffline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_plugin_artifacts_offline_present_ok() {
+        // --offline + a present, hash-matching plugin: re-verify the cached copy
+        // with no network, returning it successfully.
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_path = tmp.path().join("plugin.jar");
+        let content = b"present plugin content";
+        std::fs::write(&cache_path, content).unwrap();
+        let expected_hash = konvoy_util::hash::sha256_bytes(content);
+
+        let lockfile = Lockfile {
+            plugins: vec![PluginLock {
+                name: "present".to_owned(),
+                maven: "org.example:present".to_owned(),
+                version: "1.0.0".to_owned(),
+                sha256: expected_hash.clone(),
+                url: "http://example.com".to_owned(),
+            }],
+            ..Lockfile::default()
+        };
+        let artifacts = vec![ResolvedPluginArtifact {
+            plugin_name: "present".to_owned(),
+            maven_coord: MavenCoordinate::new("org.example", "present", "1.0.0"),
+            url: "http://127.0.0.1:1/present.jar".to_owned(), // unused
+            cache_path: cache_path.clone(),
+        }];
+
+        let result = ensure_plugin_artifacts(
+            &artifacts,
+            &lockfile,
+            crate::common::test_resolver(true, false),
         )
         .unwrap();
-        assert!(result.is_empty());
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].sha256, expected_hash);
+        assert!(!result[0].freshly_downloaded);
+    }
+
+    #[test]
+    fn ensure_plugin_artifacts_locked_pinned_absent_proceeds_to_download() {
+        // --locked + a pinned-but-absent plugin must PROCEED to download (the
+        // unified behavior), not fail-fast. The URL is unreachable, so we expect
+        // a download error — NOT LockfileUpdateRequired (which would mean the
+        // gate wrongly treated a pinned artifact as drift).
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile = Lockfile {
+            plugins: vec![PluginLock {
+                name: "pinned".to_owned(),
+                maven: "org.example:pinned".to_owned(),
+                version: "1.0.0".to_owned(),
+                sha256: "0".repeat(64),
+                url: "http://example.com".to_owned(),
+            }],
+            ..Lockfile::default()
+        };
+        let artifacts = vec![ResolvedPluginArtifact {
+            plugin_name: "pinned".to_owned(),
+            maven_coord: MavenCoordinate::new("org.example", "pinned", "1.0.0"),
+            url: "http://127.0.0.1:1/pinned.jar".to_owned(),
+            cache_path: tmp.path().join("pinned.jar"), // absent → must download
+        }];
+
+        let result = ensure_plugin_artifacts(
+            &artifacts,
+            &lockfile,
+            crate::common::test_resolver(false, true),
+        );
+        assert!(
+            result.is_err(),
+            "expected a download error, got: {result:?}"
+        );
+        assert!(
+            !matches!(result, Err(EngineError::LockfileUpdateRequired)),
+            "a pinned plugin under --locked must download, not report drift"
+        );
     }
 
     #[test]
@@ -890,8 +995,7 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &artifacts,
             &lockfile,
-            true,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::test_resolver(false, true),
         );
         assert!(matches!(result, Err(EngineError::LockfileUpdateRequired)));
     }
@@ -927,8 +1031,7 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &artifacts,
             &lockfile,
-            true,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
         assert_eq!(result.len(), 1);
@@ -956,8 +1059,7 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &[artifact],
             &lockfile,
-            false,
-            &konvoy_util::net::NetworkClient::new(false),
+            crate::common::test_resolver(false, false),
         );
         assert!(result.is_err());
     }

@@ -25,13 +25,24 @@ TEST_NAMES=()
 # Run a single test in the background.
 run_test() {
     local name="$1"
+
+    # Optional selective run: SMOKE_FILTER='<regex>' bash tests.sh
+    if [ -n "${SMOKE_FILTER:-}" ] && ! echo "$name" | grep -qE "${SMOKE_FILTER}"; then
+        return 0
+    fi
+
     local result_file="$RESULTS_DIR/$name"
 
     (
         local tmpdir
         tmpdir=$(mktemp -d)
         local log_file="$RESULTS_DIR/${name}.log"
-        if (cd "$tmpdir" && "$name") >"$log_file" 2>&1; then
+        # Run the test body under `set -e` in a standalone subshell. The old
+        # form — the subshell as an `if` condition — made bash ignore errexit
+        # inside the entire test, so only each test's LAST command decided
+        # pass/fail and every mid-test assert_* failure was silently ignored.
+        (set -e; cd "$tmpdir"; "$name") >"$log_file" 2>&1
+        if [ $? -eq 0 ]; then
             echo "pass" > "$result_file"
         else
             echo "fail" > "$result_file"
@@ -99,7 +110,9 @@ finish_tests() {
 assert_contains() {
     local haystack="$1"
     local needle="$2"
-    if ! echo "$haystack" | grep -qF "$needle"; then
+    # `--` so needles starting with `-` (e.g. "--offline ...") are not
+    # parsed as grep options.
+    if ! echo "$haystack" | grep -qF -- "$needle"; then
         echo "    expected output to contain: $needle" >&2
         echo "    got: $haystack" >&2
         return 1
@@ -133,7 +146,7 @@ assert_dir_not_exists() {
 assert_not_contains() {
     local haystack="$1"
     local needle="$2"
-    if echo "$haystack" | grep -qF "$needle"; then
+    if echo "$haystack" | grep -qF -- "$needle"; then
         echo "    expected output NOT to contain: $needle" >&2
         echo "    got: $haystack" >&2
         return 1
@@ -143,7 +156,7 @@ assert_not_contains() {
 assert_file_contains() {
     local path="$1"
     local needle="$2"
-    if ! grep -qF "$needle" "$path"; then
+    if ! grep -qF -- "$needle" "$path"; then
         echo "    expected $path to contain: $needle" >&2
         return 1
     fi
@@ -152,8 +165,18 @@ assert_file_contains() {
 assert_file_not_contains() {
     local path="$1"
     local needle="$2"
-    if grep -qF "$needle" "$path"; then
+    if grep -qF -- "$needle" "$path"; then
         echo "    expected $path NOT to contain: $needle" >&2
+        return 1
+    fi
+}
+
+assert_files_identical() {
+    local a="$1"
+    local b="$2"
+    if ! cmp -s "$a" "$b"; then
+        echo "    expected files to be byte-identical: $a vs $b" >&2
+        diff "$a" "$b" 2>&1 | sed 's/^/      /' >&2 || true
         return 1
     fi
 }
@@ -631,7 +654,8 @@ TOML
     cd update-resolve
     local output
     output=$(konvoy update 2>&1)
-    assert_contains "$output" "Resolving kotlinx-datetime 0.6.0"
+    # ("Resolving <dep>" download bars are tty-only, so assert on the summary.)
+    assert_contains "$output" "Updated 2 dependencies in konvoy.lock"
 
     # Lockfile should contain Maven dep entries.
     assert_file_exists konvoy.lock
@@ -685,8 +709,9 @@ TOML
     cd update-multi
     local output
     output=$(konvoy update 2>&1)
-    assert_contains "$output" "Resolving kotlinx-coroutines 1.8.0"
-    assert_contains "$output" "Resolving kotlinx-datetime 0.6.0"
+    # ("Resolving <dep>" download bars are tty-only, so assert on the summary:
+    # 2 direct deps + their pinned transitives.)
+    assert_contains "$output" "Updated 5 dependencies in konvoy.lock"
 
     assert_file_contains konvoy.lock "kotlinx-coroutines"
     assert_file_contains konvoy.lock "kotlinx-datetime"
@@ -848,10 +873,10 @@ fun main() {
 KOTLIN
     cd maven-app
 
-    # Step 1: update resolves the dep.
+    # Step 1: update resolves the dep ("Resolving" bars are tty-only).
     local update_out
     update_out=$(konvoy update 2>&1)
-    assert_contains "$update_out" "Resolving kotlinx-datetime"
+    assert_contains "$update_out" "dependencies in konvoy.lock"
     assert_file_exists konvoy.lock
 
     # Step 2: build downloads only the host target klib and compiles.
@@ -905,9 +930,12 @@ KOTLIN
     assert_contains "$output" "Compiling mix-app"
     assert_file_exists .konvoy/build/linux_x64/debug/mix-app
 
-    # Lockfile should have both path and Maven entries.
+    # Lockfile should have both path and Maven entries. Sibling path deps are
+    # stored RELATIVE (`../mix-lib`), never as machine-specific absolute paths
+    # — a committed lockfile must work at any checkout location under --locked.
     assert_file_contains konvoy.lock "mix-lib"
-    assert_file_contains konvoy.lock "../mix-lib"
+    assert_file_contains konvoy.lock 'source_type = "path"'
+    assert_file_contains konvoy.lock 'path = "../mix-lib"'
     assert_file_contains konvoy.lock "kotlinx-datetime"
     assert_file_contains konvoy.lock "maven ="
 }
@@ -941,8 +969,9 @@ TOML
     # Create lockfile without Maven entries.
     printf '[toolchain]\nkonanc_version = "2.2.0"\n' > konvoy.lock
 
+    # Doctor exits non-zero when it reports problems — that's the point here.
     local output
-    output=$(konvoy doctor 2>&1)
+    output=$(konvoy doctor 2>&1) || true
     assert_contains "$output" "not found"
     assert_contains "$output" "konvoy update"
 }
@@ -957,8 +986,9 @@ kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version =
 TOML
     cd doc-nolock
 
+    # Doctor exits non-zero when it reports problems — that's the point here.
     local output
-    output=$(konvoy doctor 2>&1)
+    output=$(konvoy doctor 2>&1) || true
     assert_contains "$output" "No konvoy.lock"
     assert_contains "$output" "konvoy update"
 }
@@ -1455,6 +1485,606 @@ test_lint_no_sources_warns() {
 }
 
 # ---------------------------------------------------------------------------
+# Tests: --locked / --offline reproducibility (issue #295)
+# ---------------------------------------------------------------------------
+# --locked  = reproducible install: never modify konvoy.lock; pinned artifacts
+#             are still downloaded + SHA-verified; only lockfile drift errors.
+# --offline = no network: every managed artifact must already be cached.
+# They combine freely (--locked --offline == Cargo's --frozen).
+#
+# Tests that delete from the shared ~/.konvoy cache use dependency/detekt
+# versions unique to that test, so parallel tests are unaffected.
+
+test_repro_build_lifecycle() {
+    # The everyday flow: build once online, then --offline / --locked /
+    # --locked --offline all work as cache hits and never touch the lockfile.
+    konvoy init --name repro-life >/dev/null 2>&1
+    cd repro-life
+    mkdir -p src/test
+    cat > src/test/ReproTest.kt << 'KOTLIN'
+import kotlin.test.Test
+import kotlin.test.assertEquals
+
+class ReproTest {
+    @Test
+    fun two_plus_two() {
+        assertEquals(4, 2 + 2)
+    }
+}
+KOTLIN
+
+    local out1
+    out1=$(konvoy build 2>&1) || { echo "$out1" >&2; return 1; }
+    assert_contains "$out1" "Compiling"
+    cp konvoy.lock lock.bak
+
+    local out2
+    out2=$(konvoy build --offline 2>&1) || { echo "$out2" >&2; return 1; }
+    assert_contains "$out2" "Fresh"
+
+    local out3
+    out3=$(konvoy build --locked 2>&1) || { echo "$out3" >&2; return 1; }
+    assert_contains "$out3" "Fresh"
+
+    # Strictest mode (Cargo's --frozen): no lockfile changes AND no network.
+    local out4
+    out4=$(konvoy build --locked --offline 2>&1) || { echo "$out4" >&2; return 1; }
+    assert_contains "$out4" "Fresh"
+    assert_files_identical konvoy.lock lock.bak
+
+    # A full recompile needs no network either: everything is cached.
+    local out5
+    out5=$(konvoy build --force --offline 2>&1) || { echo "$out5" >&2; return 1; }
+    assert_contains "$out5" "Compiling"
+
+    # run and test honor --offline through the same pipeline.
+    local run_out
+    run_out=$(konvoy run --offline 2>/dev/null) || { echo "$run_out" >&2; return 1; }
+    assert_contains "$run_out" "Hello, repro-life!"
+
+    konvoy test >/dev/null 2>&1
+    local test_out
+    test_out=$(konvoy test --offline 2>&1) || { echo "$test_out" >&2; return 1; }
+    assert_contains "$test_out" "Fresh"
+
+    assert_files_identical konvoy.lock lock.bak
+}
+
+test_offline_toolchain_absent_fails_fast() {
+    # Clean machine + --offline: a toolchain that was never installed is a
+    # hard, fast, actionable error — no download attempt, no lockfile created.
+    mkdir -p src
+    printf 'fun main() { println("hi") }\n' > src/main.kt
+    printf '[package]\nname = "off-tc"\n\n[toolchain]\nkotlin = "2.1.0"\n' > konvoy.toml
+
+    local output
+    if output=$(konvoy build --offline 2>&1); then
+        echo "    expected --offline build to fail with absent toolchain" >&2
+        return 1
+    fi
+    assert_contains "$output" "Kotlin/Native toolchain 2.1.0 is not installed"
+    assert_contains "$output" "--offline prevents downloads"
+    assert_not_contains "$output" "Installing"
+}
+
+test_offline_unresolved_maven_dep_fails() {
+    # --offline must refuse the automatic `konvoy update` for a Maven dep that
+    # is not in the lockfile — resolving it would hit Maven Central.
+    konvoy init --name off-dep >/dev/null 2>&1
+    cat >> off-dep/konvoy.toml << 'TOML'
+
+[dependencies]
+kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
+TOML
+    cd off-dep
+
+    local output
+    if output=$(konvoy build --offline 2>&1); then
+        echo "    expected --offline build to fail with unresolved Maven dep" >&2
+        return 1
+    fi
+    assert_contains "$output" 'dependency `kotlinx-datetime` is not resolved'
+    assert_contains "$output" "konvoy update"
+    # The refused auto-update must not have created a lockfile.
+    if [ -f konvoy.lock ]; then
+        echo "    --offline must not write konvoy.lock" >&2
+        return 1
+    fi
+}
+
+test_offline_build_after_update_succeeds() {
+    # The provisioning flow: `konvoy update` online once, then the entire
+    # build (klib resolution + compile + link) works offline.
+    konvoy init --name off-maven >/dev/null 2>&1
+    cat >> off-maven/konvoy.toml << 'TOML'
+
+[dependencies]
+kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
+TOML
+    cat > off-maven/src/main.kt << 'KOTLIN'
+import kotlinx.datetime.Clock
+
+fun main() {
+    println("Offline at ${Clock.System.now()}")
+}
+KOTLIN
+    cd off-maven
+
+    konvoy update >/dev/null 2>&1
+
+    local output
+    output=$(konvoy build --offline 2>&1) || { echo "$output" >&2; return 1; }
+    assert_contains "$output" "Compiling"
+    local binary
+    binary=$(find .konvoy/build -name off-maven -type f | head -n 1)
+    if [ -z "$binary" ]; then
+        echo "    expected an off-maven binary under .konvoy/build" >&2
+        return 1
+    fi
+}
+
+test_offline_evicted_klib_fails() {
+    # A pinned-but-evicted dependency klib under --offline is a hard error
+    # naming the library (e.g. the cache was cleaned by hand or by CI).
+    konvoy init --name off-evict >/dev/null 2>&1
+    cat >> off-evict/konvoy.toml << 'TOML'
+
+[dependencies]
+kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.1" }
+TOML
+    cd off-evict
+    konvoy update >/dev/null 2>&1
+
+    # Evict the cached klibs (version 0.6.1 is unique to this test).
+    local cached
+    cached=$(find "$HOME/.konvoy/cache" -name 'kotlinx-datetime-*0.6.1*' -type f | head -n 1)
+    if [ -z "$cached" ]; then
+        echo "    expected update to cache kotlinx-datetime 0.6.1 artifacts" >&2
+        return 1
+    fi
+    find "$HOME/.konvoy/cache" -name 'kotlinx-datetime-*0.6.1*' -type f -delete
+
+    local output
+    if output=$(konvoy build --offline 2>&1); then
+        echo "    expected --offline build to fail with evicted klib" >&2
+        return 1
+    fi
+    assert_contains "$output" 'library `kotlinx-datetime` is not downloaded'
+    assert_contains "$output" "--offline prevents downloads"
+}
+
+test_offline_lint_detekt_jar_absent_fails() {
+    # detekt configured but its JAR never downloaded: lint --offline fails
+    # fast, naming the version (1.23.5 is unique to this test — never cached).
+    konvoy init --name off-lint >/dev/null 2>&1
+    cat > off-lint/konvoy.toml << 'TOML'
+[package]
+name = "off-lint"
+
+[toolchain]
+kotlin = "2.2.0"
+detekt = "1.23.5"
+TOML
+    cd off-lint
+
+    local output
+    if output=$(konvoy lint --offline 2>&1); then
+        echo "    expected lint --offline to fail with absent detekt JAR" >&2
+        return 1
+    fi
+    assert_contains "$output" "detekt 1.23.5 is not downloaded"
+    assert_contains "$output" "--offline prevents downloads"
+}
+
+test_offline_lint_jre_failure_keeps_lockfile() {
+    # detekt JAR cached + pinned, but the toolchain that provides its JRE is
+    # not installed: lint --offline fails at the JRE — and must NOT leave a
+    # rewritten konvoy.lock behind (regression: the detekt hash used to be
+    # persisted before JRE resolution).
+    konvoy init --name off-jre >/dev/null 2>&1
+    cat > off-jre/konvoy.toml << 'TOML'
+[package]
+name = "off-jre"
+
+[toolchain]
+kotlin = "2.2.0"
+detekt = "1.23.7"
+TOML
+    cd off-jre
+
+    # Online lint caches the JAR and pins its hash (findings are fine).
+    konvoy lint >/dev/null 2>&1 || true
+    assert_file_contains konvoy.lock "detekt_jar_sha256"
+    cp konvoy.lock lock.bak
+
+    # Point the manifest at a toolchain that is not installed.
+    sed -i 's/kotlin = "2.2.0"/kotlin = "2.1.0"/' konvoy.toml
+
+    local output
+    if output=$(konvoy lint --offline 2>&1); then
+        echo "    expected lint --offline to fail at JRE resolution" >&2
+        return 1
+    fi
+    assert_contains "$output" "detekt needs its JRE"
+    assert_contains "$output" "--offline prevents downloads"
+    assert_files_identical konvoy.lock lock.bak
+}
+
+test_locked_without_lockfile_fails() {
+    # Forgot to commit konvoy.lock: --locked must fail up front, not resolve
+    # silently — and must not create the lockfile as a side effect.
+    konvoy init --name locked-nolock >/dev/null 2>&1
+    cd locked-nolock
+
+    local output
+    if output=$(konvoy build --locked 2>&1); then
+        echo "    expected --locked to fail without a lockfile" >&2
+        return 1
+    fi
+    assert_contains "$output" "lockfile is out of date"
+    if [ -f konvoy.lock ]; then
+        echo "    --locked must not create konvoy.lock" >&2
+        return 1
+    fi
+}
+
+test_locked_unpinned_toolchain_fails_before_install() {
+    # Clean machine + a lockfile that pins only the toolchain VERSION (no
+    # tarball SHAs, e.g. written by an older konvoy): --locked cannot install
+    # reproducibly, so it reports drift fast — before attempting the ~500MB
+    # toolchain download.
+    mkdir -p src
+    printf 'fun main() { println("hi") }\n' > src/main.kt
+    printf '[package]\nname = "locked-unpinned"\n\n[toolchain]\nkotlin = "2.1.0"\n' > konvoy.toml
+    printf '[toolchain]\nkonanc_version = "2.1.0"\n' > konvoy.lock
+    cp konvoy.lock lock.bak
+
+    local output
+    if output=$(konvoy build --locked 2>&1); then
+        echo "    expected --locked to fail with an unpinned absent toolchain" >&2
+        return 1
+    fi
+    assert_contains "$output" "lockfile is out of date"
+    assert_not_contains "$output" "Installing"
+    assert_files_identical konvoy.lock lock.bak
+}
+
+test_locked_redownloads_pinned_absent_klib() {
+    # The #295 unification: --locked means reproducible INSTALL, not offline.
+    # A pinned-but-evicted klib is re-downloaded (and SHA-verified) instead of
+    # erroring, and konvoy.lock stays byte-identical.
+    konvoy init --name locked-refetch >/dev/null 2>&1
+    cat >> locked-refetch/konvoy.toml << 'TOML'
+
+[dependencies]
+kotlinx-atomicfu = { maven = "org.jetbrains.kotlinx:atomicfu", version = "0.25.0" }
+TOML
+    cd locked-refetch
+    konvoy update >/dev/null 2>&1
+    konvoy build >/dev/null 2>&1
+    cp konvoy.lock lock.bak
+
+    # Evict the cached klibs (version 0.25.0 is unique to this test).
+    local cached
+    cached=$(find "$HOME/.konvoy/cache" -name 'atomicfu-*0.25.0*' -type f | head -n 1)
+    if [ -z "$cached" ]; then
+        echo "    expected atomicfu 0.25.0 artifacts in the cache" >&2
+        return 1
+    fi
+    find "$HOME/.konvoy/cache" -name 'atomicfu-*0.25.0*' -type f -delete
+
+    # --locked re-downloads the pinned klib and succeeds.
+    local output
+    output=$(konvoy build --locked 2>&1) || { echo "$output" >&2; return 1; }
+    assert_not_contains "$output" "lockfile is out of date"
+
+    # The klib is back in the cache and the lockfile is untouched.
+    cached=$(find "$HOME/.konvoy/cache" -name 'atomicfu-*0.25.0*.klib' -type f | head -n 1)
+    if [ -z "$cached" ]; then
+        echo "    expected --locked build to restore the evicted klib" >&2
+        return 1
+    fi
+    assert_files_identical konvoy.lock lock.bak
+}
+
+test_locked_redownloads_pinned_absent_detekt_jar() {
+    # Same unification for detekt: a pinned-but-deleted JAR is re-downloaded
+    # and hash-verified under --locked (this used to be a hard error). Version
+    # 1.23.6 is unique to this test.
+    konvoy init --name locked-detekt >/dev/null 2>&1
+    cat > locked-detekt/konvoy.toml << 'TOML'
+[package]
+name = "locked-detekt"
+
+[toolchain]
+kotlin = "2.2.0"
+detekt = "1.23.6"
+TOML
+    cd locked-detekt
+
+    konvoy lint >/dev/null 2>&1 || true
+    assert_file_contains konvoy.lock "detekt_jar_sha256"
+    cp konvoy.lock lock.bak
+
+    local jar="$HOME/.konvoy/tools/detekt/1.23.6/detekt-cli-1.23.6-all.jar"
+    assert_file_exists "$jar"
+    rm -rf "$HOME/.konvoy/tools/detekt/1.23.6"
+
+    # Findings may make lint exit non-zero; the asserts pin the behavior.
+    local output
+    output=$(konvoy lint --locked 2>&1) || true
+    assert_not_contains "$output" "lockfile is out of date"
+    assert_not_contains "$output" "is not downloaded"
+    assert_file_exists "$jar"
+    assert_files_identical konvoy.lock lock.bak
+}
+
+test_lint_locked_offline_lifecycle() {
+    # After one online lint, every reproducibility mode works; removing the
+    # pinned hash from the lockfile turns --locked into a drift error.
+    konvoy init --name lint-repro >/dev/null 2>&1
+    cat > lint-repro/konvoy.toml << 'TOML'
+[package]
+name = "lint-repro"
+
+[toolchain]
+kotlin = "2.2.0"
+detekt = "1.23.7"
+TOML
+    cd lint-repro
+
+    konvoy lint >/dev/null 2>&1 || true
+    assert_file_contains konvoy.lock "detekt_version"
+    assert_file_contains konvoy.lock "detekt_jar_sha256"
+
+    local out_locked out_offline out_frozen
+    out_locked=$(konvoy lint --locked 2>&1) || true
+    assert_not_contains "$out_locked" "lockfile is out of date"
+
+    out_offline=$(konvoy lint --offline 2>&1) || true
+    assert_not_contains "$out_offline" "--offline prevents downloads"
+
+    out_frozen=$(konvoy lint --locked --offline 2>&1) || true
+    assert_not_contains "$out_frozen" "lockfile is out of date"
+    assert_not_contains "$out_frozen" "--offline prevents downloads"
+
+    # Drop the pinned hash: --locked now reports drift (the lockfile would
+    # have to change to re-record it).
+    sed -i '/detekt_jar_sha256/d' konvoy.lock
+    cp konvoy.lock lock.bak
+    local out_drift
+    if out_drift=$(konvoy lint --locked 2>&1); then
+        echo "    expected lint --locked to fail after removing the pinned hash" >&2
+        return 1
+    fi
+    assert_contains "$out_drift" "lockfile is out of date"
+    assert_files_identical konvoy.lock lock.bak
+}
+
+test_frozen_drift_wins_over_offline() {
+    # --locked --offline with BOTH problems (stale lockfile AND an absent
+    # artifact): drift is the actionable root cause and must win.
+    konvoy init --name frozen-drift >/dev/null 2>&1
+    cd frozen-drift
+    konvoy build >/dev/null 2>&1
+
+    sed -i 's/konanc_version = "2.2.0"/konanc_version = "9.9.9"/' konvoy.lock
+    cp konvoy.lock lock.bak
+
+    local output
+    if output=$(konvoy build --locked --offline 2>&1); then
+        echo "    expected --frozen build to fail on lockfile drift" >&2
+        return 1
+    fi
+    assert_contains "$output" "lockfile is out of date"
+    assert_not_contains "$output" "--offline prevents downloads"
+    assert_files_identical konvoy.lock lock.bak
+}
+
+test_frozen_offline_error_when_klib_absent() {
+    # --locked --offline with a CONSISTENT lockfile but an evicted klib: no
+    # drift to report, so the offline error names the missing artifact —
+    # even though the compiled binary itself is still cached.
+    konvoy init --name frozen-absent >/dev/null 2>&1
+    cat >> frozen-absent/konvoy.toml << 'TOML'
+
+[dependencies]
+kotlinx-atomicfu = { maven = "org.jetbrains.kotlinx:atomicfu", version = "0.26.0" }
+TOML
+    cd frozen-absent
+    konvoy update >/dev/null 2>&1
+    konvoy build >/dev/null 2>&1
+    cp konvoy.lock lock.bak
+
+    # Evict the cached klibs (version 0.26.0 is unique to this test).
+    local cached
+    cached=$(find "$HOME/.konvoy/cache" -name 'atomicfu-*0.26.0*' -type f | head -n 1)
+    if [ -z "$cached" ]; then
+        echo "    expected atomicfu 0.26.0 artifacts in the cache" >&2
+        return 1
+    fi
+    find "$HOME/.konvoy/cache" -name 'atomicfu-*0.26.0*' -type f -delete
+
+    local output
+    if output=$(konvoy build --locked --offline 2>&1); then
+        echo "    expected --frozen build to fail with evicted klib" >&2
+        return 1
+    fi
+    # The eviction removes both atomicfu and its cinterop companion klib
+    # (same filename prefix); klibs resolve in parallel, so either lockfile
+    # entry may report first — assert the offline error, not the exact name.
+    assert_contains "$output" "is not downloaded"
+    assert_contains "$output" "--offline prevents downloads"
+    assert_not_contains "$output" "lockfile is out of date"
+    assert_files_identical konvoy.lock lock.bak
+}
+
+test_offline_plugin_absent_fails() {
+    # The plugin gate fires after toolchain resolution but before any compile,
+    # so --offline + an uncached plugin is a hard error naming the plugin.
+    # A fake version guarantees the artifact is never in the shared cache.
+    konvoy init --name off-plugin >/dev/null 2>&1
+    cat >> off-plugin/konvoy.toml << 'TOML'
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "9.9.9-fake" }
+TOML
+    cd off-plugin
+
+    local output
+    if output=$(konvoy build --offline 2>&1); then
+        echo "    expected --offline build to fail with absent plugin" >&2
+        return 1
+    fi
+    assert_contains "$output" 'plugin `kotlin-serialization` is not downloaded'
+    assert_contains "$output" "--offline prevents downloads"
+}
+
+test_locked_plugin_pinned_absent_attempts_download() {
+    # The #295 unification for the third artifact class: under --locked, a
+    # pinned-but-absent plugin must PROCEED TO DOWNLOAD — not report drift,
+    # not report offline. The fake version 404s at Maven Central, so the
+    # expected outcome is a download error (proof the gate let it through).
+    konvoy init --name locked-plugin >/dev/null 2>&1
+    cat >> locked-plugin/konvoy.toml << 'TOML'
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "9.9.9-fake" }
+TOML
+    cd locked-plugin
+    # Handcraft a consistent lockfile that pins the plugin (non-empty sha).
+    cat > konvoy.lock << 'LOCK'
+[toolchain]
+konanc_version = "2.2.0"
+
+[[plugins]]
+name = "kotlin-serialization"
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+version = "9.9.9-fake"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+url = "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-serialization-compiler-plugin/9.9.9-fake/kotlin-serialization-compiler-plugin-9.9.9-fake.jar"
+LOCK
+    cp konvoy.lock lock.bak
+
+    local output
+    if output=$(konvoy build --locked 2>&1); then
+        echo "    expected --locked build to fail at the 404 download" >&2
+        return 1
+    fi
+    assert_contains "$output" "cannot download plugin"
+    assert_not_contains "$output" "lockfile is out of date"
+    assert_not_contains "$output" "--offline prevents downloads"
+    assert_files_identical konvoy.lock lock.bak
+}
+
+test_locked_changed_path_dep_source_errors() {
+    # Editing a path dependency's sources after the lockfile was written is
+    # drift --locked must catch: the recorded source hash no longer matches.
+    konvoy init --name hashlib --lib >/dev/null 2>&1
+    konvoy init --name hashapp >/dev/null 2>&1
+    printf '\n[dependencies]\nhashlib = { path = "../hashlib" }\n' >> hashapp/konvoy.toml
+    cd hashapp
+    konvoy build >/dev/null 2>&1
+    assert_file_contains konvoy.lock "hashlib"
+    cp konvoy.lock lock.bak
+
+    # Change the dependency's source.
+    printf '\nfun extra(): Int = 1\n' >> ../hashlib/src/lib.kt
+
+    local output
+    if output=$(konvoy build --locked 2>&1); then
+        echo "    expected --locked to fail after dep source change" >&2
+        return 1
+    fi
+    assert_contains "$output" 'dependency `hashlib` source hash mismatch'
+    assert_contains "$output" "remove --locked"
+    assert_files_identical konvoy.lock lock.bak
+}
+
+test_locked_relocated_checkout_succeeds() {
+    # THE committed-lockfile story end-to-end: a project pair (app + sibling
+    # ../lib dep) built at one location must build --locked at a DIFFERENT
+    # location with the same lockfile — sibling paths are stored relative, so
+    # the lockfile is machine/location independent.
+    mkdir checkout-a
+    cd checkout-a
+    konvoy init --name relo-lib --lib >/dev/null 2>&1
+    konvoy init --name relo-app >/dev/null 2>&1
+    printf '\n[dependencies]\nrelo-lib = { path = "../relo-lib" }\n' >> relo-app/konvoy.toml
+    (cd relo-app && konvoy build >/dev/null 2>&1)
+    assert_file_contains relo-app/konvoy.lock 'path = "../relo-lib"'
+
+    # Same layout, different location, committed lockfile carried over.
+    cd ..
+    mkdir checkout-b
+    cp -R checkout-a/relo-lib checkout-b/relo-lib
+    mkdir checkout-b/relo-app
+    cp checkout-a/relo-app/konvoy.toml checkout-b/relo-app/
+    cp checkout-a/relo-app/konvoy.lock checkout-b/relo-app/
+    cp -R checkout-a/relo-app/src checkout-b/relo-app/src
+    cd checkout-b/relo-app
+
+    local output
+    output=$(konvoy build --locked 2>&1) || { echo "$output" >&2; return 1; }
+    assert_not_contains "$output" "lockfile is out of date"
+    assert_files_identical konvoy.lock ../../checkout-a/relo-app/konvoy.lock
+}
+
+test_locked_detekt_hash_mismatch_fails() {
+    # Integrity under --locked: a cached detekt JAR that does not match the
+    # pinned hash is rejected (tampered/rotated artifact), not silently used.
+    konvoy init --name lint-tamper >/dev/null 2>&1
+    cat > lint-tamper/konvoy.toml << 'TOML'
+[package]
+name = "lint-tamper"
+
+[toolchain]
+kotlin = "2.2.0"
+detekt = "1.23.7"
+TOML
+    cd lint-tamper
+
+    konvoy lint >/dev/null 2>&1 || true
+    assert_file_contains konvoy.lock "detekt_jar_sha256"
+
+    # Tamper with the pinned hash (project-local lockfile only — the shared
+    # JAR cache is untouched, so parallel tests are unaffected).
+    sed -i 's/detekt_jar_sha256 = ".*"/detekt_jar_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"/' konvoy.lock
+    cp konvoy.lock lock.bak
+
+    local output
+    if output=$(konvoy lint --locked 2>&1); then
+        echo "    expected lint --locked to fail on pinned-hash mismatch" >&2
+        return 1
+    fi
+    assert_contains "$output" "jar hash mismatch"
+    assert_files_identical konvoy.lock lock.bak
+}
+
+test_update_has_no_offline_flag() {
+    # `konvoy update` is inherently online (it resolves from Maven Central);
+    # --offline must be rejected by the CLI, not silently ignored.
+    konvoy init --name upd-off >/dev/null 2>&1
+    cd upd-off
+    local output
+    if output=$(konvoy update --offline 2>&1); then
+        echo '    expected `konvoy update --offline` to be rejected' >&2
+        return 1
+    fi
+    assert_contains "$output" "unexpected argument"
+}
+
+test_help_documents_repro_flags() {
+    # Every fetching command documents both reproducibility flags.
+    local cmd output
+    for cmd in build run test lint; do
+        output=$(konvoy "$cmd" --help 2>&1)
+        assert_contains "$output" "--locked"
+        assert_contains "$output" "--offline"
+    done
+}
+
+# ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
 echo "Running Konvoy smoke tests..."
@@ -1553,6 +2183,29 @@ run_test test_lint_missing_config_fails
 run_test test_build_force_bypasses_cache
 run_test test_build_verbose_shows_output
 run_test test_locked_toolchain_mismatch_fails
+
+# --locked / --offline reproducibility (issue #295)
+run_test test_repro_build_lifecycle
+run_test test_offline_toolchain_absent_fails_fast
+run_test test_offline_unresolved_maven_dep_fails
+run_test test_offline_build_after_update_succeeds
+run_test test_offline_evicted_klib_fails
+run_test test_offline_lint_detekt_jar_absent_fails
+run_test test_offline_lint_jre_failure_keeps_lockfile
+run_test test_locked_without_lockfile_fails
+run_test test_locked_unpinned_toolchain_fails_before_install
+run_test test_locked_redownloads_pinned_absent_klib
+run_test test_locked_redownloads_pinned_absent_detekt_jar
+run_test test_lint_locked_offline_lifecycle
+run_test test_frozen_drift_wins_over_offline
+run_test test_frozen_offline_error_when_klib_absent
+run_test test_offline_plugin_absent_fails
+run_test test_locked_plugin_pinned_absent_attempts_download
+run_test test_locked_changed_path_dep_source_errors
+run_test test_locked_relocated_checkout_succeeds
+run_test test_locked_detekt_hash_mismatch_fails
+run_test test_update_has_no_offline_flag
+run_test test_help_documents_repro_flags
 
 # init in-place
 run_test test_init_in_place

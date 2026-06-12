@@ -41,9 +41,14 @@ enum Command {
         /// Force a rebuild, bypassing the cache
         #[arg(long)]
         force: bool,
-        /// Require the lockfile to be up-to-date; error on any mismatch
+        /// Assert that konvoy.lock is up to date and never modify it (pinned
+        /// artifacts may still be downloaded; only lockfile drift is an error)
         #[arg(long)]
         locked: bool,
+        /// Run without network access: every managed artifact must already be
+        /// present locally, or the build fails
+        #[arg(long)]
+        offline: bool,
     },
     /// Build and run the project
     Run {
@@ -59,9 +64,14 @@ enum Command {
         /// Force a rebuild, bypassing the cache
         #[arg(long)]
         force: bool,
-        /// Require the lockfile to be up-to-date; error on any mismatch
+        /// Assert that konvoy.lock is up to date and never modify it (pinned
+        /// artifacts may still be downloaded; only lockfile drift is an error)
         #[arg(long)]
         locked: bool,
+        /// Run without network access: every managed artifact must already be
+        /// present locally, or the build fails
+        #[arg(long)]
+        offline: bool,
         /// Arguments to pass to the program
         #[arg(last = true)]
         args: Vec<String>,
@@ -80,9 +90,14 @@ enum Command {
         /// Force a rebuild, bypassing the cache
         #[arg(long)]
         force: bool,
-        /// Require the lockfile to be up-to-date; error on any mismatch
+        /// Assert that konvoy.lock is up to date and never modify it (pinned
+        /// artifacts may still be downloaded; only lockfile drift is an error)
         #[arg(long)]
         locked: bool,
+        /// Run without network access: every managed artifact must already be
+        /// present locally, or the build fails
+        #[arg(long)]
+        offline: bool,
         /// Only run tests matching this pattern (forwarded to --ktest_filter)
         #[arg(long)]
         filter: Option<String>,
@@ -95,9 +110,14 @@ enum Command {
         /// Path to a custom detekt configuration file
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Require the lockfile to be up-to-date; error on any mismatch
+        /// Assert that konvoy.lock is up to date and never modify it (the pinned
+        /// detekt JAR may still be downloaded; only lockfile drift is an error)
         #[arg(long)]
         locked: bool,
+        /// Run without network access: detekt and its JRE must already be
+        /// present locally, or the lint fails
+        #[arg(long)]
+        offline: bool,
     },
     /// Resolve Maven dependencies and update konvoy.lock
     Update,
@@ -127,15 +147,31 @@ enum ToolchainAction {
     List,
 }
 
+/// Build a command-scoped `ArtifactResolver` from the `--offline`/`--locked`
+/// flags and hand it to `f`.
+///
+/// The resolver borrows a `NetworkClient` that lives only for this call, so it is
+/// threaded through a closure rather than returned. Every fetching command builds
+/// its resolver this way, keeping the net/lockfile wiring in one place.
+fn with_resolver<T>(
+    offline: bool,
+    locked: bool,
+    f: impl FnOnce(konvoy_engine::ArtifactResolver<'_>) -> T,
+) -> T {
+    let net = konvoy_util::net::NetworkClient::new(offline);
+    let resolver =
+        konvoy_engine::ArtifactResolver::new(&net, konvoy_engine::LockfileManager::new(locked));
+    f(resolver)
+}
+
 fn main() {
     let cli = Cli::parse();
 
-    // The single outbound-HTTP funnel for the whole process: constructed once
-    // here at the program entry point and threaded into every command that may
-    // fetch. Always online for now; the --offline flag (#295) will feed this
-    // constructor when it lands.
-    let net = konvoy_util::net::NetworkClient::new(false);
-
+    // The single outbound-HTTP funnel for the whole process: one client per
+    // invocation, built here at the program entry from the command's --offline
+    // flag (or always-online for inherently-online commands) and threaded into
+    // everything that may fetch. `--offline` lives in the client, not in the
+    // build/lint options — network access is the client's concern.
     let result = match cli.command {
         Command::Init { name, lib } => cmd_init(name, lib),
         Command::Build {
@@ -144,55 +180,62 @@ fn main() {
             verbose,
             force,
             locked,
-        } => cmd_build(
-            target,
-            profile_from_flag(release),
-            verbose,
-            force,
-            locked,
-            &net,
-        ),
+            offline,
+        } => with_resolver(offline, locked, |resolver| {
+            cmd_build(target, profile_from_flag(release), verbose, force, resolver)
+        }),
         Command::Run {
             target,
             release,
             verbose,
             force,
             locked,
+            offline,
             args,
-        } => cmd_run(
-            target,
-            profile_from_flag(release),
-            verbose,
-            force,
-            locked,
-            &args,
-            &net,
-        ),
+        } => with_resolver(offline, locked, |resolver| {
+            cmd_run(
+                target,
+                profile_from_flag(release),
+                verbose,
+                force,
+                &args,
+                resolver,
+            )
+        }),
         Command::Test {
             target,
             release,
             verbose,
             force,
             locked,
+            offline,
             filter,
-        } => cmd_test(
-            target,
-            profile_from_flag(release),
-            verbose,
-            force,
-            locked,
-            &filter,
-            &net,
-        ),
+        } => with_resolver(offline, locked, |resolver| {
+            cmd_test(
+                target,
+                profile_from_flag(release),
+                verbose,
+                force,
+                &filter,
+                resolver,
+            )
+        }),
         Command::Lint {
             verbose,
             config,
             locked,
-        } => cmd_lint(verbose, config, locked, &net),
-        Command::Update => cmd_update(&net),
+            offline,
+        } => with_resolver(offline, locked, |resolver| {
+            cmd_lint(verbose, config, resolver)
+        }),
+        // `konvoy update` is inherently online and never locked: it exists to
+        // (re)resolve dependencies and rewrite konvoy.lock.
+        Command::Update => with_resolver(false, false, cmd_update),
         Command::Clean { all } => cmd_clean(all),
         Command::Doctor => cmd_doctor(),
-        Command::Toolchain { action } => cmd_toolchain(action, &net),
+        Command::Toolchain { action } => {
+            cmd_toolchain(action, &konvoy_util::net::NetworkClient::new(false))
+        }
     };
 
     if let Err(msg) = result {
@@ -268,14 +311,12 @@ fn build_options(
     profile: konvoy_config::Profile,
     verbose: bool,
     force: bool,
-    locked: bool,
 ) -> konvoy_engine::BuildOptions {
     konvoy_engine::BuildOptions {
         target,
         profile,
         verbose,
         force,
-        locked,
     }
 }
 
@@ -284,13 +325,12 @@ fn cmd_build(
     profile: konvoy_config::Profile,
     verbose: bool,
     force: bool,
-    locked: bool,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: konvoy_engine::ArtifactResolver<'_>,
 ) -> CliResult {
     let root = project_root()?;
-    let options = build_options(target, profile, verbose, force, locked);
+    let options = build_options(target, profile, verbose, force);
 
-    let result = konvoy_engine::build(&root, &options, net)?;
+    let result = konvoy_engine::build(&root, &options, resolver)?;
 
     match result.outcome {
         konvoy_engine::BuildOutcome::Cached => {
@@ -315,9 +355,8 @@ fn cmd_run(
     profile: konvoy_config::Profile,
     verbose: bool,
     force: bool,
-    locked: bool,
     args: &[String],
-    net: &konvoy_util::net::NetworkClient,
+    resolver: konvoy_engine::ArtifactResolver<'_>,
 ) -> CliResult {
     let root = project_root()?;
 
@@ -330,9 +369,9 @@ fn cmd_run(
         );
     }
 
-    let options = build_options(target, profile, verbose, force, locked);
+    let options = build_options(target, profile, verbose, force);
 
-    let result = konvoy_engine::build(&root, &options, net)?;
+    let result = konvoy_engine::build(&root, &options, resolver)?;
 
     eprintln!(
         "    Finished `{profile}` target in {:.2}s",
@@ -358,14 +397,13 @@ fn cmd_test(
     profile: konvoy_config::Profile,
     verbose: bool,
     force: bool,
-    locked: bool,
     filter: &Option<String>,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: konvoy_engine::ArtifactResolver<'_>,
 ) -> CliResult {
     let root = project_root()?;
-    let options = build_options(target, profile, verbose, force, locked);
+    let options = build_options(target, profile, verbose, force);
 
-    let result = konvoy_engine::build_tests(&root, &options, net)?;
+    let result = konvoy_engine::build_tests(&root, &options, resolver)?;
 
     eprintln!(
         "    Finished `{profile}` test target in {:.2}s",
@@ -393,17 +431,12 @@ fn cmd_test(
 fn cmd_lint(
     verbose: bool,
     config: Option<PathBuf>,
-    locked: bool,
-    net: &konvoy_util::net::NetworkClient,
+    resolver: konvoy_engine::ArtifactResolver<'_>,
 ) -> CliResult {
     let root = project_root()?;
-    let options = konvoy_engine::LintOptions {
-        verbose,
-        config,
-        locked,
-    };
+    let options = konvoy_engine::LintOptions { verbose, config };
 
-    let result = konvoy_engine::lint(&root, &options, net)?;
+    let result = konvoy_engine::lint(&root, &options, resolver)?;
 
     if result.success {
         eprintln!("    No lint issues found");
@@ -423,10 +456,10 @@ fn cmd_lint(
     Err(format!("lint found {} issue(s)", result.finding_count).into())
 }
 
-fn cmd_update(net: &konvoy_util::net::NetworkClient) -> CliResult {
+fn cmd_update(resolver: konvoy_engine::ArtifactResolver<'_>) -> CliResult {
     let root = project_root()?;
     // `konvoy update` is inherently online — resolving fetches POMs/klibs.
-    let result = konvoy_engine::update(&root, net)?;
+    let result = konvoy_engine::update(&root, resolver)?;
     eprintln!(
         "  Updated {} dependencies in konvoy.lock",
         result.updated_count
@@ -739,12 +772,14 @@ mod tests {
                 verbose,
                 force,
                 locked,
+                offline,
             } => {
                 assert!(target.is_none());
                 assert!(!release);
                 assert!(!verbose);
                 assert!(!force);
                 assert!(!locked);
+                assert!(!offline);
             }
             other => panic!("expected Build, got {other:?}"),
         }
@@ -799,6 +834,7 @@ mod tests {
             "--verbose",
             "--force",
             "--locked",
+            "--offline",
         ])
         .unwrap();
         match cli.command {
@@ -808,12 +844,28 @@ mod tests {
                 verbose,
                 force,
                 locked,
+                offline,
             } => {
                 assert_eq!(target.as_deref(), Some("linux_x64"));
                 assert!(release);
                 assert!(verbose);
                 assert!(force);
                 assert!(locked);
+                assert!(offline);
+            }
+            other => panic!("expected Build, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_build_offline() {
+        let cli = Cli::try_parse_from(["konvoy", "build", "--offline"]).unwrap();
+        match cli.command {
+            Command::Build {
+                locked, offline, ..
+            } => {
+                assert!(offline);
+                assert!(!locked, "--offline must not imply --locked");
             }
             other => panic!("expected Build, got {other:?}"),
         }
@@ -829,6 +881,7 @@ mod tests {
                 verbose,
                 force,
                 locked,
+                offline,
                 args,
             } => {
                 assert!(target.is_none());
@@ -836,6 +889,7 @@ mod tests {
                 assert!(!verbose);
                 assert!(!force);
                 assert!(!locked);
+                assert!(!offline);
                 assert!(args.is_empty());
             }
             other => panic!("expected Run, got {other:?}"),
@@ -871,6 +925,7 @@ mod tests {
             "--verbose",
             "--force",
             "--locked",
+            "--offline",
             "--",
             "arg1",
         ])
@@ -882,6 +937,7 @@ mod tests {
                 verbose,
                 force,
                 locked,
+                offline,
                 args,
             } => {
                 assert_eq!(target.as_deref(), Some("linux_x64"));
@@ -889,6 +945,7 @@ mod tests {
                 assert!(verbose);
                 assert!(force);
                 assert!(locked);
+                assert!(offline);
                 assert_eq!(args, vec!["arg1"]);
             }
             other => panic!("expected Run, got {other:?}"),
@@ -946,6 +1003,7 @@ mod tests {
                 verbose,
                 force,
                 locked,
+                offline,
                 filter,
             } => {
                 assert!(target.is_none());
@@ -953,6 +1011,7 @@ mod tests {
                 assert!(!verbose);
                 assert!(!force);
                 assert!(!locked);
+                assert!(!offline);
                 assert!(filter.is_none());
             }
             other => panic!("expected Test, got {other:?}"),
@@ -979,6 +1038,7 @@ mod tests {
             "linux_x64",
             "--force",
             "--locked",
+            "--offline",
             "--filter",
             "MathTest.*",
         ])
@@ -990,6 +1050,7 @@ mod tests {
                 verbose,
                 force,
                 locked,
+                offline,
                 filter,
             } => {
                 assert_eq!(target.as_deref(), Some("linux_x64"));
@@ -997,6 +1058,7 @@ mod tests {
                 assert!(verbose);
                 assert!(force);
                 assert!(locked);
+                assert!(offline);
                 assert_eq!(filter.as_deref(), Some("MathTest.*"));
             }
             other => panic!("expected Test, got {other:?}"),
@@ -1319,10 +1381,12 @@ mod tests {
                 verbose,
                 config,
                 locked,
+                offline,
             } => {
                 assert!(!verbose);
                 assert!(config.is_none());
                 assert!(!locked);
+                assert!(!offline);
             }
             other => panic!("expected Lint, got {other:?}"),
         }
@@ -1366,6 +1430,7 @@ mod tests {
             "--config",
             "custom.yml",
             "--locked",
+            "--offline",
         ])
         .unwrap();
         match cli.command {
@@ -1373,10 +1438,12 @@ mod tests {
                 verbose,
                 config,
                 locked,
+                offline,
             } => {
                 assert!(verbose);
                 assert_eq!(config, Some(PathBuf::from("custom.yml")));
                 assert!(locked);
+                assert!(offline);
             }
             other => panic!("expected Lint, got {other:?}"),
         }
@@ -1497,22 +1564,19 @@ mod tests {
             konvoy_config::Profile::Release,
             true,
             true,
-            true,
         );
         assert_eq!(opts.target.as_deref(), Some("linux_x64"));
         assert_eq!(opts.profile, konvoy_config::Profile::Release);
         assert!(opts.verbose);
         assert!(opts.force);
-        assert!(opts.locked);
     }
 
     #[test]
     fn build_options_defaults_are_false() {
-        let opts = build_options(None, konvoy_config::Profile::Debug, false, false, false);
+        let opts = build_options(None, konvoy_config::Profile::Debug, false, false);
         assert!(opts.target.is_none());
         assert_eq!(opts.profile, konvoy_config::Profile::Debug);
         assert!(!opts.verbose);
         assert!(!opts.force);
-        assert!(!opts.locked);
     }
 }
