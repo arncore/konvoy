@@ -166,16 +166,9 @@ fn main() {
             offline,
         } => {
             let net = konvoy_util::net::NetworkClient::new(offline);
-            let resolver = konvoy_engine::ArtifactResolver::new(&net);
             let lockfiles = konvoy_engine::LockfileManager::new(locked);
-            cmd_build(
-                target,
-                profile_from_flag(release),
-                verbose,
-                force,
-                resolver,
-                lockfiles,
-            )
+            let resolver = konvoy_engine::ArtifactResolver::new(&net, lockfiles);
+            cmd_build(target, profile_from_flag(release), verbose, force, resolver)
         }
         Command::Run {
             target,
@@ -187,8 +180,8 @@ fn main() {
             args,
         } => {
             let net = konvoy_util::net::NetworkClient::new(offline);
-            let resolver = konvoy_engine::ArtifactResolver::new(&net);
             let lockfiles = konvoy_engine::LockfileManager::new(locked);
+            let resolver = konvoy_engine::ArtifactResolver::new(&net, lockfiles);
             cmd_run(
                 target,
                 profile_from_flag(release),
@@ -196,7 +189,6 @@ fn main() {
                 force,
                 &args,
                 resolver,
-                lockfiles,
             )
         }
         Command::Test {
@@ -209,8 +201,8 @@ fn main() {
             filter,
         } => {
             let net = konvoy_util::net::NetworkClient::new(offline);
-            let resolver = konvoy_engine::ArtifactResolver::new(&net);
             let lockfiles = konvoy_engine::LockfileManager::new(locked);
+            let resolver = konvoy_engine::ArtifactResolver::new(&net, lockfiles);
             cmd_test(
                 target,
                 profile_from_flag(release),
@@ -218,7 +210,6 @@ fn main() {
                 force,
                 &filter,
                 resolver,
-                lockfiles,
             )
         }
         Command::Lint {
@@ -228,13 +219,16 @@ fn main() {
             offline,
         } => {
             let net = konvoy_util::net::NetworkClient::new(offline);
-            let resolver = konvoy_engine::ArtifactResolver::new(&net);
             let lockfiles = konvoy_engine::LockfileManager::new(locked);
-            cmd_lint(verbose, config, resolver, lockfiles)
+            let resolver = konvoy_engine::ArtifactResolver::new(&net, lockfiles);
+            cmd_lint(verbose, config, resolver)
         }
         Command::Update => {
             let net = konvoy_util::net::NetworkClient::new(false);
-            let resolver = konvoy_engine::ArtifactResolver::new(&net);
+            let resolver = konvoy_engine::ArtifactResolver::new(
+                &net,
+                konvoy_engine::LockfileManager::new(false),
+            );
             cmd_update(resolver)
         }
         Command::Clean { all } => cmd_clean(all),
@@ -332,12 +326,11 @@ fn cmd_build(
     verbose: bool,
     force: bool,
     resolver: konvoy_engine::ArtifactResolver<'_>,
-    lockfiles: konvoy_engine::LockfileManager,
 ) -> CliResult {
     let root = project_root()?;
     let options = build_options(target, profile, verbose, force);
 
-    let result = konvoy_engine::build(&root, &options, resolver, lockfiles)?;
+    let result = konvoy_engine::build(&root, &options, resolver)?;
 
     match result.outcome {
         konvoy_engine::BuildOutcome::Cached => {
@@ -364,7 +357,6 @@ fn cmd_run(
     force: bool,
     args: &[String],
     resolver: konvoy_engine::ArtifactResolver<'_>,
-    lockfiles: konvoy_engine::LockfileManager,
 ) -> CliResult {
     let root = project_root()?;
 
@@ -379,7 +371,7 @@ fn cmd_run(
 
     let options = build_options(target, profile, verbose, force);
 
-    let result = konvoy_engine::build(&root, &options, resolver, lockfiles)?;
+    let result = konvoy_engine::build(&root, &options, resolver)?;
 
     eprintln!(
         "    Finished `{profile}` target in {:.2}s",
@@ -407,12 +399,11 @@ fn cmd_test(
     force: bool,
     filter: &Option<String>,
     resolver: konvoy_engine::ArtifactResolver<'_>,
-    lockfiles: konvoy_engine::LockfileManager,
 ) -> CliResult {
     let root = project_root()?;
     let options = build_options(target, profile, verbose, force);
 
-    let result = konvoy_engine::build_tests(&root, &options, resolver, lockfiles)?;
+    let result = konvoy_engine::build_tests(&root, &options, resolver)?;
 
     eprintln!(
         "    Finished `{profile}` test target in {:.2}s",
@@ -441,12 +432,11 @@ fn cmd_lint(
     verbose: bool,
     config: Option<PathBuf>,
     resolver: konvoy_engine::ArtifactResolver<'_>,
-    lockfiles: konvoy_engine::LockfileManager,
 ) -> CliResult {
     let root = project_root()?;
     let options = konvoy_engine::LintOptions { verbose, config };
 
-    let result = konvoy_engine::lint(&root, &options, resolver, lockfiles)?;
+    let result = konvoy_engine::lint(&root, &options, resolver)?;
 
     if result.success {
         eprintln!("    No lint issues found");

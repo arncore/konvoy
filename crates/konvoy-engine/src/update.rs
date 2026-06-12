@@ -869,7 +869,10 @@ my-utils = { path = "../my-utils" }
 
         let result = update(
             project.path(),
-            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::ArtifactResolver::new(
+                &konvoy_util::net::NetworkClient::new(false),
+                crate::common::LockfileManager::new(false),
+            ),
         )
         .unwrap();
         assert_eq!(result.updated_count, 0);
@@ -909,7 +912,10 @@ my-utils = { path = "../my-utils" }
 
         let result = update(
             project.path(),
-            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::ArtifactResolver::new(
+                &konvoy_util::net::NetworkClient::new(false),
+                crate::common::LockfileManager::new(false),
+            ),
         )
         .unwrap();
         assert_eq!(result.updated_count, 0);
@@ -943,7 +949,10 @@ kotlin = "2.1.0"
 
         let result = update(
             project.path(),
-            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::ArtifactResolver::new(
+                &konvoy_util::net::NetworkClient::new(false),
+                crate::common::LockfileManager::new(false),
+            ),
         )
         .unwrap();
         assert_eq!(result.updated_count, 0);
@@ -969,7 +978,10 @@ kotlin = "2.1.0"
 
         let result = update(
             project.path(),
-            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::ArtifactResolver::new(
+                &konvoy_util::net::NetworkClient::new(false),
+                crate::common::LockfileManager::new(false),
+            ),
         )
         .unwrap();
         assert_eq!(result.updated_count, 0);
@@ -1088,7 +1100,10 @@ kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", 
     fn resolve_transitive_empty_direct_deps() {
         let result = resolve_transitive(
             &[],
-            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::ArtifactResolver::new(
+                &konvoy_util::net::NetworkClient::new(false),
+                crate::common::LockfileManager::new(false),
+            ),
         )
         .unwrap();
         assert!(result.is_empty());
@@ -1144,7 +1159,10 @@ kotlin = "2.1.0"
         // No konvoy.lock on disk — `update` creates it from scratch.
         let result = update(
             project.path(),
-            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::ArtifactResolver::new(
+                &konvoy_util::net::NetworkClient::new(false),
+                crate::common::LockfileManager::new(false),
+            ),
         )
         .unwrap();
         assert_eq!(result.updated_count, 0);
@@ -1177,7 +1195,10 @@ kotlin = "2.1.0"
 
         let result = update(
             project.path(),
-            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::ArtifactResolver::new(
+                &konvoy_util::net::NetworkClient::new(false),
+                crate::common::LockfileManager::new(false),
+            ),
         )
         .unwrap();
         assert_eq!(result.updated_count, 0);
@@ -1256,7 +1277,10 @@ kotlin = "2.1.0"
     fn resolve_transitive_no_direct_deps_returns_empty() {
         let result = resolve_transitive(
             &[],
-            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::ArtifactResolver::new(
+                &konvoy_util::net::NetworkClient::new(false),
+                crate::common::LockfileManager::new(false),
+            ),
         )
         .unwrap();
         assert!(result.is_empty());
@@ -1500,7 +1524,10 @@ atomicfu = { maven = "org.jetbrains.kotlinx:atomicfu", version = "0.23.1" }
         // and classifier) and skip re-downloading.
         let result = update(
             project.path(),
-            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::ArtifactResolver::new(
+                &konvoy_util::net::NetworkClient::new(false),
+                crate::common::LockfileManager::new(false),
+            ),
         )
         .unwrap();
         // updated_count reflects total resolved deps (already-locked or new).
