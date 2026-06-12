@@ -276,7 +276,11 @@ fn run_detekt_process(
 /// Returns an error if the explicitly provided config file does not exist,
 /// detekt cannot be downloaded, the JRE is unavailable, or the detekt
 /// process fails to execute.
-pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineError> {
+pub fn lint(
+    root: &Path,
+    options: &LintOptions,
+    net: &konvoy_util::net::NetworkClient,
+) -> Result<LintResult, EngineError> {
     let manifest = konvoy_config::Manifest::from_path(&root.join("konvoy.toml"))?;
 
     let detekt_version = manifest
@@ -289,10 +293,9 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
     let lockfile_path = root.join("konvoy.lock");
     let lockfile = konvoy_config::lockfile::Lockfile::from_path(&lockfile_path)?;
 
-    // One client per lint invocation — the single funnel for the detekt JAR
-    // and JRE downloads below. Always online for now; --offline (#295) will
-    // feed this constructor when it lands.
-    let net = konvoy_util::net::NetworkClient::new(false);
+    // `net` is the process-wide outbound-HTTP funnel, constructed once at the
+    // program entry point and threaded in — the detekt JAR and JRE downloads
+    // below route through it.
 
     let expected_hash = resolve_lockfile_hash(&lockfile, detekt_version);
 
@@ -311,7 +314,7 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
 
     // Ensure detekt jar is available and hash-verified. The path is derived again
     // (from the same spec) inside `run_detekt_process`, so it is discarded here.
-    let (_, actual_hash) = ensure_detekt(detekt_version, expected_hash, &net)?;
+    let (_, actual_hash) = ensure_detekt(detekt_version, expected_hash, net)?;
 
     // Persist hash to lockfile if not already stored.
     if expected_hash.is_none() {
@@ -325,7 +328,7 @@ pub fn lint(root: &Path, options: &LintOptions) -> Result<LintResult, EngineErro
     }
 
     // Resolve JRE.
-    let jre_home = resolve_jre_home(&manifest.toolchain.kotlin, options.locked, &net)?;
+    let jre_home = resolve_jre_home(&manifest.toolchain.kotlin, options.locked, net)?;
 
     // Check for sources.
     let src_dir = root.join("src");
@@ -718,6 +721,7 @@ src/main.kt:3:5: Magic number. [MagicNumber]
                 config: None,
                 locked: true,
             },
+            &konvoy_util::net::NetworkClient::new(false),
         );
 
         // Clean up the fake JAR before asserting.

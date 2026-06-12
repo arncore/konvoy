@@ -16,10 +16,10 @@
 
 /// Owns Konvoy's outbound network access and the offline policy.
 ///
-/// Construct ONCE at a command entry point (from `--offline` for builds, or
-/// `new(false)` for inherently-online commands like `konvoy update` and
-/// `konvoy toolchain install`) and thread it to everything that may fetch.
-/// Do not construct ad-hoc clients deep inside resolution paths — that
+/// Construct ONCE at the program entry point (`konvoy-cli`'s `main`) and thread
+/// it down to everything that may fetch — builds, lint, `konvoy update`, and
+/// `konvoy toolchain install` all receive the same client. Do not construct
+/// ad-hoc clients deep inside resolution paths (or per-command): that
 /// reintroduces the per-site-policy problem this type exists to end.
 #[derive(Debug, Clone, Copy)]
 pub struct NetworkClient {

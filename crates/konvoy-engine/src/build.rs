@@ -230,6 +230,7 @@ fn predicted_effective_lockfile(
 pub(crate) fn resolve_build_context(
     project_root: &Path,
     options: &BuildOptions,
+    net: &konvoy_util::net::NetworkClient,
 ) -> Result<ResolvedBuildContext, EngineError> {
     // 1. Read konvoy.toml.
     let manifest_path = project_root.join("konvoy.toml");
@@ -239,17 +240,16 @@ pub(crate) fn resolve_build_context(
     let lockfile_path = project_root.join("konvoy.lock");
     let lockfile = Lockfile::from_path(&lockfile_path)?;
 
-    // One client per build, threaded to everything that may fetch — the single
-    // funnel for outbound HTTP (see konvoy_util::net). Always online for now;
-    // the --offline flag (#295) will feed this constructor when it lands.
-    let net = konvoy_util::net::NetworkClient::new(false);
+    // `net` is the process-wide outbound-HTTP funnel, constructed once at the
+    // program entry point and threaded in here (see konvoy_util::net) — every
+    // fetch below routes through it.
 
     // 3. Auto-resolve Maven deps if needed (unless --locked).
     //    When the manifest declares Maven deps that aren't in the lockfile,
     //    run `konvoy update` automatically so users don't have to.
     let lockfile = if !options.locked && has_unresolved_maven_deps(&manifest, &lockfile) {
         eprintln!("  Maven dependencies not resolved \u{2014} running update automatically...");
-        crate::update::update(project_root, &net)?;
+        crate::update::update(project_root, net)?;
         // Re-read the lockfile after update wrote it.
         Lockfile::from_path(&lockfile_path)?
     } else {
@@ -274,7 +274,7 @@ pub(crate) fn resolve_build_context(
             version: manifest.toolchain.kotlin,
         });
     }
-    let resolved = resolve_konanc(&manifest.toolchain.kotlin, &net)?;
+    let resolved = resolve_konanc(&manifest.toolchain.kotlin, net)?;
     let konanc = resolved.info;
     let jre_home = resolved.jre_home;
     let konanc_tarball_sha256 = resolved.konanc_tarball_sha256;
@@ -306,7 +306,7 @@ pub(crate) fn resolve_build_context(
             &resolved_artifacts,
             &lockfile,
             options.locked,
-            &net,
+            net,
         )?;
         let locks = crate::plugin::build_plugin_locks(&results);
         let jars: Vec<PathBuf> = results.iter().map(|r| r.path.clone()).collect();
@@ -380,7 +380,7 @@ pub(crate) fn resolve_build_context(
     // 7a. Resolve and download Maven dependency klibs for the current target.
     //     Each Maven klib comes back with a precomputed sha256 from
     //     `download_artifact`, which the cache-key code reuses to skip rehashing.
-    let maven_klibs = resolve_maven_deps(&effective_lockfile, &target, &net)?;
+    let maven_klibs = resolve_maven_deps(&effective_lockfile, &target, net)?;
     library_inputs.extend(maven_klibs);
 
     let store = ArtifactStore::new(project_root);
@@ -423,9 +423,13 @@ pub(crate) fn resolve_build_context(
 /// # Errors
 /// Returns an error if any step fails (config parsing, compiler detection,
 /// compilation failure, filesystem errors, etc.).
-pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult, EngineError> {
+pub fn build(
+    project_root: &Path,
+    options: &BuildOptions,
+    net: &konvoy_util::net::NetworkClient,
+) -> Result<BuildResult, EngineError> {
     let start = Instant::now();
-    let ctx = resolve_build_context(project_root, options)?;
+    let ctx = resolve_build_context(project_root, options, net)?;
 
     // 8. Build the root project.
     let cc = CompileContext {
@@ -1270,7 +1274,11 @@ mod tests {
             force: false,
             locked: false,
         };
-        let result = build(tmp.path(), &options);
+        let result = build(
+            tmp.path(),
+            &options,
+            &konvoy_util::net::NetworkClient::new(false),
+        );
         assert!(result.is_err());
     }
 
@@ -1302,6 +1310,7 @@ mod tests {
                 force: false,
                 locked: true,
             },
+            &konvoy_util::net::NetworkClient::new(false),
         );
 
         assert!(result.is_err(), "expected Err, got: {result:?}");
@@ -1335,7 +1344,11 @@ mod tests {
             force: false,
             locked: false,
         };
-        let result = build(&project, &options);
+        let result = build(
+            &project,
+            &options,
+            &konvoy_util::net::NetworkClient::new(false),
+        );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
