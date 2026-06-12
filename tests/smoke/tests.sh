@@ -930,11 +930,12 @@ KOTLIN
     assert_contains "$output" "Compiling mix-app"
     assert_file_exists .konvoy/build/linux_x64/debug/mix-app
 
-    # Lockfile should have both path and Maven entries. (Sibling path deps
-    # fall back to an absolute path in the lockfile — `../mix-lib` does not
-    # survive normalization — so assert on the source type instead.)
+    # Lockfile should have both path and Maven entries. Sibling path deps are
+    # stored RELATIVE (`../mix-lib`), never as machine-specific absolute paths
+    # — a committed lockfile must work at any checkout location under --locked.
     assert_file_contains konvoy.lock "mix-lib"
     assert_file_contains konvoy.lock 'source_type = "path"'
+    assert_file_contains konvoy.lock 'path = "../mix-lib"'
     assert_file_contains konvoy.lock "kotlinx-datetime"
     assert_file_contains konvoy.lock "maven ="
 }

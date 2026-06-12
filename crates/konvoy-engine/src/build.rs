@@ -1067,16 +1067,18 @@ fn update_lockfile_if_needed(
     }
 
     // Build new dependency lock entries from path deps in the dep graph.
+    // Dep roots come back canonicalized (absolute) from `resolve_dep_path`;
+    // canonicalize the project root too so the relative computation is between
+    // like paths even when the cwd contains symlinks (e.g. /tmp on macOS).
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
     let mut new_deps: Vec<DependencyLock> = dep_graph
         .order
         .iter()
         .filter(|dep| !dep.source_hash.is_empty())
         .map(|dep| {
-            let rel_path = dep
-                .project_root
-                .strip_prefix(project_root)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| dep.project_root.display().to_string());
+            let rel_path = portable_dep_path(&canonical_root, &dep.project_root);
             DependencyLock {
                 name: dep.name.clone(),
                 source: DepSource::Path { path: rel_path },
@@ -1175,6 +1177,43 @@ fn carry_forward_detekt(rebuilt: &mut Lockfile, original: &Lockfile) {
         rebuilt_tc.detekt_version = orig_tc.detekt_version.clone();
         rebuilt_tc.detekt_jar_sha256 = orig_tc.detekt_jar_sha256.clone();
     }
+}
+
+/// Render a dependency's root as a path RELATIVE to the project root for the
+/// lockfile, walking up with `..` when the dep lives outside the project tree
+/// (e.g. a sibling `path = "../my-lib"` dependency).
+///
+/// The lockfile is committed and compared byte-for-byte under `--locked`
+/// (`write_updated_lockfile`), so the stored path must be machine-independent.
+/// The old `strip_prefix` fallback wrote the dep's ABSOLUTE path whenever it
+/// wasn't under the project root, making the lockfile differ across checkout
+/// locations and `--locked` report spurious drift on any other machine.
+///
+/// Both arguments must be canonicalized for the component walk to line up;
+/// `resolve_dep_path` canonicalizes dep roots, and the caller canonicalizes
+/// the project root.
+fn portable_dep_path(project_root: &Path, dep_root: &Path) -> String {
+    let base: Vec<_> = project_root.components().collect();
+    let target: Vec<_> = dep_root.components().collect();
+    let common = base
+        .iter()
+        .zip(target.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let mut rel = PathBuf::new();
+    for _ in common..base.len() {
+        rel.push("..");
+    }
+    for component in target.iter().skip(common) {
+        rel.push(component);
+    }
+    if rel.as_os_str().is_empty() {
+        // dep_root == project_root; can't happen for a real dep (cycle
+        // detection rejects self-deps) but render something sensible.
+        return ".".to_owned();
+    }
+    rel.display().to_string()
 }
 
 /// Verify freshly-downloaded toolchain tarball SHAs against the lockfile pins.
@@ -1330,10 +1369,7 @@ mod tests {
         let result = build(
             tmp.path(),
             &options,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         );
         assert!(result.is_err());
     }
@@ -1360,10 +1396,7 @@ mod tests {
         let result = build(
             root,
             &BuildOptions::default(),
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(true),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(true, false),
         );
 
         assert!(result.is_err(), "expected Err, got: {result:?}");
@@ -1404,10 +1437,7 @@ mod tests {
             &BuildOptions {
                 ..Default::default()
             },
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(true),
-            ),
+            crate::common::test_resolver(false, true),
         );
 
         assert!(
@@ -1440,10 +1470,7 @@ mod tests {
             &BuildOptions {
                 ..Default::default()
             },
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(true),
-            ),
+            crate::common::test_resolver(false, true),
         );
 
         assert!(
@@ -1479,10 +1506,7 @@ mod tests {
         let result = build(
             tmp.path(),
             &BuildOptions::default(),
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(true),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(true, false),
         );
 
         match result {
@@ -1505,10 +1529,7 @@ mod tests {
             &BuildOptions {
                 ..Default::default()
             },
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(true),
-                crate::common::LockfileManager::new(true),
-            ),
+            crate::common::test_resolver(true, true),
         );
 
         assert!(
@@ -1538,10 +1559,7 @@ mod tests {
         let result = build(
             &project,
             &options,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1625,10 +1643,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
         assert!(lockfile_path.exists());
@@ -1661,10 +1676,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
     }
@@ -1693,10 +1705,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
         let content = fs::read_to_string(&lockfile_path).unwrap();
@@ -1725,10 +1734,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -1786,10 +1792,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
         let content = fs::read_to_string(&lockfile_path).unwrap();
@@ -2110,10 +2113,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -2152,10 +2152,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -2193,10 +2190,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -2230,10 +2224,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         );
 
         assert!(result.is_err());
@@ -2274,10 +2265,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             true,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -2314,10 +2302,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -2353,10 +2338,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -2413,10 +2395,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(true),
-            ), // locked = true
+            crate::common::test_resolver(false, true), // locked = true
         );
 
         assert!(result.is_err());
@@ -2477,10 +2456,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ), // locked = false
+            crate::common::test_resolver(false, false), // locked = false
         );
 
         assert!(result.is_ok());
@@ -2508,9 +2484,14 @@ mod tests {
             fingerprint: "abc".to_owned(),
         };
 
+        // Dep roots are canonicalized in production (`resolve_dep_path`), so
+        // mirror that here — the candidate lockfile's relative path must come
+        // out as exactly "my-lib" to match the stored entry.
+        let lib_dir = tmp.path().join("my-lib");
+        fs::create_dir_all(&lib_dir).unwrap();
         let dep = crate::resolve::ResolvedDep {
             name: "my-lib".to_owned(),
-            project_root: tmp.path().join("my-lib"),
+            project_root: lib_dir.canonicalize().unwrap(),
             manifest: konvoy_config::manifest::Manifest::from_str(
                 "[package]\nname = \"my-lib\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
                 "konvoy.toml",
@@ -2532,10 +2513,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(true),
-            ), // locked = true
+            crate::common::test_resolver(false, true), // locked = true
         );
 
         assert!(result.is_ok());
@@ -2614,10 +2592,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(true),
-            ), // locked = true
+            crate::common::test_resolver(false, true), // locked = true
         );
 
         assert!(result.is_err());
@@ -2707,10 +2682,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(true),
-            ), // locked = true
+            crate::common::test_resolver(false, true), // locked = true
         );
 
         assert!(
@@ -2752,10 +2724,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(true),
-            ), // locked = true
+            crate::common::test_resolver(false, true), // locked = true
         );
 
         assert!(matches!(result, Err(EngineError::LockfileUpdateRequired)));
@@ -2798,10 +2767,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -2817,6 +2783,197 @@ mod tests {
             tc.detekt_jar_sha256.as_deref(),
             Some("detektsha"),
             "detekt jar hash must survive a toolchain-changing build"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // portable_dep_path / lockfile path-dep portability
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn portable_dep_path_in_tree() {
+        assert_eq!(
+            portable_dep_path(Path::new("/w/app"), Path::new("/w/app/libs/x")),
+            "libs/x"
+        );
+    }
+
+    #[test]
+    fn portable_dep_path_sibling() {
+        assert_eq!(
+            portable_dep_path(Path::new("/w/app"), Path::new("/w/my-lib")),
+            "../my-lib"
+        );
+    }
+
+    #[test]
+    fn portable_dep_path_two_levels_up() {
+        assert_eq!(
+            portable_dep_path(Path::new("/w/nested/app"), Path::new("/w/my-lib")),
+            "../../my-lib"
+        );
+    }
+
+    #[test]
+    fn portable_dep_path_same_dir() {
+        assert_eq!(
+            portable_dep_path(Path::new("/w/app"), Path::new("/w/app")),
+            "."
+        );
+    }
+
+    /// Build a lib-manifest `ResolvedDep` rooted at `root` for the path-dep
+    /// lockfile tests.
+    fn resolved_path_dep(
+        name: &str,
+        root: PathBuf,
+        source_hash: &str,
+    ) -> crate::resolve::ResolvedDep {
+        crate::resolve::ResolvedDep {
+            name: name.to_owned(),
+            project_root: root,
+            manifest: konvoy_config::manifest::Manifest::from_str(
+                &format!(
+                    "[package]\nname = \"{name}\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n"
+                ),
+                "konvoy.toml",
+            )
+            .unwrap(),
+            dep_names: Vec::new(),
+            source_hash: source_hash.to_owned(),
+        }
+    }
+
+    #[test]
+    fn update_lockfile_sibling_dep_writes_relative_path() {
+        // A sibling `../my-lib` dep must be recorded as a RELATIVE path. The
+        // old strip_prefix fallback wrote the dep's absolute path, making the
+        // committed lockfile machine-specific.
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        let lib = tmp.path().join("my-lib");
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(&lib).unwrap();
+        let lockfile_path = app.join("konvoy.lock");
+        Lockfile::with_toolchain("2.1.0")
+            .write_to(&lockfile_path)
+            .unwrap();
+        let lockfile = Lockfile::from_path(&lockfile_path).unwrap();
+
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+        let graph = crate::resolve::ResolvedGraph {
+            order: vec![resolved_path_dep(
+                "my-lib",
+                lib.canonicalize().unwrap(),
+                "hash1",
+            )],
+        };
+
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &graph,
+            &[],
+            &app,
+            &lockfile_path,
+            false,
+            crate::common::test_resolver(false, false),
+        )
+        .unwrap();
+
+        let written = Lockfile::from_path(&lockfile_path).unwrap();
+        let dep = written.dependencies.first().unwrap();
+        match &dep.source {
+            DepSource::Path { path } => {
+                assert_eq!(path, "../my-lib", "sibling dep must be stored relative");
+                assert!(
+                    !Path::new(path).is_absolute(),
+                    "lockfile path must not be machine-specific: {path}"
+                );
+            }
+            other => panic!("expected Path source, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn locked_build_with_sibling_dep_is_portable_across_checkouts() {
+        // THE portability property --locked exists for: a lockfile written at
+        // one checkout location must not report drift when the same project
+        // (same layout, same sources) builds --locked at a DIFFERENT location.
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+
+        // Checkout A writes the lockfile.
+        let a = tempfile::tempdir().unwrap();
+        let a_app = a.path().join("app");
+        let a_lib = a.path().join("my-lib");
+        fs::create_dir_all(&a_app).unwrap();
+        fs::create_dir_all(&a_lib).unwrap();
+        let a_lock = a_app.join("konvoy.lock");
+        Lockfile::with_toolchain("2.1.0").write_to(&a_lock).unwrap();
+        let a_graph = crate::resolve::ResolvedGraph {
+            order: vec![resolved_path_dep(
+                "my-lib",
+                a_lib.canonicalize().unwrap(),
+                "hash1",
+            )],
+        };
+        update_lockfile_if_needed(
+            &Lockfile::from_path(&a_lock).unwrap(),
+            &konanc,
+            None,
+            None,
+            &a_graph,
+            &[],
+            &a_app,
+            &a_lock,
+            false,
+            crate::common::test_resolver(false, false),
+        )
+        .unwrap();
+
+        // Checkout B: same layout elsewhere, committed lockfile carried over.
+        let b = tempfile::tempdir().unwrap();
+        let b_app = b.path().join("app");
+        let b_lib = b.path().join("my-lib");
+        fs::create_dir_all(&b_app).unwrap();
+        fs::create_dir_all(&b_lib).unwrap();
+        let b_lock = b_app.join("konvoy.lock");
+        fs::copy(&a_lock, &b_lock).unwrap();
+        let b_graph = crate::resolve::ResolvedGraph {
+            order: vec![resolved_path_dep(
+                "my-lib",
+                b_lib.canonicalize().unwrap(),
+                "hash1",
+            )],
+        };
+
+        let result = update_lockfile_if_needed(
+            &Lockfile::from_path(&b_lock).unwrap(),
+            &konanc,
+            None,
+            None,
+            &b_graph,
+            &[],
+            &b_app,
+            &b_lock,
+            false,
+            crate::common::test_resolver(false, true), // locked = true
+        );
+
+        assert!(
+            result.is_ok(),
+            "a committed lockfile with a sibling path dep must not drift at a \
+             different checkout location: {result:?}"
         );
     }
 
@@ -2848,10 +3005,7 @@ mod tests {
             Some("new1"),
             Some("new2"),
             &[],
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         );
 
         let tc = effective.toolchain.as_ref().unwrap();
@@ -3070,10 +3224,7 @@ mod tests {
             None,
             None,
             &plugin_locks,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         );
 
         // After the first build, `update_lockfile_if_needed` writes a lockfile
@@ -3089,10 +3240,7 @@ mod tests {
             None,
             None,
             &plugin_locks,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         );
 
         let content_first = lockfile_toml_content(&effective_first).unwrap();
@@ -3182,10 +3330,7 @@ mod tests {
             None,
             None,
             &[],
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(true),
-            ),
+            crate::common::test_resolver(false, true),
         );
 
         // In locked mode, the empty lockfile is used without modification.
@@ -3536,10 +3681,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -3595,10 +3737,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -3669,10 +3808,7 @@ mod tests {
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
         assert!(
@@ -3691,10 +3827,7 @@ mod tests {
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
         assert!(
@@ -3723,10 +3856,7 @@ mod tests {
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -3760,10 +3890,7 @@ mod tests {
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(true),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(true, false),
         );
         match result {
             Err(EngineError::LibraryOffline { name }) => assert_eq!(name, "phantom-lib"),
@@ -3810,10 +3937,7 @@ mod tests {
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(true),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(true, false),
         );
         // Clean up before asserting: remove the whole fake-group subtree
         // (`com/example/offlinetest/...`) we created under the real cache,
@@ -3962,10 +4086,7 @@ linux_x64 = "1111"
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -4080,10 +4201,7 @@ linux_x64 = "1111"
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -4142,10 +4260,7 @@ linux_x64 = "1111"
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -4234,10 +4349,7 @@ linux_x64 = "1111"
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(true),
-            ), // locked = true
+            crate::common::test_resolver(false, true), // locked = true
         );
 
         assert!(result.is_err());
@@ -4291,10 +4403,7 @@ linux_x64 = "1111"
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -4785,10 +4894,7 @@ url = "https://example.com/plugin.jar"
             dir.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -5016,10 +5122,7 @@ url = "https://example.com/plugin.jar"
             dir.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
 
@@ -5104,10 +5207,7 @@ kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-comp
             dir.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(true),
-            ), // locked = true
+            crate::common::test_resolver(false, true), // locked = true
         );
         assert!(
             result.is_err(),
@@ -5525,10 +5625,7 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
             tmp.path(),
             &lockfile_path,
             false,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(true),
-            ), // locked
+            crate::common::test_resolver(false, true), // locked
         );
         assert!(result.is_err());
     }
@@ -5557,10 +5654,7 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
             tmp.path(),
             &lockfile_path,
             false, // not force
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         );
         assert!(result.is_err(), "should detect tampered konanc hash");
     }
@@ -5589,10 +5683,7 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
             tmp.path(),
             &lockfile_path,
             true, // force
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         );
         assert!(result.is_ok(), "force should bypass hash mismatch");
     }

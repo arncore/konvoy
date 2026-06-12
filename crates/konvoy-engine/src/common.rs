@@ -432,6 +432,15 @@ impl LockfileManager {
     }
 }
 
+/// Test-only resolver constructor: leaks a `NetworkClient` (fine for tests) so
+/// the borrowing `ArtifactResolver` can be returned directly, instead of every
+/// test site repeating the net + manager + resolver wiring.
+#[cfg(test)]
+pub(crate) fn test_resolver(offline: bool, locked: bool) -> ArtifactResolver<'static> {
+    let net = Box::leak(Box::new(konvoy_util::net::NetworkClient::new(offline)));
+    ArtifactResolver::new(net, LockfileManager::new(locked))
+}
+
 /// Split a `groupId:artifactId` string into its two parts.
 ///
 /// # Errors

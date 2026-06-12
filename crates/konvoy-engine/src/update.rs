@@ -867,14 +867,7 @@ my-utils = { path = "../my-utils" }
             .write_to(&project.path().join("konvoy.lock"))
             .unwrap();
 
-        let result = update(
-            project.path(),
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
-        )
-        .unwrap();
+        let result = update(project.path(), crate::common::test_resolver(false, false)).unwrap();
         assert_eq!(result.updated_count, 0);
 
         // Verify the lockfile still has the path dep.
@@ -910,14 +903,7 @@ my-utils = { path = "../my-utils" }
             .write_to(&project.path().join("konvoy.lock"))
             .unwrap();
 
-        let result = update(
-            project.path(),
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
-        )
-        .unwrap();
+        let result = update(project.path(), crate::common::test_resolver(false, false)).unwrap();
         assert_eq!(result.updated_count, 0);
 
         let reparsed = Lockfile::from_path(&project.path().join("konvoy.lock")).unwrap();
@@ -947,14 +933,7 @@ kotlin = "2.1.0"
             .write_to(&project.path().join("konvoy.lock"))
             .unwrap();
 
-        let result = update(
-            project.path(),
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
-        )
-        .unwrap();
+        let result = update(project.path(), crate::common::test_resolver(false, false)).unwrap();
         assert_eq!(result.updated_count, 0);
 
         let reparsed = Lockfile::from_path(&project.path().join("konvoy.lock")).unwrap();
@@ -976,14 +955,7 @@ kotlin = "2.1.0"
 "#,
         );
 
-        let result = update(
-            project.path(),
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
-        )
-        .unwrap();
+        let result = update(project.path(), crate::common::test_resolver(false, false)).unwrap();
         assert_eq!(result.updated_count, 0);
 
         // Lockfile should exist (possibly empty/default).
@@ -1098,14 +1070,7 @@ kotlinx-coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", 
 
     #[test]
     fn resolve_transitive_empty_direct_deps() {
-        let result = resolve_transitive(
-            &[],
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
-        )
-        .unwrap();
+        let result = resolve_transitive(&[], crate::common::test_resolver(false, false)).unwrap();
         assert!(result.is_empty());
     }
 
@@ -1157,14 +1122,7 @@ kotlin = "2.1.0"
 "#,
         );
         // No konvoy.lock on disk — `update` creates it from scratch.
-        let result = update(
-            project.path(),
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
-        )
-        .unwrap();
+        let result = update(project.path(), crate::common::test_resolver(false, false)).unwrap();
         assert_eq!(result.updated_count, 0);
 
         let reparsed = Lockfile::from_path(&project.path().join("konvoy.lock")).unwrap();
@@ -1193,14 +1151,7 @@ kotlin = "2.1.0"
             .write_to(&project.path().join("konvoy.lock"))
             .unwrap();
 
-        let result = update(
-            project.path(),
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
-        )
-        .unwrap();
+        let result = update(project.path(), crate::common::test_resolver(false, false)).unwrap();
         assert_eq!(result.updated_count, 0);
 
         let reparsed = Lockfile::from_path(&project.path().join("konvoy.lock")).unwrap();
@@ -1275,14 +1226,7 @@ kotlin = "2.1.0"
 
     #[test]
     fn resolve_transitive_no_direct_deps_returns_empty() {
-        let result = resolve_transitive(
-            &[],
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
-        )
-        .unwrap();
+        let result = resolve_transitive(&[], crate::common::test_resolver(false, false)).unwrap();
         assert!(result.is_empty());
     }
 
@@ -1522,14 +1466,7 @@ atomicfu = { maven = "org.jetbrains.kotlinx:atomicfu", version = "0.23.1" }
 
         // Running update should detect these as already locked (same version
         // and classifier) and skip re-downloading.
-        let result = update(
-            project.path(),
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
-        )
-        .unwrap();
+        let result = update(project.path(), crate::common::test_resolver(false, false)).unwrap();
         // updated_count reflects total resolved deps (already-locked or new).
         assert!(
             result.updated_count >= 2,

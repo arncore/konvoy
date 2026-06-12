@@ -562,10 +562,7 @@ src/main.kt:3:5: Magic number. [MagicNumber]
         let result = super::ensure_detekt(
             version,
             Some("0000000000000000000000000000000000000000000000000000000000000000"),
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         );
         // Clean up before asserting.
         let _ = std::fs::remove_file(&jar);
@@ -594,10 +591,7 @@ src/main.kt:3:5: Magic number. [MagicNumber]
         let result = super::ensure_detekt(
             version,
             Some(&real_hash),
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         );
         // Clean up.
         let _ = std::fs::remove_file(&jar);
@@ -616,15 +610,8 @@ src/main.kt:3:5: Magic number. [MagicNumber]
     /// be caught by either, so it does not exercise the difference).
     #[test]
     fn ensure_detekt_rejects_dotdot_version() {
-        let err = super::ensure_detekt(
-            "1..2",
-            None,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
-        )
-        .expect_err("a `..` version must be rejected before any download");
+        let err = super::ensure_detekt("1..2", None, crate::common::test_resolver(false, false))
+            .expect_err("a `..` version must be rejected before any download");
         let msg = err.to_string();
         assert!(
             msg.contains("invalid detekt version"),
@@ -674,10 +661,7 @@ src/main.kt:3:5: Magic number. [MagicNumber]
                 verbose: false,
                 config: None,
             },
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(true),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(true, false),
         );
 
         // Clean up the fake JAR before asserting.
@@ -736,10 +720,7 @@ src/main.kt:3:5: Magic number. [MagicNumber]
                 verbose: false,
                 config: None,
             },
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(true),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(true, false),
         );
 
         match result {
@@ -788,10 +769,7 @@ src/main.kt:3:5: Magic number. [MagicNumber]
                 verbose: false,
                 config: None,
             },
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(true),
-            ),
+            crate::common::test_resolver(false, true),
         );
 
         assert!(
@@ -839,10 +817,7 @@ src/main.kt:3:5: Magic number. [MagicNumber]
                 verbose: false,
                 config: None,
             },
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(true),
-            ),
+            crate::common::test_resolver(false, true),
         );
 
         assert!(
@@ -895,10 +870,7 @@ src/main.kt:3:5: Magic number. [MagicNumber]
                 verbose: false,
                 config: None,
             },
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(true),
-            ),
+            crate::common::test_resolver(false, true),
         );
 
         let _ = std::fs::remove_file(&jar);

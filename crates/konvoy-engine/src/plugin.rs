@@ -831,10 +831,7 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &artifacts,
             &lockfile,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(true),
-            ),
+            crate::common::test_resolver(false, true),
         );
         assert!(
             result.is_err(),
@@ -847,15 +844,9 @@ mod tests {
     #[test]
     fn ensure_plugin_artifacts_empty_input_returns_empty() {
         let lockfile = Lockfile::default();
-        let result = ensure_plugin_artifacts(
-            &[],
-            &lockfile,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
-        )
-        .unwrap();
+        let result =
+            ensure_plugin_artifacts(&[], &lockfile, crate::common::test_resolver(false, false))
+                .unwrap();
         assert!(result.is_empty());
     }
 
@@ -884,10 +875,7 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &artifacts,
             &lockfile,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(true),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(true, false),
         );
         match result {
             Err(EngineError::PluginOffline { name }) => assert_eq!(name, "ser"),
@@ -925,10 +913,7 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &artifacts,
             &lockfile,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(true),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(true, false),
         )
         .unwrap();
         assert_eq!(result.len(), 1);
@@ -963,10 +948,7 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &artifacts,
             &lockfile,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(true),
-            ),
+            crate::common::test_resolver(false, true),
         );
         assert!(
             result.is_err(),
@@ -1013,10 +995,7 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &artifacts,
             &lockfile,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(true),
-            ),
+            crate::common::test_resolver(false, true),
         );
         assert!(matches!(result, Err(EngineError::LockfileUpdateRequired)));
     }
@@ -1052,10 +1031,7 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &artifacts,
             &lockfile,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         )
         .unwrap();
         assert_eq!(result.len(), 1);
@@ -1083,10 +1059,7 @@ mod tests {
         let result = ensure_plugin_artifacts(
             &[artifact],
             &lockfile,
-            crate::common::ArtifactResolver::new(
-                &konvoy_util::net::NetworkClient::new(false),
-                crate::common::LockfileManager::new(false),
-            ),
+            crate::common::test_resolver(false, false),
         );
         assert!(result.is_err());
     }
