@@ -130,6 +130,12 @@ enum ToolchainAction {
 fn main() {
     let cli = Cli::parse();
 
+    // The single outbound-HTTP funnel for the whole process: constructed once
+    // here at the program entry point and threaded into every command that may
+    // fetch. Always online for now; the --offline flag (#295) will feed this
+    // constructor when it lands.
+    let net = konvoy_util::net::NetworkClient::new(false);
+
     let result = match cli.command {
         Command::Init { name, lib } => cmd_init(name, lib),
         Command::Build {
@@ -138,7 +144,14 @@ fn main() {
             verbose,
             force,
             locked,
-        } => cmd_build(target, profile_from_flag(release), verbose, force, locked),
+        } => cmd_build(
+            target,
+            profile_from_flag(release),
+            verbose,
+            force,
+            locked,
+            &net,
+        ),
         Command::Run {
             target,
             release,
@@ -153,6 +166,7 @@ fn main() {
             force,
             locked,
             &args,
+            &net,
         ),
         Command::Test {
             target,
@@ -168,16 +182,17 @@ fn main() {
             force,
             locked,
             &filter,
+            &net,
         ),
         Command::Lint {
             verbose,
             config,
             locked,
-        } => cmd_lint(verbose, config, locked),
-        Command::Update => cmd_update(),
+        } => cmd_lint(verbose, config, locked, &net),
+        Command::Update => cmd_update(&net),
         Command::Clean { all } => cmd_clean(all),
         Command::Doctor => cmd_doctor(),
-        Command::Toolchain { action } => cmd_toolchain(action),
+        Command::Toolchain { action } => cmd_toolchain(action, &net),
     };
 
     if let Err(msg) = result {
@@ -270,11 +285,12 @@ fn cmd_build(
     verbose: bool,
     force: bool,
     locked: bool,
+    net: &konvoy_util::net::NetworkClient,
 ) -> CliResult {
     let root = project_root()?;
     let options = build_options(target, profile, verbose, force, locked);
 
-    let result = konvoy_engine::build(&root, &options)?;
+    let result = konvoy_engine::build(&root, &options, net)?;
 
     match result.outcome {
         konvoy_engine::BuildOutcome::Cached => {
@@ -301,6 +317,7 @@ fn cmd_run(
     force: bool,
     locked: bool,
     args: &[String],
+    net: &konvoy_util::net::NetworkClient,
 ) -> CliResult {
     let root = project_root()?;
 
@@ -315,7 +332,7 @@ fn cmd_run(
 
     let options = build_options(target, profile, verbose, force, locked);
 
-    let result = konvoy_engine::build(&root, &options)?;
+    let result = konvoy_engine::build(&root, &options, net)?;
 
     eprintln!(
         "    Finished `{profile}` target in {:.2}s",
@@ -343,11 +360,12 @@ fn cmd_test(
     force: bool,
     locked: bool,
     filter: &Option<String>,
+    net: &konvoy_util::net::NetworkClient,
 ) -> CliResult {
     let root = project_root()?;
     let options = build_options(target, profile, verbose, force, locked);
 
-    let result = konvoy_engine::build_tests(&root, &options)?;
+    let result = konvoy_engine::build_tests(&root, &options, net)?;
 
     eprintln!(
         "    Finished `{profile}` test target in {:.2}s",
@@ -372,7 +390,12 @@ fn cmd_test(
     Ok(())
 }
 
-fn cmd_lint(verbose: bool, config: Option<PathBuf>, locked: bool) -> CliResult {
+fn cmd_lint(
+    verbose: bool,
+    config: Option<PathBuf>,
+    locked: bool,
+    net: &konvoy_util::net::NetworkClient,
+) -> CliResult {
     let root = project_root()?;
     let options = konvoy_engine::LintOptions {
         verbose,
@@ -380,7 +403,7 @@ fn cmd_lint(verbose: bool, config: Option<PathBuf>, locked: bool) -> CliResult {
         locked,
     };
 
-    let result = konvoy_engine::lint(&root, &options)?;
+    let result = konvoy_engine::lint(&root, &options, net)?;
 
     if result.success {
         eprintln!("    No lint issues found");
@@ -400,9 +423,10 @@ fn cmd_lint(verbose: bool, config: Option<PathBuf>, locked: bool) -> CliResult {
     Err(format!("lint found {} issue(s)", result.finding_count).into())
 }
 
-fn cmd_update() -> CliResult {
+fn cmd_update(net: &konvoy_util::net::NetworkClient) -> CliResult {
     let root = project_root()?;
-    let result = konvoy_engine::update(&root)?;
+    // `konvoy update` is inherently online — resolving fetches POMs/klibs.
+    let result = konvoy_engine::update(&root, net)?;
     eprintln!(
         "  Updated {} dependencies in konvoy.lock",
         result.updated_count
@@ -603,7 +627,7 @@ fn cmd_doctor() -> CliResult {
     }
 }
 
-fn cmd_toolchain(action: ToolchainAction) -> CliResult {
+fn cmd_toolchain(action: ToolchainAction, net: &konvoy_util::net::NetworkClient) -> CliResult {
     match action {
         ToolchainAction::Install { version } => {
             let version = if let Some(v) = version {
@@ -626,7 +650,7 @@ fn cmd_toolchain(action: ToolchainAction) -> CliResult {
             }
 
             eprintln!("    Installing Kotlin/Native {version}...");
-            let result = konvoy_konanc::toolchain::install(&version)?;
+            let result = konvoy_konanc::toolchain::install(&version, net)?;
             eprintln!(
                 "    Installed Kotlin/Native {version} at {}",
                 result.konanc_path.display()

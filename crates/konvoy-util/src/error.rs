@@ -22,6 +22,14 @@ pub enum UtilError {
     #[error("download failed: {message}")]
     Download { message: String },
 
+    /// An outbound request was refused because offline mode is active.
+    ///
+    /// Raised by the wire-level [`NetworkClient`](crate::net::NetworkClient)
+    /// floor; engine-level gates normally fail first with artifact-specific
+    /// errors, so reaching this means a fetch path had no earlier gate.
+    #[error("network access is disabled (--offline) — refused to fetch {url}")]
+    Offline { url: String },
+
     /// A Maven coordinate string is malformed.
     #[error("invalid Maven coordinate \"{coordinate}\": {reason}")]
     InvalidMavenCoordinate { coordinate: String, reason: String },

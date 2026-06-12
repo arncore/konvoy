@@ -230,6 +230,7 @@ fn predicted_effective_lockfile(
 pub(crate) fn resolve_build_context(
     project_root: &Path,
     options: &BuildOptions,
+    net: &konvoy_util::net::NetworkClient,
 ) -> Result<ResolvedBuildContext, EngineError> {
     // 1. Read konvoy.toml.
     let manifest_path = project_root.join("konvoy.toml");
@@ -239,12 +240,16 @@ pub(crate) fn resolve_build_context(
     let lockfile_path = project_root.join("konvoy.lock");
     let lockfile = Lockfile::from_path(&lockfile_path)?;
 
+    // `net` is the process-wide outbound-HTTP funnel, constructed once at the
+    // program entry point and threaded in here (see konvoy_util::net) — every
+    // fetch below routes through it.
+
     // 3. Auto-resolve Maven deps if needed (unless --locked).
     //    When the manifest declares Maven deps that aren't in the lockfile,
     //    run `konvoy update` automatically so users don't have to.
     let lockfile = if !options.locked && has_unresolved_maven_deps(&manifest, &lockfile) {
         eprintln!("  Maven dependencies not resolved \u{2014} running update automatically...");
-        crate::update::update(project_root)?;
+        crate::update::update(project_root, net)?;
         // Re-read the lockfile after update wrote it.
         Lockfile::from_path(&lockfile_path)?
     } else {
@@ -269,7 +274,7 @@ pub(crate) fn resolve_build_context(
             version: manifest.toolchain.kotlin,
         });
     }
-    let resolved = resolve_konanc(&manifest.toolchain.kotlin)?;
+    let resolved = resolve_konanc(&manifest.toolchain.kotlin, net)?;
     let konanc = resolved.info;
     let jre_home = resolved.jre_home;
     let konanc_tarball_sha256 = resolved.konanc_tarball_sha256;
@@ -297,8 +302,12 @@ pub(crate) fn resolve_build_context(
     // `ensure_plugin_artifacts` only re-verifies hashes — it does not download.
     let (plugin_jars, plugin_locks) = if !manifest.plugins.is_empty() {
         let resolved_artifacts = crate::plugin::resolve_plugin_artifacts(&manifest)?;
-        let results =
-            crate::plugin::ensure_plugin_artifacts(&resolved_artifacts, &lockfile, options.locked)?;
+        let results = crate::plugin::ensure_plugin_artifacts(
+            &resolved_artifacts,
+            &lockfile,
+            options.locked,
+            net,
+        )?;
         let locks = crate::plugin::build_plugin_locks(&results);
         let jars: Vec<PathBuf> = results.iter().map(|r| r.path.clone()).collect();
         (jars, locks)
@@ -371,7 +380,7 @@ pub(crate) fn resolve_build_context(
     // 7a. Resolve and download Maven dependency klibs for the current target.
     //     Each Maven klib comes back with a precomputed sha256 from
     //     `download_artifact`, which the cache-key code reuses to skip rehashing.
-    let maven_klibs = resolve_maven_deps(&effective_lockfile, &target)?;
+    let maven_klibs = resolve_maven_deps(&effective_lockfile, &target, net)?;
     library_inputs.extend(maven_klibs);
 
     let store = ArtifactStore::new(project_root);
@@ -414,9 +423,13 @@ pub(crate) fn resolve_build_context(
 /// # Errors
 /// Returns an error if any step fails (config parsing, compiler detection,
 /// compilation failure, filesystem errors, etc.).
-pub fn build(project_root: &Path, options: &BuildOptions) -> Result<BuildResult, EngineError> {
+pub fn build(
+    project_root: &Path,
+    options: &BuildOptions,
+    net: &konvoy_util::net::NetworkClient,
+) -> Result<BuildResult, EngineError> {
     let start = Instant::now();
-    let ctx = resolve_build_context(project_root, options)?;
+    let ctx = resolve_build_context(project_root, options, net)?;
 
     // 8. Build the root project.
     let cc = CompileContext {
@@ -793,6 +806,7 @@ struct PreparedKlib<'a> {
 pub(crate) fn resolve_maven_deps(
     lockfile: &Lockfile,
     target: &Target,
+    net: &konvoy_util::net::NetworkClient,
 ) -> Result<Vec<LibraryInput>, EngineError> {
     use rayon::prelude::IndexedParallelIterator;
 
@@ -892,7 +906,7 @@ pub(crate) fn resolve_maven_deps(
     let klib_inputs: Vec<Result<LibraryInput, EngineError>> = prepared
         .par_iter()
         .zip(aligned_bars.par_iter())
-        .map(|(p, maybe_bar)| download_one_klib(p, *maybe_bar))
+        .map(|(p, maybe_bar)| download_one_klib(p, *maybe_bar, net))
         .collect();
 
     // Trailing newline only if we actually rendered any bars.
@@ -909,9 +923,11 @@ pub(crate) fn resolve_maven_deps(
 fn download_one_klib(
     p: &PreparedKlib<'_>,
     maybe_bar: Option<&konvoy_util::progress::DownloadBar>,
+    net: &konvoy_util::net::NetworkClient,
 ) -> Result<LibraryInput, EngineError> {
     let dep_name = p.entry.name.to_owned();
     let result = konvoy_util::progress::fetch(
+        net,
         &p.url,
         &p.dest,
         Some(p.expected_sha256),
@@ -1258,7 +1274,11 @@ mod tests {
             force: false,
             locked: false,
         };
-        let result = build(tmp.path(), &options);
+        let result = build(
+            tmp.path(),
+            &options,
+            &konvoy_util::net::NetworkClient::new(false),
+        );
         assert!(result.is_err());
     }
 
@@ -1290,6 +1310,7 @@ mod tests {
                 force: false,
                 locked: true,
             },
+            &konvoy_util::net::NetworkClient::new(false),
         );
 
         assert!(result.is_err(), "expected Err, got: {result:?}");
@@ -1323,7 +1344,11 @@ mod tests {
             force: false,
             locked: false,
         };
-        let result = build(&project, &options);
+        let result = build(
+            &project,
+            &options,
+            &konvoy_util::net::NetworkClient::new(false),
+        );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -3129,7 +3154,12 @@ mod tests {
         let lockfile = Lockfile::with_toolchain("2.1.0");
         let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
 
-        let result = resolve_maven_deps(&lockfile, &target).unwrap();
+        let result = resolve_maven_deps(
+            &lockfile,
+            &target,
+            &konvoy_util::net::NetworkClient::new(false),
+        )
+        .unwrap();
         assert!(
             result.is_empty(),
             "expected empty vec for path-only deps, got: {result:?}"
@@ -3143,7 +3173,12 @@ mod tests {
         let lockfile = Lockfile::with_toolchain("2.1.0");
         let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
 
-        let result = resolve_maven_deps(&lockfile, &target).unwrap();
+        let result = resolve_maven_deps(
+            &lockfile,
+            &target,
+            &konvoy_util::net::NetworkClient::new(false),
+        )
+        .unwrap();
         assert!(
             result.is_empty(),
             "expected empty vec when lockfile has no Maven entries, got: {result:?}"
@@ -3167,7 +3202,11 @@ mod tests {
         });
         let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
 
-        let result = resolve_maven_deps(&lockfile, &target);
+        let result = resolve_maven_deps(
+            &lockfile,
+            &target,
+            &konvoy_util::net::NetworkClient::new(false),
+        );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -3309,7 +3348,11 @@ linux_x64 = "1111"
         });
         let target: konvoy_targets::Target = "linux_x64".parse().unwrap();
 
-        let result = resolve_maven_deps(&lockfile, &target);
+        let result = resolve_maven_deps(
+            &lockfile,
+            &target,
+            &konvoy_util::net::NetworkClient::new(false),
+        );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(

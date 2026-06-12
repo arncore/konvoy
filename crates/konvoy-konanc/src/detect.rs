@@ -39,12 +39,15 @@ pub struct ResolvedKonanc {
 /// # Errors
 /// Returns an error if the toolchain cannot be installed, the version
 /// doesn't match, or the binary cannot be fingerprinted.
-pub fn resolve_konanc(version: &str) -> Result<ResolvedKonanc, KonancError> {
+pub fn resolve_konanc(
+    version: &str,
+    net: &konvoy_util::net::NetworkClient,
+) -> Result<ResolvedKonanc, KonancError> {
     let installed = toolchain::is_installed(version)?;
 
     let (konanc_tarball_sha256, jre_tarball_sha256) = if !installed {
         eprintln!("    Installing Kotlin/Native {version}...");
-        let result = toolchain::install(version)?;
+        let result = toolchain::install(version, net)?;
         (result.konanc_tarball_sha256, result.jre_tarball_sha256)
     } else {
         (None, None)

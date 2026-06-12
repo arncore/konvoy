@@ -356,17 +356,20 @@ const fn ignore_progress(_: u64, _: Option<u64>) {}
 ///   has the wrong hash, or the downloaded file has the wrong hash.
 /// - Other [`crate::error::UtilError`] variants for I/O / network failures.
 pub fn fetch(
+    net: &crate::net::NetworkClient,
     url: &str,
     dest: &std::path::Path,
     expected_sha256: Option<&str>,
     label: &str,
     bar: Option<&DownloadBar>,
 ) -> Result<crate::artifact::ArtifactResult, crate::error::UtilError> {
+    // The cache check runs before any network involvement, so an offline
+    // client resolves already-cached artifacts exactly like an online one.
     if let Some(cached) = crate::artifact::check_cached(dest, expected_sha256)? {
         return Ok(cached);
     }
     let download = |on_progress: &mut dyn FnMut(u64, Option<u64>)| {
-        crate::artifact::download_artifact(url, dest, expected_sha256, label, on_progress)
+        crate::artifact::download_artifact(net, url, dest, expected_sha256, label, on_progress)
     };
     if let Some(b) = bar {
         b.run(|pb| download(&mut bar_progress(pb)))
@@ -386,12 +389,13 @@ pub fn fetch(
 /// # Errors
 /// Returns whatever `crate::download::stream_download` returns.
 pub fn stream_with_bar(
+    net: &crate::net::NetworkClient,
     url: &str,
     dest: &std::path::Path,
     bar: Option<&DownloadBar>,
 ) -> Result<String, crate::error::UtilError> {
     let download = |on_progress: &mut dyn FnMut(u64, Option<u64>)| {
-        crate::download::stream_download(url, dest, on_progress)
+        crate::download::stream_download(net, url, dest, on_progress)
     };
     if let Some(b) = bar {
         b.run(|pb| download(&mut bar_progress(pb)))
@@ -864,6 +868,7 @@ mod tests {
         let expected = crate::hash::sha256_bytes(content);
 
         let result = fetch(
+            &crate::net::NetworkClient::new(false),
             "http://127.0.0.1:1/should-not-be-hit",
             &dest,
             Some(&expected),
@@ -889,6 +894,7 @@ mod tests {
         let computed = crate::hash::sha256_bytes(content);
 
         let result = fetch(
+            &crate::net::NetworkClient::new(false),
             "http://127.0.0.1:1/should-not-be-hit",
             &dest,
             None,
@@ -911,6 +917,7 @@ mod tests {
         let bogus = "0".repeat(64);
 
         let result = fetch(
+            &crate::net::NetworkClient::new(false),
             "http://127.0.0.1:1/should-not-be-hit",
             &dest,
             Some(&bogus),
@@ -936,6 +943,7 @@ mod tests {
 
         let bar = new_download_bar("test");
         let result = fetch(
+            &crate::net::NetworkClient::new(false),
             "http://127.0.0.1:1/should-not-be-hit",
             &dest,
             Some(&expected),
@@ -946,5 +954,52 @@ mod tests {
 
         assert!(!result.freshly_downloaded);
         assert_eq!(bar.state.load(Ordering::Relaxed), STATE_IN_PROGRESS);
+    }
+
+    /// An offline client still serves cache hits: `check_cached` runs before
+    /// any network involvement, so a present, hash-matching artifact resolves
+    /// identically to the online case.
+    #[test]
+    fn fetch_offline_serves_cache_hit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("artifact.jar");
+        let content = b"offline cached content";
+        std::fs::write(&dest, content).unwrap();
+        let expected = crate::hash::sha256_bytes(content);
+
+        let result = fetch(
+            &crate::net::NetworkClient::new(true),
+            "http://127.0.0.1:1/never",
+            &dest,
+            Some(&expected),
+            "test",
+            None,
+        )
+        .unwrap();
+
+        assert!(!result.freshly_downloaded);
+        assert_eq!(result.sha256, expected);
+    }
+
+    /// The wire-level floor: an offline client with a cache miss refuses with
+    /// `UtilError::Offline` instead of attempting the download.
+    #[test]
+    fn fetch_offline_cache_miss_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("absent.jar");
+
+        let result = fetch(
+            &crate::net::NetworkClient::new(true),
+            "http://127.0.0.1:1/never",
+            &dest,
+            Some(&"0".repeat(64)),
+            "test",
+            None,
+        );
+
+        assert!(
+            matches!(result, Err(crate::error::UtilError::Offline { .. })),
+            "expected UtilError::Offline, got: {result:?}"
+        );
     }
 }

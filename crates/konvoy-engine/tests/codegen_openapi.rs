@@ -383,7 +383,11 @@ fn fabrikt_jar_path_format() {
 
 #[test]
 fn ensure_fabrikt_rejects_invalid_version() {
-    let result = konvoy_engine::codegen::openapi::ensure_fabrikt("../bad", None);
+    let result = konvoy_engine::codegen::openapi::ensure_fabrikt(
+        "../bad",
+        None,
+        &konvoy_util::net::NetworkClient::new(false),
+    );
     assert!(result.is_err());
     let message = result.unwrap_err().to_string();
     assert!(
@@ -398,7 +402,11 @@ fn ensure_fabrikt_rejects_dotdot_version() {
     // validate_version would have let this through, so this is the regression guard
     // for the validate_identifier fix. `../bad` above does NOT exercise it (the `/`
     // is rejected by either check).
-    let result = konvoy_engine::codegen::openapi::ensure_fabrikt("1..2", None);
+    let result = konvoy_engine::codegen::openapi::ensure_fabrikt(
+        "1..2",
+        None,
+        &konvoy_util::net::NetworkClient::new(false),
+    );
     let message = result
         .expect_err("a `..` version must be rejected")
         .to_string();
@@ -425,6 +433,7 @@ fn ensure_fabrikt_hash_mismatch_on_existing_jar() {
     let result = konvoy_engine::codegen::openapi::ensure_fabrikt(
         &version,
         Some("0000000000000000000000000000000000000000000000000000000000000000"),
+        &konvoy_util::net::NetworkClient::new(false),
     );
 
     assert!(result.is_err());
@@ -448,7 +457,11 @@ fn ensure_fabrikt_accepts_matching_hash_on_existing_jar() {
     fs::write(&jar, b"already cached").unwrap();
     let real_hash = konvoy_util::hash::sha256_file(&jar).unwrap();
 
-    let result = konvoy_engine::codegen::openapi::ensure_fabrikt(&version, Some(&real_hash));
+    let result = konvoy_engine::codegen::openapi::ensure_fabrikt(
+        &version,
+        Some(&real_hash),
+        &konvoy_util::net::NetworkClient::new(false),
+    );
 
     assert!(result.is_ok(), "matching hash should pass: {result:?}");
     let (path, hash) = result.unwrap();

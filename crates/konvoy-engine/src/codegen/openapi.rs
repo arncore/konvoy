@@ -82,6 +82,7 @@ pub fn is_installed(version: &str) -> Result<bool, EngineError> {
 pub fn ensure_fabrikt(
     version: &str,
     expected_sha256: Option<&str>,
+    net: &konvoy_util::net::NetworkClient,
 ) -> Result<(PathBuf, String), EngineError> {
     // Pre-validate for an actionable, Fabrikt-specific message; the shared tool
     // also validates, but its raw error would map to a generic one. Use the same
@@ -96,7 +97,7 @@ pub fn ensure_fabrikt(
         ),
     })?;
     fabrikt_tool(version)
-        .ensure(expected_sha256)
+        .ensure(expected_sha256, net)
         .map_err(|e| map_fabrikt_download_err(version, e))
 }
 

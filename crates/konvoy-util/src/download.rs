@@ -12,21 +12,10 @@ fn u64_from_usize(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 
-/// Create an HTTP agent with the given global timeout.
-///
-/// Uses a 30-second connect timeout for all requests.
-pub fn http_agent(global_timeout_secs: u64) -> ureq::Agent {
-    ureq::Agent::new_with_config(
-        ureq::config::Config::builder()
-            .timeout_connect(Some(std::time::Duration::from_secs(30)))
-            .timeout_global(Some(std::time::Duration::from_secs(global_timeout_secs)))
-            .build(),
-    )
-}
-
 /// Stream a URL to a file, calling `on_progress` as bytes arrive and computing SHA-256.
 ///
-/// Pure network primitive: no UI dependencies. Callers in
+/// Pure network primitive: no UI dependencies. All wire access goes through
+/// the supplied [`NetworkClient`](crate::net::NetworkClient). Callers in
 /// [`crate::artifact`] and [`crate::progress`] adapt it to higher-level
 /// flows; engine code should not call this directly — use
 /// [`crate::progress::stream_with_bar`] for tarballs or
@@ -45,6 +34,7 @@ pub fn http_agent(global_timeout_secs: u64) -> ureq::Agent {
 /// Returns an error if the HTTP request fails, the file cannot be written,
 /// or a read error occurs during streaming.
 pub(crate) fn stream_download<F>(
+    net: &crate::net::NetworkClient,
     url: &str,
     dest: &Path,
     mut on_progress: F,
@@ -52,10 +42,12 @@ pub(crate) fn stream_download<F>(
 where
     F: FnMut(u64, Option<u64>),
 {
-    let agent = http_agent(600);
-
-    let response = agent.get(url).call().map_err(|e| UtilError::Download {
-        message: e.to_string(),
+    let response = net.get(url, 600).map_err(|e| match e {
+        crate::net::RequestError::Offline => UtilError::Offline {
+            url: url.to_owned(),
+        },
+        crate::net::RequestError::Status { message, .. }
+        | crate::net::RequestError::Transport { message } => UtilError::Download { message },
     })?;
 
     let content_length: Option<u64> = response
@@ -122,11 +114,21 @@ mod tests {
         assert!(result > 0);
     }
 
+    /// An online client for tests that exercise the error paths past the wire.
+    fn online() -> crate::net::NetworkClient {
+        crate::net::NetworkClient::new(false)
+    }
+
     #[test]
     fn download_invalid_url_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("out.bin");
-        let result = stream_download("http://127.0.0.1:1/nonexistent", &dest, ignore_progress);
+        let result = stream_download(
+            &online(),
+            "http://127.0.0.1:1/nonexistent",
+            &dest,
+            ignore_progress,
+        );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("download failed"), "error was: {err}");
@@ -136,17 +138,37 @@ mod tests {
     fn download_malformed_url_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("out.bin");
-        let result = stream_download("not-a-valid-url", &dest, ignore_progress);
+        let result = stream_download(&online(), "not-a-valid-url", &dest, ignore_progress);
         assert!(result.is_err());
     }
 
     #[test]
     fn download_unwritable_dest_returns_error() {
         let result = stream_download(
+            &online(),
             "http://127.0.0.1:1/file.bin",
             std::path::Path::new("/nonexistent_root/subdir/out.bin"),
             ignore_progress,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn download_offline_refuses_before_any_io() {
+        // The wire-level floor: an offline client refuses the request with
+        // UtilError::Offline — no connection attempt, no dest file created.
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("out.bin");
+        let result = stream_download(
+            &crate::net::NetworkClient::new(true),
+            "http://127.0.0.1:1/never",
+            &dest,
+            ignore_progress,
+        );
+        assert!(
+            matches!(result, Err(crate::error::UtilError::Offline { .. })),
+            "expected UtilError::Offline, got: {result:?}"
+        );
+        assert!(!dest.exists(), "no file must be created when offline");
     }
 }

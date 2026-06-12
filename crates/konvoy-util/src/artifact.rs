@@ -123,6 +123,7 @@ pub fn check_cached(
 /// Returns an error if the download fails, the hash does not match, or an
 /// I/O operation fails.
 pub fn download_artifact<F>(
+    net: &crate::net::NetworkClient,
     url: &str,
     dest: &Path,
     expected_sha256: Option<&str>,
@@ -150,7 +151,7 @@ where
         .unwrap_or_else(|| PathBuf::from(&tmp_name));
 
     // Download to temp file.
-    let download_hash = crate::download::stream_download(url, &tmp_path, on_progress)?;
+    let download_hash = crate::download::stream_download(net, url, &tmp_path, on_progress)?;
 
     // Verify hash of downloaded file before placing it.
     if let Some(expected) = expected_sha256 {
@@ -327,6 +328,7 @@ mod tests {
         let dest = tmp.path().join("missing.jar");
 
         let result = download_artifact(
+            &crate::net::NetworkClient::new(false),
             "http://127.0.0.1:1/nonexistent",
             &dest,
             None,
