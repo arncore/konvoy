@@ -95,6 +95,7 @@ pub fn fetch_artifact_metadata(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::test_util::ENV_LOCK;
 
     #[test]
     fn artifact_metadata_default_construction() {
@@ -147,6 +148,71 @@ mod tests {
             "linuxx64",
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn fetch_artifact_metadata_offline_falls_back_to_cached_pom() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved_home = std::env::var("HOME").ok();
+        let saved_profile = std::env::var("USERPROFILE").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("USERPROFILE");
+
+        let pom_path = crate::fs::konvoy_home()
+            .unwrap()
+            .join("cache")
+            .join("pom")
+            .join("com")
+            .join("example")
+            .join("lib-linuxx64-1.0.0.pom");
+        std::fs::create_dir_all(pom_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &pom_path,
+            r#"
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>lib-linuxx64</artifactId>
+  <version>1.0.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>dep-linuxx64</artifactId>
+      <version>2.0.0</version>
+    </dependency>
+  </dependencies>
+</project>
+"#,
+        )
+        .unwrap();
+
+        let result = fetch_artifact_metadata(
+            &crate::net::NetworkClient::new(true),
+            "com.example",
+            "lib-linuxx64",
+            "1.0.0",
+            "linuxx64",
+        );
+
+        if let Some(v) = saved_home {
+            std::env::set_var("HOME", v);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(v) = saved_profile {
+            std::env::set_var("USERPROFILE", v);
+        }
+
+        let metadata = result.unwrap();
+        assert_eq!(metadata.files, Vec::new());
+        let [dep] = metadata.dependencies.as_slice() else {
+            assert_eq!(metadata.dependencies.len(), 1);
+            return;
+        };
+        assert_eq!(dep.group_id, "com.example");
+        assert_eq!(dep.artifact_id, "dep");
+        assert_eq!(dep.version, "2.0.0");
     }
 
     #[test]

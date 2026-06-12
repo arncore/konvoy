@@ -92,6 +92,29 @@ impl NetworkClient {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn serve_once(status_line: &str, body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let status_line = status_line.to_owned();
+        let body = body.to_owned();
+
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!(
+                "{status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        url
+    }
 
     #[test]
     fn offline_client_refuses_get_without_touching_network() {
@@ -115,6 +138,37 @@ mod tests {
             matches!(result, Err(RequestError::Transport { .. })),
             "connection refused must map to Transport, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn online_client_returns_successful_response_body() {
+        let url = serve_once("HTTP/1.1 200 OK", "hello");
+        let response = NetworkClient::new(false)
+            .get(&url, 5)
+            .expect("successful local response");
+
+        let body = response.into_body().read_to_string().unwrap();
+        assert_eq!(body, "hello");
+    }
+
+    #[test]
+    fn online_client_maps_http_status_errors_with_status_code() {
+        let url = serve_once("HTTP/1.1 503 Service Unavailable", "down");
+        let result = NetworkClient::new(false).get(&url, 5);
+
+        match result {
+            Err(RequestError::Status { code, message }) => {
+                assert_eq!(code, 503);
+                assert!(
+                    message.contains("503"),
+                    "status error should preserve the upstream status in its message: {message}"
+                );
+            }
+            other => assert!(
+                matches!(other, Err(RequestError::Status { .. })),
+                "expected RequestError::Status, got: {other:?}"
+            ),
+        }
     }
 
     #[test]
