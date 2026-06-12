@@ -560,6 +560,97 @@ KOTLIN
     assert_not_contains "$out3" "Compiling"
 }
 
+test_path_dep_plugin_build_lifecycle() {
+    # Path-dep [plugins] are applied to the dep's own compile and pinned in the
+    # ROOT lockfile (#293; the root here declares no plugins of its own).
+    konvoy init --name plug-dep-lib --lib >/dev/null 2>&1
+    konvoy init --name plug-dep-app >/dev/null 2>&1
+    cat >> plug-dep-lib/konvoy.toml << 'TOML'
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin-embeddable", version = "{kotlin}" }
+TOML
+    cat >> plug-dep-app/konvoy.toml << 'TOML'
+
+[dependencies]
+plug-dep-lib = { path = "../plug-dep-lib" }
+TOML
+
+    # Probe source: the serialization plugin matches @Serializable by FQ name
+    # and errors because the runtime library is absent — a failing dep compile
+    # is positive proof the dep was built with its -Xplugin. Before #293 the
+    # dep compiled with no plugins, so this build SUCCEEDED (silently wrong).
+    cat > plug-dep-lib/src/lib.kt << 'KOTLIN'
+package kotlinx.serialization
+
+@Target(AnnotationTarget.CLASS)
+annotation class Serializable
+
+@Serializable
+data class User(val name: String, val age: Int)
+KOTLIN
+
+    cd plug-dep-app
+    local probe
+    if probe=$(konvoy build 2>&1); then
+        echo "    expected the dep compile to fail under the serialization plugin (was -Xplugin applied to the dep?)" >&2
+        return 1
+    fi
+    assert_contains "$probe" "serializer has not been found"
+
+    # Standalone parity: the dep must fail the same way built on its own.
+    local standalone
+    if standalone=$(cd ../plug-dep-lib && konvoy build 2>&1); then
+        echo "    expected the standalone dep build to fail under the serialization plugin" >&2
+        return 1
+    fi
+    assert_contains "$standalone" "serializer has not been found"
+    rm -rf ../plug-dep-lib/.konvoy ../plug-dep-lib/konvoy.lock
+
+    # Make the dep's plugin a no-op (plain source) and verify the pinning +
+    # caching lifecycle.
+    cat > ../plug-dep-lib/src/lib.kt << 'KOTLIN'
+package models
+
+fun greet(): String = "hello"
+KOTLIN
+    local out1
+    out1=$(konvoy build 2>&1)
+    assert_contains "$out1" "Compiling plug-dep-lib"
+    assert_contains "$out1" "Compiling plug-dep-app"
+
+    # The dep's plugin pin lands in the ROOT lockfile; the dep checkout is
+    # never written to by the root build.
+    assert_file_contains konvoy.lock "[[plugins]]"
+    assert_file_contains konvoy.lock "kotlin-serialization-compiler-plugin-embeddable"
+    assert_file_contains konvoy.lock "sha256"
+    if [ -f ../plug-dep-lib/konvoy.lock ]; then
+        echo "    root build must not write a lockfile into the dep checkout" >&2
+        return 1
+    fi
+
+    # Second build: fully cached — the dep plugin pins and the path-dep entries
+    # are folded into the first build's cache key (issue #133 class).
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "(cached)"
+    assert_not_contains "$out2" "Compiling"
+
+    # --locked succeeds with the dep's pin present...
+    local out3
+    out3=$(konvoy build --locked 2>&1)
+    assert_contains "$out3" "(cached)"
+
+    # ...and fails actionably when the dep's pin is missing.
+    sed -i '/\[\[plugins\]\]/,$d' konvoy.lock
+    local out4
+    if out4=$(konvoy build --locked 2>&1); then
+        echo "    expected --locked to fail with the dep plugin pin missing" >&2
+        return 1
+    fi
+    assert_contains "$out4" "lockfile"
+}
+
 test_plugin_kotlin_placeholder_resolves() {
     # version = "{kotlin}" should resolve to the toolchain version in the lockfile.
     konvoy init --name plug-placeholder >/dev/null 2>&1
@@ -2145,6 +2236,7 @@ run_test test_plugin_without_maven_fails
 run_test test_plugin_with_path_fails
 run_test test_plugin_locked_no_entries_error
 run_test test_plugin_build_lifecycle
+run_test test_path_dep_plugin_build_lifecycle
 run_test test_plugin_kotlin_placeholder_resolves
 
 # Issue #239: serialization plugin must use embeddable JAR

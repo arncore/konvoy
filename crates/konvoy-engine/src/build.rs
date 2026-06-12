@@ -143,9 +143,12 @@ pub(crate) struct ResolvedBuildContext {
     /// Library inputs (path + optional pre-computed hash) from built path-deps
     /// and downloaded Maven klibs.
     pub library_inputs: Vec<LibraryInput>,
-    /// Paths to downloaded compiler plugin JARs.
+    /// The ROOT project's compiler plugin JAR paths (used by the test build,
+    /// which compiles the root's test sources). `build_single` derives each
+    /// project's own set from its manifest.
     pub plugin_jars: Vec<PathBuf>,
-    /// Lockfile entries for resolved plugins (used by `update_lockfile_if_needed`).
+    /// Resolved plugin lockfile pins — the deduped union across the root and
+    /// all path-deps (persisted to the root lock by `update_lockfile_if_needed`).
     pub plugin_locks: Vec<konvoy_config::lockfile::PluginLock>,
     /// Resolved path-dependency graph in topological order.
     pub dep_graph: ResolvedGraph,
@@ -169,11 +172,13 @@ pub(crate) struct LockfileWriteInputs {
 ///
 /// - In `--locked` mode the on-disk lockfile is authoritative and returned
 ///   unchanged (the user explicitly forbids any modification; it already
-///   contains the plugin entries, enforced by the staleness check).
+///   contains the plugin entries — the root's enforced by the staleness check,
+///   dep-contributed ones by the graph-wide ensure's pin gate).
 /// - Otherwise the toolchain section is stabilized to the detected konanc
-///   version (predicting the post-build write), existing dependencies are
-///   preserved, and the predicted `[[plugins]]` entries (`plugin_locks`,
-///   resolved before the cache key is computed) are folded in.
+///   version (predicting the post-build write), and the predicted `[[plugins]]`
+///   entries (`plugin_locks`, resolved before the cache key is computed) and
+///   `[[dependencies]]` entries (path-dep locks derived from `dep_graph`, Maven
+///   locks preserved) are folded in.
 ///
 /// Folding the plugin entries in BOTH the version-matches branch and the
 /// stabilized branch is what fixes the spurious one-time recompile of projects
@@ -182,12 +187,15 @@ pub(crate) struct LockfileWriteInputs {
 /// the two builds produce different `lockfile_content` and therefore different
 /// cache keys. Plugins genuinely affect compilation, so they must stay in the
 /// cache key — folding the predicted entries in is what keeps it stable.
+#[allow(clippy::too_many_arguments)]
 fn predicted_effective_lockfile(
     lockfile: &Lockfile,
     konanc_version: &str,
     konanc_tarball_sha256: Option<&str>,
     jre_tarball_sha256: Option<&str>,
     plugin_locks: &[PluginLock],
+    dep_graph: &ResolvedGraph,
+    project_root: &Path,
     resolver: crate::common::ArtifactResolver<'_>,
 ) -> Lockfile {
     resolver.cache_key_artifact_state(lockfile, || {
@@ -197,15 +205,14 @@ fn predicted_effective_lockfile(
             Some(tc) if tc.konanc_version == konanc_version => lockfile.clone(),
             // Lockfile is missing or has a different version. Build the same
             // lockfile that will eventually be written so the cache key is stable
-            // from the first build. Preserve existing dependencies (e.g. Maven deps
-            // written by `konvoy update`).
+            // from the first build. (Dependencies are folded in below, for both
+            // branches.)
             _ => {
                 let mut stabilized = Lockfile::with_managed_toolchain(
                     konanc_version,
                     konanc_tarball_sha256,
                     jre_tarball_sha256,
                 );
-                stabilized.dependencies = lockfile.dependencies.clone();
                 // Mirror the detekt carry-forward that `update_lockfile_if_needed`
                 // applies to the WRITTEN lockfile, or the predicted cache-key
                 // lockfile would drop detekt and diverge from what gets written
@@ -220,8 +227,58 @@ fn predicted_effective_lockfile(
         // (`updated.plugins = plugin_locks`). This keeps the cache key identical
         // across the first and second builds of a project with plugins.
         effective.plugins = plugin_locks.to_vec();
+        // Same reasoning for the [[dependencies]] entries: path-dep locks are
+        // written only at the END of the build, so predict them here (the shared
+        // helper keeps the prediction and the write in lockstep) — otherwise a
+        // project with path-deps recompiles its whole graph once after the
+        // first build (issue #133 class).
+        effective.dependencies = predicted_dependency_locks(lockfile, dep_graph, project_root);
         effective
     })
+}
+
+/// Build the dependency lock entries the build will write for the current
+/// graph: path-dep entries derived from `dep_graph` (portable relative paths
+/// plus source hashes), with the lockfile's existing Maven entries preserved
+/// (`konvoy update` owns those; `konvoy build` never edits them).
+///
+/// Single authority shared by `predicted_effective_lockfile` (the cache-key
+/// prediction) and `update_lockfile_if_needed` (the write) so the two cannot
+/// drift — if they did, the first build would key on different lockfile content
+/// than the second build reads back from disk (issue #133 class).
+fn predicted_dependency_locks(
+    lockfile: &Lockfile,
+    dep_graph: &ResolvedGraph,
+    project_root: &Path,
+) -> Vec<DependencyLock> {
+    // Dep roots come back canonicalized (absolute) from `resolve_dep_path`;
+    // canonicalize the project root too so the relative computation is between
+    // like paths even when the cwd contains symlinks (e.g. /tmp on macOS).
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let mut new_deps: Vec<DependencyLock> = dep_graph
+        .order
+        .iter()
+        .filter(|dep| !dep.source_hash.is_empty())
+        .map(|dep| {
+            let rel_path = portable_dep_path(&canonical_root, &dep.project_root);
+            DependencyLock {
+                name: dep.name.clone(),
+                source: DepSource::Path { path: rel_path },
+                source_hash: dep.source_hash.clone(),
+            }
+        })
+        .collect();
+
+    // Preserve existing Maven dep locks from the current lockfile.
+    // Maven dep locks are only modified by `konvoy update`, not by `konvoy build`.
+    for dep_lock in &lockfile.dependencies {
+        if matches!(&dep_lock.source, DepSource::Maven { .. }) {
+            new_deps.push(dep_lock.clone());
+        }
+    }
+    new_deps
 }
 
 /// Resolve the common build pipeline state (steps 1–7a).
@@ -232,11 +289,12 @@ fn predicted_effective_lockfile(
 /// 3. Check lockfile staleness in `--locked` mode
 /// 4. Resolve target and profile
 /// 5. Resolve managed konanc toolchain
-/// 6. Resolve plugin artifacts, then pre-stabilize the lockfile for cache-key
+/// 6. Resolve the dependency graph, then ensure the graph-wide plugin union
+///    (root + every path-dep) and pre-stabilize the lockfile for cache-key
 ///    consistency (the predicted `[[plugins]]` entries are folded in so the
 ///    cache key is stable from the first build)
-/// 7. Resolve + build path dependencies in topological order, then download
-///    Maven dependency klibs
+/// 7. Build path dependencies in topological order, then download Maven
+///    dependency klibs
 pub(crate) fn resolve_build_context(
     project_root: &Path,
     options: &BuildOptions,
@@ -315,8 +373,16 @@ pub(crate) fn resolve_build_context(
         )?;
     }
 
-    // 6. Resolve plugin artifacts, then pre-stabilize the lockfile for
-    //    cache-key consistency (issue #133).
+    // 6. Resolve the dependency graph up front. Plugin pinning spans the WHOLE
+    //    graph (root + path-deps), so every dependency's manifest must be known
+    //    before plugins are resolved and the lockfile is predicted.
+    //    `resolve_dependencies` only reads dep manifests + source hashes (no
+    //    toolchain/plugin state), so running it here — earlier than the build
+    //    loop below — is safe.
+    let dep_graph = resolve_dependencies(project_root, &manifest)?;
+
+    // 6a. Resolve + ensure plugin artifacts graph-wide, then pre-stabilize the
+    //     lockfile for cache-key consistency (issue #133).
     //
     // When `konvoy.lock` does not exist (first build) or the toolchain version
     // has changed, the lockfile read at step 2 will differ from what
@@ -331,20 +397,28 @@ pub(crate) fn resolve_build_context(
     // the effective lockfile. Otherwise a project with a `[plugins]` section
     // recompiles once unnecessarily after its first build (issue #133 class).
     //
+    // The pin set is the deduped UNION of every plugin across the root and all
+    // path-deps (issue #293): a path-dep's `[plugins]` must be downloaded and
+    // pinned just like the root's, because the dep's own compile step applies
+    // them (see `build_single`). The union is recorded in the root
+    // `konvoy.lock`, exactly as the root lock aggregates the graph's Maven
+    // deps; no dependency checkout is written to.
+    //
     // Hash lookup uses the on-disk `lockfile` (its `[[plugins]]` entries, if
     // any), which is exactly what the effective lockfile carried before folding.
     // On a warm cache the artifacts are already present and pinned, so
     // `ensure_plugin_artifacts` only re-verifies hashes — it does not download.
-    let (plugin_jars, plugin_locks) = if !manifest.plugins.is_empty() {
-        let resolved_artifacts = crate::plugin::resolve_plugin_artifacts(&manifest)?;
-        let results =
-            crate::plugin::ensure_plugin_artifacts(&resolved_artifacts, &lockfile, resolver)?;
-        let locks = crate::plugin::build_plugin_locks(&results);
-        let jars: Vec<PathBuf> = results.iter().map(|r| r.path.clone()).collect();
-        (jars, locks)
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    let graph_plugin_artifacts = crate::plugin::resolve_graph_plugin_artifacts(
+        std::iter::once(&manifest).chain(dep_graph.order.iter().map(|dep| &dep.manifest)),
+    )?;
+    let plugin_results =
+        crate::plugin::ensure_plugin_artifacts(&graph_plugin_artifacts, &lockfile, resolver)?;
+    let plugin_locks = crate::plugin::build_plugin_locks(&plugin_results);
+
+    // The ROOT project's own -Xplugin set, for the test build (`build_tests`
+    // compiles the root's test sources). Regular compilation derives each
+    // project's set from its own manifest inside `build_single`.
+    let plugin_jars = crate::plugin::plugin_jar_paths(&manifest)?;
 
     // We predict the lockfile content that will eventually be written, so the
     // cache key is the same in the first and second builds. In `--locked` mode
@@ -355,11 +429,12 @@ pub(crate) fn resolve_build_context(
         konanc_tarball_sha256.as_deref(),
         jre_tarball_sha256.as_deref(),
         &plugin_locks,
+        &dep_graph,
+        project_root,
         resolver,
     );
 
-    // 7. Resolve dependencies and build them in topological order.
-    let dep_graph = resolve_dependencies(project_root, &manifest)?;
+    // 7. Build path dependencies in topological order.
     let lockfile_content = lockfile_toml_content(&effective_lockfile)?;
 
     let levels = parallel_levels(&dep_graph);
@@ -382,7 +457,6 @@ pub(crate) fn resolve_build_context(
                     target: &target,
                     options,
                     library_inputs: &lib_inputs,
-                    plugin_jars: &[],
                 };
                 let (output, outcome) = build_single(
                     &dep.project_root,
@@ -469,7 +543,6 @@ pub fn build(
         target: &ctx.target,
         options,
         library_inputs: &ctx.library_inputs,
-        plugin_jars: &ctx.plugin_jars,
     };
     let (output_path, outcome) = build_single(
         project_root,
@@ -518,9 +591,10 @@ pub(crate) struct CompileContext<'a> {
     /// Dependency `.klib` inputs (path + optional pre-computed hash).
     ///
     /// The compiler only consumes the paths; the hashes feed the cache key.
+    /// Plugin JARs are NOT part of this context: each project's `-Xplugin` set
+    /// is derived from its own manifest inside `build_single`, so the same
+    /// context serves the root and every path-dep.
     pub library_inputs: &'a [LibraryInput],
-    /// Compiler plugin JAR paths to pass as `-Xplugin` args.
-    pub plugin_jars: &'a [PathBuf],
 }
 
 /// Build a single project (either root or a dependency).
@@ -548,6 +622,15 @@ pub(crate) fn build_single(
     }
 
     let is_lib = manifest.package.kind == PackageKind::Lib;
+
+    // This project's compiler plugins, from its OWN manifest — the root and
+    // every path-dep are treated identically, so a dep's `[plugins]` are applied
+    // to the dep's compilation exactly as when it is built standalone (#293).
+    // The JARs were already downloaded + SHA-pinned graph-wide in
+    // `resolve_build_context`; this is pure path derivation. The cache key
+    // covers plugins through `manifest_content` (the `[plugins]` config) and
+    // `lockfile_content` (the graph-wide pin union, version + sha256).
+    let plugin_jars = crate::plugin::plugin_jar_paths(manifest)?;
 
     // Compute cache key.
     let manifest_content = manifest.to_toml()?;
@@ -609,7 +692,7 @@ pub(crate) fn build_single(
     } else {
         ProduceKind::Program
     };
-    let compile_output = compile(cc, &sources, &output_path, produce)?;
+    let compile_output = compile(cc, &sources, &output_path, produce, &plugin_jars)?;
 
     // Store artifact in cache.
     let metadata = BuildMetadata {
@@ -665,6 +748,7 @@ fn compile_two_step(
     cc: &CompileContext<'_>,
     sources: &[PathBuf],
     output_path: &Path,
+    plugin_jars: &[PathBuf],
 ) -> Result<PathBuf, EngineError> {
     // Step 1: compile sources → temporary klib (with plugins active).
     let klib_path = output_path.with_extension("klib");
@@ -679,7 +763,7 @@ fn compile_two_step(
         .release(cc.options.is_release())
         .produce(ProduceKind::Library)
         .libraries(&lib_paths)
-        .plugins(cc.plugin_jars);
+        .plugins(plugin_jars);
 
     if let Some(jh) = cc.jre_home {
         compile_cmd = compile_cmd.java_home(jh);
@@ -735,6 +819,7 @@ fn compile_single_step(
     sources: &[PathBuf],
     output_path: &Path,
     produce: ProduceKind,
+    plugin_jars: &[PathBuf],
 ) -> Result<PathBuf, EngineError> {
     let lib_paths = library_paths_of(cc.library_inputs);
 
@@ -745,7 +830,7 @@ fn compile_single_step(
         .release(cc.options.is_release())
         .produce(produce)
         .libraries(&lib_paths)
-        .plugins(cc.plugin_jars);
+        .plugins(plugin_jars);
 
     if let Some(jh) = cc.jre_home {
         cmd = cmd.java_home(jh);
@@ -776,16 +861,17 @@ fn compile(
     sources: &[PathBuf],
     output_path: &Path,
     produce: ProduceKind,
+    plugin_jars: &[PathBuf],
 ) -> Result<PathBuf, EngineError> {
     // Ensure the output directory exists.
     if let Some(parent) = output_path.parent() {
         konvoy_util::fs::ensure_dir(parent)?;
     }
 
-    if needs_two_step_compilation(produce, cc.plugin_jars) {
-        compile_two_step(cc, sources, output_path)
+    if needs_two_step_compilation(produce, plugin_jars) {
+        compile_two_step(cc, sources, output_path, plugin_jars)
     } else {
-        compile_single_step(cc, sources, output_path, produce)
+        compile_single_step(cc, sources, output_path, produce, plugin_jars)
     }
 }
 
@@ -1008,12 +1094,13 @@ pub(crate) fn check_lockfile_staleness(
         }
     }
 
-    // Each declared plugin must have a *pinned* lockfile entry. Use the same
-    // `find_lockfile_hash` the resolver gate uses, so this fast-fail and the
-    // per-artifact gate agree that an empty `sha256` is "no pin" — otherwise a
+    // Each declared plugin must have a *pinned* lockfile entry for its resolved
+    // `(name, maven, version)` identity. Use the same lookup the resolver gate
+    // uses, so this fast-fail and the per-artifact gate agree on what "pinned"
+    // means (identity match, empty `sha256` is "no pin") — otherwise a stale or
     // malformed entry would slip past this check only to fail deeper in.
-    for plugin_name in manifest.plugins.keys() {
-        if crate::plugin::find_lockfile_hash(lockfile, plugin_name).is_none() {
+    for artifact in &crate::plugin::resolve_plugin_artifacts(manifest)? {
+        if crate::plugin::find_artifact_lockfile_hash(lockfile, artifact).is_none() {
             return Err(EngineError::LockfileUpdateRequired);
         }
     }
@@ -1066,34 +1153,10 @@ fn update_lockfile_if_needed(
         }
     }
 
-    // Build new dependency lock entries from path deps in the dep graph.
-    // Dep roots come back canonicalized (absolute) from `resolve_dep_path`;
-    // canonicalize the project root too so the relative computation is between
-    // like paths even when the cwd contains symlinks (e.g. /tmp on macOS).
-    let canonical_root = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-    let mut new_deps: Vec<DependencyLock> = dep_graph
-        .order
-        .iter()
-        .filter(|dep| !dep.source_hash.is_empty())
-        .map(|dep| {
-            let rel_path = portable_dep_path(&canonical_root, &dep.project_root);
-            DependencyLock {
-                name: dep.name.clone(),
-                source: DepSource::Path { path: rel_path },
-                source_hash: dep.source_hash.clone(),
-            }
-        })
-        .collect();
-
-    // Preserve existing Maven dep locks from the current lockfile.
-    // Maven dep locks are only modified by `konvoy update`, not by `konvoy build`.
-    for dep_lock in &lockfile.dependencies {
-        if matches!(&dep_lock.source, DepSource::Maven { .. }) {
-            new_deps.push(dep_lock.clone());
-        }
-    }
+    // Build new dependency lock entries from path deps in the dep graph,
+    // preserving existing Maven dep locks (shared with the cache-key prediction
+    // in `predicted_effective_lockfile` so the two stay in lockstep).
+    let new_deps = predicted_dependency_locks(lockfile, dep_graph, project_root);
 
     let toolchain_changed = match &lockfile.toolchain {
         Some(tc) => tc.konanc_version != konanc.version,
@@ -1882,7 +1945,6 @@ mod tests {
             target: &target,
             options: &options,
             library_inputs: &[],
-            plugin_jars: &[],
         };
         let (output_path, outcome) =
             build_single(&project, &manifest, &cc, profile, &lockfile_content).unwrap();
@@ -1968,7 +2030,6 @@ mod tests {
             target: &target,
             options: &options,
             library_inputs: &[],
-            plugin_jars: &[],
         };
         let (output_path, outcome) =
             build_single(&project, &manifest, &cc, profile, &lockfile_content).unwrap();
@@ -2079,7 +2140,6 @@ mod tests {
             target: &target,
             options: &options,
             library_inputs: &[],
-            plugin_jars: &[],
         };
         let (output_path, outcome) =
             build_single(&project, &manifest, &cc, profile, &lockfile_content).unwrap();
@@ -3005,6 +3065,8 @@ mod tests {
             Some("new1"),
             Some("new2"),
             &[],
+            &crate::resolve::ResolvedGraph { order: Vec::new() },
+            Path::new("/tmp"),
             crate::common::test_resolver(false, false),
         );
 
@@ -3091,7 +3153,6 @@ mod tests {
             target: &target,
             options: &options_no_force,
             library_inputs: &[],
-            plugin_jars: &[],
         };
         let (_, outcome) = build_single(
             &project,
@@ -3118,7 +3179,6 @@ mod tests {
             target: &target,
             options: &options_force,
             library_inputs: &[],
-            plugin_jars: &[],
         };
         let result = build_single(&project, &manifest, &cc_force, profile, &lockfile_content);
 
@@ -3224,6 +3284,8 @@ mod tests {
             None,
             None,
             &plugin_locks,
+            &crate::resolve::ResolvedGraph { order: Vec::new() },
+            Path::new("/tmp"),
             crate::common::test_resolver(false, false),
         );
 
@@ -3240,6 +3302,8 @@ mod tests {
             None,
             None,
             &plugin_locks,
+            &crate::resolve::ResolvedGraph { order: Vec::new() },
+            Path::new("/tmp"),
             crate::common::test_resolver(false, false),
         );
 
@@ -3254,6 +3318,249 @@ mod tests {
             content_first.contains("kotlin-serialization"),
             "predicted plugin entries must be folded into the cache-key lockfile content"
         );
+    }
+
+    /// Pre-stabilization parity for a DEP-contributed plugin in the graph-wide
+    /// union (issue #293): the union resolved on the first build (root's plugin
+    /// + a path-dep's plugin, including a second version of the same plugin
+    /// name) must produce the same cache-key lockfile content as the second
+    /// build, which reads those pins back from disk. Otherwise a project with
+    /// plugin-using deps spuriously recompiles once after its first build
+    /// (issue #133 class).
+    #[test]
+    fn pre_stabilized_lockfile_matches_post_update_lockfile_with_dep_plugin_union() {
+        let konanc_version = "2.1.0";
+
+        // The graph-wide union: the root's serialization plugin plus a path-dep's
+        // plugins — one of them the same plugin name at a DIFFERENT version
+        // (allowed as a distinct pin, not a conflict).
+        let plugin_locks = vec![
+            PluginLock {
+                name: "kotlin-serialization".to_owned(),
+                maven: "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin".to_owned(),
+                version: konanc_version.to_owned(),
+                sha256: "root-plugin-sha".to_owned(),
+                url: "https://repo.maven.apache.org/ser.jar".to_owned(),
+            },
+            PluginLock {
+                name: "my-plugin".to_owned(),
+                maven: "com.example:my-plugin".to_owned(),
+                version: "1.0.0".to_owned(),
+                sha256: "dep-plugin-sha-v1".to_owned(),
+                url: "https://repo.maven.apache.org/my-plugin-1.0.0.jar".to_owned(),
+            },
+            PluginLock {
+                name: "my-plugin".to_owned(),
+                maven: "com.example:my-plugin".to_owned(),
+                version: "2.0.0".to_owned(),
+                sha256: "dep-plugin-sha-v2".to_owned(),
+                url: "https://repo.maven.apache.org/my-plugin-2.0.0.jar".to_owned(),
+            },
+        ];
+
+        // First build: no lockfile on disk.
+        let first_on_disk = Lockfile::default();
+        let effective_first = predicted_effective_lockfile(
+            &first_on_disk,
+            konanc_version,
+            None,
+            None,
+            &plugin_locks,
+            &crate::resolve::ResolvedGraph { order: Vec::new() },
+            Path::new("/tmp"),
+            crate::common::test_resolver(false, false),
+        );
+
+        // After the first build, `update_lockfile_if_needed` writes the union.
+        let mut written = Lockfile::with_managed_toolchain(konanc_version, None, None);
+        written.plugins = plugin_locks.clone();
+
+        // Second build reads `written` from disk and resolves the same union.
+        let effective_second = predicted_effective_lockfile(
+            &written,
+            konanc_version,
+            None,
+            None,
+            &plugin_locks,
+            &crate::resolve::ResolvedGraph { order: Vec::new() },
+            Path::new("/tmp"),
+            crate::common::test_resolver(false, false),
+        );
+
+        let content_first = lockfile_toml_content(&effective_first).unwrap();
+        let content_second = lockfile_toml_content(&effective_second).unwrap();
+        assert_eq!(
+            content_first, content_second,
+            "cache key lockfile content must be identical between the first and second \
+             builds when path-deps contribute plugins to the union"
+        );
+        for needle in ["root-plugin-sha", "dep-plugin-sha-v1", "dep-plugin-sha-v2"] {
+            assert!(
+                content_first.contains(needle),
+                "the dep-contributed union pins must be folded into the cache-key \
+                 lockfile content (missing {needle})"
+            );
+        }
+    }
+
+    /// Pre-stabilization parity for PATH-DEP `[[dependencies]]` entries: the
+    /// first build's predicted lockfile must already contain the dep entries
+    /// that `update_lockfile_if_needed` writes after the build, or the second
+    /// build reads them back from disk, computes a different `lockfile_content`,
+    /// and recompiles the whole graph once for nothing (issue #133 class — the
+    /// path-dep analogue of the plugin fold above).
+    #[test]
+    fn pre_stabilized_lockfile_matches_post_update_lockfile_with_path_deps() {
+        let konanc_version = "2.1.0";
+        let root_dir = tempfile::tempdir().unwrap();
+        let dep_dir = tempfile::tempdir().unwrap();
+
+        let dep_manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"models\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let graph = crate::resolve::ResolvedGraph {
+            order: vec![crate::resolve::ResolvedDep {
+                name: "models".to_owned(),
+                project_root: dep_dir.path().canonicalize().unwrap(),
+                manifest: dep_manifest,
+                dep_names: Vec::new(),
+                source_hash: "dep-source-hash".to_owned(),
+            }],
+        };
+
+        // First build: no lockfile on disk.
+        let first_on_disk = Lockfile::default();
+        let effective_first = predicted_effective_lockfile(
+            &first_on_disk,
+            konanc_version,
+            None,
+            None,
+            &[],
+            &graph,
+            root_dir.path(),
+            crate::common::test_resolver(false, false),
+        );
+
+        // After the first build, `update_lockfile_if_needed` writes the dep
+        // entries. Use the real write path so the prediction is compared with
+        // what actually lands on disk.
+        let lockfile_path = root_dir.path().join("konvoy.lock");
+        let konanc = KonancInfo {
+            path: PathBuf::from("/fake/konanc"),
+            version: konanc_version.to_owned(),
+            fingerprint: "fp".to_owned(),
+        };
+        update_lockfile_if_needed(
+            &first_on_disk,
+            &konanc,
+            None,
+            None,
+            &graph,
+            &[],
+            root_dir.path(),
+            &lockfile_path,
+            false,
+            crate::common::test_resolver(false, false),
+        )
+        .unwrap();
+        let written = Lockfile::from_path(&lockfile_path).unwrap();
+
+        // Second build reads `written` from disk and resolves the same graph.
+        let effective_second = predicted_effective_lockfile(
+            &written,
+            konanc_version,
+            None,
+            None,
+            &[],
+            &graph,
+            root_dir.path(),
+            crate::common::test_resolver(false, false),
+        );
+
+        let content_first = lockfile_toml_content(&effective_first).unwrap();
+        let content_second = lockfile_toml_content(&effective_second).unwrap();
+        assert_eq!(
+            content_first, content_second,
+            "cache key lockfile content must be identical between the first and \
+             second builds of a project with path-deps"
+        );
+        assert!(
+            content_first.contains("dep-source-hash"),
+            "the predicted dep entries must be folded into the cache-key lockfile content"
+        );
+    }
+
+    /// `update_lockfile_if_needed` persists the graph-wide plugin union,
+    /// including the same plugin name at multiple versions (distinct pins, not
+    /// a conflict), and a second write with the unchanged union is a no-op.
+    #[test]
+    fn update_lockfile_writes_multi_version_plugin_union_and_no_ops_when_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join("konvoy.lock");
+        let lockfile = Lockfile::default();
+        let konanc = KonancInfo {
+            path: PathBuf::from("/fake/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "fp".to_owned(),
+        };
+        let plugin_locks = vec![
+            PluginLock {
+                name: "my-plugin".to_owned(),
+                maven: "com.example:my-plugin".to_owned(),
+                version: "1.0.0".to_owned(),
+                sha256: "sha-v1".to_owned(),
+                url: "https://example.com/my-plugin-1.0.0.jar".to_owned(),
+            },
+            PluginLock {
+                name: "my-plugin".to_owned(),
+                maven: "com.example:my-plugin".to_owned(),
+                version: "2.0.0".to_owned(),
+                sha256: "sha-v2".to_owned(),
+                url: "https://example.com/my-plugin-2.0.0.jar".to_owned(),
+            },
+        ];
+
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            &plugin_locks,
+            dir.path(),
+            &lockfile_path,
+            false,
+            crate::common::test_resolver(false, false),
+        )
+        .unwrap();
+
+        let written = Lockfile::from_path(&lockfile_path).unwrap();
+        assert_eq!(
+            written.plugins, plugin_locks,
+            "both versions of the plugin must be recorded as distinct pins"
+        );
+
+        // Re-running with the unchanged union must not error and must leave the
+        // lockfile identical (it would be rejected under --locked otherwise).
+        let before = fs::read_to_string(&lockfile_path).unwrap();
+        update_lockfile_if_needed(
+            &written,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            &plugin_locks,
+            dir.path(),
+            &lockfile_path,
+            false,
+            crate::common::test_resolver(false, true),
+        )
+        .unwrap();
+        let after = fs::read_to_string(&lockfile_path).unwrap();
+        assert_eq!(before, after, "an unchanged union must be a no-op write");
     }
 
     /// The pre-stabilized lockfile should NOT change the content when the
@@ -3330,6 +3637,8 @@ mod tests {
             None,
             None,
             &[],
+            &crate::resolve::ResolvedGraph { order: Vec::new() },
+            Path::new("/tmp"),
             crate::common::test_resolver(false, true),
         );
 
@@ -3483,6 +3792,59 @@ mod tests {
         assert!(
             err.contains("lockfile is out of date"),
             "expected staleness error for missing plugin entries, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_plugin_version_drift_errors() {
+        // Manifest pins the plugin at a literal version; the lockfile entry has
+        // the same name but a DIFFERENT version. The pin lookup must be
+        // version-aware: a name-only match would wrongly treat the stale pin as
+        // valid (and the graph-wide union allows the same plugin name at several
+        // versions, which a name-only lookup cannot distinguish).
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nmy-plugin = { maven = \"com.example:my-plugin\", version = \"1.1.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "my-plugin".to_owned(),
+            maven: "com.example:my-plugin".to_owned(),
+            version: "1.0.0".to_owned(),
+            sha256: "abc123".to_owned(),
+            url: "https://example.com/my-plugin-1.0.0.jar".to_owned(),
+        });
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(
+            result.is_err(),
+            "a pin at a different version must be drift, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_plugin_maven_drift_errors() {
+        // Same plugin name and version, but the manifest now points at a
+        // different Maven coordinate — the old pin is for a different artifact.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[plugins]\nmy-plugin = { maven = \"com.example:new-coord\", version = \"1.0.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.plugins.push(konvoy_config::lockfile::PluginLock {
+            name: "my-plugin".to_owned(),
+            maven: "com.example:old-coord".to_owned(),
+            version: "1.0.0".to_owned(),
+            sha256: "abc123".to_owned(),
+            url: "https://example.com/old-coord-1.0.0.jar".to_owned(),
+        });
+
+        let result = check_lockfile_staleness(&manifest, &lockfile);
+        assert!(
+            result.is_err(),
+            "a pin for a different maven coordinate must be drift, got: {result:?}"
         );
     }
 

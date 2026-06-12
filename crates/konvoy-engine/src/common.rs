@@ -132,7 +132,7 @@ impl<'a> ArtifactResolver<'a> {
         lockfile: &Lockfile,
         bar: Option<&konvoy_util::progress::DownloadBar>,
     ) -> Result<crate::plugin::PluginArtifactResult, EngineError> {
-        let expected_sha256 = crate::plugin::find_lockfile_hash(lockfile, &artifact.plugin_name);
+        let expected_sha256 = crate::plugin::find_artifact_lockfile_hash(lockfile, artifact);
         self.resolve_artifact(
             || Ok(expected_sha256.is_some()),
             artifact.cache_path.exists(),
@@ -170,7 +170,7 @@ impl<'a> ArtifactResolver<'a> {
         let present: Vec<bool> = artifacts.iter().map(|a| a.cache_path.exists()).collect();
         for (artifact, is_present) in artifacts.iter().zip(present.iter().copied()) {
             self.resolve_artifact(
-                || Ok(crate::plugin::find_lockfile_hash(lockfile, &artifact.plugin_name).is_some()),
+                || Ok(crate::plugin::find_artifact_lockfile_hash(lockfile, artifact).is_some()),
                 is_present,
                 || EngineError::PluginOffline {
                     name: artifact.plugin_name.clone(),

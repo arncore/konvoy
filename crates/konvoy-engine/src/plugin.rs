@@ -4,6 +4,7 @@
 //! as dependencies. Any Maven-published compiler plugin JAR can be used without
 //! needing a built-in descriptor.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use konvoy_config::lockfile::{Lockfile, PluginLock};
@@ -116,24 +117,119 @@ pub fn resolve_plugin_artifacts(
     Ok(artifacts)
 }
 
+/// The given artifacts, deduplicated by their full `(name, maven, version)`
+/// identity and in stable sorted order.
+///
+/// A build graph (root + path-dependencies) may declare the same plugin several
+/// times. Identical declarations collapse to one entry — the JAR is
+/// content-addressed under `~/.konvoy/cache/maven`, so it is downloaded,
+/// verified, and pinned once. The same plugin name at a different version (or
+/// coordinate) stays a distinct entry: compiler plugins are applied
+/// per-compilation, not linked into a shared artifact classpath, so multiple
+/// versions across the graph are benign — unlike linked Maven *library* version
+/// conflicts, which Konvoy intentionally surfaces. Sorting keeps the resulting
+/// lockfile pins deterministic regardless of the order projects were discovered.
+fn unique_plugin_artifacts(artifacts: Vec<ResolvedPluginArtifact>) -> Vec<ResolvedPluginArtifact> {
+    let mut unique: BTreeMap<(String, String, String), ResolvedPluginArtifact> = BTreeMap::new();
+    for artifact in artifacts {
+        unique
+            .entry((
+                artifact.plugin_name.clone(),
+                artifact.maven_coord.group_artifact(),
+                artifact.maven_coord.version.clone(),
+            ))
+            .or_insert(artifact);
+    }
+    unique.into_values().collect()
+}
+
+/// Resolve the deduped union of plugin artifacts across a build graph's
+/// manifests (the root plus every path-dependency).
+///
+/// This is the graph-wide ensure's input: each manifest's plugins are resolved
+/// against its own `[toolchain]` (for the `{kotlin}` placeholder — path-deps are
+/// required to match the root's Kotlin version), then deduplicated and sorted by
+/// [`unique_plugin_artifacts`]. The resulting pins are recorded in the **root**
+/// `konvoy.lock`, exactly as the root lock already aggregates the graph's Maven
+/// dependencies; no dependency checkout is written to.
+///
+/// # Errors
+/// Returns an error if any manifest's plugin config is invalid (missing `maven`
+/// or `version`, malformed coordinate) or the cache root cannot be determined.
+pub fn resolve_graph_plugin_artifacts<'a>(
+    manifests: impl IntoIterator<Item = &'a Manifest>,
+) -> Result<Vec<ResolvedPluginArtifact>, EngineError> {
+    let mut all = Vec::new();
+    for manifest in manifests {
+        all.extend(resolve_plugin_artifacts(manifest)?);
+    }
+    Ok(unique_plugin_artifacts(all))
+}
+
+/// This project's compiler-plugin JAR paths, derived from its own manifest.
+///
+/// Pure path computation — no download. The JARs are downloaded and SHA-verified
+/// up front by the graph-wide ensure in `resolve_build_context`; each project's
+/// compile step (root or path-dep) then derives its own `-Xplugin` set here, so
+/// a project is compiled with the plugins *it* declares whether it is built
+/// standalone or as a dependency.
+///
+/// # Errors
+/// Returns an error if the plugin config is invalid or the cache root cannot be
+/// determined.
+pub fn plugin_jar_paths(manifest: &Manifest) -> Result<Vec<PathBuf>, EngineError> {
+    Ok(resolve_plugin_artifacts(manifest)?
+        .into_iter()
+        .map(|artifact| artifact.cache_path)
+        .collect())
+}
+
 // ---------------------------------------------------------------------------
 // Download / verification
 // ---------------------------------------------------------------------------
 
 /// Look up the pinned SHA-256 for a plugin from the lockfile.
 ///
+/// Pins are matched by their full identity — `(name, maven, version)` — not by
+/// name alone: the lockfile aggregates plugins across the whole build graph
+/// (root + path-deps), which may legitimately pin the same plugin name at
+/// several versions. A name-only match would return whichever pin happens to
+/// come first and verify a different artifact against it; an identity miss
+/// (e.g. after a version bump) is "no pin", falling back to download-and-record.
+///
 /// An empty string is treated as "no pin", so a malformed or half-written entry
 /// falls back to download-and-record instead of being verified against an empty
-/// hash. Shared by the resolver's pin gate (`prepare_plugin_artifacts`) and its
-/// hash lookup (`resolve_plugin_artifact`) so the two agree on what "pinned"
-/// means.
-pub(crate) fn find_lockfile_hash<'a>(lockfile: &'a Lockfile, plugin_name: &str) -> Option<&'a str> {
+/// hash. Shared by the resolver's pin gate (`prepare_plugin_artifacts`), its
+/// hash lookup (`resolve_plugin_artifact`), and the `--locked` staleness check
+/// (`check_lockfile_staleness`) so all three agree on what "pinned" means.
+pub(crate) fn find_lockfile_hash<'a>(
+    lockfile: &'a Lockfile,
+    plugin_name: &str,
+    maven: &str,
+    version: &str,
+) -> Option<&'a str> {
     lockfile
         .plugins
         .iter()
-        .find(|p| p.name == plugin_name)
+        .find(|p| p.name == plugin_name && p.maven == maven && p.version == version)
         .map(|p| p.sha256.as_str())
         .filter(|s| !s.is_empty())
+}
+
+/// Look up the pinned SHA-256 for a resolved plugin artifact.
+///
+/// Convenience over [`find_lockfile_hash`] using the artifact's resolved
+/// `(name, maven, version)` identity.
+pub(crate) fn find_artifact_lockfile_hash<'a>(
+    lockfile: &'a Lockfile,
+    artifact: &ResolvedPluginArtifact,
+) -> Option<&'a str> {
+    find_lockfile_hash(
+        lockfile,
+        &artifact.plugin_name,
+        &artifact.maven_coord.group_artifact(),
+        &artifact.maven_coord.version,
+    )
 }
 
 /// Map a `UtilError` from a plugin download into the matching `EngineError`.
@@ -234,7 +330,7 @@ pub fn build_plugin_locks(results: &[PluginArtifactResult]) -> Vec<PluginLock> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::path::Path;
 
     #[test]
     fn resolve_plugin_artifacts_basic() {
@@ -361,14 +457,68 @@ mod tests {
             ..Lockfile::default()
         };
 
-        let hash = find_lockfile_hash(&lockfile, "kotlin-serialization");
+        let hash = find_lockfile_hash(
+            &lockfile,
+            "kotlin-serialization",
+            "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin",
+            "2.1.0",
+        );
         assert_eq!(hash, Some("abc123"));
+    }
+
+    #[test]
+    fn find_lockfile_hash_distinguishes_versions_and_coordinates() {
+        // The graph-wide union records distinct pins for the same plugin name at
+        // different versions, so the lookup must match the full identity
+        // (name, maven, version) — a name-only match would return whichever pin
+        // happens to come first and verify the wrong artifact against it.
+        let lockfile = Lockfile {
+            plugins: vec![
+                PluginLock {
+                    name: "ser".to_owned(),
+                    maven: "org.example:ser".to_owned(),
+                    version: "1.0.0".to_owned(),
+                    sha256: "sha-v1".to_owned(),
+                    url: "https://example.com/ser-1.0.0.jar".to_owned(),
+                },
+                PluginLock {
+                    name: "ser".to_owned(),
+                    maven: "org.example:ser".to_owned(),
+                    version: "2.0.0".to_owned(),
+                    sha256: "sha-v2".to_owned(),
+                    url: "https://example.com/ser-2.0.0.jar".to_owned(),
+                },
+            ],
+            ..Lockfile::default()
+        };
+
+        assert_eq!(
+            find_lockfile_hash(&lockfile, "ser", "org.example:ser", "1.0.0"),
+            Some("sha-v1")
+        );
+        assert_eq!(
+            find_lockfile_hash(&lockfile, "ser", "org.example:ser", "2.0.0"),
+            Some("sha-v2")
+        );
+        assert!(
+            find_lockfile_hash(&lockfile, "ser", "org.example:ser", "3.0.0").is_none(),
+            "a version with no pin must not match another version's pin"
+        );
+        assert!(
+            find_lockfile_hash(&lockfile, "ser", "org.other:ser", "1.0.0").is_none(),
+            "a different maven coordinate must not match"
+        );
     }
 
     #[test]
     fn find_lockfile_hash_absent() {
         let lockfile = Lockfile::default();
-        let hash = find_lockfile_hash(&lockfile, "kotlin-serialization");
+        let hash = find_lockfile_hash(
+            &lockfile,
+            "kotlin-serialization",
+            "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin",
+            "2.1.0",
+        );
         assert!(hash.is_none());
     }
 
@@ -388,8 +538,119 @@ mod tests {
             ..Lockfile::default()
         };
 
-        let hash = find_lockfile_hash(&lockfile, "kotlin-serialization");
+        let hash = find_lockfile_hash(
+            &lockfile,
+            "kotlin-serialization",
+            "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin",
+            "2.1.0",
+        );
         assert!(hash.is_none(), "empty sha256 must not count as a pin");
+    }
+
+    #[test]
+    fn unique_plugin_artifacts_dedupes_by_identity_and_sorts() {
+        let make = |name: &str, group: &str, artifact: &str, version: &str| {
+            let coord = MavenCoordinate::new(group, artifact, version);
+            ResolvedPluginArtifact {
+                plugin_name: name.to_owned(),
+                url: coord.to_url(MAVEN_CENTRAL),
+                cache_path: coord.cache_path(Path::new("/cache/maven")),
+                maven_coord: coord,
+            }
+        };
+
+        let artifacts = vec![
+            make("z-plugin", "com.example", "z-plugin", "1.0.0"),
+            make("a-plugin", "com.example", "a-plugin", "2.0.0"),
+            // Exact duplicate of z-plugin (e.g. root and a dep declare it
+            // identically) — collapses to one entry.
+            make("z-plugin", "com.example", "z-plugin", "1.0.0"),
+            // Same name at a DIFFERENT version (a dep pins an older release) —
+            // kept as a distinct entry, not a conflict.
+            make("z-plugin", "com.example", "z-plugin", "0.9.0"),
+        ];
+
+        let unique = unique_plugin_artifacts(artifacts);
+        let identities: Vec<(String, String)> = unique
+            .iter()
+            .map(|a| (a.plugin_name.clone(), a.maven_coord.version.clone()))
+            .collect();
+        assert_eq!(
+            identities,
+            vec![
+                ("a-plugin".to_owned(), "2.0.0".to_owned()),
+                ("z-plugin".to_owned(), "0.9.0".to_owned()),
+                ("z-plugin".to_owned(), "1.0.0".to_owned()),
+            ],
+            "union must be deduped by (name, maven, version) and sorted deterministically"
+        );
+    }
+
+    #[test]
+    fn resolve_graph_plugin_artifacts_unions_root_and_deps() {
+        // Root and one dep declare the same plugin (same resolved version via
+        // {kotlin}); other deps contribute their own plugins, one of them a
+        // second version of a plugin name the graph already has.
+        let root = make_manifest_with_plugin(
+            "kotlin-serialization",
+            "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin",
+            "{kotlin}",
+        );
+        let dep_same = make_manifest_with_plugin(
+            "kotlin-serialization",
+            "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin",
+            "{kotlin}",
+        );
+        let dep_other = make_manifest_with_plugin("my-plugin", "com.example:my-plugin", "1.0.0");
+        let dep_other_version =
+            make_manifest_with_plugin("my-plugin", "com.example:my-plugin", "2.0.0");
+
+        let union = resolve_graph_plugin_artifacts(
+            [&root, &dep_same, &dep_other, &dep_other_version].map(|m| m as &Manifest),
+        )
+        .unwrap();
+
+        let identities: Vec<(String, String)> = union
+            .iter()
+            .map(|a| (a.plugin_name.clone(), a.maven_coord.version.clone()))
+            .collect();
+        assert_eq!(
+            identities,
+            vec![
+                ("kotlin-serialization".to_owned(), "2.1.0".to_owned()),
+                ("my-plugin".to_owned(), "1.0.0".to_owned()),
+                ("my-plugin".to_owned(), "2.0.0".to_owned()),
+            ],
+            "graph union must collapse identical declarations and keep distinct versions"
+        );
+    }
+
+    #[test]
+    fn plugin_jar_paths_derive_from_own_manifest() {
+        // The per-project compile step derives its -Xplugin jars from the
+        // project's OWN manifest; the paths must be exactly the cache paths the
+        // graph-wide ensure downloaded to.
+        let manifest = make_manifest_with_plugin(
+            "kotlin-serialization",
+            "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin",
+            "{kotlin}",
+        );
+        let paths = plugin_jar_paths(&manifest).unwrap();
+        let expected: Vec<PathBuf> = resolve_plugin_artifacts(&manifest)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.cache_path)
+            .collect();
+        assert_eq!(paths, expected);
+        assert_eq!(paths.len(), 1);
+        assert!(
+            paths[0]
+                .display()
+                .to_string()
+                .ends_with("kotlin-serialization-compiler-plugin-2.1.0.jar"),
+            "jar path must be the resolved cache path: {}",
+            paths[0].display()
+        );
     }
 
     #[test]
@@ -566,14 +827,26 @@ mod tests {
             ..Lockfile::default()
         };
         assert_eq!(
-            find_lockfile_hash(&lockfile, "kotlin-serialization"),
+            find_lockfile_hash(
+                &lockfile,
+                "kotlin-serialization",
+                "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin",
+                "2.1.0",
+            ),
             Some("hash-ser")
         );
         assert_eq!(
-            find_lockfile_hash(&lockfile, "kotlin-allopen"),
+            find_lockfile_hash(
+                &lockfile,
+                "kotlin-allopen",
+                "org.jetbrains.kotlin:kotlin-allopen-compiler-plugin",
+                "2.1.0",
+            ),
             Some("hash-open")
         );
-        assert!(find_lockfile_hash(&lockfile, "nonexistent").is_none());
+        assert!(
+            find_lockfile_hash(&lockfile, "nonexistent", "org.example:nope", "1.0.0").is_none()
+        );
     }
 
     #[test]
@@ -773,7 +1046,12 @@ mod tests {
                 source_hash: "abcdef".to_owned(),
             });
         // Same name as a dep but should not be found as a plugin.
-        let hash = find_lockfile_hash(&lockfile, "kotlin-serialization");
+        let hash = find_lockfile_hash(
+            &lockfile,
+            "kotlin-serialization",
+            "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin",
+            "2.1.0",
+        );
         assert!(
             hash.is_none(),
             "plugin lookup should not match dependency entries"
