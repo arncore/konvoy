@@ -66,59 +66,28 @@ pub(crate) fn gate_artifact(
 
 /// Per-command resolver for managed artifacts.
 ///
-/// This keeps the reproducibility checks and the shared network client behind
-/// one command-scoped construct. Callers ask it to resolve artifacts; they do
-/// not need to branch on the individual command flags.
+/// This keeps artifact fetching and the shared network client behind one
+/// command-scoped construct. Callers ask it to resolve artifacts; they do not
+/// need to branch on the network mode directly.
 #[derive(Debug, Clone, Copy)]
 pub struct ArtifactResolver<'a> {
-    locked: bool,
     net: &'a konvoy_util::net::NetworkClient,
 }
 
 impl<'a> ArtifactResolver<'a> {
     /// Create an artifact resolver for one command invocation.
     #[must_use]
-    pub const fn new(locked: bool, net: &'a konvoy_util::net::NetworkClient) -> Self {
-        Self { locked, net }
+    pub const fn new(net: &'a konvoy_util::net::NetworkClient) -> Self {
+        Self { net }
     }
 
-    /// Resolve whether an artifact may be used or fetched.
-    pub(crate) fn resolve_artifact(
+    /// Resolve whether an already-pinned artifact may be used or fetched.
+    fn resolve_available_artifact(
         self,
-        has_pin: bool,
         is_present: bool,
         offline_error: impl FnOnce() -> EngineError,
     ) -> Result<(), EngineError> {
-        gate_artifact(has_pin, is_present, self.locked, self.net.is_offline())
-            .into_result(offline_error)
-    }
-
-    /// Resolve a lockfile drift path: fail under locked/offline policy, or run
-    /// the supplied resolver when the command is allowed to update/fetch.
-    pub(crate) fn resolve_lockfile_drift<T>(
-        self,
-        offline_error: impl FnOnce() -> EngineError,
-        resolve: impl FnOnce() -> Result<T, EngineError>,
-    ) -> Result<T, EngineError> {
-        if self.locked {
-            Err(EngineError::LockfileUpdateRequired)
-        } else if self.net.is_offline() {
-            Err(offline_error())
-        } else {
-            resolve()
-        }
-    }
-
-    /// Run a lockfile staleness check only when locked policy requires it.
-    pub(crate) fn verify_current_lockfile(
-        self,
-        check: impl FnOnce() -> Result<(), EngineError>,
-    ) -> Result<(), EngineError> {
-        if self.locked {
-            check()
-        } else {
-            Ok(())
-        }
+        gate_artifact(true, is_present, false, self.net.is_offline()).into_result(offline_error)
     }
 
     /// Resolve and, if necessary, install the managed Kotlin/Native toolchain.
@@ -173,6 +142,110 @@ impl<'a> ArtifactResolver<'a> {
             version,
             maven_suffix,
         )
+    }
+}
+
+/// Per-command manager for lockfile policy.
+///
+/// This keeps `--locked` behind a command-scoped construct. Callers ask the
+/// manager whether a lockfile-affecting action may proceed; they do not branch
+/// on the flag directly.
+#[derive(Debug, Clone, Copy)]
+pub struct LockfileManager {
+    locked: bool,
+}
+
+impl LockfileManager {
+    /// Create a lockfile manager for one command invocation.
+    #[must_use]
+    pub const fn new(locked: bool) -> Self {
+        Self { locked }
+    }
+
+    /// Resolve whether an artifact may be used or fetched without changing the
+    /// lockfile.
+    pub(crate) fn resolve_artifact(
+        self,
+        artifacts: ArtifactResolver<'_>,
+        has_pin: bool,
+        is_present: bool,
+        offline_error: impl FnOnce() -> EngineError,
+    ) -> Result<(), EngineError> {
+        if self.locked && !has_pin {
+            Err(EngineError::LockfileUpdateRequired)
+        } else {
+            artifacts.resolve_available_artifact(is_present, offline_error)
+        }
+    }
+
+    /// Resolve a lockfile drift path: fail under locked/offline policy, or run
+    /// the supplied resolver when the command is allowed to update/fetch.
+    pub(crate) fn resolve_lockfile_drift<T>(
+        self,
+        artifacts: ArtifactResolver<'_>,
+        offline_error: impl FnOnce() -> EngineError,
+        resolve: impl FnOnce() -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        if self.locked {
+            Err(EngineError::LockfileUpdateRequired)
+        } else {
+            artifacts.resolve_available_artifact(false, offline_error)?;
+            resolve()
+        }
+    }
+
+    /// Run a lockfile staleness check only when locked policy requires it.
+    pub(crate) fn verify_current_lockfile(
+        self,
+        check: impl FnOnce() -> Result<(), EngineError>,
+    ) -> Result<(), EngineError> {
+        if self.locked {
+            check()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Reject a lockfile-changing condition when locked policy forbids writes.
+    pub(crate) fn reject_if_locked(
+        self,
+        err: impl FnOnce() -> EngineError,
+    ) -> Result<(), EngineError> {
+        if self.locked {
+            Err(err())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Return the candidate lockfile content that should feed cache keys.
+    pub(crate) fn effective_lockfile(
+        self,
+        current: &konvoy_config::lockfile::Lockfile,
+        unlocked: impl FnOnce() -> konvoy_config::lockfile::Lockfile,
+    ) -> konvoy_config::lockfile::Lockfile {
+        if self.locked {
+            current.clone()
+        } else {
+            unlocked()
+        }
+    }
+
+    /// Write a changed lockfile candidate, or reject the write when locked.
+    pub(crate) fn write_updated_lockfile(
+        self,
+        current: &konvoy_config::lockfile::Lockfile,
+        updated: konvoy_config::lockfile::Lockfile,
+        lockfile_path: &std::path::Path,
+    ) -> Result<(), EngineError> {
+        if updated == *current {
+            return Ok(());
+        }
+        if self.locked {
+            return Err(EngineError::LockfileUpdateRequired);
+        }
+        updated.write_to(lockfile_path)?;
+        Ok(())
     }
 }
 
@@ -353,31 +426,37 @@ mod tests {
     }
 
     #[test]
-    fn artifact_resolver_gates_lockfile_drift_before_offline() {
+    fn lockfile_manager_gates_lockfile_drift_before_offline() {
         let net = konvoy_util::net::NetworkClient::new(true);
-        let resolver = ArtifactResolver::new(true, &net);
+        let resolver = ArtifactResolver::new(&net);
+        let lockfiles = LockfileManager::new(true);
 
-        let result = resolver.resolve_artifact(false, false, || EngineError::LintNotConfigured);
+        let result =
+            lockfiles.resolve_artifact(resolver, false, false, || EngineError::LintNotConfigured);
 
         assert!(matches!(result, Err(EngineError::LockfileUpdateRequired)));
     }
 
     #[test]
-    fn artifact_resolver_maps_offline_unavailable() {
+    fn lockfile_manager_maps_offline_unavailable() {
         let net = konvoy_util::net::NetworkClient::new(true);
-        let resolver = ArtifactResolver::new(false, &net);
+        let resolver = ArtifactResolver::new(&net);
+        let lockfiles = LockfileManager::new(false);
 
-        let result = resolver.resolve_artifact(true, false, || EngineError::LintNotConfigured);
+        let result =
+            lockfiles.resolve_artifact(resolver, true, false, || EngineError::LintNotConfigured);
 
         assert!(matches!(result, Err(EngineError::LintNotConfigured)));
     }
 
     #[test]
-    fn artifact_resolver_resolves_lockfile_drift_only_when_allowed() {
+    fn lockfile_manager_resolves_lockfile_drift_only_when_allowed() {
         let online = konvoy_util::net::NetworkClient::new(false);
-        let resolver = ArtifactResolver::new(false, &online);
+        let resolver = ArtifactResolver::new(&online);
+        let lockfiles = LockfileManager::new(false);
 
-        let result = resolver.resolve_lockfile_drift(
+        let result = lockfiles.resolve_lockfile_drift(
+            resolver,
             || EngineError::LintNotConfigured,
             || Ok::<_, EngineError>("resolved"),
         );
@@ -386,10 +465,9 @@ mod tests {
     }
 
     #[test]
-    fn artifact_resolver_verifies_current_lockfile_only_when_locked() {
-        let online = konvoy_util::net::NetworkClient::new(false);
-        let unlocked = ArtifactResolver::new(false, &online);
-        let locked = ArtifactResolver::new(true, &online);
+    fn lockfile_manager_verifies_current_lockfile_only_when_locked() {
+        let unlocked = LockfileManager::new(false);
+        let locked = LockfileManager::new(true);
 
         assert!(unlocked
             .verify_current_lockfile(|| Err(EngineError::LintNotConfigured))

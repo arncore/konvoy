@@ -29,15 +29,6 @@ pub struct BuildOptions {
     pub verbose: bool,
     /// Force a rebuild, bypassing the cache.
     pub force: bool,
-    /// Require the lockfile to be up-to-date: never modify `konvoy.lock`.
-    /// Downloading pinned artifacts is still allowed; only lockfile drift
-    /// (a missing/mismatched pin) is an error.
-    ///
-    /// The orthogonal `--offline` flag (Cargo's `--frozen` is both) is carried
-    /// by the command-scoped [`ArtifactResolver`](crate::ArtifactResolver).
-    /// Build code asks the resolver to resolve artifacts instead of branching
-    /// on the individual flags.
-    pub locked: bool,
 }
 
 impl BuildOptions {
@@ -54,7 +45,6 @@ impl Default for BuildOptions {
             profile: Profile::Debug,
             verbose: false,
             force: false,
-            locked: false,
         }
     }
 }
@@ -198,39 +188,35 @@ fn predicted_effective_lockfile(
     konanc_tarball_sha256: Option<&str>,
     jre_tarball_sha256: Option<&str>,
     plugin_locks: &[PluginLock],
-    locked: bool,
+    lockfiles: crate::common::LockfileManager,
 ) -> Lockfile {
-    // In --locked mode the lockfile must not change. It already contains the
-    // plugin entries (the staleness check enforces this), so no fold is needed.
-    if locked {
-        return lockfile.clone();
-    }
+    lockfiles.effective_lockfile(lockfile, || {
+        let mut effective = match &lockfile.toolchain {
+            // Lockfile already has the correct version — use as-is (preserves any
+            // existing tarball hashes and detekt info).
+            Some(tc) if tc.konanc_version == konanc_version => lockfile.clone(),
+            // Lockfile is missing or has a different version. Build the same
+            // lockfile that will eventually be written so the cache key is stable
+            // from the first build. Preserve existing dependencies (e.g. Maven deps
+            // written by `konvoy update`).
+            _ => {
+                let mut stabilized = Lockfile::with_managed_toolchain(
+                    konanc_version,
+                    konanc_tarball_sha256,
+                    jre_tarball_sha256,
+                );
+                stabilized.dependencies = lockfile.dependencies.clone();
+                stabilized
+            }
+        };
 
-    let mut effective = match &lockfile.toolchain {
-        // Lockfile already has the correct version — use as-is (preserves any
-        // existing tarball hashes and detekt info).
-        Some(tc) if tc.konanc_version == konanc_version => lockfile.clone(),
-        // Lockfile is missing or has a different version. Build the same
-        // lockfile that will eventually be written so the cache key is stable
-        // from the first build. Preserve existing dependencies (e.g. Maven deps
-        // written by `konvoy update`).
-        _ => {
-            let mut stabilized = Lockfile::with_managed_toolchain(
-                konanc_version,
-                konanc_tarball_sha256,
-                jre_tarball_sha256,
-            );
-            stabilized.dependencies = lockfile.dependencies.clone();
-            stabilized
-        }
-    };
-
-    // Fold the predicted [[plugins]] entries into the effective lockfile in
-    // BOTH branches above, matching what `update_lockfile_if_needed` writes
-    // (`updated.plugins = plugin_locks`). This keeps the cache key identical
-    // across the first and second builds of a project with plugins.
-    effective.plugins = plugin_locks.to_vec();
-    effective
+        // Fold the predicted [[plugins]] entries into the effective lockfile in
+        // BOTH branches above, matching what `update_lockfile_if_needed` writes
+        // (`updated.plugins = plugin_locks`). This keeps the cache key identical
+        // across the first and second builds of a project with plugins.
+        effective.plugins = plugin_locks.to_vec();
+        effective
+    })
 }
 
 /// Resolve the common build pipeline state (steps 1–7a).
@@ -250,6 +236,7 @@ pub(crate) fn resolve_build_context(
     project_root: &Path,
     options: &BuildOptions,
     resolver: crate::common::ArtifactResolver<'_>,
+    lockfiles: crate::common::LockfileManager,
 ) -> Result<ResolvedBuildContext, EngineError> {
     // 1. Read konvoy.toml.
     let manifest_path = project_root.join("konvoy.toml");
@@ -272,7 +259,8 @@ pub(crate) fn resolve_build_context(
     //      fetches POMs and klibs from Maven Central, so an unresolved dep is
     //      a hard error here instead of a silent network access.
     let lockfile = match first_unresolved_maven_dep(&manifest, &lockfile) {
-        Some(name) => resolver.resolve_lockfile_drift(
+        Some(name) => lockfiles.resolve_lockfile_drift(
+            resolver,
             || EngineError::MissingLockfileEntry { name },
             || {
                 eprintln!(
@@ -288,7 +276,7 @@ pub(crate) fn resolve_build_context(
 
     // In --locked mode, verify the lockfile is complete and consistent
     // with what konvoy.toml specifies before doing any work.
-    resolver.verify_current_lockfile(|| check_lockfile_staleness(&manifest, &lockfile))?;
+    lockfiles.verify_current_lockfile(|| check_lockfile_staleness(&manifest, &lockfile))?;
 
     // 4. Resolve target.
     let target = resolve_target(&options.target)?;
@@ -309,7 +297,7 @@ pub(crate) fn resolve_build_context(
     let toolchain_installed = konvoy_konanc::toolchain::is_installed(&manifest.toolchain.kotlin)?;
     let toolchain_pinned =
         has_required_toolchain_artifact_pins(&lockfile, &manifest.toolchain.kotlin)?;
-    resolver.resolve_artifact(toolchain_pinned, toolchain_installed, || {
+    lockfiles.resolve_artifact(resolver, toolchain_pinned, toolchain_installed, || {
         EngineError::ToolchainOffline {
             version: manifest.toolchain.kotlin.clone(),
         }
@@ -362,8 +350,12 @@ pub(crate) fn resolve_build_context(
     // `ensure_plugin_artifacts` only re-verifies hashes — it does not download.
     let (plugin_jars, plugin_locks) = if !manifest.plugins.is_empty() {
         let resolved_artifacts = crate::plugin::resolve_plugin_artifacts(&manifest)?;
-        let results =
-            crate::plugin::ensure_plugin_artifacts(&resolved_artifacts, &lockfile, resolver)?;
+        let results = crate::plugin::ensure_plugin_artifacts(
+            &resolved_artifacts,
+            &lockfile,
+            resolver,
+            lockfiles,
+        )?;
         let locks = crate::plugin::build_plugin_locks(&results);
         let jars: Vec<PathBuf> = results.iter().map(|r| r.path.clone()).collect();
         (jars, locks)
@@ -380,7 +372,7 @@ pub(crate) fn resolve_build_context(
         konanc_tarball_sha256.as_deref(),
         jre_tarball_sha256.as_deref(),
         &plugin_locks,
-        options.locked,
+        lockfiles,
     );
 
     // 7. Resolve dependencies and build them in topological order.
@@ -436,7 +428,7 @@ pub(crate) fn resolve_build_context(
     // 7a. Resolve and download Maven dependency klibs for the current target.
     //     Each Maven klib comes back with a precomputed sha256 from
     //     `download_artifact`, which the cache-key code reuses to skip rehashing.
-    let maven_klibs = resolve_maven_deps(&effective_lockfile, &target, resolver)?;
+    let maven_klibs = resolve_maven_deps(&effective_lockfile, &target, resolver, lockfiles)?;
     library_inputs.extend(maven_klibs);
 
     let store = ArtifactStore::new(project_root);
@@ -483,9 +475,10 @@ pub fn build(
     project_root: &Path,
     options: &BuildOptions,
     resolver: crate::common::ArtifactResolver<'_>,
+    lockfiles: crate::common::LockfileManager,
 ) -> Result<BuildResult, EngineError> {
     let start = Instant::now();
-    let ctx = resolve_build_context(project_root, options, resolver)?;
+    let ctx = resolve_build_context(project_root, options, resolver, lockfiles)?;
 
     // 8. Build the root project.
     let cc = CompileContext {
@@ -517,7 +510,7 @@ pub fn build(
         project_root,
         &lockfile_path,
         options.force,
-        options.locked,
+        lockfiles,
     )?;
 
     Ok(BuildResult {
@@ -538,7 +531,7 @@ pub(crate) struct CompileContext<'a> {
     pub jre_home: Option<&'a Path>,
     /// Kotlin/Native compilation target.
     pub target: &'a Target,
-    /// Build options (release, verbose, force, locked).
+    /// Build options (release, verbose, force).
     pub options: &'a BuildOptions,
     /// Dependency `.klib` inputs (path + optional pre-computed hash).
     ///
@@ -863,6 +856,7 @@ pub(crate) fn resolve_maven_deps(
     lockfile: &Lockfile,
     target: &Target,
     resolver: crate::common::ArtifactResolver<'_>,
+    lockfiles: crate::common::LockfileManager,
 ) -> Result<Vec<LibraryInput>, EngineError> {
     use rayon::prelude::IndexedParallelIterator;
 
@@ -937,8 +931,10 @@ pub(crate) fn resolve_maven_deps(
     // `MissingTargetHash`, raised above). Ask the command resolver to fail fast
     // for any artifact it cannot resolve before spawning downloads.
     for p in &prepared {
-        resolver.resolve_artifact(true, !p.needs_download, || EngineError::LibraryOffline {
-            name: p.entry.name.to_owned(),
+        lockfiles.resolve_artifact(resolver, true, !p.needs_download, || {
+            EngineError::LibraryOffline {
+                name: p.entry.name.to_owned(),
+            }
         })?;
     }
 
@@ -1130,20 +1126,18 @@ fn update_lockfile_if_needed(
     project_root: &Path,
     lockfile_path: &Path,
     force: bool,
-    locked: bool,
+    lockfiles: crate::common::LockfileManager,
 ) -> Result<(), EngineError> {
     // Check for dependency source hash mismatches.
     // In --locked mode this is a hard error; otherwise warn and continue.
     for dep in &dep_graph.order {
         if let Some(locked_dep) = lockfile.dependencies.iter().find(|d| d.name == dep.name) {
             if locked_dep.source_hash != dep.source_hash && !dep.source_hash.is_empty() {
-                if locked {
-                    return Err(EngineError::DependencyHashMismatch {
-                        name: dep.name.clone(),
-                        expected: locked_dep.source_hash.clone(),
-                        actual: dep.source_hash.clone(),
-                    });
-                }
+                lockfiles.reject_if_locked(|| EngineError::DependencyHashMismatch {
+                    name: dep.name.clone(),
+                    expected: locked_dep.source_hash.clone(),
+                    actual: dep.source_hash.clone(),
+                })?;
                 eprintln!(
                     "warning: dependency `{}` source has changed (locked: {}, current: {})",
                     dep.name,
@@ -1255,24 +1249,7 @@ fn update_lockfile_if_needed(
         updated_tc.detekt_jar_sha256 = orig_tc.detekt_jar_sha256.clone();
     }
 
-    // If the candidate is byte-for-byte what's already on disk, there is nothing
-    // to write — not even under --locked. A --locked build that re-downloads the
-    // already-pinned toolchain gets back fresh SHAs identical to the lockfile's;
-    // that is not drift. Checking this BEFORE the locked guard is what prevents a
-    // spurious `LockfileUpdateRequired`. (Lockfile derives PartialEq.)
-    if updated == *lockfile {
-        return Ok(());
-    }
-
-    // The lockfile genuinely differs from disk. Under --locked we must not
-    // modify it — report drift so the user re-runs without --locked.
-    if locked {
-        return Err(EngineError::LockfileUpdateRequired);
-    }
-
-    updated.write_to(lockfile_path)?;
-
-    Ok(())
+    lockfiles.write_updated_lockfile(lockfile, updated, lockfile_path)
 }
 
 /// Verify freshly-downloaded toolchain tarball SHAs against the lockfile pins.
@@ -1424,15 +1401,12 @@ mod tests {
             profile: Profile::Debug,
             verbose: false,
             force: false,
-            locked: false,
         };
         let result = build(
             tmp.path(),
             &options,
-            crate::common::ArtifactResolver::new(
-                false,
-                &konvoy_util::net::NetworkClient::new(false),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::LockfileManager::new(false),
         );
         assert!(result.is_err());
     }
@@ -1459,10 +1433,8 @@ mod tests {
         let result = build(
             root,
             &BuildOptions::default(),
-            crate::common::ArtifactResolver::new(
-                false,
-                &konvoy_util::net::NetworkClient::new(true),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(true)),
+            crate::common::LockfileManager::new(false),
         );
 
         assert!(result.is_err(), "expected Err, got: {result:?}");
@@ -1501,13 +1473,10 @@ mod tests {
         let result = build(
             root,
             &BuildOptions {
-                locked: true,
                 ..Default::default()
             },
-            crate::common::ArtifactResolver::new(
-                true,
-                &konvoy_util::net::NetworkClient::new(false),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::LockfileManager::new(true),
         );
 
         assert!(
@@ -1538,13 +1507,10 @@ mod tests {
         let result = build(
             root,
             &BuildOptions {
-                locked: true,
                 ..Default::default()
             },
-            crate::common::ArtifactResolver::new(
-                true,
-                &konvoy_util::net::NetworkClient::new(false),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::LockfileManager::new(true),
         );
 
         assert!(
@@ -1580,10 +1546,8 @@ mod tests {
         let result = build(
             tmp.path(),
             &BuildOptions::default(),
-            crate::common::ArtifactResolver::new(
-                false,
-                &konvoy_util::net::NetworkClient::new(true),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(true)),
+            crate::common::LockfileManager::new(false),
         );
 
         match result {
@@ -1604,10 +1568,10 @@ mod tests {
         let result = build(
             tmp.path(),
             &BuildOptions {
-                locked: true,
                 ..Default::default()
             },
-            crate::common::ArtifactResolver::new(true, &konvoy_util::net::NetworkClient::new(true)),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(true)),
+            crate::common::LockfileManager::new(true),
         );
 
         assert!(
@@ -1633,15 +1597,12 @@ mod tests {
             profile: Profile::Debug,
             verbose: false,
             force: false,
-            locked: false,
         };
         let result = build(
             &project,
             &options,
-            crate::common::ArtifactResolver::new(
-                false,
-                &konvoy_util::net::NetworkClient::new(false),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::LockfileManager::new(false),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1725,7 +1686,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
         assert!(lockfile_path.exists());
@@ -1758,7 +1719,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
     }
@@ -1787,7 +1748,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
         let content = fs::read_to_string(&lockfile_path).unwrap();
@@ -1816,7 +1777,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
 
@@ -1838,7 +1799,6 @@ mod tests {
         assert!(!opts.is_release());
         assert!(!opts.verbose);
         assert!(!opts.force);
-        assert!(!opts.locked);
     }
 
     #[test]
@@ -1875,7 +1835,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
         let content = fs::read_to_string(&lockfile_path).unwrap();
@@ -1922,7 +1882,6 @@ mod tests {
             profile: Profile::Debug,
             verbose: false,
             force: false,
-            locked: false,
         };
 
         // Compute the cache key that build_single would compute.
@@ -2009,7 +1968,6 @@ mod tests {
             profile: Profile::Debug,
             verbose: false,
             force: false,
-            locked: false,
         };
 
         // Compute cache key the same way build_single does (without test sources).
@@ -2091,7 +2049,6 @@ mod tests {
             profile: Profile::Debug,
             verbose: false,
             force: false,
-            locked: false,
         };
 
         // Compute cache key before adding the outside file.
@@ -2199,7 +2156,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
 
@@ -2238,7 +2195,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
 
@@ -2276,7 +2233,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
 
@@ -2310,7 +2267,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         );
 
         assert!(result.is_err());
@@ -2351,7 +2308,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             true,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
 
@@ -2388,7 +2345,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
 
@@ -2424,7 +2381,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
 
@@ -2481,7 +2438,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            true, // locked = true
+            crate::common::LockfileManager::new(true), // locked = true
         );
 
         assert!(result.is_err());
@@ -2542,7 +2499,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false, // locked = false
+            crate::common::LockfileManager::new(false), // locked = false
         );
 
         assert!(result.is_ok());
@@ -2594,7 +2551,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            true, // locked = true
+            crate::common::LockfileManager::new(true), // locked = true
         );
 
         assert!(result.is_ok());
@@ -2673,7 +2630,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            true, // locked = true
+            crate::common::LockfileManager::new(true), // locked = true
         );
 
         assert!(result.is_err());
@@ -2763,7 +2720,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            true, // locked = true
+            crate::common::LockfileManager::new(true), // locked = true
         );
 
         assert!(
@@ -2805,7 +2762,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            true, // locked = true
+            crate::common::LockfileManager::new(true), // locked = true
         );
 
         assert!(matches!(result, Err(EngineError::LockfileUpdateRequired)));
@@ -2848,7 +2805,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
 
@@ -2929,7 +2886,6 @@ mod tests {
             profile: Profile::Debug,
             verbose: false,
             force: false,
-            locked: false,
         };
         let cc_no_force = CompileContext {
             konanc: &konanc,
@@ -2957,7 +2913,6 @@ mod tests {
             profile: Profile::Debug,
             verbose: false,
             force: true,
-            locked: false,
         };
         let cc_force = CompileContext {
             konanc: &konanc,
@@ -3071,7 +3026,7 @@ mod tests {
             None,
             None,
             &plugin_locks,
-            false,
+            crate::common::LockfileManager::new(false),
         );
 
         // After the first build, `update_lockfile_if_needed` writes a lockfile
@@ -3087,7 +3042,7 @@ mod tests {
             None,
             None,
             &plugin_locks,
-            false,
+            crate::common::LockfileManager::new(false),
         );
 
         let content_first = lockfile_toml_content(&effective_first).unwrap();
@@ -3171,16 +3126,14 @@ mod tests {
         let lockfile = Lockfile::default(); // No toolchain
         let konanc_version = "2.1.0";
 
-        // Simulate --locked mode: use the lockfile as-is.
-        let locked = true;
-        let effective = if locked {
-            lockfile.clone()
-        } else {
-            match &lockfile.toolchain {
-                Some(tc) if tc.konanc_version == konanc_version => lockfile.clone(),
-                _ => Lockfile::with_managed_toolchain(konanc_version, None, None),
-            }
-        };
+        let effective = predicted_effective_lockfile(
+            &lockfile,
+            konanc_version,
+            None,
+            None,
+            &[],
+            crate::common::LockfileManager::new(true),
+        );
 
         // In locked mode, the empty lockfile is used without modification.
         assert!(
@@ -3501,7 +3454,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
 
@@ -3557,7 +3510,7 @@ mod tests {
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
 
@@ -3628,10 +3581,8 @@ mod tests {
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            crate::common::ArtifactResolver::new(
-                false,
-                &konvoy_util::net::NetworkClient::new(false),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
         assert!(
@@ -3650,10 +3601,8 @@ mod tests {
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            crate::common::ArtifactResolver::new(
-                false,
-                &konvoy_util::net::NetworkClient::new(false),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
         assert!(
@@ -3682,10 +3631,8 @@ mod tests {
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            crate::common::ArtifactResolver::new(
-                false,
-                &konvoy_util::net::NetworkClient::new(false),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::LockfileManager::new(false),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -3719,10 +3666,8 @@ mod tests {
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            crate::common::ArtifactResolver::new(
-                false,
-                &konvoy_util::net::NetworkClient::new(true),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(true)),
+            crate::common::LockfileManager::new(false),
         );
         match result {
             Err(EngineError::LibraryOffline { name }) => assert_eq!(name, "phantom-lib"),
@@ -3769,10 +3714,8 @@ mod tests {
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            crate::common::ArtifactResolver::new(
-                false,
-                &konvoy_util::net::NetworkClient::new(true),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(true)),
+            crate::common::LockfileManager::new(false),
         );
         // Clean up before asserting: remove the whole fake-group subtree
         // (`com/example/offlinetest/...`) we created under the real cache,
@@ -3921,10 +3864,8 @@ linux_x64 = "1111"
         let result = resolve_maven_deps(
             &lockfile,
             &target,
-            crate::common::ArtifactResolver::new(
-                false,
-                &konvoy_util::net::NetworkClient::new(false),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::LockfileManager::new(false),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -4039,7 +3980,7 @@ linux_x64 = "1111"
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
 
@@ -4098,7 +4039,7 @@ linux_x64 = "1111"
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
 
@@ -4187,7 +4128,7 @@ linux_x64 = "1111"
             tmp.path(),
             &lockfile_path,
             false,
-            true, // locked = true
+            crate::common::LockfileManager::new(true), // locked = true
         );
 
         assert!(result.is_err());
@@ -4241,7 +4182,7 @@ linux_x64 = "1111"
             tmp.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
 
@@ -4732,7 +4673,7 @@ url = "https://example.com/plugin.jar"
             dir.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
 
@@ -4960,7 +4901,7 @@ url = "https://example.com/plugin.jar"
             dir.path(),
             &lockfile_path,
             false,
-            false,
+            crate::common::LockfileManager::new(false),
         )
         .unwrap();
 
@@ -5045,7 +4986,7 @@ kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-comp
             dir.path(),
             &lockfile_path,
             false,
-            true, // locked = true
+            crate::common::LockfileManager::new(true), // locked = true
         );
         assert!(
             result.is_err(),
@@ -5463,7 +5404,7 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
             tmp.path(),
             &lockfile_path,
             false,
-            true, // locked
+            crate::common::LockfileManager::new(true), // locked
         );
         assert!(result.is_err());
     }
@@ -5492,7 +5433,7 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
             tmp.path(),
             &lockfile_path,
             false, // not force
-            false,
+            crate::common::LockfileManager::new(false),
         );
         assert!(result.is_err(), "should detect tampered konanc hash");
     }
@@ -5521,7 +5462,7 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
             tmp.path(),
             &lockfile_path,
             true, // force
-            false,
+            crate::common::LockfileManager::new(false),
         );
         assert!(result.is_ok(), "force should bypass hash mismatch");
     }

@@ -23,7 +23,7 @@ pub use codegen::{
     compute_codegen_hash_pairs, compute_codegen_hashes, generator_output_dir, generator_summaries,
     managed_tools, CodeGenerator, GeneratorSummary,
 };
-pub use common::ArtifactResolver;
+pub use common::{ArtifactResolver, LockfileManager};
 pub use detekt::{lint, DetektDiagnostic, LintOptions, LintResult};
 pub use error::EngineError;
 pub use init::{

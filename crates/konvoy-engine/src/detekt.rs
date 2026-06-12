@@ -180,13 +180,14 @@ fn resolve_jre_home(
     kotlin_version: &str,
     lockfile: &konvoy_config::lockfile::Lockfile,
     resolver: crate::common::ArtifactResolver<'_>,
+    lockfiles: crate::common::LockfileManager,
 ) -> Result<PathBuf, EngineError> {
     if !konvoy_konanc::toolchain::is_installed(kotlin_version)? {
         // The detekt JRE rides along with the managed toolchain. If installing
         // would download any missing toolchain artifact under --locked, the
         // relevant tarball hash must already be pinned in konvoy.lock.
         let has_pin = crate::build::has_required_toolchain_artifact_pins(lockfile, kotlin_version)?;
-        resolver.resolve_artifact(has_pin, false, || EngineError::DetektJreOffline {
+        lockfiles.resolve_artifact(resolver, has_pin, false, || EngineError::DetektJreOffline {
             version: kotlin_version.to_owned(),
         })?;
         eprintln!("    Installing Kotlin/Native {kotlin_version} (for JRE)...");
@@ -281,6 +282,7 @@ pub fn lint(
     root: &Path,
     options: &LintOptions,
     resolver: crate::common::ArtifactResolver<'_>,
+    lockfiles: crate::common::LockfileManager,
 ) -> Result<LintResult, EngineError> {
     let manifest = konvoy_config::Manifest::from_path(&root.join("konvoy.toml"))?;
 
@@ -298,7 +300,7 @@ pub fn lint(
     // (issue #295: every command fails for the same reasons). This catches
     // konanc/detekt VERSION drift up-front; the per-artifact gates below only
     // see the detekt JAR's hash pin, not the toolchain version.
-    resolver
+    lockfiles
         .verify_current_lockfile(|| crate::build::check_lockfile_staleness(&manifest, &lockfile))?;
 
     let expected_hash = resolve_lockfile_hash(&lockfile, detekt_version);
@@ -306,7 +308,7 @@ pub fn lint(
     // Resolve the detekt JAR before any download. has_pin: the lockfile pins
     // this detekt version's JAR hash; is_present: the JAR is already on disk.
     let jar_present = is_installed(detekt_version)?;
-    resolver.resolve_artifact(expected_hash.is_some(), jar_present, || {
+    lockfiles.resolve_artifact(resolver, expected_hash.is_some(), jar_present, || {
         EngineError::DetektJarOffline {
             version: detekt_version.to_owned(),
         }
@@ -328,7 +330,7 @@ pub fn lint(
     }
 
     // Resolve JRE.
-    let jre_home = resolve_jre_home(&manifest.toolchain.kotlin, &lockfile, resolver)?;
+    let jre_home = resolve_jre_home(&manifest.toolchain.kotlin, &lockfile, resolver, lockfiles)?;
 
     // Check for sources.
     let src_dir = root.join("src");
@@ -623,10 +625,7 @@ src/main.kt:3:5: Magic number. [MagicNumber]
         let result = super::ensure_detekt(
             version,
             Some("0000000000000000000000000000000000000000000000000000000000000000"),
-            crate::common::ArtifactResolver::new(
-                true,
-                &konvoy_util::net::NetworkClient::new(false),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
         );
         // Clean up before asserting.
         let _ = std::fs::remove_file(&jar);
@@ -655,10 +654,7 @@ src/main.kt:3:5: Magic number. [MagicNumber]
         let result = super::ensure_detekt(
             version,
             Some(&real_hash),
-            crate::common::ArtifactResolver::new(
-                true,
-                &konvoy_util::net::NetworkClient::new(false),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
         );
         // Clean up.
         let _ = std::fs::remove_file(&jar);
@@ -680,10 +676,7 @@ src/main.kt:3:5: Magic number. [MagicNumber]
         let err = super::ensure_detekt(
             "1..2",
             None,
-            crate::common::ArtifactResolver::new(
-                true,
-                &konvoy_util::net::NetworkClient::new(false),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
         )
         .expect_err("a `..` version must be rejected before any download");
         let msg = err.to_string();
@@ -735,10 +728,8 @@ src/main.kt:3:5: Magic number. [MagicNumber]
                 verbose: false,
                 config: None,
             },
-            crate::common::ArtifactResolver::new(
-                false,
-                &konvoy_util::net::NetworkClient::new(true),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(true)),
+            crate::common::LockfileManager::new(false),
         );
 
         // Clean up the fake JAR before asserting.
@@ -797,10 +788,8 @@ src/main.kt:3:5: Magic number. [MagicNumber]
                 verbose: false,
                 config: None,
             },
-            crate::common::ArtifactResolver::new(
-                false,
-                &konvoy_util::net::NetworkClient::new(true),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(true)),
+            crate::common::LockfileManager::new(false),
         );
 
         match result {
@@ -838,10 +827,8 @@ src/main.kt:3:5: Magic number. [MagicNumber]
                 verbose: false,
                 config: None,
             },
-            crate::common::ArtifactResolver::new(
-                true,
-                &konvoy_util::net::NetworkClient::new(false),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::LockfileManager::new(true),
         );
 
         assert!(
@@ -889,10 +876,8 @@ src/main.kt:3:5: Magic number. [MagicNumber]
                 verbose: false,
                 config: None,
             },
-            crate::common::ArtifactResolver::new(
-                true,
-                &konvoy_util::net::NetworkClient::new(false),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::LockfileManager::new(true),
         );
 
         assert!(
@@ -945,10 +930,8 @@ src/main.kt:3:5: Magic number. [MagicNumber]
                 verbose: false,
                 config: None,
             },
-            crate::common::ArtifactResolver::new(
-                true,
-                &konvoy_util::net::NetworkClient::new(false),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::LockfileManager::new(true),
         );
 
         let _ = std::fs::remove_file(&jar);

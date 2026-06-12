@@ -38,9 +38,10 @@ pub fn build_tests(
     project_root: &Path,
     options: &BuildOptions,
     resolver: crate::common::ArtifactResolver<'_>,
+    lockfiles: crate::common::LockfileManager,
 ) -> Result<TestBuildResult, EngineError> {
     let start = Instant::now();
-    let ctx = resolve_build_context(project_root, options, resolver)?;
+    let ctx = resolve_build_context(project_root, options, resolver, lockfiles)?;
 
     // Collect project sources (excluding src/test/) and test sources.
     let src_dir = project_root.join("src");
@@ -193,16 +194,13 @@ mod tests {
             profile: konvoy_config::Profile::Debug,
             verbose: false,
             force: false,
-            locked: false,
         };
 
         let result = build_tests(
             &project,
             &options,
-            crate::common::ArtifactResolver::new(
-                false,
-                &konvoy_util::net::NetworkClient::new(false),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::LockfileManager::new(false),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -229,16 +227,13 @@ mod tests {
             profile: konvoy_config::Profile::Debug,
             verbose: false,
             force: false,
-            locked: false,
         };
 
         let result = build_tests(
             &project,
             &options,
-            crate::common::ArtifactResolver::new(
-                false,
-                &konvoy_util::net::NetworkClient::new(false),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::LockfileManager::new(false),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -256,16 +251,13 @@ mod tests {
             profile: konvoy_config::Profile::Debug,
             verbose: false,
             force: false,
-            locked: false,
         };
 
         let result = build_tests(
             tmp.path(),
             &options,
-            crate::common::ArtifactResolver::new(
-                false,
-                &konvoy_util::net::NetworkClient::new(false),
-            ),
+            crate::common::ArtifactResolver::new(&konvoy_util::net::NetworkClient::new(false)),
+            crate::common::LockfileManager::new(false),
         );
         assert!(result.is_err());
     }
