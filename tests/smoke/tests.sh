@@ -1919,6 +1919,148 @@ TOML
     assert_files_identical konvoy.lock lock.bak
 }
 
+test_offline_plugin_absent_fails() {
+    # The plugin gate fires after toolchain resolution but before any compile,
+    # so --offline + an uncached plugin is a hard error naming the plugin.
+    # A fake version guarantees the artifact is never in the shared cache.
+    konvoy init --name off-plugin >/dev/null 2>&1
+    cat >> off-plugin/konvoy.toml << 'TOML'
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "9.9.9-fake" }
+TOML
+    cd off-plugin
+
+    local output
+    if output=$(konvoy build --offline 2>&1); then
+        echo "    expected --offline build to fail with absent plugin" >&2
+        return 1
+    fi
+    assert_contains "$output" 'plugin `kotlin-serialization` is not downloaded'
+    assert_contains "$output" "--offline prevents downloads"
+}
+
+test_locked_plugin_pinned_absent_attempts_download() {
+    # The #295 unification for the third artifact class: under --locked, a
+    # pinned-but-absent plugin must PROCEED TO DOWNLOAD — not report drift,
+    # not report offline. The fake version 404s at Maven Central, so the
+    # expected outcome is a download error (proof the gate let it through).
+    konvoy init --name locked-plugin >/dev/null 2>&1
+    cat >> locked-plugin/konvoy.toml << 'TOML'
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "9.9.9-fake" }
+TOML
+    cd locked-plugin
+    # Handcraft a consistent lockfile that pins the plugin (non-empty sha).
+    cat > konvoy.lock << 'LOCK'
+[toolchain]
+konanc_version = "2.2.0"
+
+[[plugins]]
+name = "kotlin-serialization"
+maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin"
+version = "9.9.9-fake"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+url = "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-serialization-compiler-plugin/9.9.9-fake/kotlin-serialization-compiler-plugin-9.9.9-fake.jar"
+LOCK
+    cp konvoy.lock lock.bak
+
+    local output
+    if output=$(konvoy build --locked 2>&1); then
+        echo "    expected --locked build to fail at the 404 download" >&2
+        return 1
+    fi
+    assert_contains "$output" "cannot download plugin"
+    assert_not_contains "$output" "lockfile is out of date"
+    assert_not_contains "$output" "--offline prevents downloads"
+    assert_files_identical konvoy.lock lock.bak
+}
+
+test_locked_changed_path_dep_source_errors() {
+    # Editing a path dependency's sources after the lockfile was written is
+    # drift --locked must catch: the recorded source hash no longer matches.
+    konvoy init --name hashlib --lib >/dev/null 2>&1
+    konvoy init --name hashapp >/dev/null 2>&1
+    printf '\n[dependencies]\nhashlib = { path = "../hashlib" }\n' >> hashapp/konvoy.toml
+    cd hashapp
+    konvoy build >/dev/null 2>&1
+    assert_file_contains konvoy.lock "hashlib"
+    cp konvoy.lock lock.bak
+
+    # Change the dependency's source.
+    printf '\nfun extra(): Int = 1\n' >> ../hashlib/src/lib.kt
+
+    local output
+    if output=$(konvoy build --locked 2>&1); then
+        echo "    expected --locked to fail after dep source change" >&2
+        return 1
+    fi
+    assert_contains "$output" 'dependency `hashlib` source hash mismatch'
+    assert_contains "$output" "remove --locked"
+    assert_files_identical konvoy.lock lock.bak
+}
+
+test_locked_relocated_checkout_succeeds() {
+    # THE committed-lockfile story end-to-end: a project pair (app + sibling
+    # ../lib dep) built at one location must build --locked at a DIFFERENT
+    # location with the same lockfile — sibling paths are stored relative, so
+    # the lockfile is machine/location independent.
+    mkdir checkout-a
+    cd checkout-a
+    konvoy init --name relo-lib --lib >/dev/null 2>&1
+    konvoy init --name relo-app >/dev/null 2>&1
+    printf '\n[dependencies]\nrelo-lib = { path = "../relo-lib" }\n' >> relo-app/konvoy.toml
+    (cd relo-app && konvoy build >/dev/null 2>&1)
+    assert_file_contains relo-app/konvoy.lock 'path = "../relo-lib"'
+
+    # Same layout, different location, committed lockfile carried over.
+    cd ..
+    mkdir checkout-b
+    cp -R checkout-a/relo-lib checkout-b/relo-lib
+    mkdir checkout-b/relo-app
+    cp checkout-a/relo-app/konvoy.toml checkout-b/relo-app/
+    cp checkout-a/relo-app/konvoy.lock checkout-b/relo-app/
+    cp -R checkout-a/relo-app/src checkout-b/relo-app/src
+    cd checkout-b/relo-app
+
+    local output
+    output=$(konvoy build --locked 2>&1) || { echo "$output" >&2; return 1; }
+    assert_not_contains "$output" "lockfile is out of date"
+    assert_files_identical konvoy.lock ../../checkout-a/relo-app/konvoy.lock
+}
+
+test_locked_detekt_hash_mismatch_fails() {
+    # Integrity under --locked: a cached detekt JAR that does not match the
+    # pinned hash is rejected (tampered/rotated artifact), not silently used.
+    konvoy init --name lint-tamper >/dev/null 2>&1
+    cat > lint-tamper/konvoy.toml << 'TOML'
+[package]
+name = "lint-tamper"
+
+[toolchain]
+kotlin = "2.2.0"
+detekt = "1.23.7"
+TOML
+    cd lint-tamper
+
+    konvoy lint >/dev/null 2>&1 || true
+    assert_file_contains konvoy.lock "detekt_jar_sha256"
+
+    # Tamper with the pinned hash (project-local lockfile only — the shared
+    # JAR cache is untouched, so parallel tests are unaffected).
+    sed -i 's/detekt_jar_sha256 = ".*"/detekt_jar_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"/' konvoy.lock
+    cp konvoy.lock lock.bak
+
+    local output
+    if output=$(konvoy lint --locked 2>&1); then
+        echo "    expected lint --locked to fail on pinned-hash mismatch" >&2
+        return 1
+    fi
+    assert_contains "$output" "jar hash mismatch"
+    assert_files_identical konvoy.lock lock.bak
+}
+
 test_update_has_no_offline_flag() {
     # `konvoy update` is inherently online (it resolves from Maven Central);
     # --offline must be rejected by the CLI, not silently ignored.
@@ -2057,6 +2199,11 @@ run_test test_locked_redownloads_pinned_absent_detekt_jar
 run_test test_lint_locked_offline_lifecycle
 run_test test_frozen_drift_wins_over_offline
 run_test test_frozen_offline_error_when_klib_absent
+run_test test_offline_plugin_absent_fails
+run_test test_locked_plugin_pinned_absent_attempts_download
+run_test test_locked_changed_path_dep_source_errors
+run_test test_locked_relocated_checkout_succeeds
+run_test test_locked_detekt_hash_mismatch_fails
 run_test test_update_has_no_offline_flag
 run_test test_help_documents_repro_flags
 
