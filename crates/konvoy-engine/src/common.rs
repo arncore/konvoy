@@ -1,7 +1,12 @@
 //! Small shared helpers used across multiple engine modules.
 
-use crate::error::EngineError;
+use crate::error::{map_artifact_download_err, EngineError};
 use konvoy_config::{lockfile::Lockfile, Manifest};
+
+pub(crate) struct ResolvedDetektJar {
+    pub actual_sha256: String,
+    pub was_pinned: bool,
+}
 
 /// Per-command resolver for managed artifacts.
 ///
@@ -38,7 +43,7 @@ impl<'a> ArtifactResolver<'a> {
     ///
     /// Lockfile drift is checked first so `--locked --offline` reports the
     /// lockfile problem before reporting a cache miss.
-    pub(crate) fn resolve_artifact(
+    fn resolve_artifact(
         self,
         has_pin: bool,
         is_present: bool,
@@ -46,6 +51,160 @@ impl<'a> ArtifactResolver<'a> {
     ) -> Result<(), EngineError> {
         self.lockfiles.require_artifact_pin(has_pin)?;
         self.require_available(is_present, offline_error)
+    }
+
+    /// Resolve and, if necessary, install the managed Kotlin/Native toolchain.
+    pub(crate) fn resolve_toolchain(
+        self,
+        version: &str,
+        lockfile: &Lockfile,
+    ) -> Result<konvoy_konanc::detect::ResolvedKonanc, EngineError> {
+        let is_present = konvoy_konanc::toolchain::is_installed(version)?;
+        let has_pin = has_required_toolchain_artifact_pins(lockfile, version)?;
+        self.resolve_artifact(has_pin, is_present, || EngineError::ToolchainOffline {
+            version: version.to_owned(),
+        })?;
+        Ok(konvoy_konanc::detect::resolve_konanc(version, self.net)?)
+    }
+
+    /// Resolve the detekt CLI JAR and return the hash that was verified.
+    pub(crate) fn resolve_detekt_jar(
+        self,
+        version: &str,
+        lockfile: &Lockfile,
+    ) -> Result<ResolvedDetektJar, EngineError> {
+        let expected_sha256 = lockfile.toolchain.as_ref().and_then(|tc| {
+            (tc.detekt_version.as_deref() == Some(version))
+                .then(|| tc.detekt_jar_sha256.as_deref())
+                .flatten()
+        });
+        let was_pinned = expected_sha256.is_some();
+        let is_present = crate::detekt::is_installed(version)?;
+        self.resolve_artifact(was_pinned, is_present, || EngineError::DetektJarOffline {
+            version: version.to_owned(),
+        })?;
+        let (_, actual_sha256) = crate::detekt::ensure_detekt(version, expected_sha256, self)?;
+        Ok(ResolvedDetektJar {
+            actual_sha256,
+            was_pinned,
+        })
+    }
+
+    /// Resolve the JRE used to run detekt.
+    pub(crate) fn resolve_detekt_jre(
+        self,
+        kotlin_version: &str,
+        lockfile: &Lockfile,
+    ) -> Result<std::path::PathBuf, EngineError> {
+        if !konvoy_konanc::toolchain::is_installed(kotlin_version)? {
+            let has_pin = has_required_toolchain_artifact_pins(lockfile, kotlin_version)?;
+            self.resolve_artifact(has_pin, false, || EngineError::DetektJreOffline {
+                version: kotlin_version.to_owned(),
+            })?;
+            eprintln!("    Installing Kotlin/Native {kotlin_version} (for JRE)...");
+            konvoy_konanc::toolchain::install(kotlin_version, self.net)?;
+        }
+
+        let jre_home = konvoy_konanc::toolchain::jre_home_path(kotlin_version)?;
+        if !jre_home.join("bin").join("java").exists() {
+            return Err(EngineError::DetektNoJre);
+        }
+        Ok(jre_home)
+    }
+
+    /// Resolve a compiler plugin artifact and return its verified artifact data.
+    pub(crate) fn resolve_plugin_artifact(
+        self,
+        artifact: &crate::plugin::ResolvedPluginArtifact,
+        lockfile: &Lockfile,
+        bar: Option<&konvoy_util::progress::DownloadBar>,
+    ) -> Result<crate::plugin::PluginArtifactResult, EngineError> {
+        let expected_sha256 = lockfile
+            .plugins
+            .iter()
+            .find(|p| p.name == artifact.plugin_name)
+            .map(|p| p.sha256.as_str());
+        self.resolve_artifact(
+            expected_sha256.is_some(),
+            artifact.cache_path.exists(),
+            || EngineError::PluginOffline {
+                name: artifact.plugin_name.clone(),
+            },
+        )?;
+        let util_result = self
+            .fetch_artifact(
+                &artifact.url,
+                &artifact.cache_path,
+                expected_sha256,
+                &artifact.plugin_name,
+                bar,
+            )
+            .map_err(|e| {
+                map_artifact_download_err(
+                    &artifact.plugin_name,
+                    e,
+                    |name, message| EngineError::PluginDownload { name, message },
+                    |name, expected, actual| EngineError::PluginHashMismatch {
+                        name,
+                        expected,
+                        actual,
+                    },
+                )
+            })?;
+
+        Ok(crate::plugin::PluginArtifactResult {
+            plugin_name: artifact.plugin_name.clone(),
+            path: util_result.path,
+            sha256: util_result.sha256,
+            url: artifact.url.clone(),
+            freshly_downloaded: util_result.freshly_downloaded,
+            maven: artifact.maven_coord.group_artifact(),
+            version: artifact.maven_coord.version.clone(),
+        })
+    }
+
+    /// Resolve plugin artifact cache state before scheduling downloads.
+    pub(crate) fn prepare_plugin_artifacts(
+        self,
+        artifacts: &[crate::plugin::ResolvedPluginArtifact],
+        lockfile: &Lockfile,
+    ) -> Result<Vec<bool>, EngineError> {
+        let present: Vec<bool> = artifacts.iter().map(|a| a.cache_path.exists()).collect();
+        for (artifact, is_present) in artifacts.iter().zip(present.iter().copied()) {
+            let has_pin = lockfile
+                .plugins
+                .iter()
+                .any(|p| p.name == artifact.plugin_name);
+            self.resolve_artifact(has_pin, is_present, || EngineError::PluginOffline {
+                name: artifact.plugin_name.clone(),
+            })?;
+        }
+        Ok(present)
+    }
+
+    /// Resolve a Maven dependency klib and return a cache-key-ready library input.
+    pub(crate) fn resolve_maven_klib(
+        self,
+        name: &str,
+        url: &str,
+        dest: &std::path::Path,
+        expected_sha256: &str,
+        bar: Option<&konvoy_util::progress::DownloadBar>,
+    ) -> Result<crate::build::LibraryInput, EngineError> {
+        self.resolve_artifact(true, dest.exists(), || EngineError::LibraryOffline {
+            name: name.to_owned(),
+        })?;
+        let result = self
+            .fetch_artifact(url, dest, Some(expected_sha256), name, bar)
+            .map_err(|e| EngineError::LibraryDownloadFailed {
+                name: name.to_owned(),
+                url: url.to_owned(),
+                message: e.to_string(),
+            })?;
+        Ok(crate::build::LibraryInput::with_hash(
+            result.path,
+            result.sha256,
+        ))
     }
 
     /// Resolve missing Maven dependency state by running update when policy and
@@ -109,22 +268,6 @@ impl<'a> ArtifactResolver<'a> {
             .write_updated_lockfile(current, updated, lockfile_path)
     }
 
-    /// Resolve and, if necessary, install the managed Kotlin/Native toolchain.
-    pub(crate) fn resolve_konanc(
-        self,
-        version: &str,
-    ) -> Result<konvoy_konanc::detect::ResolvedKonanc, konvoy_konanc::error::KonancError> {
-        konvoy_konanc::detect::resolve_konanc(version, self.net)
-    }
-
-    /// Install the managed Kotlin/Native toolchain.
-    pub(crate) fn install_toolchain(
-        self,
-        version: &str,
-    ) -> Result<konvoy_konanc::toolchain::InstallResult, konvoy_konanc::error::KonancError> {
-        konvoy_konanc::toolchain::install(version, self.net)
-    }
-
     /// Ensure a managed tool artifact exists and is verified.
     pub(crate) fn ensure_managed_tool(
         self,
@@ -162,6 +305,35 @@ impl<'a> ArtifactResolver<'a> {
             maven_suffix,
         )
     }
+}
+
+fn has_required_toolchain_artifact_pins(
+    lockfile: &Lockfile,
+    kotlin_version: &str,
+) -> Result<bool, EngineError> {
+    let Some(tc) = lockfile
+        .toolchain
+        .as_ref()
+        .filter(|tc| tc.konanc_version == kotlin_version)
+    else {
+        return Ok(false);
+    };
+
+    let konanc_missing = !konvoy_konanc::toolchain::managed_konanc_path(kotlin_version)?.exists();
+    let jre_missing = !konvoy_konanc::toolchain::jre_dir(kotlin_version)?.exists();
+
+    let konanc_pinned = !konanc_missing
+        || tc
+            .konanc_tarball_sha256
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
+    let jre_pinned = !jre_missing
+        || tc
+            .jre_tarball_sha256
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
+
+    Ok(konanc_pinned && jre_pinned)
 }
 
 /// Per-command manager for lockfile policy.

@@ -284,15 +284,7 @@ pub(crate) fn resolve_build_context(
     //    SHA is a separate integrity pin, verified just below (and in
     //    `update_lockfile_if_needed`); it cannot gate a cached toolchain — see
     //    #296.
-    let toolchain_installed = konvoy_konanc::toolchain::is_installed(&manifest.toolchain.kotlin)?;
-    let toolchain_pinned =
-        has_required_toolchain_artifact_pins(&lockfile, &manifest.toolchain.kotlin)?;
-    resolver.resolve_artifact(toolchain_pinned, toolchain_installed, || {
-        EngineError::ToolchainOffline {
-            version: manifest.toolchain.kotlin.clone(),
-        }
-    })?;
-    let resolved = resolver.resolve_konanc(&manifest.toolchain.kotlin)?;
+    let resolved = resolver.resolve_toolchain(&manifest.toolchain.kotlin, &lockfile)?;
     let konanc = resolved.info;
     let jre_home = resolved.jre_home;
     let konanc_tarball_sha256 = resolved.konanc_tarball_sha256;
@@ -911,15 +903,6 @@ pub(crate) fn resolve_maven_deps(
             })
             .collect::<Result<Vec<_>, EngineError>>()?;
 
-    // Klibs are always SHA-pinned by their lockfile entry (a missing pin is
-    // `MissingTargetHash`, raised above). Ask the command resolver to fail fast
-    // for any artifact it cannot resolve before spawning downloads.
-    for p in &prepared {
-        resolver.resolve_artifact(true, !p.needs_download, || EngineError::LibraryOffline {
-            name: p.entry.name.to_owned(),
-        })?;
-    }
-
     // Only allocate bars for entries that actually need a network fetch;
     // cached entries are silent. The `aligned_bars` Vec parallels `prepared`
     // so the par_iter zip pairs each entry with its bar (or None).
@@ -968,25 +951,7 @@ fn download_one_klib(
     maybe_bar: Option<&konvoy_util::progress::DownloadBar>,
     resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<LibraryInput, EngineError> {
-    let dep_name = p.entry.name.to_owned();
-    let result = resolver
-        .fetch_artifact(
-            &p.url,
-            &p.dest,
-            Some(p.expected_sha256),
-            &dep_name,
-            maybe_bar,
-        )
-        .map_err(|e| EngineError::LibraryDownloadFailed {
-            name: dep_name,
-            url: p.url.clone(),
-            message: e.to_string(),
-        })?;
-    // `progress::fetch` already enforces `expected_sha256` (via
-    // `check_cached` on hit, `download_artifact` on miss), so `result.sha256`
-    // is guaranteed to match. Carry the freshly-verified hash through so
-    // `build_single` can reuse it for the cache key without re-reading.
-    Ok(LibraryInput::with_hash(result.path, result.sha256))
+    resolver.resolve_maven_klib(p.entry.name, &p.url, &p.dest, p.expected_sha256, maybe_bar)
 }
 
 /// Returns the name of the first manifest Maven dep that has no matching
@@ -1002,43 +967,6 @@ pub(crate) fn first_unresolved_maven_dep(
         .iter()
         .find(|(name, spec)| spec.is_maven() && !lockfile.has_maven_entry(name))
         .map(|(name, _)| name.clone())
-}
-
-/// Return whether every missing managed-toolchain artifact has a matching
-/// lockfile pin for `kotlin_version`.
-///
-/// This is deliberately about artifacts that would be downloaded now, not a
-/// blanket "does this lockfile have all possible hashes?" check. A cached
-/// toolchain can still run under `--locked` without tarball hashes because there
-/// is no tarball left to verify; a clean-machine install must have the tarball
-/// hashes pinned before `--locked` may fetch anything.
-pub(crate) fn has_required_toolchain_artifact_pins(
-    lockfile: &Lockfile,
-    kotlin_version: &str,
-) -> Result<bool, EngineError> {
-    let Some(tc) = lockfile
-        .toolchain
-        .as_ref()
-        .filter(|tc| tc.konanc_version == kotlin_version)
-    else {
-        return Ok(false);
-    };
-
-    let konanc_missing = !konvoy_konanc::toolchain::managed_konanc_path(kotlin_version)?.exists();
-    let jre_missing = !konvoy_konanc::toolchain::jre_dir(kotlin_version)?.exists();
-
-    let konanc_pinned = !konanc_missing
-        || tc
-            .konanc_tarball_sha256
-            .as_deref()
-            .is_some_and(|s| !s.is_empty());
-    let jre_pinned = !jre_missing
-        || tc
-            .jre_tarball_sha256
-            .as_deref()
-            .is_some_and(|s| !s.is_empty());
-
-    Ok(konanc_pinned && jre_pinned)
 }
 
 /// Check that the lockfile is complete and consistent with the manifest.

@@ -121,6 +121,7 @@ pub fn resolve_plugin_artifacts(
 // ---------------------------------------------------------------------------
 
 /// Look up the expected SHA-256 for a plugin from the lockfile.
+#[cfg(test)]
 fn find_lockfile_hash<'a>(lockfile: &'a Lockfile, plugin_name: &str) -> Option<&'a str> {
     lockfile
         .plugins
@@ -129,7 +130,7 @@ fn find_lockfile_hash<'a>(lockfile: &'a Lockfile, plugin_name: &str) -> Option<&
         .map(|p| p.sha256.as_str())
 }
 
-/// Map a `UtilError::Download` to `EngineError::PluginDownload`.
+#[cfg(test)]
 fn map_download_err(name: &str, e: konvoy_util::error::UtilError) -> EngineError {
     crate::error::map_artifact_download_err(
         name,
@@ -160,19 +161,9 @@ pub fn ensure_plugin_artifacts(
 ) -> Result<Vec<PluginArtifactResult>, EngineError> {
     use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
-    // Stat each artifact's cache path once; the gate precheck, the label list,
-    // and the bar alignment below all share this snapshot — consistent
-    // decisions and no repeated I/O.
-    let present: Vec<bool> = artifacts.iter().map(|a| a.cache_path.exists()).collect();
-
-    // Fail fast before spawning any downloads: ask the command resolver to
-    // resolve each plugin artifact against the current lockfile/cache state.
-    for (artifact, is_present) in artifacts.iter().zip(present.iter().copied()) {
-        let has_pin = find_lockfile_hash(lockfile, &artifact.plugin_name).is_some();
-        resolver.resolve_artifact(has_pin, is_present, || EngineError::PluginOffline {
-            name: artifact.plugin_name.clone(),
-        })?;
-    }
+    // Resolve artifact state once; the resolver owns locked/offline policy, and
+    // the returned cache snapshot drives progress-bar layout below.
+    let present = resolver.prepare_plugin_artifacts(artifacts, lockfile)?;
 
     if artifacts.is_empty() {
         return Ok(Vec::new());
@@ -204,26 +195,7 @@ pub fn ensure_plugin_artifacts(
         .par_iter()
         .zip(aligned_bars.par_iter())
         .map(|(artifact, maybe_bar)| {
-            let expected_hash = find_lockfile_hash(lockfile, &artifact.plugin_name);
-            let util_result = resolver
-                .fetch_artifact(
-                    &artifact.url,
-                    &artifact.cache_path,
-                    expected_hash,
-                    &artifact.plugin_name,
-                    *maybe_bar,
-                )
-                .map_err(|e| map_download_err(&artifact.plugin_name, e))?;
-
-            Ok(PluginArtifactResult {
-                plugin_name: artifact.plugin_name.clone(),
-                path: util_result.path,
-                sha256: util_result.sha256,
-                url: artifact.url.clone(),
-                freshly_downloaded: util_result.freshly_downloaded,
-                maven: artifact.maven_coord.group_artifact(),
-                version: artifact.maven_coord.version.clone(),
-            })
+            resolver.resolve_plugin_artifact(artifact, lockfile, *maybe_bar)
         })
         .collect();
 
