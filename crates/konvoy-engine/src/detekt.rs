@@ -187,18 +187,19 @@ fn persist_detekt_hash(
 fn resolve_jre_home(
     kotlin_version: &str,
     locked: bool,
+    lockfile: &konvoy_config::lockfile::Lockfile,
     net: &konvoy_util::net::NetworkClient,
 ) -> Result<PathBuf, EngineError> {
     if !konvoy_konanc::toolchain::is_installed(kotlin_version)? {
-        // The detekt JRE rides along with the managed toolchain; there is no
-        // separate JRE pin to drift here (the toolchain-version pin is checked
-        // by `check_lockfile_staleness` in `lint` under --locked), so
-        // `has_pin = true` and only --offline can block the install.
-        crate::common::gate_artifact(true, false, locked, net.is_offline()).into_result(|| {
-            EngineError::DetektJreOffline {
+        // The detekt JRE rides along with the managed toolchain. If installing
+        // would download any missing toolchain artifact under --locked, the
+        // relevant tarball hash must already be pinned in konvoy.lock.
+        let has_pin = crate::build::has_required_toolchain_artifact_pins(lockfile, kotlin_version)?;
+        crate::common::gate_artifact(has_pin, false, locked, net.is_offline()).into_result(
+            || EngineError::DetektJreOffline {
                 version: kotlin_version.to_owned(),
-            }
-        })?;
+            },
+        )?;
         eprintln!("    Installing Kotlin/Native {kotlin_version} (for JRE)...");
         konvoy_konanc::toolchain::install(kotlin_version, net)?;
     }
@@ -338,7 +339,7 @@ pub fn lint(
     if expected_hash.is_none() {
         persist_detekt_hash(
             &lockfile_path,
-            lockfile,
+            lockfile.clone(),
             &manifest.toolchain.kotlin,
             detekt_version,
             actual_hash,
@@ -346,7 +347,7 @@ pub fn lint(
     }
 
     // Resolve JRE.
-    let jre_home = resolve_jre_home(&manifest.toolchain.kotlin, options.locked, net)?;
+    let jre_home = resolve_jre_home(&manifest.toolchain.kotlin, options.locked, &lockfile, net)?;
 
     // Check for sources.
     let src_dir = root.join("src");
@@ -898,6 +899,63 @@ src/main.kt:3:5: Magic number. [MagicNumber]
                 Err(crate::error::EngineError::LockfileUpdateRequired)
             ),
             "expected LockfileUpdateRequired, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn lint_locked_errors_when_jre_toolchain_tarball_hashes_missing() {
+        // The detekt JRE comes from the managed Kotlin/Native toolchain. Under
+        // --locked, a clean-machine install is only allowed when the toolchain
+        // tarballs are pinned; a version-only lockfile entry must fail before
+        // installing anything.
+        let detekt_version = "99.0.6-locked-jre";
+        let jar = super::detekt_jar_path(detekt_version).unwrap();
+        std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
+        let content = b"fake jar for locked jre test";
+        std::fs::write(&jar, content).unwrap();
+        let jar_hash = konvoy_util::hash::sha256_bytes(content);
+
+        let kotlin_version = "0.0.0-locked-jre-test";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("konvoy.toml"),
+            format!(
+                "[package]\nname = \"demo\"\n\n[toolchain]\nkotlin = \"{kotlin_version}\"\ndetekt = \"{detekt_version}\"\n"
+            ),
+        )
+        .unwrap();
+        let lockfile = konvoy_config::lockfile::Lockfile {
+            toolchain: Some(konvoy_config::lockfile::ToolchainLock {
+                konanc_version: kotlin_version.to_owned(),
+                konanc_tarball_sha256: None,
+                jre_tarball_sha256: None,
+                detekt_version: Some(detekt_version.to_owned()),
+                detekt_jar_sha256: Some(jar_hash),
+            }),
+            ..Default::default()
+        };
+        lockfile.write_to(&root.join("konvoy.lock")).unwrap();
+
+        let result = super::lint(
+            root,
+            &super::LintOptions {
+                verbose: false,
+                config: None,
+                locked: true,
+            },
+            &konvoy_util::net::NetworkClient::new(false),
+        );
+
+        let _ = std::fs::remove_file(&jar);
+        let _ = std::fs::remove_dir(jar.parent().unwrap());
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::EngineError::LockfileUpdateRequired)
+            ),
+            "expected LockfileUpdateRequired before JRE install, got: {result:?}"
         );
     }
 

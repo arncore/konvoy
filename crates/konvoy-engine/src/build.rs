@@ -309,10 +309,8 @@ pub(crate) fn resolve_build_context(
     //    `update_lockfile_if_needed`); it cannot gate a cached toolchain — see
     //    #296.
     let toolchain_installed = konvoy_konanc::toolchain::is_installed(&manifest.toolchain.kotlin)?;
-    let toolchain_pinned = lockfile
-        .toolchain
-        .as_ref()
-        .is_some_and(|tc| tc.konanc_version == manifest.toolchain.kotlin);
+    let toolchain_pinned =
+        has_required_toolchain_artifact_pins(&lockfile, &manifest.toolchain.kotlin)?;
     crate::common::gate_artifact(
         toolchain_pinned,
         toolchain_installed,
@@ -1043,6 +1041,43 @@ pub(crate) fn first_unresolved_maven_dep(
         .map(|(name, _)| name.clone())
 }
 
+/// Return whether every missing managed-toolchain artifact has a matching
+/// lockfile pin for `kotlin_version`.
+///
+/// This is deliberately about artifacts that would be downloaded now, not a
+/// blanket "does this lockfile have all possible hashes?" check. A cached
+/// toolchain can still run under `--locked` without tarball hashes because there
+/// is no tarball left to verify; a clean-machine install must have the tarball
+/// hashes pinned before `--locked` may fetch anything.
+pub(crate) fn has_required_toolchain_artifact_pins(
+    lockfile: &Lockfile,
+    kotlin_version: &str,
+) -> Result<bool, EngineError> {
+    let Some(tc) = lockfile
+        .toolchain
+        .as_ref()
+        .filter(|tc| tc.konanc_version == kotlin_version)
+    else {
+        return Ok(false);
+    };
+
+    let konanc_missing = !konvoy_konanc::toolchain::managed_konanc_path(kotlin_version)?.exists();
+    let jre_missing = !konvoy_konanc::toolchain::jre_dir(kotlin_version)?.exists();
+
+    let konanc_pinned = !konanc_missing
+        || tc
+            .konanc_tarball_sha256
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
+    let jre_pinned = !jre_missing
+        || tc
+            .jre_tarball_sha256
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
+
+    Ok(konanc_pinned && jre_pinned)
+}
+
 /// Check that the lockfile is complete and consistent with the manifest.
 ///
 /// This is the staleness check for `--locked` mode. It catches cases where
@@ -1484,6 +1519,40 @@ mod tests {
         assert!(
             matches!(result, Err(EngineError::LockfileUpdateRequired)),
             "expected LockfileUpdateRequired, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn build_locked_errors_when_toolchain_tarball_hashes_missing() {
+        // A version-only toolchain entry is not enough to download under
+        // --locked: installing on a clean machine would fetch artifacts whose
+        // tarball hashes are not pinned in konvoy.lock.
+        let kotlin_version = "0.0.0-unpinned-locked-test";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("main.kt"), "fun main() {}\n").unwrap();
+        fs::write(
+            root.join("konvoy.toml"),
+            format!("[package]\nname = \"demo\"\n\n[toolchain]\nkotlin = \"{kotlin_version}\"\n"),
+        )
+        .unwrap();
+        Lockfile::with_toolchain(kotlin_version)
+            .write_to(&root.join("konvoy.lock"))
+            .unwrap();
+
+        let result = build(
+            root,
+            &BuildOptions {
+                locked: true,
+                ..Default::default()
+            },
+            &konvoy_util::net::NetworkClient::new(false),
+        );
+
+        assert!(
+            matches!(result, Err(EngineError::LockfileUpdateRequired)),
+            "expected LockfileUpdateRequired before any install, got: {result:?}"
         );
     }
 
