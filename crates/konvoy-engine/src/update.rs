@@ -499,21 +499,38 @@ fn collect_graph_direct_maven_deps<'a>(
     Ok(by_key.into_values().map(|(dep, _)| dep).collect())
 }
 
-/// Order two Maven version strings by dotted-numeric segments, so `1.10.0`
-/// sorts above `1.9.0` (a plain string compare gets this wrong). Non-numeric
-/// segments (e.g. `-beta` suffixes) fall back to lexicographic order, and a
-/// longer numeric run is treated as newer (`1.0.1` > `1.0`). This is a hint
-/// heuristic, not a full semver implementation.
+/// Order two Maven version strings well enough to pick the higher one for a
+/// conflict hint. Compares the dotted-numeric core (`1.10.0` > `1.9.0`, and a
+/// missing trailing segment counts as `0` so `1.0` == `1.0.0`); a version with a
+/// pre-release suffix sorts BELOW the same core (`1.0.0-beta` < `1.0.0`), and two
+/// suffixes compare lexicographically. Not a full semver implementation — it
+/// only has to tolerate arbitrary Maven version strings and produce a sensible
+/// hint.
 fn compare_maven_versions(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    let mut a_parts = a.split('.');
-    let mut b_parts = b.split('.');
+
+    // Split a version into its numeric core (segments before the first `-`) and
+    // an optional pre-release suffix.
+    fn split_core(v: &str) -> (&str, Option<&str>) {
+        match v.split_once('-') {
+            Some((core, pre)) => (core, Some(pre)),
+            None => (v, None),
+        }
+    }
+
+    let (a_core, a_pre) = split_core(a);
+    let (b_core, b_pre) = split_core(b);
+
+    let mut a_parts = a_core.split('.');
+    let mut b_parts = b_core.split('.');
     loop {
         match (a_parts.next(), b_parts.next()) {
-            (None, None) => return Ordering::Equal,
-            (Some(_), None) => return Ordering::Greater,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(x), Some(y)) => {
+            (None, None) => break,
+            // Pad a missing segment with 0 so `1.0` and `1.0.0` compare equal,
+            // and `1.0.1` > `1.0`.
+            (a_seg, b_seg) => {
+                let x = a_seg.unwrap_or("0");
+                let y = b_seg.unwrap_or("0");
                 let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
                     (Ok(nx), Ok(ny)) => nx.cmp(&ny),
                     _ => x.cmp(y),
@@ -523,6 +540,15 @@ fn compare_maven_versions(a: &str, b: &str) -> std::cmp::Ordering {
                 }
             }
         }
+    }
+
+    // Equal numeric core: a pre-release suffix is LESS than no suffix; two
+    // suffixes compare lexicographically.
+    match (a_pre, b_pre) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(x), Some(y)) => x.cmp(y),
     }
 }
 
@@ -555,6 +581,29 @@ fn maven_version_conflict(
         hint_name: base_artifact_id.replace('.', "-"),
         hint_version: hint_version.to_owned(),
     }
+}
+
+/// The name of the dep that requires the child currently being recorded.
+///
+/// A queue entry's `requirer` field carries the processing dep's OWN name (set
+/// when it was enqueued); for the seed (direct) deps it is `None`, so we fall
+/// back to looking the processing dep up in `resolved` by its `group:artifact`,
+/// and finally to `"unknown"`. Shared by both the already-resolved and new-dep
+/// branches so they attribute `required_by` identically.
+fn child_requirer_name(
+    requirer: &Option<String>,
+    group_id: &str,
+    artifact_id: &str,
+    resolved: &HashMap<String, ResolvedMavenDep>,
+) -> String {
+    requirer
+        .clone()
+        .or_else(|| {
+            resolved
+                .get(&format!("{group_id}:{artifact_id}"))
+                .map(|d| d.name.clone())
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// Check for a version conflict between a newly resolved dep and one already seen.
@@ -636,8 +685,10 @@ fn discover_cinterop_deps(
     cinterop_deps
 }
 
-/// Finalize the `required_by` fields: direct deps get empty, transitive deps
-/// get the accumulated requirer set.
+/// Finalize the `required_by` fields: every dep with recorded requirers gets the
+/// accumulated set (including a dep that is BOTH declared direct and pulled
+/// transitively — see the body). A purely-direct dep has no recorded requirers
+/// and stays empty.
 fn finalize_required_by(
     resolved: &mut HashMap<String, ResolvedMavenDep>,
     required_by_map: &HashMap<String, BTreeSet<String>>,
@@ -830,33 +881,25 @@ fn resolve_transitive(
                         &base_artifact_id,
                         requirer.as_deref(),
                     )?;
-                    let parent_name = requirer
-                        .clone()
-                        .or_else(|| {
-                            state
-                                .resolved
-                                .get(&format!("{group_id}:{artifact_id}"))
-                                .map(|d| d.name.clone())
-                        })
-                        .unwrap_or_else(|| "unknown".to_owned());
-                    state
-                        .required_by_map
-                        .entry(dep_key)
-                        .or_default()
-                        .insert(parent_name);
+                    let existing_name = existing.name.clone();
+                    let parent_name =
+                        child_requirer_name(&requirer, &group_id, &artifact_id, &state.resolved);
+                    // Skip a self-reference (a dep whose POM lists itself): this
+                    // branch has no cycle check, and `A required_by [A]` is a
+                    // confusing lockfile entry that the old wipe used to hide.
+                    if parent_name != existing_name {
+                        state
+                            .required_by_map
+                            .entry(dep_key)
+                            .or_default()
+                            .insert(parent_name);
+                    }
                     continue;
                 }
 
                 let dep_name = base_artifact_id.clone();
-                let parent_name = requirer
-                    .clone()
-                    .or_else(|| {
-                        state
-                            .resolved
-                            .get(&format!("{group_id}:{artifact_id}"))
-                            .map(|d| d.name.clone())
-                    })
-                    .unwrap_or_else(|| "unknown".to_owned());
+                let parent_name =
+                    child_requirer_name(&requirer, &group_id, &artifact_id, &state.resolved);
 
                 state
                     .required_by_map
@@ -1806,6 +1849,33 @@ atomicfu = { maven = "org.jetbrains.kotlinx:atomicfu", version = "0.23.1" }
     }
 
     #[test]
+    fn compare_maven_versions_handles_segments_and_prerelease() {
+        use std::cmp::Ordering;
+        // Missing trailing segments count as 0.
+        assert_eq!(compare_maven_versions("1.0", "1.0.0"), Ordering::Equal);
+        assert_eq!(compare_maven_versions("1.0.0", "1.0"), Ordering::Equal);
+        // A pre-release suffix sorts BELOW the same numeric core (the bug the
+        // old lexicographic fallback got backwards: "1.0.0-beta" > "1.0.0").
+        assert_eq!(
+            compare_maven_versions("1.0.0-beta", "1.0.0"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_maven_versions("1.0.0", "1.0.0-RC1"),
+            Ordering::Greater
+        );
+        // Two suffixes compare lexicographically; numeric core still dominates.
+        assert_eq!(
+            compare_maven_versions("1.0.0-rc1", "1.0.0-rc2"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_maven_versions("2.0.0-beta", "1.0.0"),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
     fn maven_version_conflict_hint_suggests_the_higher_version() {
         let err = maven_version_conflict(
             "org.jetbrains.kotlinx:kotlinx-coroutines-core",
@@ -1868,7 +1938,7 @@ atomicfu = { maven = "org.jetbrains.kotlinx:atomicfu", version = "0.23.1" }
 
         let reparsed = Lockfile::from_path(&project.path().join("konvoy.lock")).unwrap();
         assert!(
-            reparsed.has_maven_entry("kotlinx-datetime") == false,
+            !reparsed.has_maven_entry("kotlinx-datetime"),
             "stale Maven pin must be pruned"
         );
         assert_eq!(reparsed.dependencies.len(), 1, "the path dep must be kept");

@@ -463,7 +463,10 @@ pub(crate) fn resolve_build_context(
     //    the same key across projects must not collapse.
     let all_maven_entries: Vec<&DependencyLock> = effective_lockfile.dependencies.iter().collect();
     let all_maven_klibs = resolve_maven_klibs(&all_maven_entries, &target, resolver)?;
-    let klib_by_coord: HashMap<MavenCoordKey, LibraryInput> = effective_lockfile
+    // A `BTreeMap` so `.values()` is coord-sorted + deduped — the exact set the
+    // root links (its subtree is the whole graph), in a deterministic order so
+    // the root's cache key is stable.
+    let klib_by_coord: std::collections::BTreeMap<MavenCoordKey, LibraryInput> = effective_lockfile
         .dependencies
         .iter()
         .filter_map(maven_coord_key)
@@ -598,18 +601,11 @@ pub(crate) fn resolve_build_context(
         .map(LibraryInput::unhashed)
         .collect();
 
-    // The root links every path-dep klib (above) plus the Maven closure of its
-    // OWN subtree, which IS the whole graph — same mechanism as every path-dep,
-    // no special case. With the union pinned exactly (no stale entries) this
-    // equals the full union the root linked before.
-    let mut root_coords: BTreeSet<MavenCoordKey> =
-        project_maven_closure_coords(&manifest, &effective_lockfile)
-            .into_iter()
-            .collect();
-    for coords in own_closure.values() {
-        root_coords.extend(coords.iter().cloned());
-    }
-    library_inputs.extend(coords_to_klibs(root_coords));
+    // The root links every path-dep klib (above) plus the WHOLE Maven union: its
+    // subtree is the entire graph, so its closure is exactly the pinned set,
+    // which `klib_by_coord.values()` already holds coord-deduped and sorted — no
+    // need to re-run the closure fixpoint over the whole graph just to rebuild it.
+    library_inputs.extend(klib_by_coord.values().cloned());
 
     let store = ArtifactStore::new(project_root);
 
@@ -1051,6 +1047,10 @@ struct PreparedKlib<'a> {
 /// entry's `name`: the union dedups by coordinate and may keep another project's
 /// konvoy key for a shared dep, so a name match would miss it. Transitive
 /// expansion follows the lockfile's `required_by` (which lists requirer *names*).
+/// This assumes `required_by` is complete, which `konvoy update` guarantees; a
+/// lockfile written by a pre-#293 konvoy may have gaps, so a `--locked` build
+/// against such a stale lock could under-resolve — re-running `konvoy update`
+/// (or any non-locked build) regenerates a complete lock.
 ///
 /// This is the `[dependencies]` analogue of deriving each project's own
 /// `-Xplugin` set (#293): a path-dep is compiled against exactly the klibs it
