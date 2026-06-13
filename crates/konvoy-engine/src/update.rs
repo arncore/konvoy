@@ -1838,6 +1838,48 @@ atomicfu = { maven = "org.jetbrains.kotlinx:atomicfu", version = "0.23.1" }
     }
 
     #[test]
+    fn child_requirer_name_prefers_requirer_then_resolved_then_unknown() {
+        let mut resolved: HashMap<String, ResolvedMavenDep> = HashMap::new();
+        resolved.insert(
+            "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
+            ResolvedMavenDep {
+                name: "coroutines".to_owned(),
+                group_id: "org.jetbrains.kotlinx".to_owned(),
+                artifact_id: "kotlinx-coroutines-core".to_owned(),
+                version: "1.8.0".to_owned(),
+                required_by: Vec::new(),
+                classifier: None,
+            },
+        );
+
+        // requirer is Some → used directly (the cached processing-dep name).
+        assert_eq!(
+            child_requirer_name(
+                &Some("coroutines".to_owned()),
+                "org.jetbrains.kotlinx",
+                "kotlinx-coroutines-core",
+                &resolved,
+            ),
+            "coroutines"
+        );
+        // requirer None (a seed/direct dep) → fall back to the resolved entry's name.
+        assert_eq!(
+            child_requirer_name(
+                &None,
+                "org.jetbrains.kotlinx",
+                "kotlinx-coroutines-core",
+                &resolved,
+            ),
+            "coroutines"
+        );
+        // requirer None and the processing dep isn't resolved → "unknown".
+        assert_eq!(
+            child_requirer_name(&None, "com.example", "missing", &resolved),
+            "unknown"
+        );
+    }
+
+    #[test]
     fn compare_maven_versions_is_numeric_not_lexicographic() {
         use std::cmp::Ordering;
         // The bug this guards: a string compare makes "1.10.0" < "1.9.0".

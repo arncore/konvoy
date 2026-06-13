@@ -4530,6 +4530,91 @@ mod tests {
     }
 
     #[test]
+    fn maven_coord_key_extracts_coordinate_and_skips_path() {
+        // Maven entry → (coordinate, version, classifier).
+        let m = maven_lock("a", "g:a", "1.0", &[]);
+        assert_eq!(
+            maven_coord_key(&m),
+            Some(("g:a".to_owned(), "1.0".to_owned(), None))
+        );
+        // Classifier is carried through (cinterop entries).
+        let cinterop = DependencyLock {
+            name: "atomicfu-cinterop".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets: std::collections::BTreeMap::new(),
+                required_by: vec!["atomicfu".to_owned()],
+                classifier: Some("cinterop-interop".to_owned()),
+            },
+            source_hash: "h".to_owned(),
+        };
+        assert_eq!(
+            maven_coord_key(&cinterop),
+            Some((
+                "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                "0.23.1".to_owned(),
+                Some("cinterop-interop".to_owned())
+            ))
+        );
+        // Path entry → None.
+        let p = DependencyLock {
+            name: "lib".to_owned(),
+            source: DepSource::Path {
+                path: "../lib".to_owned(),
+            },
+            source_hash: "h".to_owned(),
+        };
+        assert_eq!(maven_coord_key(&p), None);
+    }
+
+    #[test]
+    fn predicted_dependency_locks_sorts_by_name_and_keeps_maven() {
+        // Path deps in NON-alphabetical graph order + a Maven lock entry. The
+        // output must be sorted by name (byte-for-byte what `konvoy update`
+        // writes) so `update` then `build --locked` doesn't see an ordering diff.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut zdep = resolved_dep("zlib", &[]);
+        zdep.project_root = tmp.path().join("zlib");
+        let mut adep = resolved_dep("alib", &[]);
+        adep.project_root = tmp.path().join("alib");
+        let graph = crate::resolve::ResolvedGraph {
+            order: vec![zdep, adep],
+        };
+        let mut lockfile = Lockfile::default();
+        lockfile
+            .dependencies
+            .push(maven_lock("mlib", "g:m", "1.0", &[]));
+
+        let locks = predicted_dependency_locks(&lockfile, &graph, tmp.path());
+        let names: Vec<&str> = locks.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["alib", "mlib", "zlib"],
+            "deps must be sorted by name, with the Maven entry preserved"
+        );
+    }
+
+    #[test]
+    fn predicted_dependency_locks_drops_deps_with_empty_source_hash() {
+        // A dep whose source hasn't been hashed (empty source_hash) is omitted —
+        // it can't be pinned yet.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut hashed = resolved_dep("hashed", &[]);
+        hashed.project_root = tmp.path().join("hashed");
+        let mut unhashed = resolved_dep("unhashed", &[]);
+        unhashed.project_root = tmp.path().join("unhashed");
+        unhashed.source_hash = String::new();
+        let graph = crate::resolve::ResolvedGraph {
+            order: vec![hashed, unhashed],
+        };
+
+        let locks = predicted_dependency_locks(&Lockfile::default(), &graph, tmp.path());
+        let names: Vec<&str> = locks.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["hashed"]);
+    }
+
+    #[test]
     fn collect_descendant_deps_walks_transitively_and_dedupes_diamond() {
         // Graph: parent -> {child, sibling}; child -> grandchild; sibling -> grandchild
         // (a diamond). parent's transitive descendants are child, sibling, and
