@@ -562,13 +562,17 @@ KOTLIN
 
 test_path_dep_plugin_build_lifecycle() {
     # Path-dep [plugins] are applied to the dep's own compile and pinned in the
-    # ROOT lockfile (#293; the root here declares no plugins of its own).
+    # ROOT lockfile (#293; the root here declares no plugins of its own). Uses
+    # the canonical serialization plugin coordinate, same as the rest of the
+    # suite (the -embeddable variant was reverted in #245 as "not the real fix";
+    # the real #239 fix was two-step program compilation, #243 — and library
+    # path-deps compile single-step with -Xplugin regardless).
     konvoy init --name plug-dep-lib --lib >/dev/null 2>&1
     konvoy init --name plug-dep-app >/dev/null 2>&1
     cat >> plug-dep-lib/konvoy.toml << 'TOML'
 
 [plugins]
-kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin-embeddable", version = "{kotlin}" }
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
 TOML
     cat >> plug-dep-app/konvoy.toml << 'TOML'
 
@@ -576,10 +580,14 @@ TOML
 plug-dep-lib = { path = "../plug-dep-lib" }
 TOML
 
-    # Probe source: the serialization plugin matches @Serializable by FQ name
-    # and errors because the runtime library is absent — a failing dep compile
-    # is positive proof the dep was built with its -Xplugin. Before #293 the
-    # dep compiled with no plugins, so this build SUCCEEDED (silently wrong).
+    # Application probe: a @Serializable class (matched by FQ name) gives the
+    # serialization plugin something to act on. With the runtime library absent
+    # the dep's compile then FAILS — a failure localized to the dep's own
+    # compilation is positive, platform-independent proof the dep was built with
+    # its -Xplugin. Before #293 the dep compiled with no plugins, so this build
+    # SUCCEEDED (silently wrong). PART 2 below flips the result by removing only
+    # the @Serializable usage (plugin still declared) and the build succeeds —
+    # confirming the failure was the plugin engaging, not the annotation itself.
     cat > plug-dep-lib/src/lib.kt << 'KOTLIN'
 package kotlinx.serialization
 
@@ -596,7 +604,11 @@ KOTLIN
         echo "    expected the dep compile to fail under the serialization plugin (was -Xplugin applied to the dep?)" >&2
         return 1
     fi
-    assert_contains "$probe" "serializer has not been found"
+    # The failure must be in the DEP's compilation (the dep got the plugin), so
+    # the dep's compile line printed but the root's never did.
+    assert_contains "$probe" "Compiling plug-dep-lib"
+    assert_contains "$probe" "compilation failed"
+    assert_not_contains "$probe" "Compiling plug-dep-app"
 
     # Standalone parity: the dep must fail the same way built on its own.
     local standalone
@@ -604,11 +616,13 @@ KOTLIN
         echo "    expected the standalone dep build to fail under the serialization plugin" >&2
         return 1
     fi
-    assert_contains "$standalone" "serializer has not been found"
+    assert_contains "$standalone" "compilation failed"
     rm -rf ../plug-dep-lib/.konvoy ../plug-dep-lib/konvoy.lock
 
-    # Make the dep's plugin a no-op (plain source) and verify the pinning +
-    # caching lifecycle.
+    # PART 2 — control + pinning/caching lifecycle. Same plugin still declared,
+    # but the source no longer uses @Serializable, so the plugin is a clean
+    # no-op and the build succeeds. That this now compiles (vs. PART 1's failure)
+    # is the control proving the plugin was genuinely engaging in PART 1.
     cat > ../plug-dep-lib/src/lib.kt << 'KOTLIN'
 package models
 
@@ -622,7 +636,7 @@ KOTLIN
     # The dep's plugin pin lands in the ROOT lockfile; the dep checkout is
     # never written to by the root build.
     assert_file_contains konvoy.lock "[[plugins]]"
-    assert_file_contains konvoy.lock "kotlin-serialization-compiler-plugin-embeddable"
+    assert_file_contains konvoy.lock "kotlin-serialization-compiler-plugin"
     assert_file_contains konvoy.lock "sha256"
     if [ -f ../plug-dep-lib/konvoy.lock ]; then
         echo "    root build must not write a lockfile into the dep checkout" >&2
@@ -658,7 +672,7 @@ test_path_dep_plugin_union_dedup() {
     # root lock — not duplicated, not a conflict (#293).
     konvoy init --name dedup-lib --lib >/dev/null 2>&1
     konvoy init --name dedup-app >/dev/null 2>&1
-    local ser='kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin-embeddable", version = "{kotlin}" }'
+    local ser='kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }'
     printf '\n[plugins]\n%s\n' "$ser" >> dedup-lib/konvoy.toml
     printf '\n[plugins]\n%s\n\n[dependencies]\ndedup-lib = { path = "../dedup-lib" }\n' "$ser" >> dedup-app/konvoy.toml
     # No @Serializable anywhere — the plugin is a clean no-op, so both compiles
@@ -679,7 +693,7 @@ test_path_dep_plugin_union_dedup() {
         cat konvoy.lock >&2
         return 1
     fi
-    assert_file_contains konvoy.lock "kotlin-serialization-compiler-plugin-embeddable"
+    assert_file_contains konvoy.lock "kotlin-serialization-compiler-plugin"
 
     # Second build is fully cached (the deduped pin is folded into the key).
     local out2
@@ -699,12 +713,12 @@ test_graph_plugin_union_different_plugins() {
     cat >> union-lib/konvoy.toml << 'TOML'
 
 [plugins]
-allopen = { maven = "org.jetbrains.kotlin:kotlin-allopen-compiler-plugin-embeddable", version = "{kotlin}" }
+allopen = { maven = "org.jetbrains.kotlin:kotlin-allopen-compiler-plugin", version = "{kotlin}" }
 TOML
     cat >> union-app/konvoy.toml << 'TOML'
 
 [plugins]
-kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin-embeddable", version = "{kotlin}" }
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
 
 [dependencies]
 union-lib = { path = "../union-lib" }
@@ -725,8 +739,8 @@ TOML
         cat konvoy.lock >&2
         return 1
     fi
-    assert_file_contains konvoy.lock "kotlin-allopen-compiler-plugin-embeddable"
-    assert_file_contains konvoy.lock "kotlin-serialization-compiler-plugin-embeddable"
+    assert_file_contains konvoy.lock "kotlin-allopen-compiler-plugin"
+    assert_file_contains konvoy.lock "kotlin-serialization-compiler-plugin"
 
     # The dep contributed a pin to the root lock but its own checkout is never
     # written to.
@@ -752,7 +766,7 @@ test_transitive_dep_plugin_applied_and_pinned() {
     cat >> gc-lib/konvoy.toml << 'TOML'
 
 [plugins]
-kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin-embeddable", version = "{kotlin}" }
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
 TOML
     cat >> child-lib/konvoy.toml << 'TOML'
 
@@ -765,10 +779,12 @@ TOML
 child-lib = { path = "../child-lib" }
 TOML
 
-    # Probe: a fake @Serializable in the GRANDCHILD makes its plugin fire and
-    # error (the runtime serializers are absent). A failing grandchild compile
-    # is positive proof the plugin reached depth 2 of the graph. Before #293 the
-    # grandchild compiled with no -Xplugin, so the build SUCCEEDED (silently wrong).
+    # Probe: a @Serializable class in the GRANDCHILD gives its plugin something
+    # to act on; with the runtime absent the grandchild's compile then FAILS. A
+    # failure localized to the grandchild's own compilation is positive proof the
+    # plugin reached depth 2 of the graph. Before #293 the grandchild compiled
+    # with no -Xplugin, so the build SUCCEEDED (silently wrong). The no-op rebuild
+    # below (plugin still declared) flips it to success — the control.
     cat > gc-lib/src/lib.kt << 'KOTLIN'
 package kotlinx.serialization
 
@@ -785,8 +801,11 @@ KOTLIN
         echo "    expected the grandchild compile to fail under the serialization plugin (did the union reach depth 2?)" >&2
         return 1
     fi
-    assert_contains "$probe" "serializer has not been found"
+    # Failure is in the grandchild's compile (it got the plugin); the build never
+    # reached the child or the root.
     assert_contains "$probe" "Compiling gc-lib"
+    assert_contains "$probe" "compilation failed"
+    assert_not_contains "$probe" "Compiling app-root"
 
     # Make the grandchild's plugin a no-op and verify the full pin lifecycle.
     cat > ../gc-lib/src/lib.kt << 'KOTLIN'
@@ -803,7 +822,7 @@ KOTLIN
     # The grandchild's plugin pin lands in the ROOT (app) lockfile; neither
     # intermediate checkout is written to.
     assert_file_contains konvoy.lock "[[plugins]]"
-    assert_file_contains konvoy.lock "kotlin-serialization-compiler-plugin-embeddable"
+    assert_file_contains konvoy.lock "kotlin-serialization-compiler-plugin"
     if [ -f ../gc-lib/konvoy.lock ] || [ -f ../child-lib/konvoy.lock ]; then
         echo "    root build must not write lockfiles into dep checkouts" >&2
         return 1
@@ -2416,7 +2435,8 @@ run_test test_graph_plugin_union_different_plugins
 run_test test_transitive_dep_plugin_applied_and_pinned
 run_test test_plugin_kotlin_placeholder_resolves
 
-# Issue #239: serialization plugin must use embeddable JAR
+# Issue #239: serialization plugin downloaded but not applied (fixed by two-step
+# program compilation, #243 — the embeddable-JAR mapping was reverted in #245).
 run_test test_issue_239_serialization_plugin_applied
 
 # Maven dependencies
