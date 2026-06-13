@@ -1142,6 +1142,75 @@ KOTLIN
     assert_contains "$out4" "lockfile"
 }
 
+# Expected: the root AND a path-dep BOTH declare [codegen.openapi] with the SAME
+# Fabrikt version. The graph-wide union is content-addressed by (name, version),
+# so the shared tool is pinned exactly ONCE in the root lock — not duplicated, not
+# a conflict. (Different base_packages avoid a generated-class collision; both
+# projects generate + compile their own models.)
+test_codegen_graph_union_dedup() {
+    konvoy init --name cgdedup-lib --lib >/dev/null 2>&1
+    konvoy init --name cgdedup-app >/dev/null 2>&1
+    _write_openapi_spec cgdedup-lib/specs/api.yaml
+    _write_openapi_spec cgdedup-app/specs/api.yaml
+    cat >> cgdedup-lib/konvoy.toml << 'TOML'
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+
+[dependencies]
+kotlinx-serialization-core = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-core", version = "1.7.3" }
+kotlinx-serialization-json = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-json", version = "1.7.3" }
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.lib"
+TOML
+    cat >> cgdedup-app/konvoy.toml << 'TOML'
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+
+[dependencies]
+cgdedup-lib = { path = "../cgdedup-lib" }
+kotlinx-serialization-core = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-core", version = "1.7.3" }
+kotlinx-serialization-json = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-json", version = "1.7.3" }
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.app"
+TOML
+    cd cgdedup-app
+
+    local out
+    out=$(konvoy build 2>&1)
+    assert_contains "$out" "Compiling cgdedup-lib"
+    assert_contains "$out" "Compiling cgdedup-app"
+
+    # Exactly one [[codegen_tools]] entry despite codegen declared by BOTH projects.
+    local count
+    count=$(grep -c '^\[\[codegen_tools\]\]' konvoy.lock)
+    if [ "$count" != "1" ]; then
+        echo "    expected exactly 1 deduped codegen pin, got $count" >&2
+        cat konvoy.lock >&2
+        return 1
+    fi
+    assert_file_contains konvoy.lock "fabrikt"
+
+    # Second build fully cached (the deduped pin folded into the key).
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "(cached)"
+    assert_not_contains "$out2" "Compiling"
+
+    # --locked satisfied by the single deduped pin (declared by both projects).
+    local out3
+    out3=$(konvoy build --locked 2>&1)
+    assert_contains "$out3" "(cached)"
+    assert_not_contains "$out3" "Compiling"
+}
+
 # Unexpected: [codegen.openapi] declared, lockfile pins the toolchain but NOT the
 # codegen tool → --locked drift, before any download.
 test_codegen_locked_no_pin_fails() {
@@ -3065,6 +3134,7 @@ run_test test_issue_239_serialization_plugin_applied
 run_test test_codegen_build_lifecycle
 run_test test_codegen_fully_generated_lib_builds
 run_test test_codegen_path_dep_build_lifecycle
+run_test test_codegen_graph_union_dedup
 run_test test_codegen_locked_no_pin_fails
 run_test test_codegen_offline_tool_absent_fails
 run_test test_codegen_missing_spec_fails
