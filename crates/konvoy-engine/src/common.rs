@@ -214,13 +214,17 @@ impl<'a> ArtifactResolver<'a> {
     pub(crate) fn resolve_missing_maven_dependencies(
         self,
         project_root: &std::path::Path,
+        manifest: &Manifest,
+        dep_graph: &crate::resolve::ResolvedGraph,
         lockfile_path: &std::path::Path,
         name: String,
     ) -> Result<Lockfile, EngineError> {
         self.lockfiles.require_update_allowed()?;
         self.require_available(false, || EngineError::MissingLockfileEntry { name })?;
         eprintln!("  Maven dependencies not resolved - running update automatically...");
-        crate::update::update(project_root, self)?;
+        // Reuse the already-resolved graph so we don't re-walk + re-hash every
+        // path-dep's source tree a second time on this cold build.
+        crate::update::update_with_graph(project_root, manifest, dep_graph, self)?;
         Ok(Lockfile::from_path(lockfile_path)?)
     }
 

@@ -1,6 +1,6 @@
 //! Build orchestration: resolve config, detect target, invoke compiler, store artifacts.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -278,6 +278,14 @@ fn predicted_dependency_locks(
             new_deps.push(dep_lock.clone());
         }
     }
+
+    // Sort by name, byte-for-byte identical to what `konvoy update` writes
+    // (update.rs sorts its merged dependency set the same way). Without this the
+    // build emits deps in topological+lockfile order while `update` emits them
+    // alphabetically, so `konvoy update` then `konvoy build --locked` would see a
+    // pure ordering difference and spuriously fail (and recompile, since the
+    // lockfile order feeds the cache key).
+    new_deps.sort_by(|a, b| a.name.cmp(&b.name));
     new_deps
 }
 
@@ -333,9 +341,13 @@ pub(crate) fn resolve_build_context(
         std::iter::once(&manifest).chain(dep_graph.order.iter().map(|d| &d.manifest)),
         &lockfile,
     ) {
-        Some(name) => {
-            resolver.resolve_missing_maven_dependencies(project_root, &lockfile_path, name)?
-        }
+        Some(name) => resolver.resolve_missing_maven_dependencies(
+            project_root,
+            &manifest,
+            &dep_graph,
+            &lockfile_path,
+            name,
+        )?,
         _ => lockfile,
     };
 
@@ -446,26 +458,80 @@ pub(crate) fn resolve_build_context(
     // 7. Resolve & download the graph-wide Maven klib union ONCE, up front, so
     //    each project's own compile (root or path-dep) can be handed the klibs
     //    it links. Each klib comes back with a precomputed sha256 from
-    //    `download_artifact`, reused by the cache-key code. The union is keyed by
-    //    lock-entry name so a per-project subset can be assembled below.
+    //    `download_artifact`, reused by the cache-key code. Klibs are keyed by
+    //    COORDINATE (not the konvoy lock name): two coordinates declared under
+    //    the same key across projects must not collapse.
     let all_maven_entries: Vec<&DependencyLock> = effective_lockfile.dependencies.iter().collect();
     let all_maven_klibs = resolve_maven_klibs(&all_maven_entries, &target, resolver)?;
-    let klib_by_name: HashMap<&str, LibraryInput> = effective_lockfile
+    let klib_by_coord: HashMap<MavenCoordKey, LibraryInput> = effective_lockfile
         .dependencies
         .iter()
-        .filter(|d| matches!(&d.source, DepSource::Maven { .. }))
-        .map(|d| d.name.as_str())
+        .filter_map(maven_coord_key)
         .zip(all_maven_klibs.iter().cloned())
         .collect();
 
-    // Index path-deps by name so a project's path-dep SUBTREE can be walked for
-    // its transitive Maven closure (a klib that exposes a Maven type in its API
-    // forces every dependent's compile to also see that Maven klib — verified:
-    // compiling against a klib whose API returns `Flow` needs coroutines.klib).
+    // Index path-deps by name, and precompute each dep's OWN Maven closure
+    // (coordinates) once — a dep shared by several dependents would otherwise be
+    // re-derived per dependent. A project's compile then links the union of its
+    // whole subtree's closures: a klib whose API exposes a Maven type forces
+    // every dependent's compile to also see that klib (verified: compiling
+    // against a klib whose API returns `Flow` needs coroutines.klib).
     let dep_by_name: HashMap<&str, &ResolvedDep> = dep_graph
         .order
         .iter()
         .map(|dep| (dep.name.as_str(), dep))
+        .collect();
+    let own_closure: HashMap<&str, Vec<MavenCoordKey>> = dep_graph
+        .order
+        .iter()
+        .map(|dep| {
+            (
+                dep.name.as_str(),
+                project_maven_closure_coords(&dep.manifest, &effective_lockfile),
+            )
+        })
+        .collect();
+
+    // Resolve the coordinate set into klibs (deduped + sorted for determinism).
+    let coords_to_klibs = |coords: BTreeSet<MavenCoordKey>| -> Vec<LibraryInput> {
+        coords
+            .iter()
+            .filter_map(|c| klib_by_coord.get(c).cloned())
+            .collect()
+    };
+
+    // Per-dep compile inputs, invariant across build levels: its transitive
+    // path-dep descendant NAMES (their klibs are looked up in `completed` during
+    // the loop) and its subtree's Maven klibs (own closure ∪ descendants').
+    let dep_inputs: HashMap<&str, (Vec<String>, Vec<LibraryInput>)> = dep_graph
+        .order
+        .iter()
+        .map(|dep| {
+            let descendants = collect_descendant_deps(&dep.dep_names, &dep_by_name);
+            // own_closure has an entry for every dep in dep_graph.order (incl.
+            // every descendant), so the lookups never miss; `flatten` over the
+            // `Option` keeps it index-panic-free.
+            let mut coords: BTreeSet<MavenCoordKey> = own_closure
+                .get(dep.name.as_str())
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect();
+            for d in &descendants {
+                coords.extend(
+                    own_closure
+                        .get(d.name.as_str())
+                        .into_iter()
+                        .flatten()
+                        .cloned(),
+                );
+            }
+            let descendant_names = descendants.iter().map(|d| d.name.clone()).collect();
+            (
+                dep.name.as_str(),
+                (descendant_names, coords_to_klibs(coords)),
+            )
+        })
         .collect();
 
     // 8. Build path dependencies in topological order.
@@ -475,37 +541,32 @@ pub(crate) fn resolve_build_context(
     let mut completed: HashMap<String, PathBuf> = HashMap::new();
 
     for level in &levels {
-        // Snapshot of path-dep klibs built in PRIOR levels, keyed by dep name so
-        // each dep can select only its OWN transitive path-dep descendants.
-        // (Same-level deps are independent and not yet in `completed`, so they
-        // never see each other — taking the snapshot before the level enforces
-        // that.) Path-deps don't carry a pre-computed hash through the build
-        // pipeline, so the cache-key code rehashes them as needed.
-        let prior_klibs: HashMap<String, PathBuf> = completed.clone();
         let results: Vec<Result<(String, PathBuf, BuildOutcome), EngineError>> = level
             .par_iter()
             .map(|dep| {
                 // This dep is compiled against exactly its OWN subtree — its
-                // transitive path-dep descendants' klibs plus the Maven closure
-                // of that subtree — the `[dependencies]` analogue of deriving
-                // each project's own `-Xplugin` set (#293). So a path-dep builds
+                // transitive path-dep descendants' klibs plus the Maven closure of
+                // that subtree — the `[dependencies]` analogue of deriving each
+                // project's own `-Xplugin` set (#293). So a path-dep builds
                 // identically standalone and as a dependency (parity): an
                 // undeclared cross-dep import fails here too, not only standalone,
                 // and the dep's cache key is not perturbed by unrelated deps.
-                let descendants = collect_descendant_deps(&dep.dep_names, &dep_by_name);
-                let mut lib_inputs: Vec<LibraryInput> = descendants
+                //
+                // Descendant klibs are read straight from `completed` (built in
+                // strictly-earlier levels; same-level deps aren't inserted until
+                // after the level, so they never see each other). `dep_inputs`
+                // has an entry for every dep in dep_graph.order.
+                let (descendant_names, maven_klibs) = dep_inputs
+                    .get(dep.name.as_str())
+                    .ok_or_else(|| EngineError::InternalInvariantViolated {
+                        context: format!("missing precomputed inputs for dep `{}`", dep.name),
+                    })?;
+                let mut lib_inputs: Vec<LibraryInput> = descendant_names
                     .iter()
-                    .filter_map(|d| prior_klibs.get(&d.name).cloned())
+                    .filter_map(|n| completed.get(n).cloned())
                     .map(LibraryInput::unhashed)
                     .collect();
-                let subtree: Vec<&Manifest> = std::iter::once(&dep.manifest)
-                    .chain(descendants.iter().map(|d| &d.manifest))
-                    .collect();
-                lib_inputs.extend(project_maven_klibs(
-                    &subtree,
-                    &effective_lockfile,
-                    &klib_by_name,
-                ));
+                lib_inputs.extend(maven_klibs.iter().cloned());
                 let dep_cc = CompileContext {
                     konanc: &konanc,
                     jre_home: jre_home.as_deref(),
@@ -537,10 +598,18 @@ pub(crate) fn resolve_build_context(
         .map(LibraryInput::unhashed)
         .collect();
 
-    // The root links every path-dep klib (above) plus the FULL Maven union: the
-    // root's subtree is the whole graph, so its closure is the entire union —
-    // exactly what the root linked before this change.
-    library_inputs.extend(all_maven_klibs);
+    // The root links every path-dep klib (above) plus the Maven closure of its
+    // OWN subtree, which IS the whole graph — same mechanism as every path-dep,
+    // no special case. With the union pinned exactly (no stale entries) this
+    // equals the full union the root linked before.
+    let mut root_coords: BTreeSet<MavenCoordKey> =
+        project_maven_closure_coords(&manifest, &effective_lockfile)
+            .into_iter()
+            .collect();
+    for coords in own_closure.values() {
+        root_coords.extend(coords.iter().cloned());
+    }
+    library_inputs.extend(coords_to_klibs(root_coords));
 
     let store = ArtifactStore::new(project_root);
 
@@ -1072,24 +1141,32 @@ fn collect_descendant_deps<'a>(
     out
 }
 
-/// The Maven klibs a project links: the union of [`project_maven_closure`] over
-/// its `subtree` manifests, resolved against the already-downloaded
-/// `klib_by_name`. Deduped by lock-entry name.
-fn project_maven_klibs(
-    subtree: &[&Manifest],
-    lockfile: &Lockfile,
-    klib_by_name: &HashMap<&str, LibraryInput>,
-) -> Vec<LibraryInput> {
-    use std::collections::BTreeSet;
-    let mut names: BTreeSet<String> = BTreeSet::new();
-    for manifest in subtree {
-        for entry in project_maven_closure(manifest, lockfile) {
-            names.insert(entry.name.clone());
-        }
+/// The content identity of a Maven artifact: `(groupId:artifactId, version,
+/// classifier)`. Used to key downloaded klibs so two coordinates declared under
+/// the same konvoy key across projects never collapse (a name-keyed map would
+/// drop one).
+type MavenCoordKey = (String, String, Option<String>);
+
+/// The coordinate key of a Maven lock entry, or `None` for a path entry.
+fn maven_coord_key(dep: &DependencyLock) -> Option<MavenCoordKey> {
+    match &dep.source {
+        DepSource::Maven {
+            maven,
+            version,
+            classifier,
+            ..
+        } => Some((maven.clone(), version.clone(), classifier.clone())),
+        DepSource::Path { .. } => None,
     }
-    names
+}
+
+/// A project's own direct+transitive Maven closure as coordinate keys (see
+/// [`project_maven_closure`]). Computed once per project and unioned across a
+/// subtree to assemble compile inputs.
+fn project_maven_closure_coords(manifest: &Manifest, lockfile: &Lockfile) -> Vec<MavenCoordKey> {
+    project_maven_closure(manifest, lockfile)
         .iter()
-        .filter_map(|n| klib_by_name.get(n.as_str()).cloned())
+        .filter_map(|d| maven_coord_key(d))
         .collect()
 }
 
@@ -1326,14 +1403,13 @@ fn manifest_maven_deps_resolved(
     manifest: &Manifest,
     lockfile: &Lockfile,
 ) -> Result<(), EngineError> {
-    for spec in manifest.dependencies.values() {
-        if let Some((maven, version)) = spec.as_maven_coord() {
-            if !lockfile.has_maven_coord(maven, version) {
-                return Err(EngineError::LockfileUpdateRequired);
-            }
-        }
+    // Same predicate as `first_unresolved_maven_dep`, surfaced as a staleness
+    // error — share the one implementation so the two can't disagree about what
+    // "resolved" means.
+    match first_unresolved_maven_dep(manifest, lockfile) {
+        Some(_) => Err(EngineError::LockfileUpdateRequired),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Graph-wide staleness: the full root check plus, for every path-dependency,

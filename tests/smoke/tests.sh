@@ -1284,12 +1284,6 @@ KOTLIN
     assert_contains "$out1" "Compiling md-lib"
     assert_contains "$out1" "Compiling md-app"
 
-    # The binary links + runs end-to-end (proves the dep's Maven klib was both
-    # compiled against AND linked into the final binary).
-    local run_out
-    run_out=$(konvoy run 2>&1)
-    assert_contains "$run_out" "stamp-len="
-
     # The dep's Maven dep (and its transitive) are pinned in the ROOT lock; the
     # dep checkout is never written to.
     assert_file_contains konvoy.lock "kotlinx-datetime"
@@ -1300,6 +1294,9 @@ KOTLIN
     fi
 
     # Second build is fully cached (the union is folded into the cache key).
+    # Asserted BEFORE any `konvoy run` — `run` itself builds, and the one-time
+    # issue-#133 recompile happens on the build right after the first, so a `run`
+    # in between would absorb it and hide a cache-key regression.
     local out2
     out2=$(konvoy build 2>&1)
     assert_contains "$out2" "(cached)"
@@ -1310,6 +1307,12 @@ KOTLIN
     local out3
     out3=$(konvoy build --locked 2>&1)
     assert_contains "$out3" "(cached)"
+
+    # Finally, the binary links + runs end-to-end (proves the dep's Maven klib
+    # was both compiled against AND linked into the final binary).
+    local run_out
+    run_out=$(konvoy run 2>&1)
+    assert_contains "$run_out" "stamp-len="
 }
 
 test_path_dep_maven_version_conflict_surfaced() {
@@ -1398,22 +1401,24 @@ KOTLIN
 
     konvoy build 2>&1
 
-    # The round-trip executes through the dep — proving the dep's serializers were
-    # generated (plugin applied) and its serialization runtime was linked.
-    local run_out
-    run_out=$(konvoy run 2>&1)
-    assert_contains "$run_out" "name=Alice age=30"
-
     # The dep's plugin and Maven deps are all pinned in the ROOT lock.
     assert_file_contains konvoy.lock "kotlin-serialization-compiler-plugin"
     assert_file_contains konvoy.lock "kotlinx-serialization-core"
     assert_file_contains konvoy.lock "kotlinx-serialization-json"
 
-    # Second build is fully cached across the whole stack.
+    # Second build is fully cached across the whole stack. Asserted BEFORE the
+    # `konvoy run` below: `run` rebuilds, so it would absorb the one-time
+    # issue-#133 recompile and hide a cache-key regression.
     local out2
     out2=$(konvoy build 2>&1)
     assert_contains "$out2" "(cached)"
     assert_not_contains "$out2" "Compiling"
+
+    # The round-trip executes through the dep — proving the dep's serializers were
+    # generated (plugin applied) and its serialization runtime was linked.
+    local run_out
+    run_out=$(konvoy run 2>&1)
+    assert_contains "$run_out" "name=Alice age=30"
 }
 
 test_path_dep_undeclared_sibling_fails() {

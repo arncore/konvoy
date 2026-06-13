@@ -178,10 +178,24 @@ pub fn update(
     project_root: &Path,
     resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<UpdateResult, EngineError> {
-    // 1. Read konvoy.toml and konvoy.lock.
-    let manifest_path = project_root.join("konvoy.toml");
-    let manifest = Manifest::from_path(&manifest_path)?;
+    let manifest = Manifest::from_path(&project_root.join("konvoy.toml"))?;
+    // Resolve the path-dependency graph once; the Maven union spans it.
+    let dep_graph = crate::resolve::resolve_dependencies(project_root, &manifest)?;
+    update_with_graph(project_root, &manifest, &dep_graph, resolver)
+}
 
+/// [`update`] with the path-dependency graph already resolved.
+///
+/// The build's auto-update path has already resolved (and source-hashed) the
+/// graph at `resolve_build_context`, so it calls this directly to avoid walking
+/// and hashing every path-dep's source tree a second time on a cold build.
+pub(crate) fn update_with_graph(
+    project_root: &Path,
+    manifest: &Manifest,
+    dep_graph: &crate::resolve::ResolvedGraph,
+    resolver: crate::common::ArtifactResolver<'_>,
+) -> Result<UpdateResult, EngineError> {
+    // 1. Read konvoy.lock.
     let lockfile_path = project_root.join("konvoy.lock");
     let mut lockfile = Lockfile::from_path(&lockfile_path)?;
 
@@ -202,11 +216,8 @@ pub fn update(
     //    `[dependencies]` must be resolved and pinned in the root lock too,
     //    because the dep's own compile links the klibs it declares (the
     //    `[dependencies]` analogue of the path-dep `[plugins]` fix, #293).
-    //    `resolve_dependencies` only reads dep manifests + source hashes, so it
-    //    is safe to run here; it also enforces the shared Kotlin version. Cross-
-    //    project version clashes are surfaced (libraries are linked).
-    let dep_graph = crate::resolve::resolve_dependencies(project_root, &manifest)?;
-    let mut projects: Vec<(&str, &Manifest)> = vec![("konvoy.toml", &manifest)];
+    //    Cross-project version clashes are surfaced (libraries are linked).
+    let mut projects: Vec<(&str, &Manifest)> = vec![("konvoy.toml", manifest)];
     projects.extend(
         dep_graph
             .order
@@ -216,6 +227,13 @@ pub fn update(
     let direct_deps = collect_graph_direct_maven_deps(projects)?;
 
     if direct_deps.is_empty() {
+        // No Maven deps anywhere in the graph — prune any stale Maven pins (the
+        // last Maven dep may have just been removed) while preserving path-dep
+        // locks, then write. Without this, a removed Maven dep's pin would
+        // linger and still be linked/enforced under `--locked`.
+        lockfile
+            .dependencies
+            .retain(|d| matches!(&d.source, DepSource::Path { .. }));
         lockfile.write_to(&lockfile_path)?;
         return Ok(UpdateResult { updated_count: 0 });
     }
@@ -461,20 +479,14 @@ fn collect_graph_direct_maven_deps<'a>(
 
             match by_key.get(&key) {
                 Some((existing, existing_label)) if existing.version != dep.version => {
-                    let hint_version = if dep.version.as_str() > existing.version.as_str() {
-                        dep.version.clone()
-                    } else {
-                        existing.version.clone()
-                    };
-                    return Err(EngineError::MavenVersionConflict {
-                        maven: key,
-                        details: format!(
-                            "  {existing_label} requires {}\n  {label} requires {}",
-                            existing.version, dep.version
-                        ),
-                        hint_name: artifact_id.replace('.', "-"),
-                        hint_version,
-                    });
+                    return Err(maven_version_conflict(
+                        &key,
+                        artifact_id,
+                        existing_label,
+                        &existing.version,
+                        label,
+                        &dep.version,
+                    ));
                 }
                 Some(_) => { /* identical declaration — dedup */ }
                 None => {
@@ -485,6 +497,64 @@ fn collect_graph_direct_maven_deps<'a>(
     }
 
     Ok(by_key.into_values().map(|(dep, _)| dep).collect())
+}
+
+/// Order two Maven version strings by dotted-numeric segments, so `1.10.0`
+/// sorts above `1.9.0` (a plain string compare gets this wrong). Non-numeric
+/// segments (e.g. `-beta` suffixes) fall back to lexicographic order, and a
+/// longer numeric run is treated as newer (`1.0.1` > `1.0`). This is a hint
+/// heuristic, not a full semver implementation.
+fn compare_maven_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut a_parts = a.split('.');
+    let mut b_parts = b.split('.');
+    loop {
+        match (a_parts.next(), b_parts.next()) {
+            (None, None) => return Ordering::Equal,
+            (Some(_), None) => return Ordering::Greater,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(x), Some(y)) => {
+                let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+                    (Ok(nx), Ok(ny)) => nx.cmp(&ny),
+                    _ => x.cmp(y),
+                };
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+        }
+    }
+}
+
+/// Build a [`EngineError::MavenVersionConflict`] naming the two clashing
+/// requirers and suggesting the higher version to pin.
+///
+/// Single source of the conflict message format + hint policy, shared by the
+/// graph-direct collector ([`collect_graph_direct_maven_deps`]) and the
+/// transitive resolver ([`check_version_conflict`]) so they can't drift.
+fn maven_version_conflict(
+    dep_key: &str,
+    base_artifact_id: &str,
+    existing_requirer: &str,
+    existing_version: &str,
+    current_requirer: &str,
+    current_version: &str,
+) -> EngineError {
+    let hint_version = if compare_maven_versions(current_version, existing_version)
+        == std::cmp::Ordering::Greater
+    {
+        current_version
+    } else {
+        existing_version
+    };
+    EngineError::MavenVersionConflict {
+        maven: dep_key.to_owned(),
+        details: format!(
+            "  {existing_requirer} requires {existing_version}\n  {current_requirer} requires {current_version}"
+        ),
+        hint_name: base_artifact_id.replace('.', "-"),
+        hint_version: hint_version.to_owned(),
+    }
 }
 
 /// Check for a version conflict between a newly resolved dep and one already seen.
@@ -513,23 +583,14 @@ fn check_version_conflict(
     };
     let current_requirer = requirer.unwrap_or("konvoy.toml (direct)");
 
-    let details = format!(
-        "  {existing_requirer} requires {}\n  {current_requirer} requires {resolved_version}",
-        existing.version
-    );
-    let hint_name = base_artifact_id.replace('.', "-");
-    let hint_version = if resolved_version > existing.version.as_str() {
-        resolved_version.to_owned()
-    } else {
-        existing.version.clone()
-    };
-
-    Err(EngineError::MavenVersionConflict {
-        maven: dep_key.to_owned(),
-        details,
-        hint_name,
-        hint_version,
-    })
+    Err(maven_version_conflict(
+        dep_key,
+        base_artifact_id,
+        existing_requirer,
+        &existing.version,
+        current_requirer,
+        resolved_version,
+    ))
 }
 
 /// Discover cinterop klibs from cached metadata and return them as separate deps.
@@ -580,16 +641,17 @@ fn discover_cinterop_deps(
 fn finalize_required_by(
     resolved: &mut HashMap<String, ResolvedMavenDep>,
     required_by_map: &HashMap<String, BTreeSet<String>>,
-    direct_deps: &[ResolvedMavenDep],
 ) {
+    // A dep's `required_by` must record EVERY transitive requirer, even when the
+    // dep is ALSO declared direct somewhere in the graph. The per-project Maven
+    // closure (`build::project_maven_closure`) reconstructs a path-dep's
+    // transitive set SOLELY from `required_by`, so emptying it for graph-direct
+    // deps would make a transitive-that's-also-direct unreachable for a sibling
+    // path-dep that needs it — a standalone-vs-as-a-dependency parity break. A
+    // purely-direct dep simply has no `required_by_map` entry and stays empty.
     for (key, dep) in resolved.iter_mut() {
         if let Some(requirers) = required_by_map.get(key) {
-            let is_direct = direct_deps.iter().any(|d| d.key() == *key);
-            if is_direct {
-                dep.required_by = Vec::new();
-            } else {
-                dep.required_by = requirers.iter().cloned().collect();
-            }
+            dep.required_by = requirers.iter().cloned().collect();
         }
     }
 }
@@ -753,7 +815,13 @@ fn resolve_transitive(
                     .cloned()
                     .unwrap_or_else(|| meta_dep.version.clone());
 
-                // Already resolved — check for version conflict, then skip.
+                // Already resolved — check for version conflict, then record the
+                // requiring edge and skip re-queueing. The requirer is THIS entry
+                // (the dep whose metadata we're reading), not this entry's own
+                // requirer — matching the new-dep branch below. Recording it even
+                // for an already-resolved (e.g. direct-seeded) child is what lets
+                // `build::project_maven_closure` reach a transitive that is also
+                // declared direct somewhere in the graph.
                 if let Some(existing) = state.resolved.get(&dep_key) {
                     check_version_conflict(
                         existing,
@@ -762,13 +830,20 @@ fn resolve_transitive(
                         &base_artifact_id,
                         requirer.as_deref(),
                     )?;
-                    if let Some(req) = &requirer {
-                        state
-                            .required_by_map
-                            .entry(dep_key)
-                            .or_default()
-                            .insert(req.clone());
-                    }
+                    let parent_name = requirer
+                        .clone()
+                        .or_else(|| {
+                            state
+                                .resolved
+                                .get(&format!("{group_id}:{artifact_id}"))
+                                .map(|d| d.name.clone())
+                        })
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    state
+                        .required_by_map
+                        .entry(dep_key)
+                        .or_default()
+                        .insert(parent_name);
                     continue;
                 }
 
@@ -819,7 +894,7 @@ fn resolve_transitive(
         }
     }
 
-    finalize_required_by(&mut state.resolved, &state.required_by_map, direct_deps);
+    finalize_required_by(&mut state.resolved, &state.required_by_map);
 
     let cinterop_deps =
         discover_cinterop_deps(&state.resolved, &state.metadata_cache, maven_suffix);
@@ -1380,20 +1455,12 @@ kotlin = "2.1.0"
     }
 
     #[test]
-    fn finalize_required_by_clears_direct_deps_and_fills_transitive() {
-        // Build a minimal graph: one direct dep `kotlinx-coroutines-core`
-        // that pulls in transitive `atomicfu`. `finalize_required_by` should
-        // clear required_by on the direct dep and populate it on the
-        // transitive one.
-        let direct = ResolvedMavenDep {
-            name: "kotlinx-coroutines".to_owned(),
-            group_id: "org.jetbrains.kotlinx".to_owned(),
-            artifact_id: "kotlinx-coroutines-core".to_owned(),
-            version: "1.8.0".to_owned(),
-            required_by: vec!["leftover".to_owned()], // must be cleared
-            classifier: None,
-        };
-        let transitive = ResolvedMavenDep {
+    fn finalize_required_by_records_every_transitive_requirer() {
+        // A transitive dep that is ALSO declared direct must STILL record its
+        // transitive requirers — the per-project Maven closure relies on
+        // `required_by` to reach it (emptying it broke standalone-vs-as-dep
+        // parity; see the comment in `finalize_required_by`).
+        let direct_and_transitive = ResolvedMavenDep {
             name: "atomicfu".to_owned(),
             group_id: "org.jetbrains.kotlinx".to_owned(),
             artifact_id: "atomicfu".to_owned(),
@@ -1403,37 +1470,24 @@ kotlin = "2.1.0"
         };
 
         let mut resolved = HashMap::new();
-        resolved.insert(direct.key(), direct.clone());
-        resolved.insert(transitive.key(), transitive.clone());
+        resolved.insert(direct_and_transitive.key(), direct_and_transitive.clone());
 
         let mut required_by_map: HashMap<String, BTreeSet<String>> = HashMap::new();
+        // atomicfu is pulled in by coroutines AND declared direct by the root.
         required_by_map.insert(
-            direct.key(),
-            BTreeSet::from(["self-ref-ignored".to_owned()]),
-        );
-        required_by_map.insert(
-            transitive.key(),
+            direct_and_transitive.key(),
             BTreeSet::from(["kotlinx-coroutines-core".to_owned()]),
         );
 
-        finalize_required_by(&mut resolved, &required_by_map, &[direct.clone()]);
+        finalize_required_by(&mut resolved, &required_by_map);
 
-        // Direct dep: required_by must be cleared even though the map has an entry.
-        assert!(
-            resolved
-                .get(&direct.key())
-                .expect("direct still present")
-                .required_by
-                .is_empty(),
-            "direct dep should have empty required_by"
-        );
-        // Transitive dep: required_by must reflect the map.
         assert_eq!(
             resolved
-                .get(&transitive.key())
-                .expect("transitive still present")
+                .get(&direct_and_transitive.key())
+                .expect("dep still present")
                 .required_by,
-            vec!["kotlinx-coroutines-core".to_owned()]
+            vec!["kotlinx-coroutines-core".to_owned()],
+            "a direct-AND-transitive dep must keep its transitive requirer so the closure can reach it"
         );
     }
 
@@ -1452,7 +1506,7 @@ kotlin = "2.1.0"
         resolved.insert(dep.key(), dep.clone());
         let required_by_map: HashMap<String, BTreeSet<String>> = HashMap::new();
 
-        finalize_required_by(&mut resolved, &required_by_map, &[]);
+        finalize_required_by(&mut resolved, &required_by_map);
 
         assert_eq!(
             resolved
@@ -1738,6 +1792,87 @@ atomicfu = { maven = "org.jetbrains.kotlinx:atomicfu", version = "0.23.1" }
             }
             other => panic!("expected MavenVersionConflict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn compare_maven_versions_is_numeric_not_lexicographic() {
+        use std::cmp::Ordering;
+        // The bug this guards: a string compare makes "1.10.0" < "1.9.0".
+        assert_eq!(compare_maven_versions("1.10.0", "1.9.0"), Ordering::Greater);
+        assert_eq!(compare_maven_versions("1.9.0", "1.10.0"), Ordering::Less);
+        assert_eq!(compare_maven_versions("2.0.0", "2.0.0"), Ordering::Equal);
+        assert_eq!(compare_maven_versions("1.0.1", "1.0"), Ordering::Greater);
+        assert_eq!(compare_maven_versions("0.6.1", "0.6.0"), Ordering::Greater);
+    }
+
+    #[test]
+    fn maven_version_conflict_hint_suggests_the_higher_version() {
+        let err = maven_version_conflict(
+            "org.jetbrains.kotlinx:kotlinx-coroutines-core",
+            "kotlinx-coroutines-core",
+            "konvoy.toml",
+            "1.9.0",
+            "models",
+            "1.10.0",
+        );
+        match err {
+            EngineError::MavenVersionConflict {
+                hint_version,
+                details,
+                ..
+            } => {
+                assert_eq!(
+                    hint_version, "1.10.0",
+                    "hint must suggest the higher version"
+                );
+                assert!(details.contains("konvoy.toml requires 1.9.0"));
+                assert!(details.contains("models requires 1.10.0"));
+            }
+            other => panic!("expected MavenVersionConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_prunes_stale_maven_when_graph_has_none() {
+        // A lockfile pins a Maven dep that the manifest no longer declares (and
+        // there are no Maven deps anywhere). update() must drop the stale pin
+        // while keeping path-dep locks.
+        let project = make_project(
+            "[package]\nname = \"app\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[dependencies]\nmy-utils = { path = \"my-utils\" }\n",
+        );
+        add_nested_lib_dep(project.path(), "my-utils", "2.1.0");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.dependencies.push(DependencyLock {
+            name: "my-utils".to_owned(),
+            source: DepSource::Path {
+                path: "my-utils".to_owned(),
+            },
+            source_hash: "h".to_owned(),
+        });
+        lockfile.dependencies.push(DependencyLock {
+            name: "kotlinx-datetime".to_owned(),
+            source: DepSource::Maven {
+                version: "0.6.0".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-datetime".to_owned(),
+                targets: std::collections::BTreeMap::new(),
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "stale".to_owned(),
+        });
+        lockfile
+            .write_to(&project.path().join("konvoy.lock"))
+            .unwrap();
+
+        update(project.path(), crate::common::test_resolver(false, false)).unwrap();
+
+        let reparsed = Lockfile::from_path(&project.path().join("konvoy.lock")).unwrap();
+        assert!(
+            reparsed.has_maven_entry("kotlinx-datetime") == false,
+            "stale Maven pin must be pruned"
+        );
+        assert_eq!(reparsed.dependencies.len(), 1, "the path dep must be kept");
+        assert_eq!(reparsed.dependencies[0].name, "my-utils");
     }
 
     #[test]
