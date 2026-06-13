@@ -475,25 +475,32 @@ pub(crate) fn resolve_build_context(
     let mut completed: HashMap<String, PathBuf> = HashMap::new();
 
     for level in &levels {
-        // Path-deps don't carry a pre-computed hash through the build pipeline,
-        // so the cache-key code rehashes them as needed.
-        let completed_path_klibs: Vec<LibraryInput> = completed
-            .values()
-            .cloned()
-            .map(LibraryInput::unhashed)
-            .collect();
+        // Snapshot of path-dep klibs built in PRIOR levels, keyed by dep name so
+        // each dep can select only its OWN transitive path-dep descendants.
+        // (Same-level deps are independent and not yet in `completed`, so they
+        // never see each other — taking the snapshot before the level enforces
+        // that.) Path-deps don't carry a pre-computed hash through the build
+        // pipeline, so the cache-key code rehashes them as needed.
+        let prior_klibs: HashMap<String, PathBuf> = completed.clone();
         let results: Vec<Result<(String, PathBuf, BuildOutcome), EngineError>> = level
             .par_iter()
             .map(|dep| {
-                // This dep links the path-dep klibs built so far plus the Maven
-                // closure of ITS OWN subtree — the `[dependencies]` analogue of
-                // deriving each project's own `-Xplugin` set (#293). A path-dep
-                // is thus compiled against exactly the klibs it (transitively)
-                // declares: identical to building it standalone (parity), and its
-                // cache key is not perturbed by unrelated deps elsewhere.
-                let mut lib_inputs = completed_path_klibs.clone();
-                let subtree =
-                    collect_subtree_manifests(&dep.manifest, &dep.dep_names, &dep_by_name);
+                // This dep is compiled against exactly its OWN subtree — its
+                // transitive path-dep descendants' klibs plus the Maven closure
+                // of that subtree — the `[dependencies]` analogue of deriving
+                // each project's own `-Xplugin` set (#293). So a path-dep builds
+                // identically standalone and as a dependency (parity): an
+                // undeclared cross-dep import fails here too, not only standalone,
+                // and the dep's cache key is not perturbed by unrelated deps.
+                let descendants = collect_descendant_deps(&dep.dep_names, &dep_by_name);
+                let mut lib_inputs: Vec<LibraryInput> = descendants
+                    .iter()
+                    .filter_map(|d| prior_klibs.get(&d.name).cloned())
+                    .map(LibraryInput::unhashed)
+                    .collect();
+                let subtree: Vec<&Manifest> = std::iter::once(&dep.manifest)
+                    .chain(descendants.iter().map(|d| &d.manifest))
+                    .collect();
                 lib_inputs.extend(project_maven_klibs(
                     &subtree,
                     &effective_lockfile,
@@ -1033,20 +1040,24 @@ pub(crate) fn project_maven_closure<'a>(
         .collect()
 }
 
-/// Collect the manifests in a project's path-dependency **subtree**: the project
-/// itself plus every path-dep transitively reachable through `dep_names`.
+/// Collect a project's transitive path-dependency **descendants**: every path-dep
+/// reachable through `start_dep_names` (deduped; diamonds collapse). Does NOT
+/// include the starting project itself.
 ///
-/// A project's compile must see the Maven closure of its whole subtree, not just
-/// its own direct deps: a path-dep whose public API exposes a Maven type forces
-/// every dependent's compile to also resolve that Maven klib (konanc rejects a
-/// klib reference whose transitive deps aren't on the library path).
-fn collect_subtree_manifests<'a>(
-    start_manifest: &'a Manifest,
+/// This is the single source of a project's subtree, used for BOTH the path-dep
+/// klibs it links and the Maven closure it compiles against, so a project is
+/// built against exactly what it (transitively) declares — standalone ==
+/// as-a-dependency (parity), and an undeclared cross-dep import fails in the
+/// workspace build, not only in a standalone one. (A project's compile also
+/// needs its descendants' Maven klibs: konanc rejects a klib reference whose
+/// transitive deps aren't on the library path — e.g. compiling against a klib
+/// whose API returns `Flow` requires `coroutines.klib`.)
+fn collect_descendant_deps<'a>(
     start_dep_names: &[String],
     by_name: &HashMap<&str, &'a ResolvedDep>,
-) -> Vec<&'a Manifest> {
+) -> Vec<&'a ResolvedDep> {
     use std::collections::BTreeSet;
-    let mut out = vec![start_manifest];
+    let mut out: Vec<&ResolvedDep> = Vec::new();
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     let mut stack: Vec<&str> = start_dep_names.iter().map(String::as_str).collect();
     while let Some(name) = stack.pop() {
@@ -1054,7 +1065,7 @@ fn collect_subtree_manifests<'a>(
             continue;
         }
         if let Some(dep) = by_name.get(name) {
-            out.push(&dep.manifest);
+            out.push(dep);
             stack.extend(dep.dep_names.iter().map(String::as_str));
         }
     }
@@ -4426,6 +4437,49 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    fn resolved_dep(name: &str, dep_names: &[&str]) -> ResolvedDep {
+        ResolvedDep {
+            name: name.to_owned(),
+            project_root: PathBuf::from(format!("/{name}")),
+            manifest: konvoy_config::manifest::Manifest::from_str(
+                "[package]\nname = \"x\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.2.0\"\n",
+                "konvoy.toml",
+            )
+            .unwrap(),
+            dep_names: dep_names.iter().map(|s| (*s).to_owned()).collect(),
+            source_hash: "h".to_owned(),
+        }
+    }
+
+    #[test]
+    fn collect_descendant_deps_walks_transitively_and_dedupes_diamond() {
+        // Graph: parent -> {child, sibling}; child -> grandchild; sibling -> grandchild
+        // (a diamond). parent's transitive descendants are child, sibling, and
+        // grandchild — grandchild appears once despite two paths to it.
+        let child = resolved_dep("child", &["grandchild"]);
+        let sibling = resolved_dep("sibling", &["grandchild"]);
+        let grandchild = resolved_dep("grandchild", &[]);
+        let by_name: HashMap<&str, &ResolvedDep> = [
+            ("child", &child),
+            ("sibling", &sibling),
+            ("grandchild", &grandchild),
+        ]
+        .into_iter()
+        .collect();
+
+        let descendants =
+            collect_descendant_deps(&["child".to_owned(), "sibling".to_owned()], &by_name);
+        let mut names: Vec<&str> = descendants.iter().map(|d| d.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["child", "grandchild", "sibling"]);
+    }
+
+    #[test]
+    fn collect_descendant_deps_leaf_has_no_descendants() {
+        let by_name: HashMap<&str, &ResolvedDep> = HashMap::new();
+        assert!(collect_descendant_deps(&[], &by_name).is_empty());
     }
 
     #[test]

@@ -1416,6 +1416,74 @@ KOTLIN
     assert_not_contains "$out2" "Compiling"
 }
 
+test_path_dep_undeclared_sibling_fails() {
+    # Each path-dep is compiled against ONLY its own subtree (its transitive
+    # path-dep descendants), not every klib built so far. So an UNDECLARED
+    # cross-dep import fails in the workspace build — it isn't silently masked by
+    # a sibling that happens to be compiled earlier. Standalone == as-a-dependency
+    # parity for path-dep klibs, the same guarantee the Maven closure gives.
+    konvoy init --name us-child --lib >/dev/null 2>&1
+    konvoy init --name us-sibling --lib >/dev/null 2>&1
+    konvoy init --name us-parent --lib >/dev/null 2>&1
+    konvoy init --name us-app >/dev/null 2>&1
+    printf 'package uschild\nfun childFn(): Int = 1\n' > us-child/src/lib.kt
+    printf 'package ussibling\nfun siblingFn(): Int = 2\n' > us-sibling/src/lib.kt
+    # parent declares ONLY child, but its source uses BOTH child and sibling.
+    cat >> us-parent/konvoy.toml << 'TOML'
+
+[dependencies]
+us-child = { path = "../us-child" }
+TOML
+    cat > us-parent/src/lib.kt << 'KOTLIN'
+package usparent
+
+import uschild.childFn
+import ussibling.siblingFn
+
+fun total(): Int = childFn() + siblingFn()
+KOTLIN
+    # app pulls in parent AND sibling. sibling (a leaf) builds at level 0; parent
+    # builds at level 1 — the exact shape that USED to mask the undeclared use,
+    # because sibling's klib was in the "all completed klibs" set handed to parent.
+    cat >> us-app/konvoy.toml << 'TOML'
+
+[dependencies]
+us-parent = { path = "../us-parent" }
+us-sibling = { path = "../us-sibling" }
+TOML
+    cat > us-app/src/main.kt << 'KOTLIN'
+import usparent.total
+
+fun main() {
+    println("total=" + total())
+}
+KOTLIN
+    cd us-app
+
+    # parent uses `us-sibling` without declaring it → the workspace build must
+    # FAIL in parent's OWN compile (localized: parent compiled, app never did).
+    local out1
+    if out1=$(konvoy build 2>&1); then
+        echo "    expected the build to fail: parent uses an UNDECLARED sibling path-dep" >&2
+        return 1
+    fi
+    assert_contains "$out1" "Compiling us-parent"
+    assert_contains "$out1" "unresolved reference"
+    assert_not_contains "$out1" "Compiling us-app"
+
+    # Declaring the dependency fixes it (proving the failure was the missing
+    # declaration, not anything else): the build now succeeds and runs.
+    cat >> ../us-parent/konvoy.toml << 'TOML'
+us-sibling = { path = "../us-sibling" }
+TOML
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "Compiling us-app"
+    local run_out
+    run_out=$(konvoy run 2>&1)
+    assert_contains "$run_out" "total=3"
+}
+
 test_doctor_maven_dep_checks() {
     # Doctor should check Maven deps and lockfile entries.
     konvoy init --name doc-maven >/dev/null 2>&1
@@ -2648,6 +2716,7 @@ run_test test_maven_dep_mixed_with_path_dep_build
 run_test test_path_dep_maven_dep_build_lifecycle
 run_test test_path_dep_maven_version_conflict_surfaced
 run_test test_path_dep_serialization_roundtrip
+run_test test_path_dep_undeclared_sibling_fails
 run_test test_doctor_maven_dep_checks
 run_test test_doctor_missing_lockfile_entry_warns
 run_test test_doctor_no_lockfile_warns
