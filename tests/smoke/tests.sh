@@ -700,6 +700,15 @@ test_path_dep_plugin_union_dedup() {
     out2=$(konvoy build 2>&1)
     assert_contains "$out2" "(cached)"
     assert_not_contains "$out2" "Compiling"
+
+    # --locked is satisfied by the single deduped pin even though the plugin is
+    # declared by BOTH the root (checked via staleness) and the dep (gated by the
+    # graph-wide ensure). A name-only or per-project pin scheme would mis-handle
+    # this; the (name, maven, version) identity makes the one pin cover both.
+    local out3
+    out3=$(konvoy build --locked 2>&1)
+    assert_contains "$out3" "(cached)"
+    assert_not_contains "$out3" "Compiling"
 }
 
 test_graph_plugin_union_different_plugins() {
@@ -754,6 +763,14 @@ TOML
     out2=$(konvoy build 2>&1)
     assert_contains "$out2" "(cached)"
     assert_not_contains "$out2" "Compiling"
+
+    # --locked is satisfied by the union: the root's serialization pin (via the
+    # staleness check) and the dep's allopen pin (via the graph-wide ensure)
+    # must both be present, with no spurious version-conflict rejection.
+    local out3
+    out3=$(konvoy build --locked 2>&1)
+    assert_contains "$out3" "(cached)"
+    assert_not_contains "$out3" "Compiling"
 }
 
 test_transitive_dep_plugin_applied_and_pinned() {
