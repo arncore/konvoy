@@ -150,6 +150,9 @@ pub(crate) struct ResolvedBuildContext {
     /// Resolved plugin lockfile pins — the deduped union across the root and
     /// all path-deps (persisted to the root lock by `update_lockfile_if_needed`).
     pub plugin_locks: Vec<konvoy_config::lockfile::PluginLock>,
+    /// Resolved codegen-tool lockfile pins — the deduped union across the root and
+    /// all path-deps (persisted to the root lock by `update_lockfile_if_needed`).
+    pub codegen_locks: Vec<konvoy_config::lockfile::CodegenToolLock>,
     /// Resolved path-dependency graph in topological order.
     pub dep_graph: ResolvedGraph,
     /// Content-addressed artifact store for this project.
@@ -194,6 +197,7 @@ fn predicted_effective_lockfile(
     konanc_tarball_sha256: Option<&str>,
     jre_tarball_sha256: Option<&str>,
     plugin_locks: &[PluginLock],
+    codegen_locks: &[konvoy_config::lockfile::CodegenToolLock],
     dep_graph: &ResolvedGraph,
     project_root: &Path,
     resolver: crate::common::ArtifactResolver<'_>,
@@ -233,6 +237,9 @@ fn predicted_effective_lockfile(
         // project with path-deps recompiles its whole graph once after the
         // first build (issue #133 class).
         effective.dependencies = predicted_dependency_locks(lockfile, dep_graph, project_root);
+        // Same reasoning for the predicted [[codegen_tools]] pins (the deduped
+        // graph-wide union), matching `updated.codegen_tools = codegen_locks`.
+        effective.codegen_tools = codegen_locks.to_vec();
         effective
     })
 }
@@ -436,6 +443,18 @@ pub(crate) fn resolve_build_context(
         crate::plugin::ensure_plugin_artifacts(&graph_plugin_artifacts, &lockfile, resolver)?;
     let plugin_locks = crate::plugin::build_plugin_locks(&plugin_results);
 
+    // The codegen-tool union, by the same graph-wide reasoning as plugins (#293):
+    // a path-dep's `[codegen]` tool is downloaded + SHA-pinned just like the root's
+    // — the dep's own compile step uses the generated sources — and recorded as the
+    // deduped union in the root `konvoy.lock`. Generation itself, and each project's
+    // input hashing, are deferred to a cache miss in `build_single`.
+    let mut graph_generators = crate::codegen::active_generators(&manifest.codegen);
+    for dep in &dep_graph.order {
+        graph_generators.extend(crate::codegen::active_generators(&dep.manifest.codegen));
+    }
+    let codegen_locks =
+        crate::codegen::ensure_codegen_tools(&graph_generators, &lockfile.codegen_tools, resolver)?;
+
     // The ROOT project's own -Xplugin set, for the test build (`build_tests`
     // compiles the root's test sources). Regular compilation derives each
     // project's set from its own manifest inside `build_single`.
@@ -450,6 +469,7 @@ pub(crate) fn resolve_build_context(
         konanc_tarball_sha256.as_deref(),
         jre_tarball_sha256.as_deref(),
         &plugin_locks,
+        &codegen_locks,
         &dep_graph,
         project_root,
         resolver,
@@ -624,6 +644,7 @@ pub(crate) fn resolve_build_context(
         library_inputs,
         plugin_jars,
         plugin_locks,
+        codegen_locks,
         dep_graph,
         store,
     })
@@ -681,6 +702,7 @@ pub fn build(
         ctx.lockfile_write_inputs.jre_tarball_sha256.as_deref(),
         &ctx.dep_graph,
         &ctx.plugin_locks,
+        &ctx.codegen_locks,
         project_root,
         &lockfile_path,
         options.force,
@@ -726,19 +748,21 @@ pub(crate) fn build_single(
     profile: Profile,
     lockfile_content: &str,
 ) -> Result<(PathBuf, BuildOutcome), EngineError> {
-    // Collect source files, excluding test sources (src/test/).
+    // Collect source files, excluding test sources (src/test/). `src/` may be
+    // absent for a project whose Kotlin is entirely generated; treat that as "no
+    // hand-written sources" rather than an I/O error. Emptiness is checked AFTER
+    // codegen (below), with a clear `NoSources` when nothing was produced.
     let src_dir = project_root.join("src");
     let test_dir = src_dir.join("test");
-    let all_sources = konvoy_util::fs::collect_files(&src_dir, "kt")?;
-    let sources: Vec<PathBuf> = all_sources
+    let all_sources = if src_dir.is_dir() {
+        konvoy_util::fs::collect_files(&src_dir, "kt")?
+    } else {
+        Vec::new()
+    };
+    let mut sources: Vec<PathBuf> = all_sources
         .into_iter()
         .filter(|p| !p.starts_with(&test_dir))
         .collect();
-    if sources.is_empty() {
-        return Err(EngineError::NoSources {
-            dir: src_dir.display().to_string(),
-        });
-    }
 
     let is_lib = manifest.package.kind == PackageKind::Lib;
 
@@ -750,6 +774,14 @@ pub(crate) fn build_single(
     // covers plugins through `manifest_content` (the `[plugins]` config) and
     // `lockfile_content` (the graph-wide pin union, version + sha256).
     let plugin_jars = crate::plugin::plugin_jar_paths(manifest)?;
+
+    // This project's code generators, from its OWN manifest — identical treatment
+    // for the root and every path-dep. The tags (spec contents + config + tool
+    // version) feed this project's cache key; the generators run on a miss (below).
+    // Their tools were ensured graph-wide in `resolve_build_context`, so a miss
+    // here only runs them, never downloads.
+    let generators = crate::codegen::active_generators(&manifest.codegen);
+    let codegen_hashes = crate::codegen::compute_codegen_hashes(project_root, &generators)?;
 
     // Compute cache key.
     let manifest_content = manifest.to_toml()?;
@@ -774,6 +806,9 @@ pub(crate) fn build_single(
                 None => konvoy_util::hash::sha256_file(&lib.path).map_err(EngineError::from),
             })
             .collect::<Result<Vec<_>, _>>()?,
+        // Codegen inputs (spec files + generator config + tool version) — a change
+        // here rebuilds. Empty when the project has no `[codegen]` config.
+        codegen_hashes,
     };
     let cache_key = CacheKey::compute(&cache_inputs)?;
 
@@ -797,6 +832,26 @@ pub(crate) fn build_single(
         eprintln!("    Fresh {} (cached)", manifest.package.name);
         store.materialize(&cache_key, &output_name, &output_path)?;
         return Ok((output_path, BuildOutcome::Cached));
+    }
+
+    // Cache miss: run this project's code generators (tools ensured graph-wide in
+    // resolve_build_context) and add the emitted `.kt` to the source set. The
+    // generated output is NOT in the cache key directly — its inputs are, via
+    // `codegen_hashes` — so generation is deterministic w.r.t. the key.
+    if !generators.is_empty() {
+        let generated = crate::codegen::run_codegen(
+            project_root,
+            &generators,
+            cc.jre_home,
+            cc.options.verbose,
+        )?;
+        sources.extend(generated);
+    }
+
+    if sources.is_empty() {
+        return Err(EngineError::NoSources {
+            dir: src_dir.display().to_string(),
+        });
     }
 
     // Compile.
@@ -1389,6 +1444,21 @@ pub(crate) fn check_lockfile_staleness(
         }
     }
 
+    // Each configured codegen generator's tool must have a *pinned* lockfile entry
+    // (same identity + non-empty-`sha256` rule as plugins), so a --locked build
+    // fails fast before any download. Path-dep codegen drift is caught by the
+    // graph-wide ensure, mirroring how path-dep plugins are handled.
+    for generator in crate::codegen::active_generators(&manifest.codegen) {
+        let tool = generator.managed_tool();
+        let pinned = lockfile
+            .codegen_tools
+            .iter()
+            .any(|c| c.name == tool.id() && c.version == tool.version() && !c.sha256.is_empty());
+        if !pinned {
+            return Err(EngineError::LockfileUpdateRequired);
+        }
+    }
+
     // If the manifest has Maven dependencies (maven + version set), the lockfile
     // must pin each (by coordinate + version).
     manifest_maven_deps_resolved(manifest, lockfile)?;
@@ -1441,6 +1511,7 @@ fn update_lockfile_if_needed(
     jre_tarball_sha256: Option<&str>,
     dep_graph: &ResolvedGraph,
     plugin_locks: &[konvoy_config::lockfile::PluginLock],
+    codegen_locks: &[konvoy_config::lockfile::CodegenToolLock],
     project_root: &Path,
     lockfile_path: &Path,
     force: bool,
@@ -1479,9 +1550,15 @@ fn update_lockfile_if_needed(
     let has_new_hashes = konanc_tarball_sha256.is_some() || jre_tarball_sha256.is_some();
     let deps_changed = lockfile.dependencies != new_deps;
     let plugins_changed = lockfile.plugins.as_slice() != plugin_locks;
+    let codegen_changed = lockfile.codegen_tools.as_slice() != codegen_locks;
 
     // If nothing changed, nothing to do.
-    if !toolchain_changed && !has_new_hashes && !deps_changed && !plugins_changed {
+    if !toolchain_changed
+        && !has_new_hashes
+        && !deps_changed
+        && !plugins_changed
+        && !codegen_changed
+    {
         return Ok(());
     }
 
@@ -1531,6 +1608,7 @@ fn update_lockfile_if_needed(
     );
     updated.dependencies = new_deps;
     updated.plugins = plugin_locks.to_vec();
+    updated.codegen_tools = codegen_locks.to_vec();
     carry_forward_detekt(&mut updated, lockfile);
 
     resolver.persist_resolved_artifacts(lockfile, &updated, lockfile_path)
@@ -2016,6 +2094,7 @@ mod tests {
             None,
             &empty_graph,
             &[],
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -2049,6 +2128,7 @@ mod tests {
             None,
             &empty_graph,
             &[],
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -2078,6 +2158,7 @@ mod tests {
             Some("cafebabe"),
             &empty_graph,
             &[],
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -2106,6 +2187,7 @@ mod tests {
             Some("first-konanc-hash"),
             Some("first-jre-hash"),
             &empty_graph,
+            &[],
             &[],
             tmp.path(),
             &lockfile_path,
@@ -2164,6 +2246,7 @@ mod tests {
             None,
             None,
             &graph,
+            &[],
             &[],
             tmp.path(),
             &lockfile_path,
@@ -2233,6 +2316,7 @@ mod tests {
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
             dependency_hashes: Vec::new(),
+            codegen_hashes: Vec::new(),
         };
         let cache_key = CacheKey::compute(&cache_inputs).unwrap();
 
@@ -2318,6 +2402,7 @@ mod tests {
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
             dependency_hashes: Vec::new(),
+            codegen_hashes: Vec::new(),
         };
         let cache_key = CacheKey::compute(&cache_inputs).unwrap();
 
@@ -2398,6 +2483,7 @@ mod tests {
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
             dependency_hashes: Vec::new(),
+            codegen_hashes: Vec::new(),
         };
         let key_before = CacheKey::compute(&cache_inputs_before).unwrap();
 
@@ -2439,6 +2525,7 @@ mod tests {
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
             dependency_hashes: Vec::new(),
+            codegen_hashes: Vec::new(),
         };
         let key_after = CacheKey::compute(&cache_inputs_after).unwrap();
         assert_eq!(
@@ -2483,6 +2570,7 @@ mod tests {
             None,
             &empty_graph,
             &[],
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -2522,6 +2610,7 @@ mod tests {
             Some("newhash2"),
             &empty_graph,
             &[],
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -2560,6 +2649,7 @@ mod tests {
             Some("samehash2"),
             &empty_graph,
             &[],
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -2593,6 +2683,7 @@ mod tests {
             Some("newhash1"),
             Some("newhash2"),
             &empty_graph,
+            &[],
             &[],
             tmp.path(),
             &lockfile_path,
@@ -2635,6 +2726,7 @@ mod tests {
             Some("newhash2"),
             &empty_graph,
             &[],
+            &[],
             tmp.path(),
             &lockfile_path,
             true,
@@ -2672,6 +2764,7 @@ mod tests {
             None,
             &empty_graph,
             &[],
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -2707,6 +2800,7 @@ mod tests {
             None,
             None,
             &empty_graph,
+            &[],
             &[],
             tmp.path(),
             &lockfile_path,
@@ -2764,6 +2858,7 @@ mod tests {
             None,
             None,
             &graph,
+            &[],
             &[],
             tmp.path(),
             &lockfile_path,
@@ -2826,6 +2921,7 @@ mod tests {
             None,
             &graph,
             &[],
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -2882,6 +2978,7 @@ mod tests {
             None,
             None,
             &graph,
+            &[],
             &[],
             tmp.path(),
             &lockfile_path,
@@ -2961,6 +3058,7 @@ mod tests {
             None,
             None,
             &empty_graph,
+            &[],
             &[],
             tmp.path(),
             &lockfile_path,
@@ -3052,6 +3150,7 @@ mod tests {
             Some("pinned2"),
             &empty_graph,
             &[],
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -3093,6 +3192,7 @@ mod tests {
             Some("freshhash1"),
             Some("freshhash2"),
             &empty_graph,
+            &[],
             &[],
             tmp.path(),
             &lockfile_path,
@@ -3136,6 +3236,7 @@ mod tests {
             None,
             None,
             &empty_graph,
+            &[],
             &[],
             tmp.path(),
             &lockfile_path,
@@ -3253,6 +3354,7 @@ mod tests {
             None,
             &graph,
             &[],
+            &[],
             &app,
             &lockfile_path,
             false,
@@ -3307,6 +3409,7 @@ mod tests {
             None,
             &a_graph,
             &[],
+            &[],
             &a_app,
             &a_lock,
             false,
@@ -3336,6 +3439,7 @@ mod tests {
             None,
             None,
             &b_graph,
+            &[],
             &[],
             &b_app,
             &b_lock,
@@ -3377,6 +3481,7 @@ mod tests {
             "2.1.0",
             Some("new1"),
             Some("new2"),
+            &[],
             &[],
             &crate::resolve::ResolvedGraph { order: Vec::new() },
             Path::new("/tmp"),
@@ -3435,6 +3540,7 @@ mod tests {
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
             dependency_hashes: Vec::new(),
+            codegen_hashes: Vec::new(),
         };
         let cache_key = CacheKey::compute(&cache_inputs).unwrap();
 
@@ -3597,6 +3703,7 @@ mod tests {
             None,
             None,
             &plugin_locks,
+            &[],
             &crate::resolve::ResolvedGraph { order: Vec::new() },
             Path::new("/tmp"),
             crate::common::test_resolver(false, false),
@@ -3615,6 +3722,7 @@ mod tests {
             None,
             None,
             &plugin_locks,
+            &[],
             &crate::resolve::ResolvedGraph { order: Vec::new() },
             Path::new("/tmp"),
             crate::common::test_resolver(false, false),
@@ -3679,6 +3787,7 @@ mod tests {
             None,
             None,
             &plugin_locks,
+            &[],
             &crate::resolve::ResolvedGraph { order: Vec::new() },
             Path::new("/tmp"),
             crate::common::test_resolver(false, false),
@@ -3695,6 +3804,7 @@ mod tests {
             None,
             None,
             &plugin_locks,
+            &[],
             &crate::resolve::ResolvedGraph { order: Vec::new() },
             Path::new("/tmp"),
             crate::common::test_resolver(false, false),
@@ -3751,6 +3861,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             &graph,
             root_dir.path(),
             crate::common::test_resolver(false, false),
@@ -3772,6 +3883,7 @@ mod tests {
             None,
             &graph,
             &[],
+            &[],
             root_dir.path(),
             &lockfile_path,
             false,
@@ -3786,6 +3898,7 @@ mod tests {
             konanc_version,
             None,
             None,
+            &[],
             &[],
             &graph,
             root_dir.path(),
@@ -3843,6 +3956,7 @@ mod tests {
             None,
             &empty_graph,
             &plugin_locks,
+            &[],
             dir.path(),
             &lockfile_path,
             false,
@@ -3866,6 +3980,7 @@ mod tests {
             None,
             &empty_graph,
             &plugin_locks,
+            &[],
             dir.path(),
             &lockfile_path,
             false,
@@ -3949,6 +4064,7 @@ mod tests {
             konanc_version,
             None,
             None,
+            &[],
             &[],
             &crate::resolve::ResolvedGraph { order: Vec::new() },
             Path::new("/tmp"),
@@ -4353,6 +4469,7 @@ mod tests {
             None,
             &empty_graph,
             &plugin_locks,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -4370,6 +4487,149 @@ mod tests {
         );
         assert_eq!(plugin.version, "2.1.0");
         assert_eq!(plugin.sha256, "pluginhash1");
+    }
+
+    fn codegen_manifest() -> konvoy_config::manifest::Manifest {
+        konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"myapp\"\n\n[toolchain]\nkotlin = \"2.1.0\"\n\n[codegen.openapi]\nversion = \"20.0.0\"\nspec = \"specs/api.yaml\"\nbase_package = \"com.example.api\"\n",
+            "konvoy.toml",
+        )
+        .unwrap()
+    }
+
+    fn fabrikt_lock(sha256: &str, version: &str) -> konvoy_config::lockfile::CodegenToolLock {
+        konvoy_config::lockfile::CodegenToolLock {
+            name: "fabrikt".to_owned(),
+            version: version.to_owned(),
+            sha256: sha256.to_owned(),
+        }
+    }
+
+    #[test]
+    fn check_lockfile_staleness_missing_codegen_tool_errors() {
+        // [codegen.openapi] configured but no [[codegen_tools]] pin → drift.
+        let lockfile = Lockfile::with_toolchain("2.1.0");
+        assert!(
+            matches!(
+                check_lockfile_staleness(&codegen_manifest(), &lockfile),
+                Err(EngineError::LockfileUpdateRequired)
+            ),
+            "a configured codegen tool with no pin must be drift"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_matching_codegen_tool_succeeds() {
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile
+            .codegen_tools
+            .push(fabrikt_lock("abc123", "20.0.0"));
+        assert!(
+            check_lockfile_staleness(&codegen_manifest(), &lockfile).is_ok(),
+            "matching [[codegen_tools]] pin should pass"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_wrong_codegen_version_errors() {
+        // Lockfile pins fabrikt at a different version than the manifest → drift.
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile
+            .codegen_tools
+            .push(fabrikt_lock("abc123", "19.0.0"));
+        assert!(
+            matches!(
+                check_lockfile_staleness(&codegen_manifest(), &lockfile),
+                Err(EngineError::LockfileUpdateRequired)
+            ),
+            "a codegen tool pinned at the wrong version must be drift"
+        );
+    }
+
+    #[test]
+    fn check_lockfile_staleness_empty_codegen_sha_is_drift() {
+        // Present by name+version but empty sha256 → not a pin (matches the gate).
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile.codegen_tools.push(fabrikt_lock("", "20.0.0"));
+        assert!(
+            matches!(
+                check_lockfile_staleness(&codegen_manifest(), &lockfile),
+                Err(EngineError::LockfileUpdateRequired)
+            ),
+            "an empty-sha codegen pin must count as drift"
+        );
+    }
+
+    #[test]
+    fn update_lockfile_writes_codegen_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let lockfile = Lockfile::default();
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+        let codegen_locks = vec![fabrikt_lock("codegenhash1", "20.0.0")];
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            &[],
+            &codegen_locks,
+            tmp.path(),
+            &lockfile_path,
+            false,
+            crate::common::test_resolver(false, false),
+        )
+        .unwrap();
+
+        let reparsed = Lockfile::from_path(&lockfile_path).unwrap();
+        assert_eq!(reparsed.codegen_tools.len(), 1);
+        let tool = reparsed.codegen_tools.first().unwrap();
+        assert_eq!(tool.name, "fabrikt");
+        assert_eq!(tool.version, "20.0.0");
+        assert_eq!(tool.sha256, "codegenhash1");
+    }
+
+    #[test]
+    fn update_lockfile_detects_codegen_changes() {
+        // Toolchain matches, no dep/plugin changes — ONLY the codegen sha differs.
+        // Exercises the codegen_changed arm of the nothing-changed guard.
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile_path = tmp.path().join("konvoy.lock");
+        let mut lockfile = Lockfile::with_toolchain("2.1.0");
+        lockfile
+            .codegen_tools
+            .push(fabrikt_lock("oldhash", "20.0.0"));
+        let konanc = KonancInfo {
+            path: PathBuf::from("/usr/bin/konanc"),
+            version: "2.1.0".to_owned(),
+            fingerprint: "abc".to_owned(),
+        };
+        let new_codegen_locks = vec![fabrikt_lock("newhash", "20.0.0")];
+        let empty_graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        update_lockfile_if_needed(
+            &lockfile,
+            &konanc,
+            None,
+            None,
+            &empty_graph,
+            &[],
+            &new_codegen_locks,
+            tmp.path(),
+            &lockfile_path,
+            false,
+            crate::common::test_resolver(false, false),
+        )
+        .unwrap();
+
+        let reparsed = Lockfile::from_path(&lockfile_path).unwrap();
+        assert_eq!(reparsed.codegen_tools.len(), 1);
+        assert_eq!(reparsed.codegen_tools.first().unwrap().sha256, "newhash");
     }
 
     #[test]
@@ -4409,6 +4669,7 @@ mod tests {
             None,
             &empty_graph,
             &new_plugin_locks,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -5325,6 +5586,7 @@ linux_x64 = "1111"
             None,
             &empty_graph,
             &[],
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -5383,6 +5645,7 @@ linux_x64 = "1111"
             None,
             None,
             &empty_graph,
+            &[],
             &[],
             tmp.path(),
             &lockfile_path,
@@ -5473,6 +5736,7 @@ linux_x64 = "1111"
             None,
             &empty_graph,
             &new_plugin_locks,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -5527,6 +5791,7 @@ linux_x64 = "1111"
             None,
             &graph,
             &plugin_locks,
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -5923,6 +6188,7 @@ url = "https://example.com/plugin.jar"
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
             dependency_hashes: Vec::new(),
+            codegen_hashes: Vec::new(),
         };
 
         let key_no_plugins = CacheKey::compute(&make_inputs(content_no_plugins)).unwrap();
@@ -5974,6 +6240,7 @@ url = "https://example.com/plugin.jar"
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
             dependency_hashes: Vec::new(),
+            codegen_hashes: Vec::new(),
         };
 
         let key_v1 = CacheKey::compute(&make_inputs(content_v1)).unwrap();
@@ -6018,6 +6285,7 @@ url = "https://example.com/plugin.jar"
             None,
             &empty_graph,
             &plugin_locks,
+            &[],
             dir.path(),
             &lockfile_path,
             false,
@@ -6116,6 +6384,7 @@ url = "https://example.com/plugin.jar"
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
             dependency_hashes: Vec::new(),
+            codegen_hashes: Vec::new(),
         };
         let key = CacheKey::compute(&inputs).unwrap();
         assert_eq!(
@@ -6246,6 +6515,7 @@ url = "https://example.com/plugin.jar"
             None,
             &empty_graph,
             &plugin_locks,
+            &[],
             dir.path(),
             &lockfile_path,
             false,
@@ -6331,6 +6601,7 @@ kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-comp
             None,
             &empty_graph,
             &new_plugin_locks,
+            &[],
             dir.path(),
             &lockfile_path,
             false,
@@ -6749,6 +7020,7 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
             None,
             &empty_graph,
             &[],
+            &[],
             tmp.path(),
             &lockfile_path,
             false,
@@ -6778,6 +7050,7 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
             None,
             &empty_graph,
             &[],
+            &[],
             tmp.path(),
             &lockfile_path,
             false, // not force
@@ -6806,6 +7079,7 @@ compose = { maven = "org.jetbrains.compose.compiler:compiler", version = "1.5.0"
             Some("different-hash"),
             None,
             &empty_graph,
+            &[],
             &[],
             tmp.path(),
             &lockfile_path,

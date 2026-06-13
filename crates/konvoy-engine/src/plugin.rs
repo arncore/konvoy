@@ -149,7 +149,7 @@ fn unique_plugin_artifacts(artifacts: Vec<ResolvedPluginArtifact>) -> Vec<Resolv
 /// This is the graph-wide ensure's input: each manifest's plugins are resolved
 /// against its own `[toolchain]` (for the `{kotlin}` placeholder — path-deps are
 /// required to match the root's Kotlin version), then deduplicated and sorted by
-/// [`unique_plugin_artifacts`]. The resulting pins are recorded in the **root**
+/// `unique_plugin_artifacts`. The resulting pins are recorded in the **root**
 /// `konvoy.lock`, exactly as the root lock already aggregates the graph's Maven
 /// dependencies; no dependency checkout is written to.
 ///

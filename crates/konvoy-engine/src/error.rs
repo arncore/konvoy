@@ -165,6 +165,10 @@ pub enum EngineError {
     #[error("cannot run codegen `{name}`: {message}")]
     CodegenFailed { name: String, message: String },
 
+    /// A pinned codegen tool is absent locally and --offline prevents fetching it.
+    #[error("codegen tool `{name}` {version} is not downloaded and --offline prevents downloads — run `konvoy build` (or `konvoy generate`) once without --offline, or drop --offline")]
+    CodegenToolOffline { name: String, version: String },
+
     /// The project name supplied to `konvoy init` is invalid.
     #[error("invalid project name \"{name}\": {reason}")]
     InvalidProjectName { name: String, reason: String },

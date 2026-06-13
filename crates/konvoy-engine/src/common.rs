@@ -125,6 +125,31 @@ impl<'a> ArtifactResolver<'a> {
         Ok(jre_home)
     }
 
+    /// Resolve a code-generation tool (e.g. the Fabrikt JAR), returning its path
+    /// and freshly-verified SHA-256.
+    ///
+    /// Mirrors [`resolve_detekt_jar`](Self::resolve_detekt_jar): gate on the
+    /// `--locked` pin and `--offline` presence, then fetch-or-re-verify the
+    /// artifact through the shared network client.
+    pub(crate) fn resolve_codegen_tool(
+        self,
+        tool: &crate::managed_tool::ManagedToolSpec,
+        expected_sha256: Option<&str>,
+    ) -> Result<(std::path::PathBuf, String), EngineError> {
+        let is_present = tool.is_installed().map_err(EngineError::from)?;
+        self.resolve_artifact(
+            || Ok(expected_sha256.is_some()),
+            is_present,
+            || EngineError::CodegenToolOffline {
+                name: tool.id().to_owned(),
+                version: tool.version().to_owned(),
+            },
+        )?;
+        let version = tool.version().to_owned();
+        self.ensure_managed_tool(tool, expected_sha256)
+            .map_err(|e| crate::codegen::map_download_err(tool.id(), &version, e))
+    }
+
     /// Resolve a compiler plugin artifact and return its verified artifact data.
     pub(crate) fn resolve_plugin_artifact(
         self,

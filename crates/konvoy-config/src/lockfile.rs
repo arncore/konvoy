@@ -11,6 +11,20 @@ pub struct Lockfile {
     pub dependencies: Vec<DependencyLock>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plugins: Vec<PluginLock>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codegen_tools: Vec<CodegenToolLock>,
+}
+
+/// A locked code-generation tool entry (e.g. the Fabrikt JAR) in the lockfile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodegenToolLock {
+    /// Stable tool id (e.g. `"fabrikt"`).
+    pub name: String,
+    /// Resolved tool version.
+    pub version: String,
+    /// Hex-encoded SHA-256 hash of the artifact file.
+    pub sha256: String,
 }
 
 /// A locked plugin artifact entry in the lockfile.
@@ -112,6 +126,7 @@ impl Lockfile {
             }),
             dependencies: Vec::new(),
             plugins: Vec::new(),
+            codegen_tools: Vec::new(),
         }
     }
 
@@ -131,6 +146,7 @@ impl Lockfile {
             }),
             dependencies: Vec::new(),
             plugins: Vec::new(),
+            codegen_tools: Vec::new(),
         }
     }
 

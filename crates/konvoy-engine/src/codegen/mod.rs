@@ -7,8 +7,10 @@
 //! are assembled into a `&[Box<dyn CodeGenerator>]` by a registry that lives with
 //! the implementations, so adding a generator never touches this file.
 
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
+use konvoy_config::lockfile::CodegenToolLock;
 use konvoy_config::manifest::Codegen;
 
 use crate::error::EngineError;
@@ -164,6 +166,127 @@ pub fn compute_codegen_hashes(
 #[must_use]
 pub fn generator_output_dir(project_root: &Path, name: &str) -> PathBuf {
     project_root.join(".konvoy").join("gen").join(name)
+}
+
+/// Map a download/verify [`UtilError`](konvoy_util::error::UtilError) to the
+/// codegen-tool engine error, mirroring the detekt and plugin paths via the shared
+/// [`map_artifact_download_err`](crate::error::map_artifact_download_err).
+pub(crate) fn map_download_err(
+    name: &str,
+    version: &str,
+    e: konvoy_util::error::UtilError,
+) -> EngineError {
+    crate::error::map_artifact_download_err(
+        name,
+        e,
+        |name, message| EngineError::CodegenDownload {
+            name,
+            version: version.to_owned(),
+            message,
+        },
+        |name, expected, actual| EngineError::CodegenHashMismatch {
+            name,
+            version: version.to_owned(),
+            expected,
+            actual,
+        },
+    )
+}
+
+/// The managed tools of `generators`, deduplicated by `(id, version)` and in
+/// stable sorted order.
+///
+/// A build graph (root + path-dependencies) may have several generators backed by
+/// the same tool+version — it is content-addressed under `~/.konvoy/tools`, so it
+/// need only be downloaded, verified, and pinned once. Sorting keeps the resulting
+/// lockfile pins deterministic regardless of the order generators were discovered.
+fn unique_codegen_tools(generators: &[Box<dyn CodeGenerator>]) -> Vec<ManagedToolSpec> {
+    let mut unique: BTreeMap<(String, String), ManagedToolSpec> = BTreeMap::new();
+    for generator in generators {
+        let tool = generator.managed_tool();
+        unique
+            .entry((tool.id().to_owned(), tool.version().to_owned()))
+            .or_insert(tool);
+    }
+    unique.into_values().collect()
+}
+
+/// Download + SHA-verify the codegen tools required by `generators`, returning the
+/// resolved lockfile pins — one per **distinct** `(name, version)`, sorted.
+///
+/// `generators` is the whole build graph's set (root + every path-dependency), so
+/// a tool shared across projects is fetched and pinned once (deduped by
+/// `(name, version)`); the returned union is what the build persists into the root
+/// `konvoy.lock`.
+///
+/// The expected SHA is read from `pinned` (by tool name + version); the shared
+/// [`ArtifactResolver`](crate::common::ArtifactResolver) applies the `--locked` /
+/// `--offline` policy (a missing pin under `--locked` is `LockfileUpdateRequired`;
+/// an absent tool under `--offline` is `CodegenToolOffline`) and fetches or
+/// re-verifies the artifact through the shared network client. This is
+/// generator-agnostic — it only uses the [`ManagedToolSpec`] each generator exposes.
+///
+/// # Errors
+/// Returns an error if a tool can't be downloaded, a pinned hash doesn't match, or
+/// the command's `--locked` / `--offline` policy forbids resolving it.
+pub fn ensure_codegen_tools(
+    generators: &[Box<dyn CodeGenerator>],
+    pinned: &[CodegenToolLock],
+    resolver: crate::common::ArtifactResolver<'_>,
+) -> Result<Vec<CodegenToolLock>, EngineError> {
+    let tools = unique_codegen_tools(generators);
+    let mut resolved = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let (name, version) = (tool.id().to_owned(), tool.version().to_owned());
+
+        let expected = pinned
+            .iter()
+            .find(|p| p.name == name && p.version == version)
+            .map(|p| p.sha256.as_str())
+            // An empty `sha256` is not a pin (matches the detekt/toolchain
+            // convention): under `--locked` this surfaces as clean lockfile drift
+            // rather than a download that then fails verifying against an empty hash.
+            .filter(|s| !s.is_empty());
+
+        let (_, sha256) = resolver.resolve_codegen_tool(&tool, expected)?;
+
+        resolved.push(CodegenToolLock {
+            name,
+            version,
+            sha256,
+        });
+    }
+    Ok(resolved)
+}
+
+/// Run every generator (on a cache miss), writing sources into its
+/// `.konvoy/gen/<name>/` dir, and return the generated `.kt` files to add to the
+/// compile source set.
+///
+/// The tools must already be downloaded (call [`ensure_codegen_tools`] first).
+/// `jre_home` is forwarded to each generator's tool — required for JVM generators,
+/// ignored by native ones.
+///
+/// # Errors
+/// Returns an error if a generator fails or its output cannot be read.
+pub fn run_codegen(
+    project_root: &Path,
+    generators: &[Box<dyn CodeGenerator>],
+    jre_home: Option<&Path>,
+    verbose: bool,
+) -> Result<Vec<PathBuf>, EngineError> {
+    let mut generated = Vec::new();
+    for generator in generators {
+        let output_dir = generator_output_dir(project_root, generator.name());
+        generator.generate(project_root, &output_dir, jre_home, verbose)?;
+        // Collect the emitted `.kt` (generators may nest them, e.g. Fabrikt writes
+        // under `<output_dir>/src/main/kotlin/`), to feed into compilation. Tolerate
+        // a generator that legitimately produced no output dir (emitted nothing).
+        if output_dir.is_dir() {
+            generated.extend(konvoy_util::fs::collect_files(&output_dir, "kt")?);
+        }
+    }
+    Ok(generated)
 }
 
 fn compute_generator_hash(
@@ -676,5 +799,224 @@ mod tests {
         );
         assert_eq!(summaries[1].name, "other");
         assert_eq!(managed_tools(&gens).len(), 2);
+    }
+
+    // ---- ensure_codegen_tools (download/pin orchestration) ------------------
+
+    #[test]
+    fn ensure_codegen_tools_empty_is_noop() {
+        // No generators → no pins, under any policy, and never touches the net.
+        assert!(
+            ensure_codegen_tools(&[], &[], crate::common::test_resolver(false, false))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            ensure_codegen_tools(&[], &[], crate::common::test_resolver(true, true))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ensure_codegen_tools_locked_without_pin_requires_update() {
+        // --locked with a generator whose tool isn't pinned must fail loudly with
+        // lockfile drift, BEFORE any download. test_resolver(offline, locked).
+        let gens = vec![fake("demo", &["v=1"], &[])];
+        match ensure_codegen_tools(&gens, &[], crate::common::test_resolver(false, true)) {
+            Err(EngineError::LockfileUpdateRequired) => {}
+            other => panic!("expected LockfileUpdateRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_codegen_tools_locked_with_empty_sha_pin_is_drift() {
+        // An empty `sha256` is not a pin: under --locked it must surface as drift
+        // (LockfileUpdateRequired), not pass the gate and download-then-mismatch.
+        let gens = vec![fake("demo", &["v=1"], &[])];
+        let pins = vec![CodegenToolLock {
+            name: "demo".to_owned(),
+            version: "1.0.0".to_owned(),
+            sha256: String::new(),
+        }];
+        match ensure_codegen_tools(&gens, &pins, crate::common::test_resolver(false, true)) {
+            Err(EngineError::LockfileUpdateRequired) => {}
+            other => panic!("expected LockfileUpdateRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_codegen_tools_offline_with_pin_but_not_installed_errors() {
+        // --offline + a matching pin, but the tool was never downloaded → a
+        // CodegenToolOffline (downloads are forbidden under --offline; under
+        // --locked alone it would download). The id `uninstalled-tool`/`1.0.0` is
+        // never present under ~/.konvoy/tools, so `is_installed()` is
+        // deterministically false without env juggling.
+        let gens = vec![fake("uninstalled-tool", &["v=1"], &[])];
+        let pins = vec![CodegenToolLock {
+            name: "uninstalled-tool".to_owned(),
+            version: "1.0.0".to_owned(),
+            sha256: "a".repeat(64),
+        }];
+        match ensure_codegen_tools(&gens, &pins, crate::common::test_resolver(true, false)) {
+            Err(EngineError::CodegenToolOffline { name, version }) => {
+                assert_eq!(name, "uninstalled-tool");
+                assert_eq!(version, "1.0.0");
+            }
+            other => panic!("expected CodegenToolOffline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unique_codegen_tools_dedupes_by_name_version_and_sorts() {
+        // Across a build graph the same tool can back several generators (e.g. the
+        // root and a path-dep both use openapi/fabrikt); it must be pinned once.
+        // Order is stable (sorted) regardless of discovery order. The fake's tool
+        // id == its generator name and its version is fixed, so equal names collide.
+        let gens = vec![
+            fake("b", &[], &[]),
+            fake("a", &[], &[]),
+            fake("a", &["different-config"], &[]),
+        ];
+        let tools = unique_codegen_tools(&gens);
+        let ids: Vec<&str> = tools.iter().map(|t| t.id()).collect();
+        assert_eq!(ids, vec!["a", "b"], "deduped by (id, version), sorted");
+    }
+
+    // ---- run_codegen (generation + source collection) -----------------------
+
+    /// A generator that writes real `.kt` (and a non-`.kt`) into its output dir,
+    /// to exercise `run_codegen`'s recursive `.kt` collection. Nests one file like
+    /// Fabrikt's `src/main/kotlin/` layout.
+    struct WritingGenerator {
+        name: String,
+    }
+    impl CodeGenerator for WritingGenerator {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn display_name(&self) -> &str {
+            &self.name
+        }
+        fn managed_tool(&self) -> ManagedToolSpec {
+            ManagedToolSpec::direct_url(
+                &self.name,
+                &self.name,
+                "1.0.0",
+                "https://example.invalid/x.jar".to_owned(),
+                "x.jar".to_owned(),
+            )
+        }
+        fn config_hash_parts(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn input_files(&self, _project_root: &Path) -> Result<Vec<PathBuf>, EngineError> {
+            Ok(Vec::new())
+        }
+        fn generate(
+            &self,
+            _project_root: &Path,
+            output_dir: &Path,
+            _jre_home: Option<&Path>,
+            _verbose: bool,
+        ) -> Result<(), EngineError> {
+            let nested = output_dir.join("src").join("main").join("kotlin");
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::write(output_dir.join("Api.kt"), "package x").unwrap();
+            std::fs::write(nested.join("Model.kt"), "package x.m").unwrap();
+            std::fs::write(output_dir.join("README.md"), "not kotlin").unwrap();
+            Ok(())
+        }
+    }
+
+    /// A generator whose `generate` always fails — proves run_codegen propagates.
+    struct FailingGenerator;
+    impl CodeGenerator for FailingGenerator {
+        fn name(&self) -> &str {
+            "boom"
+        }
+        fn display_name(&self) -> &str {
+            "boom"
+        }
+        fn managed_tool(&self) -> ManagedToolSpec {
+            ManagedToolSpec::direct_url(
+                "boom",
+                "boom",
+                "1.0.0",
+                "https://example.invalid/x.jar".to_owned(),
+                "x.jar".to_owned(),
+            )
+        }
+        fn config_hash_parts(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn input_files(&self, _project_root: &Path) -> Result<Vec<PathBuf>, EngineError> {
+            Ok(Vec::new())
+        }
+        fn generate(
+            &self,
+            _project_root: &Path,
+            _output_dir: &Path,
+            _jre_home: Option<&Path>,
+            _verbose: bool,
+        ) -> Result<(), EngineError> {
+            Err(EngineError::CodegenFailed {
+                name: "boom".to_owned(),
+                message: "kaboom".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn run_codegen_collects_generated_kt_excluding_non_kt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gens: Vec<Box<dyn CodeGenerator>> = vec![Box::new(WritingGenerator {
+            name: "openapi".to_owned(),
+        })];
+        let generated = run_codegen(tmp.path(), &gens, None, false).unwrap();
+
+        // Exactly the two `.kt` files (sorted; `README.md` excluded), under
+        // `.konvoy/gen/openapi/` including the nested one.
+        let out = generator_output_dir(tmp.path(), "openapi");
+        assert_eq!(
+            generated,
+            vec![
+                out.join("Api.kt"),
+                out.join("src").join("main").join("kotlin").join("Model.kt"),
+            ]
+        );
+    }
+
+    #[test]
+    fn run_codegen_runs_every_generator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gens: Vec<Box<dyn CodeGenerator>> = vec![
+            Box::new(WritingGenerator {
+                name: "openapi".to_owned(),
+            }),
+            Box::new(WritingGenerator {
+                name: "grpc".to_owned(),
+            }),
+        ];
+        let generated = run_codegen(tmp.path(), &gens, None, false).unwrap();
+
+        // Two `.kt` per generator, each under its own `.konvoy/gen/<name>/` dir.
+        assert_eq!(generated.len(), 4);
+        assert!(generated
+            .iter()
+            .any(|p| p.starts_with(generator_output_dir(tmp.path(), "openapi"))));
+        assert!(generated
+            .iter()
+            .any(|p| p.starts_with(generator_output_dir(tmp.path(), "grpc"))));
+    }
+
+    #[test]
+    fn run_codegen_propagates_generator_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gens: Vec<Box<dyn CodeGenerator>> = vec![Box::new(FailingGenerator)];
+        match run_codegen(tmp.path(), &gens, None, false) {
+            Err(EngineError::CodegenFailed { name, .. }) => assert_eq!(name, "boom"),
+            other => panic!("expected CodegenFailed, got {other:?}"),
+        }
     }
 }
