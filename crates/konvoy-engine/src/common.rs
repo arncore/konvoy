@@ -132,7 +132,7 @@ impl<'a> ArtifactResolver<'a> {
         lockfile: &Lockfile,
         bar: Option<&konvoy_util::progress::DownloadBar>,
     ) -> Result<crate::plugin::PluginArtifactResult, EngineError> {
-        let expected_sha256 = crate::plugin::find_lockfile_hash(lockfile, &artifact.plugin_name);
+        let expected_sha256 = crate::plugin::find_artifact_lockfile_hash(lockfile, artifact);
         self.resolve_artifact(
             || Ok(expected_sha256.is_some()),
             artifact.cache_path.exists(),
@@ -170,7 +170,7 @@ impl<'a> ArtifactResolver<'a> {
         let present: Vec<bool> = artifacts.iter().map(|a| a.cache_path.exists()).collect();
         for (artifact, is_present) in artifacts.iter().zip(present.iter().copied()) {
             self.resolve_artifact(
-                || Ok(crate::plugin::find_lockfile_hash(lockfile, &artifact.plugin_name).is_some()),
+                || Ok(crate::plugin::find_artifact_lockfile_hash(lockfile, artifact).is_some()),
                 is_present,
                 || EngineError::PluginOffline {
                     name: artifact.plugin_name.clone(),
@@ -214,18 +214,23 @@ impl<'a> ArtifactResolver<'a> {
     pub(crate) fn resolve_missing_maven_dependencies(
         self,
         project_root: &std::path::Path,
+        manifest: &Manifest,
+        dep_graph: &crate::resolve::ResolvedGraph,
         lockfile_path: &std::path::Path,
         name: String,
     ) -> Result<Lockfile, EngineError> {
         self.lockfiles.require_update_allowed()?;
         self.require_available(false, || EngineError::MissingLockfileEntry { name })?;
         eprintln!("  Maven dependencies not resolved - running update automatically...");
-        crate::update::update(project_root, self)?;
+        // Reuse the already-resolved graph so we don't re-walk + re-hash every
+        // path-dep's source tree a second time on this cold build.
+        crate::update::update_with_graph(project_root, manifest, dep_graph, self)?;
         Ok(Lockfile::from_path(lockfile_path)?)
     }
 
     /// Require the manifest's managed artifacts to be resolvable under the
-    /// command's policy.
+    /// command's policy (root-only — used by `lint`, which does not build the
+    /// dependency graph).
     pub(crate) fn require_manifest_artifacts_resolvable(
         self,
         manifest: &Manifest,
@@ -233,6 +238,20 @@ impl<'a> ArtifactResolver<'a> {
     ) -> Result<(), EngineError> {
         self.lockfiles
             .verify_current_lockfile(|| crate::build::check_lockfile_staleness(manifest, lockfile))
+    }
+
+    /// Require the build graph's managed artifacts to be resolvable under the
+    /// command's policy: the root's full staleness check plus, for every
+    /// path-dependency, that its Maven deps are pinned in the (shared) root lock.
+    pub(crate) fn require_graph_artifacts_resolvable<'m>(
+        self,
+        manifest: &Manifest,
+        dep_manifests: impl IntoIterator<Item = &'m Manifest>,
+        lockfile: &Lockfile,
+    ) -> Result<(), EngineError> {
+        self.lockfiles.verify_current_lockfile(|| {
+            crate::build::check_graph_lockfile_staleness(manifest, dep_manifests, lockfile)
+        })
     }
 
     /// Resolve a changed path dependency source under the command's policy.

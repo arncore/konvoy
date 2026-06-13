@@ -162,6 +162,21 @@ impl Lockfile {
             .iter()
             .any(|d| d.name == dep_name && matches!(&d.source, DepSource::Maven { .. }))
     }
+
+    /// Whether the lockfile pins a Maven dependency at the given
+    /// `groupId:artifactId` coordinate and version.
+    ///
+    /// Matches by COORDINATE, not by konvoy key: the graph-wide union dedups a
+    /// shared dependency under whichever project declared it first, so a path-dep
+    /// that declares the same artifact under a different key is still resolved.
+    /// A name match would spuriously report it unresolved/stale.
+    #[must_use]
+    pub fn has_maven_coord(&self, maven: &str, version: &str) -> bool {
+        self.dependencies.iter().any(|d| {
+            matches!(&d.source, DepSource::Maven { maven: m, version: v, .. }
+                if m == maven && v == version)
+        })
+    }
 }
 
 /// Errors produced when reading, parsing, or writing a `konvoy.lock` lockfile.
@@ -1184,6 +1199,96 @@ url = "https://example.com/plugin.jar"
         });
         assert!(lockfile.has_maven_entry("kotlinx-coroutines"));
         assert!(!lockfile.has_maven_entry("nonexistent"));
+    }
+
+    #[test]
+    fn has_maven_coord_matches_coordinate_and_version_not_name() {
+        let mut lockfile = Lockfile::default();
+        // The lock entry's konvoy key ("coroutines") differs from a consumer's
+        // key — has_maven_coord must still find it by COORDINATE + version.
+        lockfile.dependencies.push(DependencyLock {
+            name: "coroutines".to_owned(),
+            source: DepSource::Maven {
+                version: "1.8.0".to_owned(),
+                maven: "org.jetbrains.kotlinx:kotlinx-coroutines-core".to_owned(),
+                targets: std::collections::BTreeMap::new(),
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "abc".to_owned(),
+        });
+
+        // Exact coordinate + version → found, regardless of the lock entry's name.
+        assert!(lockfile.has_maven_coord("org.jetbrains.kotlinx:kotlinx-coroutines-core", "1.8.0"));
+        // Same coordinate, different version → not pinned.
+        assert!(!lockfile.has_maven_coord("org.jetbrains.kotlinx:kotlinx-coroutines-core", "1.7.3"));
+        // Different coordinate → not pinned.
+        assert!(!lockfile.has_maven_coord("org.jetbrains.kotlinx:kotlinx-datetime", "1.8.0"));
+    }
+
+    #[test]
+    fn has_maven_coord_ignores_path_entries() {
+        let mut lockfile = Lockfile::default();
+        lockfile.dependencies.push(DependencyLock {
+            name: "my-lib".to_owned(),
+            source: DepSource::Path {
+                path: "../my-lib".to_owned(),
+            },
+            source_hash: "abc".to_owned(),
+        });
+        // A path dep is never a Maven coordinate match.
+        assert!(!lockfile.has_maven_coord("../my-lib", "1.0.0"));
+    }
+
+    #[test]
+    fn has_maven_coord_on_empty_lockfile_is_false() {
+        assert!(!Lockfile::default().has_maven_coord("g:a", "1.0.0"));
+    }
+
+    #[test]
+    fn has_maven_coord_distinguishes_among_multiple_versions() {
+        // Two pins of the same coordinate at different versions (allowed in the
+        // graph-wide union): each version matches only itself.
+        let mk = |version: &str| DependencyLock {
+            name: "lib".to_owned(),
+            source: DepSource::Maven {
+                version: version.to_owned(),
+                maven: "g:lib".to_owned(),
+                targets: std::collections::BTreeMap::new(),
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "h".to_owned(),
+        };
+        let lockfile = Lockfile {
+            dependencies: vec![mk("1.0.0"), mk("2.0.0")],
+            ..Lockfile::default()
+        };
+        assert!(lockfile.has_maven_coord("g:lib", "1.0.0"));
+        assert!(lockfile.has_maven_coord("g:lib", "2.0.0"));
+        assert!(!lockfile.has_maven_coord("g:lib", "3.0.0"));
+    }
+
+    #[test]
+    fn has_maven_coord_matches_a_classifier_bearing_entry() {
+        // has_maven_coord keys on (coordinate, version) only — a cinterop entry
+        // (which shares its parent's coordinate + version) still counts as a
+        // match. Documents the classifier-agnostic contract.
+        let lockfile = Lockfile {
+            dependencies: vec![DependencyLock {
+                name: "atomicfu-cinterop".to_owned(),
+                source: DepSource::Maven {
+                    version: "0.23.1".to_owned(),
+                    maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                    targets: std::collections::BTreeMap::new(),
+                    required_by: vec!["atomicfu".to_owned()],
+                    classifier: Some("cinterop-interop".to_owned()),
+                },
+                source_hash: "h".to_owned(),
+            }],
+            ..Lockfile::default()
+        };
+        assert!(lockfile.has_maven_coord("org.jetbrains.kotlinx:atomicfu", "0.23.1"));
     }
 
     #[test]

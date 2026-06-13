@@ -560,6 +560,307 @@ KOTLIN
     assert_not_contains "$out3" "Compiling"
 }
 
+test_path_dep_plugin_build_lifecycle() {
+    # Path-dep [plugins] are applied to the dep's own compile and pinned in the
+    # ROOT lockfile (#293; the root here declares no plugins of its own). Uses
+    # the canonical serialization plugin coordinate, same as the rest of the
+    # suite (the -embeddable variant was reverted in #245 as "not the real fix";
+    # the real #239 fix was two-step program compilation, #243 — and library
+    # path-deps compile single-step with -Xplugin regardless).
+    konvoy init --name plug-dep-lib --lib >/dev/null 2>&1
+    konvoy init --name plug-dep-app >/dev/null 2>&1
+    cat >> plug-dep-lib/konvoy.toml << 'TOML'
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+TOML
+    cat >> plug-dep-app/konvoy.toml << 'TOML'
+
+[dependencies]
+plug-dep-lib = { path = "../plug-dep-lib" }
+TOML
+
+    # Application probe: a @Serializable class (matched by FQ name) gives the
+    # serialization plugin something to act on. With the runtime library absent
+    # the dep's compile then FAILS — a failure localized to the dep's own
+    # compilation is positive, platform-independent proof the dep was built with
+    # its -Xplugin. Before #293 the dep compiled with no plugins, so this build
+    # SUCCEEDED (silently wrong). PART 2 below flips the result by removing only
+    # the @Serializable usage (plugin still declared) and the build succeeds —
+    # confirming the failure was the plugin engaging, not the annotation itself.
+    cat > plug-dep-lib/src/lib.kt << 'KOTLIN'
+package kotlinx.serialization
+
+@Target(AnnotationTarget.CLASS)
+annotation class Serializable
+
+@Serializable
+data class User(val name: String, val age: Int)
+KOTLIN
+
+    cd plug-dep-app
+    local probe
+    if probe=$(konvoy build 2>&1); then
+        echo "    expected the dep compile to fail under the serialization plugin (was -Xplugin applied to the dep?)" >&2
+        return 1
+    fi
+    # The failure must be in the DEP's compilation (the dep got the plugin), so
+    # the dep's compile line printed but the root's never did.
+    assert_contains "$probe" "Compiling plug-dep-lib"
+    assert_contains "$probe" "compilation failed"
+    assert_not_contains "$probe" "Compiling plug-dep-app"
+
+    # Standalone parity: the dep must fail the same way built on its own.
+    local standalone
+    if standalone=$(cd ../plug-dep-lib && konvoy build 2>&1); then
+        echo "    expected the standalone dep build to fail under the serialization plugin" >&2
+        return 1
+    fi
+    assert_contains "$standalone" "compilation failed"
+    rm -rf ../plug-dep-lib/.konvoy ../plug-dep-lib/konvoy.lock
+
+    # PART 2 — control + pinning/caching lifecycle. Same plugin still declared,
+    # but the source no longer uses @Serializable, so the plugin is a clean
+    # no-op and the build succeeds. That this now compiles (vs. PART 1's failure)
+    # is the control proving the plugin was genuinely engaging in PART 1.
+    cat > ../plug-dep-lib/src/lib.kt << 'KOTLIN'
+package models
+
+fun greet(): String = "hello"
+KOTLIN
+    local out1
+    out1=$(konvoy build 2>&1)
+    assert_contains "$out1" "Compiling plug-dep-lib"
+    assert_contains "$out1" "Compiling plug-dep-app"
+
+    # The dep's plugin pin lands in the ROOT lockfile; the dep checkout is
+    # never written to by the root build.
+    assert_file_contains konvoy.lock "[[plugins]]"
+    assert_file_contains konvoy.lock "kotlin-serialization-compiler-plugin"
+    assert_file_contains konvoy.lock "sha256"
+    if [ -f ../plug-dep-lib/konvoy.lock ]; then
+        echo "    root build must not write a lockfile into the dep checkout" >&2
+        return 1
+    fi
+
+    # Second build: fully cached — the dep plugin pins and the path-dep entries
+    # are folded into the first build's cache key (issue #133 class).
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "(cached)"
+    assert_not_contains "$out2" "Compiling"
+
+    # --locked succeeds with the dep's pin present...
+    local out3
+    out3=$(konvoy build --locked 2>&1)
+    assert_contains "$out3" "(cached)"
+
+    # ...and fails actionably when the dep's pin is missing.
+    sed -i '/\[\[plugins\]\]/,$d' konvoy.lock
+    local out4
+    if out4=$(konvoy build --locked 2>&1); then
+        echo "    expected --locked to fail with the dep plugin pin missing" >&2
+        return 1
+    fi
+    assert_contains "$out4" "lockfile"
+}
+
+test_path_dep_plugin_union_dedup() {
+    # The root AND a path-dep declare the SAME plugin (same coordinate + version
+    # via {kotlin}). The graph-wide union is content-addressed by
+    # (name, maven, version), so the shared plugin is pinned exactly ONCE in the
+    # root lock — not duplicated, not a conflict (#293).
+    konvoy init --name dedup-lib --lib >/dev/null 2>&1
+    konvoy init --name dedup-app >/dev/null 2>&1
+    local ser='kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }'
+    printf '\n[plugins]\n%s\n' "$ser" >> dedup-lib/konvoy.toml
+    printf '\n[plugins]\n%s\n\n[dependencies]\ndedup-lib = { path = "../dedup-lib" }\n' "$ser" >> dedup-app/konvoy.toml
+    # No @Serializable anywhere — the plugin is a clean no-op, so both compiles
+    # succeed and the lockfile is written.
+    printf 'package dedup\nfun helper(): Int = 1\n' > dedup-lib/src/lib.kt
+    cd dedup-app
+
+    local out
+    out=$(konvoy build 2>&1)
+    assert_contains "$out" "Compiling dedup-lib"
+    assert_contains "$out" "Compiling dedup-app"
+
+    # Exactly one [[plugins]] entry despite the plugin being declared twice.
+    local count
+    count=$(grep -c '^\[\[plugins\]\]' konvoy.lock)
+    if [ "$count" != "1" ]; then
+        echo "    expected exactly 1 deduped plugin pin, got $count" >&2
+        cat konvoy.lock >&2
+        return 1
+    fi
+    assert_file_contains konvoy.lock "kotlin-serialization-compiler-plugin"
+
+    # Second build is fully cached (the deduped pin is folded into the key).
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "(cached)"
+    assert_not_contains "$out2" "Compiling"
+
+    # --locked is satisfied by the single deduped pin even though the plugin is
+    # declared by BOTH the root (checked via staleness) and the dep (gated by the
+    # graph-wide ensure). A name-only or per-project pin scheme would mis-handle
+    # this; the (name, maven, version) identity makes the one pin cover both.
+    local out3
+    out3=$(konvoy build --locked 2>&1)
+    assert_contains "$out3" "(cached)"
+    assert_not_contains "$out3" "Compiling"
+}
+
+test_graph_plugin_union_different_plugins() {
+    # The root declares one plugin and a path-dep declares a DIFFERENT one. The
+    # root lock records the deduped UNION of both — each pinned once, sorted by
+    # name — and no dependency checkout is written to (#293).
+    konvoy init --name union-lib --lib >/dev/null 2>&1
+    konvoy init --name union-app >/dev/null 2>&1
+    # Dep uses allopen; root uses serialization. Both are no-ops on plain source
+    # (no annotations / no @Serializable), so both projects compile cleanly.
+    cat >> union-lib/konvoy.toml << 'TOML'
+
+[plugins]
+allopen = { maven = "org.jetbrains.kotlin:kotlin-allopen-compiler-plugin", version = "{kotlin}" }
+TOML
+    cat >> union-app/konvoy.toml << 'TOML'
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+
+[dependencies]
+union-lib = { path = "../union-lib" }
+TOML
+    printf 'package unionlib\nfun helper(): Int = 1\n' > union-lib/src/lib.kt
+    cd union-app
+
+    local out
+    out=$(konvoy build 2>&1)
+    assert_contains "$out" "Compiling union-lib"
+    assert_contains "$out" "Compiling union-app"
+
+    # Both plugins pinned in the ROOT lock — two distinct entries.
+    local count
+    count=$(grep -c '^\[\[plugins\]\]' konvoy.lock)
+    if [ "$count" != "2" ]; then
+        echo "    expected 2 plugin pins in the union, got $count" >&2
+        cat konvoy.lock >&2
+        return 1
+    fi
+    assert_file_contains konvoy.lock "kotlin-allopen-compiler-plugin"
+    assert_file_contains konvoy.lock "kotlin-serialization-compiler-plugin"
+
+    # The dep contributed a pin to the root lock but its own checkout is never
+    # written to.
+    if [ -f ../union-lib/konvoy.lock ]; then
+        echo "    root build must not write a lockfile into the dep checkout" >&2
+        return 1
+    fi
+
+    # Cache-key stability with a multi-plugin union: second build is cached.
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "(cached)"
+    assert_not_contains "$out2" "Compiling"
+
+    # --locked is satisfied by the union: the root's serialization pin (via the
+    # staleness check) and the dep's allopen pin (via the graph-wide ensure)
+    # must both be present, with no spurious version-conflict rejection.
+    local out3
+    out3=$(konvoy build --locked 2>&1)
+    assert_contains "$out3" "(cached)"
+    assert_not_contains "$out3" "Compiling"
+}
+
+test_transitive_dep_plugin_applied_and_pinned() {
+    # A grandchild (depth-2) path-dep declares a plugin: app -> child -> gc.
+    # The graph-wide union must reach the grandchild, apply its plugin to the
+    # grandchild's OWN compile, and pin it in the ROOT (app) lockfile (#293).
+    konvoy init --name gc-lib --lib >/dev/null 2>&1
+    konvoy init --name child-lib --lib >/dev/null 2>&1
+    konvoy init --name app-root >/dev/null 2>&1
+    cat >> gc-lib/konvoy.toml << 'TOML'
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+TOML
+    cat >> child-lib/konvoy.toml << 'TOML'
+
+[dependencies]
+gc-lib = { path = "../gc-lib" }
+TOML
+    cat >> app-root/konvoy.toml << 'TOML'
+
+[dependencies]
+child-lib = { path = "../child-lib" }
+TOML
+
+    # Probe: a @Serializable class in the GRANDCHILD gives its plugin something
+    # to act on; with the runtime absent the grandchild's compile then FAILS. A
+    # failure localized to the grandchild's own compilation is positive proof the
+    # plugin reached depth 2 of the graph. Before #293 the grandchild compiled
+    # with no -Xplugin, so the build SUCCEEDED (silently wrong). The no-op rebuild
+    # below (plugin still declared) flips it to success — the control.
+    cat > gc-lib/src/lib.kt << 'KOTLIN'
+package kotlinx.serialization
+
+@Target(AnnotationTarget.CLASS)
+annotation class Serializable
+
+@Serializable
+data class User(val name: String, val age: Int)
+KOTLIN
+
+    cd app-root
+    local probe
+    if probe=$(konvoy build 2>&1); then
+        echo "    expected the grandchild compile to fail under the serialization plugin (did the union reach depth 2?)" >&2
+        return 1
+    fi
+    # Failure is in the grandchild's compile (it got the plugin); the build never
+    # reached the child or the root.
+    assert_contains "$probe" "Compiling gc-lib"
+    assert_contains "$probe" "compilation failed"
+    assert_not_contains "$probe" "Compiling app-root"
+
+    # Make the grandchild's plugin a no-op and verify the full pin lifecycle.
+    cat > ../gc-lib/src/lib.kt << 'KOTLIN'
+package gclib
+
+fun greet(): String = "hello from grandchild"
+KOTLIN
+    local out1
+    out1=$(konvoy build 2>&1)
+    assert_contains "$out1" "Compiling gc-lib"
+    assert_contains "$out1" "Compiling child-lib"
+    assert_contains "$out1" "Compiling app-root"
+
+    # The grandchild's plugin pin lands in the ROOT (app) lockfile; neither
+    # intermediate checkout is written to.
+    assert_file_contains konvoy.lock "[[plugins]]"
+    assert_file_contains konvoy.lock "kotlin-serialization-compiler-plugin"
+    if [ -f ../gc-lib/konvoy.lock ] || [ -f ../child-lib/konvoy.lock ]; then
+        echo "    root build must not write lockfiles into dep checkouts" >&2
+        return 1
+    fi
+
+    # Second build fully cached across the whole 3-level graph.
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "(cached)"
+    assert_not_contains "$out2" "Compiling"
+
+    # --locked fails actionably if the grandchild's pin is removed from the lock.
+    sed -i '/\[\[plugins\]\]/,$d' konvoy.lock
+    local out3
+    if out3=$(konvoy build --locked 2>&1); then
+        echo "    expected --locked to fail with the grandchild plugin pin missing" >&2
+        return 1
+    fi
+    assert_contains "$out3" "lockfile"
+}
+
 test_plugin_kotlin_placeholder_resolves() {
     # version = "{kotlin}" should resolve to the toolchain version in the lockfile.
     konvoy init --name plug-placeholder >/dev/null 2>&1
@@ -938,6 +1239,254 @@ KOTLIN
     assert_file_contains konvoy.lock 'path = "../mix-lib"'
     assert_file_contains konvoy.lock "kotlinx-datetime"
     assert_file_contains konvoy.lock "maven ="
+}
+
+test_path_dep_maven_dep_build_lifecycle() {
+    # A path-dep that declares its OWN Maven dependency must be compiled WITH that
+    # dep's klib — the [dependencies] analogue of the path-dep [plugins] fix. The
+    # union (incl. transitives) is resolved into the ROOT lock; the dep checkout
+    # is never written to. Before this change the dep compiled with no Maven
+    # klibs and failed with "unresolved reference".
+    konvoy init --name md-lib --lib >/dev/null 2>&1
+    konvoy init --name md-app >/dev/null 2>&1
+    cat >> md-lib/konvoy.toml << 'TOML'
+
+[dependencies]
+kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
+TOML
+    # The lib's source USES its Maven dep — this only compiles if the dep's klib
+    # is on the lib's compile path.
+    cat > md-lib/src/lib.kt << 'KOTLIN'
+package mdlib
+
+import kotlinx.datetime.Clock
+
+fun stampLen(): Int = Clock.System.now().toString().length
+KOTLIN
+    cat >> md-app/konvoy.toml << 'TOML'
+
+[dependencies]
+md-lib = { path = "../md-lib" }
+TOML
+    cat > md-app/src/main.kt << 'KOTLIN'
+import mdlib.stampLen
+
+fun main() {
+    println("stamp-len=" + stampLen())
+}
+KOTLIN
+    cd md-app
+
+    # First build auto-resolves the graph-wide Maven union (the dep's datetime +
+    # its transitive) into the root lock, then compiles the dep WITH its klib.
+    local out1
+    out1=$(konvoy build 2>&1)
+    assert_contains "$out1" "Compiling md-lib"
+    assert_contains "$out1" "Compiling md-app"
+
+    # The dep's Maven dep (and its transitive) are pinned in the ROOT lock; the
+    # dep checkout is never written to.
+    assert_file_contains konvoy.lock "kotlinx-datetime"
+    assert_file_contains konvoy.lock "maven ="
+    if [ -f ../md-lib/konvoy.lock ]; then
+        echo "    root build must not write a lockfile into the dep checkout" >&2
+        return 1
+    fi
+
+    # Second build is fully cached (the union is folded into the cache key).
+    # Asserted BEFORE any `konvoy run` — `run` itself builds, and the one-time
+    # issue-#133 recompile happens on the build right after the first, so a `run`
+    # in between would absorb it and hide a cache-key regression.
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "(cached)"
+    assert_not_contains "$out2" "Compiling"
+
+    # --locked is satisfied by the path-dep's pinned Maven dep (matched by
+    # coordinate, even though the lock aggregates it in the root lock).
+    local out3
+    out3=$(konvoy build --locked 2>&1)
+    assert_contains "$out3" "(cached)"
+
+    # Finally, the binary links + runs end-to-end (proves the dep's Maven klib
+    # was both compiled against AND linked into the final binary).
+    local run_out
+    run_out=$(konvoy run 2>&1)
+    assert_contains "$run_out" "stamp-len="
+}
+
+test_path_dep_maven_version_conflict_surfaced() {
+    # Two path-deps require DIFFERENT versions of the same Maven artifact. Maven
+    # libraries are linked, so this is a hard error to surface (not distinct
+    # pins) — consistent with how the transitive resolver already surfaces
+    # conflicts. The error names both requirers and gives an actionable hint.
+    konvoy init --name cf-liba --lib >/dev/null 2>&1
+    konvoy init --name cf-libb --lib >/dev/null 2>&1
+    konvoy init --name cf-app >/dev/null 2>&1
+    cat >> cf-liba/konvoy.toml << 'TOML'
+
+[dependencies]
+coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }
+TOML
+    cat >> cf-libb/konvoy.toml << 'TOML'
+
+[dependencies]
+coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.7.3" }
+TOML
+    cat >> cf-app/konvoy.toml << 'TOML'
+
+[dependencies]
+cf-liba = { path = "../cf-liba" }
+cf-libb = { path = "../cf-libb" }
+TOML
+    cd cf-app
+    local output
+    if output=$(konvoy build 2>&1); then
+        echo "    expected a version conflict across the two path-deps" >&2
+        return 1
+    fi
+    assert_contains "$output" "version conflict"
+    assert_contains "$output" "kotlinx-coroutines-core"
+    assert_contains "$output" "1.8.0"
+    assert_contains "$output" "1.7.3"
+}
+
+test_path_dep_serialization_roundtrip() {
+    # End-to-end gold test: a path-dep uses BOTH the serialization compiler plugin
+    # AND its serialization runtime Maven deps, defines a @Serializable type, and
+    # round-trips it. The app links the dep and runs it. This exercises the whole
+    # stack the PR fixes at once — the dep's [plugins] are applied to its compile
+    # (#293) and the dep's [dependencies] (Maven) flow into the dep's compile and
+    # the final link. Impossible before this PR (the dep got neither).
+    konvoy init --name ser-models --lib >/dev/null 2>&1
+    konvoy init --name ser-app >/dev/null 2>&1
+    cat >> ser-models/konvoy.toml << 'TOML'
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+
+[dependencies]
+kotlinx-serialization-core = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-core", version = "1.7.3" }
+kotlinx-serialization-json = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-json", version = "1.7.3" }
+TOML
+    cat > ser-models/src/lib.kt << 'KOTLIN'
+package sermodels
+
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.encodeToString
+
+@Serializable
+data class User(val name: String, val age: Int)
+
+fun roundTrip(): String {
+    val json = Json.encodeToString(User("Alice", 30))
+    val back = Json.decodeFromString<User>(json)
+    return "name=${back.name} age=${back.age}"
+}
+KOTLIN
+    cat >> ser-app/konvoy.toml << 'TOML'
+
+[dependencies]
+ser-models = { path = "../ser-models" }
+TOML
+    cat > ser-app/src/main.kt << 'KOTLIN'
+import sermodels.roundTrip
+
+fun main() {
+    println(roundTrip())
+}
+KOTLIN
+    cd ser-app
+
+    konvoy build 2>&1
+
+    # The dep's plugin and Maven deps are all pinned in the ROOT lock.
+    assert_file_contains konvoy.lock "kotlin-serialization-compiler-plugin"
+    assert_file_contains konvoy.lock "kotlinx-serialization-core"
+    assert_file_contains konvoy.lock "kotlinx-serialization-json"
+
+    # Second build is fully cached across the whole stack. Asserted BEFORE the
+    # `konvoy run` below: `run` rebuilds, so it would absorb the one-time
+    # issue-#133 recompile and hide a cache-key regression.
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "(cached)"
+    assert_not_contains "$out2" "Compiling"
+
+    # The round-trip executes through the dep — proving the dep's serializers were
+    # generated (plugin applied) and its serialization runtime was linked.
+    local run_out
+    run_out=$(konvoy run 2>&1)
+    assert_contains "$run_out" "name=Alice age=30"
+}
+
+test_path_dep_undeclared_sibling_fails() {
+    # Each path-dep is compiled against ONLY its own subtree (its transitive
+    # path-dep descendants), not every klib built so far. So an UNDECLARED
+    # cross-dep import fails in the workspace build — it isn't silently masked by
+    # a sibling that happens to be compiled earlier. Standalone == as-a-dependency
+    # parity for path-dep klibs, the same guarantee the Maven closure gives.
+    konvoy init --name us-child --lib >/dev/null 2>&1
+    konvoy init --name us-sibling --lib >/dev/null 2>&1
+    konvoy init --name us-parent --lib >/dev/null 2>&1
+    konvoy init --name us-app >/dev/null 2>&1
+    printf 'package uschild\nfun childFn(): Int = 1\n' > us-child/src/lib.kt
+    printf 'package ussibling\nfun siblingFn(): Int = 2\n' > us-sibling/src/lib.kt
+    # parent declares ONLY child, but its source uses BOTH child and sibling.
+    cat >> us-parent/konvoy.toml << 'TOML'
+
+[dependencies]
+us-child = { path = "../us-child" }
+TOML
+    cat > us-parent/src/lib.kt << 'KOTLIN'
+package usparent
+
+import uschild.childFn
+import ussibling.siblingFn
+
+fun total(): Int = childFn() + siblingFn()
+KOTLIN
+    # app pulls in parent AND sibling. sibling (a leaf) builds at level 0; parent
+    # builds at level 1 — the exact shape that USED to mask the undeclared use,
+    # because sibling's klib was in the "all completed klibs" set handed to parent.
+    cat >> us-app/konvoy.toml << 'TOML'
+
+[dependencies]
+us-parent = { path = "../us-parent" }
+us-sibling = { path = "../us-sibling" }
+TOML
+    cat > us-app/src/main.kt << 'KOTLIN'
+import usparent.total
+
+fun main() {
+    println("total=" + total())
+}
+KOTLIN
+    cd us-app
+
+    # parent uses `us-sibling` without declaring it → the workspace build must
+    # FAIL in parent's OWN compile (localized: parent compiled, app never did).
+    local out1
+    if out1=$(konvoy build 2>&1); then
+        echo "    expected the build to fail: parent uses an UNDECLARED sibling path-dep" >&2
+        return 1
+    fi
+    assert_contains "$out1" "Compiling us-parent"
+    assert_contains "$out1" "unresolved reference"
+    assert_not_contains "$out1" "Compiling us-app"
+
+    # Declaring the dependency fixes it (proving the failure was the missing
+    # declaration, not anything else): the build now succeeds and runs.
+    cat >> ../us-parent/konvoy.toml << 'TOML'
+us-sibling = { path = "../us-sibling" }
+TOML
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "Compiling us-app"
+    local run_out
+    run_out=$(konvoy run 2>&1)
+    assert_contains "$run_out" "total=3"
 }
 
 test_doctor_maven_dep_checks() {
@@ -2145,9 +2694,14 @@ run_test test_plugin_without_maven_fails
 run_test test_plugin_with_path_fails
 run_test test_plugin_locked_no_entries_error
 run_test test_plugin_build_lifecycle
+run_test test_path_dep_plugin_build_lifecycle
+run_test test_path_dep_plugin_union_dedup
+run_test test_graph_plugin_union_different_plugins
+run_test test_transitive_dep_plugin_applied_and_pinned
 run_test test_plugin_kotlin_placeholder_resolves
 
-# Issue #239: serialization plugin must use embeddable JAR
+# Issue #239: serialization plugin downloaded but not applied (fixed by two-step
+# program compilation, #243 — the embeddable-JAR mapping was reverted in #245).
 run_test test_issue_239_serialization_plugin_applied
 
 # Maven dependencies
@@ -2164,6 +2718,10 @@ run_test test_build_maven_dep_without_update_succeeds
 run_test test_build_maven_dep_locked_without_update_fails
 run_test test_maven_dep_build_lifecycle
 run_test test_maven_dep_mixed_with_path_dep_build
+run_test test_path_dep_maven_dep_build_lifecycle
+run_test test_path_dep_maven_version_conflict_surfaced
+run_test test_path_dep_serialization_roundtrip
+run_test test_path_dep_undeclared_sibling_fails
 run_test test_doctor_maven_dep_checks
 run_test test_doctor_missing_lockfile_entry_warns
 run_test test_doctor_no_lockfile_warns
