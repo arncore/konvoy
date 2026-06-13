@@ -367,6 +367,7 @@ mod tests {
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
             dependency_hashes: Vec::new(),
+            codegen_hashes: Vec::new(),
         };
         CacheKey::compute(&inputs).unwrap()
     }

@@ -33,6 +33,10 @@ pub struct CacheInputs {
     pub arch: String,
     /// SHA-256 hashes of dependency `.klib` files (empty for projects with no deps).
     pub dependency_hashes: Vec<String>,
+    /// Tagged (`name:hash`) per-generator codegen hashes — folds each generator's
+    /// config + input files into the key so a spec/config change rebuilds. Empty for
+    /// projects with no `[codegen]` config (leaving the key unchanged for them).
+    pub codegen_hashes: Vec<String>,
 }
 
 /// A content-addressed cache key wrapping a SHA-256 hex string.
@@ -65,6 +69,13 @@ impl CacheKey {
         ];
         // Include dependency hashes so cache key changes when deps are rebuilt.
         for h in &inputs.dependency_hashes {
+            parts.push(h);
+        }
+        // Include codegen hashes so a spec/generator-config change rebuilds. These
+        // are `name:hash` (distinct in shape from the bare-SHA dependency hashes),
+        // and the list is empty when no codegen is configured — so projects without
+        // codegen keep their existing cache key.
+        for h in &inputs.codegen_hashes {
             parts.push(h);
         }
 
@@ -111,6 +122,7 @@ mod tests {
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
             dependency_hashes: Vec::new(),
+            codegen_hashes: Vec::new(),
         }
     }
 
@@ -177,6 +189,29 @@ mod tests {
         let key2 = CacheKey::compute(&make_inputs(tmp.path())).unwrap();
 
         assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn codegen_hashes_change_key() {
+        // Codegen inputs must participate in the key: adding codegen hashes, and
+        // changing them, both change the key. (Backward compatibility holds by
+        // construction: an empty list folds in nothing, so a non-codegen project's
+        // key stays byte-identical to the pre-codegen format.)
+        let tmp = tempfile::tempdir().unwrap();
+        setup_sources(tmp.path());
+
+        let key_none = CacheKey::compute(&make_inputs(tmp.path())).unwrap();
+
+        let mut inputs_a = make_inputs(tmp.path());
+        inputs_a.codegen_hashes = vec!["openapi:aaaa".to_owned()];
+        let key_a = CacheKey::compute(&inputs_a).unwrap();
+
+        let mut inputs_b = make_inputs(tmp.path());
+        inputs_b.codegen_hashes = vec!["openapi:bbbb".to_owned()];
+        let key_b = CacheKey::compute(&inputs_b).unwrap();
+
+        assert_ne!(key_none, key_a, "adding codegen hashes must change the key");
+        assert_ne!(key_a, key_b, "a different codegen hash must change the key");
     }
 
     #[test]
@@ -435,6 +470,7 @@ mod tests {
                             os,
                             arch,
                             dependency_hashes: Vec::new(),
+                            codegen_hashes: Vec::new(),
                         }
                     },
                 )
@@ -467,6 +503,7 @@ mod tests {
                     os: inputs1.os.clone(),
                     arch: inputs1.arch.clone(),
                     dependency_hashes: Vec::new(),
+                    codegen_hashes: Vec::new(),
                 };
 
                 let key1 = CacheKey::compute(&inputs1).unwrap();

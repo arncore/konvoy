@@ -925,6 +925,432 @@ KOTLIN
 }
 
 # ---------------------------------------------------------------------------
+# Tests: codegen (OpenAPI / Fabrikt)
+# ---------------------------------------------------------------------------
+# Fabrikt emits `@Serializable` models, so a project that COMPILES generated code
+# needs the kotlin-serialization plugin + its runtime (the same recipe the plugin
+# tests use). Fabrikt 20.0.0 is the pinned version across these tests; the shared
+# ~/.konvoy cache means it (and the serialization artifacts) download once.
+
+# Write a minimal OpenAPI spec (one @Serializable model) to $1.
+_write_openapi_spec() {
+    mkdir -p "$(dirname "$1")"
+    cat > "$1" << 'YAML'
+openapi: 3.0.3
+info:
+  title: Pet API
+  version: 1.0.0
+paths: {}
+components:
+  schemas:
+    Pet:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+YAML
+}
+
+# Append the serialization plugin + runtime + [codegen.openapi] to manifest $1.
+_append_codegen_config() {
+    cat >> "$1" << 'TOML'
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+
+[dependencies]
+kotlinx-serialization-core = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-core", version = "1.7.3" }
+kotlinx-serialization-json = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-json", version = "1.7.3" }
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.gen"
+TOML
+}
+
+# Assert dir $1 exists and holds at least one generated `.kt`.
+_assert_generated_kt() {
+    assert_dir_exists "$1"
+    if [ -z "$(find "$1" -name '*.kt' 2>/dev/null)" ]; then
+        echo "    expected generated .kt under $1" >&2
+        return 1
+    fi
+}
+
+# Expected: root [codegen.openapi] generates sources, compiles them, pins the
+# Fabrikt JAR in the lockfile; the second build is cached (#133); a spec change
+# rebuilds; --locked is a cache hit; the binary runs.
+test_codegen_build_lifecycle() {
+    konvoy init --name cg-app >/dev/null 2>&1
+    _append_codegen_config cg-app/konvoy.toml
+    _write_openapi_spec cg-app/specs/api.yaml
+    cat > cg-app/src/main.kt << 'KOTLIN'
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.encodeToString
+
+@Serializable
+data class Cfg(val name: String)
+
+fun main() {
+    println("cfg=" + Json.encodeToString(Cfg("ok")))
+}
+KOTLIN
+    cd cg-app
+
+    local out1
+    out1=$(konvoy build 2>&1)
+    assert_contains "$out1" "Compiling"
+    _assert_generated_kt .konvoy/gen/openapi
+    assert_file_exists .konvoy/build/linux_x64/debug/cg-app
+
+    # The Fabrikt JAR is pinned in the lockfile.
+    assert_file_contains konvoy.lock "[[codegen_tools]]"
+    assert_file_contains konvoy.lock "fabrikt"
+    assert_file_contains konvoy.lock "20.0.0"
+    assert_file_contains konvoy.lock "sha256"
+
+    # Second build is a cache hit — the codegen pins + input hashes are folded
+    # into the first build's cache key (issue #133 class).
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "(cached)"
+    assert_not_contains "$out2" "Compiling"
+
+    # --locked is also a cache hit (the tool is pinned).
+    local out3
+    out3=$(konvoy build --locked 2>&1)
+    assert_contains "$out3" "(cached)"
+
+    # Changing the spec changes the codegen input hash → rebuild, not a cache hit.
+    # (A comment bumps the file content without changing the generated output.)
+    printf '# rev2\n' >> specs/api.yaml
+    local out4
+    out4=$(konvoy build 2>&1)
+    assert_contains "$out4" "Compiling"
+    assert_not_contains "$out4" "(cached)"
+
+    # The binary runs (generated model compiled in alongside hand-written code).
+    local run_out
+    run_out=$(konvoy run 2>&1)
+    assert_contains "$run_out" "cfg="
+}
+
+# Expected: a library whose Kotlin is ENTIRELY generated (no hand-written src/)
+# still builds — build_single tolerates a missing src/ and compiles the generated
+# sources into the klib.
+test_codegen_fully_generated_lib_builds() {
+    konvoy init --name cg-genlib --lib >/dev/null 2>&1
+    rm -rf cg-genlib/src
+    _append_codegen_config cg-genlib/konvoy.toml
+    _write_openapi_spec cg-genlib/specs/api.yaml
+    cd cg-genlib
+
+    local out
+    out=$(konvoy build 2>&1)
+    assert_contains "$out" "Compiling"
+    _assert_generated_kt .konvoy/gen/openapi
+    assert_file_exists .konvoy/build/linux_x64/debug/cg-genlib.klib
+    assert_file_contains konvoy.lock "[[codegen_tools]]"
+    assert_file_contains konvoy.lock "fabrikt"
+}
+
+# Expected: a path-dependency with [codegen] generates @Serializable models and
+# compiles them with its OWN serialization plugin (#293/#299); the app links the
+# dep and runs. The dep's Fabrikt tool is pinned in the ROOT lockfile (graph-wide
+# union), even though the root declares no codegen, and the dep checkout is never
+# written to. --locked succeeds with the pin and fails (drift) without it.
+test_codegen_path_dep_build_lifecycle() {
+    konvoy init --name cg-dep --lib >/dev/null 2>&1
+    konvoy init --name cg-root >/dev/null 2>&1
+    _append_codegen_config cg-dep/konvoy.toml
+    _write_openapi_spec cg-dep/specs/api.yaml
+    # A hand-written entry point gives the app a stable symbol to call; the
+    # generated models are compiled into the dep's klib alongside it.
+    cat > cg-dep/src/lib.kt << 'KOTLIN'
+package cgdep
+
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.encodeToString
+
+@Serializable
+data class Marker(val ok: Boolean)
+
+fun marker(): String = Json.encodeToString(Marker(true))
+KOTLIN
+    cat >> cg-root/konvoy.toml << 'TOML'
+
+[dependencies]
+cg-dep = { path = "../cg-dep" }
+TOML
+    cat > cg-root/src/main.kt << 'KOTLIN'
+import cgdep.marker
+
+fun main() {
+    println("root:" + marker())
+}
+KOTLIN
+    cd cg-root
+
+    local out1
+    out1=$(konvoy build 2>&1)
+    assert_contains "$out1" "Compiling cg-dep"
+    assert_contains "$out1" "Compiling cg-root"
+    assert_file_exists .konvoy/build/linux_x64/debug/cg-root
+
+    # The dep generated into ITS OWN .konvoy/gen, the dep's Fabrikt tool is pinned
+    # in the ROOT lockfile (graph-wide union), and the dep checkout is untouched.
+    _assert_generated_kt ../cg-dep/.konvoy/gen/openapi
+    assert_file_contains konvoy.lock "[[codegen_tools]]"
+    assert_file_contains konvoy.lock "fabrikt"
+    if [ -f ../cg-dep/konvoy.lock ]; then
+        echo "    root build must not write a lockfile into the dep checkout" >&2
+        return 1
+    fi
+
+    # Second build fully cached across the stack (#133 — codegen pins folded in).
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "(cached)"
+    assert_not_contains "$out2" "Compiling"
+
+    # The binary runs through the dep (its generated + hand-written code linked).
+    local run_out
+    run_out=$(konvoy run 2>&1)
+    assert_contains "$run_out" "root:"
+
+    # --locked succeeds with the dep's codegen pin present...
+    local out3
+    out3=$(konvoy build --locked 2>&1)
+    assert_contains "$out3" "(cached)"
+
+    # ...and fails when the dep's codegen pin is removed: path-dep codegen drift is
+    # caught by the graph-wide ensure (the root staleness check is root-only, and
+    # the root declares no codegen). [[codegen_tools]] is the last lock section.
+    sed -i '/\[\[codegen_tools\]\]/,$d' konvoy.lock
+    local out4
+    if out4=$(konvoy build --locked 2>&1); then
+        echo "    expected --locked to fail with the dep codegen pin missing" >&2
+        return 1
+    fi
+    assert_contains "$out4" "lockfile"
+}
+
+# Expected: the root AND a path-dep BOTH declare [codegen.openapi] with the SAME
+# Fabrikt version. The graph-wide union is content-addressed by (name, version),
+# so the shared tool is pinned exactly ONCE in the root lock — not duplicated, not
+# a conflict. (Different base_packages avoid a generated-class collision; both
+# projects generate + compile their own models.)
+test_codegen_graph_union_dedup() {
+    konvoy init --name cgdedup-lib --lib >/dev/null 2>&1
+    konvoy init --name cgdedup-app >/dev/null 2>&1
+    _write_openapi_spec cgdedup-lib/specs/api.yaml
+    _write_openapi_spec cgdedup-app/specs/api.yaml
+    cat >> cgdedup-lib/konvoy.toml << 'TOML'
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+
+[dependencies]
+kotlinx-serialization-core = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-core", version = "1.7.3" }
+kotlinx-serialization-json = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-json", version = "1.7.3" }
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.lib"
+TOML
+    cat >> cgdedup-app/konvoy.toml << 'TOML'
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+
+[dependencies]
+cgdedup-lib = { path = "../cgdedup-lib" }
+kotlinx-serialization-core = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-core", version = "1.7.3" }
+kotlinx-serialization-json = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-json", version = "1.7.3" }
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.app"
+TOML
+    cd cgdedup-app
+
+    local out
+    out=$(konvoy build 2>&1)
+    assert_contains "$out" "Compiling cgdedup-lib"
+    assert_contains "$out" "Compiling cgdedup-app"
+
+    # Exactly one [[codegen_tools]] entry despite codegen declared by BOTH projects.
+    local count
+    count=$(grep -c '^\[\[codegen_tools\]\]' konvoy.lock)
+    if [ "$count" != "1" ]; then
+        echo "    expected exactly 1 deduped codegen pin, got $count" >&2
+        cat konvoy.lock >&2
+        return 1
+    fi
+    assert_file_contains konvoy.lock "fabrikt"
+
+    # Second build fully cached (the deduped pin folded into the key).
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "(cached)"
+    assert_not_contains "$out2" "Compiling"
+
+    # --locked satisfied by the single deduped pin (declared by both projects).
+    local out3
+    out3=$(konvoy build --locked 2>&1)
+    assert_contains "$out3" "(cached)"
+    assert_not_contains "$out3" "Compiling"
+}
+
+# Unexpected: [codegen.openapi] declared, lockfile pins the toolchain but NOT the
+# codegen tool → --locked drift, before any download.
+test_codegen_locked_no_pin_fails() {
+    konvoy init --name cg-locked >/dev/null 2>&1
+    cat >> cg-locked/konvoy.toml << 'TOML'
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.gen"
+TOML
+    cd cg-locked
+    printf '[toolchain]\nkonanc_version = "2.2.0"\n' > konvoy.lock
+    local output
+    if output=$(konvoy build --locked 2>&1); then
+        echo "    expected --locked to fail without a codegen pin" >&2
+        return 1
+    fi
+    assert_contains "$output" "lockfile"
+}
+
+# Unexpected: --offline + an uncached Fabrikt JAR is a hard error naming the tool.
+# A unique version guarantees it is never in the shared cache (so this is not racy
+# against the other codegen tests, which all use 20.0.0).
+test_codegen_offline_tool_absent_fails() {
+    konvoy init --name cg-offline >/dev/null 2>&1
+    cat >> cg-offline/konvoy.toml << 'TOML'
+
+[codegen.openapi]
+version = "99.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.gen"
+TOML
+    cd cg-offline
+    local output
+    if output=$(konvoy build --offline 2>&1); then
+        echo "    expected --offline build to fail with an absent codegen tool" >&2
+        return 1
+    fi
+    assert_contains "$output" 'codegen tool `fabrikt`'
+    assert_contains "$output" "--offline prevents downloads"
+}
+
+# Unexpected: the spec file is declared but absent → CodegenInputNotFound at build
+# (after the tool is ensured, before compilation).
+test_codegen_missing_spec_fails() {
+    konvoy init --name cg-nospec >/dev/null 2>&1
+    cat >> cg-nospec/konvoy.toml << 'TOML'
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.gen"
+TOML
+    cd cg-nospec
+    local output
+    if output=$(konvoy build 2>&1); then
+        echo "    expected build to fail with a missing spec file" >&2
+        return 1
+    fi
+    assert_contains "$output" "codegen input for"
+    assert_contains "$output" "not found"
+}
+
+# Unexpected (manifest validation, fails at parse before any build work): an
+# absolute spec path is rejected.
+test_codegen_absolute_spec_rejected() {
+    konvoy init --name cg-abs >/dev/null 2>&1
+    cat >> cg-abs/konvoy.toml << 'TOML'
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "/etc/api.yaml"
+base_package = "com.example.gen"
+TOML
+    cd cg-abs
+    local output
+    if output=$(konvoy build 2>&1); then
+        echo "    expected build to fail with an absolute spec path" >&2
+        return 1
+    fi
+    assert_contains "$output" "relative path inside the project"
+}
+
+# Unexpected: a non-OpenAPI spec extension is rejected.
+test_codegen_bad_spec_extension_rejected() {
+    konvoy init --name cg-ext >/dev/null 2>&1
+    cat >> cg-ext/konvoy.toml << 'TOML'
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.txt"
+base_package = "com.example.gen"
+TOML
+    cd cg-ext
+    local output
+    if output=$(konvoy build 2>&1); then
+        echo "    expected build to fail with a non-OpenAPI spec extension" >&2
+        return 1
+    fi
+    assert_contains "$output" ".yaml, .yml, or .json"
+}
+
+# Unexpected: a Fabrikt version older than the supported minimum is rejected.
+test_codegen_old_fabrikt_version_rejected() {
+    konvoy init --name cg-oldver >/dev/null 2>&1
+    cat >> cg-oldver/konvoy.toml << 'TOML'
+
+[codegen.openapi]
+version = "17.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.gen"
+TOML
+    cd cg-oldver
+    local output
+    if output=$(konvoy build 2>&1); then
+        echo "    expected build to fail with an unsupported Fabrikt version" >&2
+        return 1
+    fi
+    assert_contains "$output" "18.0.0 or newer"
+}
+
+# Unexpected: an unknown codegen tool ([codegen.grpc]) is rejected.
+test_codegen_unknown_tool_rejected() {
+    konvoy init --name cg-unknown >/dev/null 2>&1
+    cat >> cg-unknown/konvoy.toml << 'TOML'
+
+[codegen.grpc]
+version = "1.0.0"
+TOML
+    cd cg-unknown
+    local output
+    if output=$(konvoy build 2>&1); then
+        echo "    expected build to fail with an unknown codegen tool" >&2
+        return 1
+    fi
+    assert_contains "$output" "grpc"
+}
+
+# ---------------------------------------------------------------------------
 # Tests: Maven dependencies
 # ---------------------------------------------------------------------------
 
@@ -2703,6 +3129,19 @@ run_test test_plugin_kotlin_placeholder_resolves
 # Issue #239: serialization plugin downloaded but not applied (fixed by two-step
 # program compilation, #243 — the embeddable-JAR mapping was reverted in #245).
 run_test test_issue_239_serialization_plugin_applied
+
+# codegen (OpenAPI / Fabrikt)
+run_test test_codegen_build_lifecycle
+run_test test_codegen_fully_generated_lib_builds
+run_test test_codegen_path_dep_build_lifecycle
+run_test test_codegen_graph_union_dedup
+run_test test_codegen_locked_no_pin_fails
+run_test test_codegen_offline_tool_absent_fails
+run_test test_codegen_missing_spec_fails
+run_test test_codegen_absolute_spec_rejected
+run_test test_codegen_bad_spec_extension_rejected
+run_test test_codegen_old_fabrikt_version_rejected
+run_test test_codegen_unknown_tool_rejected
 
 # Maven dependencies
 run_test test_update_help

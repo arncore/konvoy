@@ -67,6 +67,12 @@ pub fn build_tests(
         .collect();
     sources.extend(test_sources);
 
+    // Codegen for the root project, derived from its own manifest (identical to
+    // `build_single`): the tags feed the cache key, the generators run on a miss.
+    // Tools were ensured graph-wide in `resolve_build_context`.
+    let generators = crate::codegen::active_generators(&ctx.manifest.codegen);
+    let codegen_hashes = crate::codegen::compute_codegen_hashes(project_root, &generators)?;
+
     // Compute cache key. The test-binary build must produce a distinct cache
     // key from a regular build of the same source tree, so we tag the lockfile
     // content with a "test" marker (the lockfile_content is already a free-form
@@ -91,6 +97,9 @@ pub fn build_tests(
                 None => konvoy_util::hash::sha256_file(&lib.path).map_err(EngineError::from),
             })
             .collect::<Result<Vec<_>, _>>()?,
+        // Codegen inputs (shared with the regular build) — a spec/config change
+        // rebuilds the test binary too. Empty when no `[codegen]` is configured.
+        codegen_hashes,
     };
     let cache_key = CacheKey::compute(&cache_inputs)?;
 
@@ -112,6 +121,19 @@ pub fn build_tests(
             output_path,
             compile_duration: start.elapsed(),
         });
+    }
+
+    // Cache miss: run the root's code generators (tools were ensured graph-wide in
+    // resolve_build_context) and add the emitted `.kt` so generated code is compiled
+    // into the test binary too.
+    if !generators.is_empty() {
+        let generated = crate::codegen::run_codegen(
+            project_root,
+            &generators,
+            ctx.jre_home.as_deref(),
+            options.verbose,
+        )?;
+        sources.extend(generated);
     }
 
     // Compile with test runner generation.
