@@ -225,7 +225,8 @@ impl<'a> ArtifactResolver<'a> {
     }
 
     /// Require the manifest's managed artifacts to be resolvable under the
-    /// command's policy.
+    /// command's policy (root-only — used by `lint`, which does not build the
+    /// dependency graph).
     pub(crate) fn require_manifest_artifacts_resolvable(
         self,
         manifest: &Manifest,
@@ -233,6 +234,20 @@ impl<'a> ArtifactResolver<'a> {
     ) -> Result<(), EngineError> {
         self.lockfiles
             .verify_current_lockfile(|| crate::build::check_lockfile_staleness(manifest, lockfile))
+    }
+
+    /// Require the build graph's managed artifacts to be resolvable under the
+    /// command's policy: the root's full staleness check plus, for every
+    /// path-dependency, that its Maven deps are pinned in the (shared) root lock.
+    pub(crate) fn require_graph_artifacts_resolvable<'m>(
+        self,
+        manifest: &Manifest,
+        dep_manifests: impl IntoIterator<Item = &'m Manifest>,
+        lockfile: &Lockfile,
+    ) -> Result<(), EngineError> {
+        self.lockfiles.verify_current_lockfile(|| {
+            crate::build::check_graph_lockfile_staleness(manifest, dep_manifests, lockfile)
+        })
     }
 
     /// Resolve a changed path dependency source under the command's policy.

@@ -16,7 +16,7 @@ use konvoy_targets::{host_target, Target};
 use crate::artifact::{ArtifactStore, BuildMetadata};
 use crate::cache::{CacheInputs, CacheKey};
 use crate::error::EngineError;
-use crate::resolve::{parallel_levels, resolve_dependencies, ResolvedGraph};
+use crate::resolve::{parallel_levels, resolve_dependencies, ResolvedDep, ResolvedGraph};
 
 /// Options controlling a build invocation.
 #[derive(Debug, Clone)]
@@ -312,24 +312,40 @@ pub(crate) fn resolve_build_context(
     // the program entry point next to the process-wide NetworkClient and
     // threaded through everything that may fetch or reject artifact resolution.
 
+    // 2a. Resolve the path-dependency graph up front. Maven-dep AND plugin pinning
+    //     both span the WHOLE graph (root + path-deps), so every dependency's
+    //     manifest must be known before the auto-update / staleness gates and the
+    //     lockfile prediction. `resolve_dependencies` only reads dep manifests +
+    //     source hashes (it also enforces the shared Kotlin version), so it is
+    //     safe to run this early, and reusing it avoids resolving the graph twice.
+    let dep_graph = resolve_dependencies(project_root, &manifest)?;
+
     // 3. Auto-resolve Maven deps if needed (unless --locked or --offline).
-    //    When the manifest declares Maven deps that aren't in the lockfile,
-    //    run `konvoy update` automatically so users don't have to.
+    //    When ANY project in the graph (root or a path-dep) declares Maven deps
+    //    that aren't in the lockfile, run `konvoy update` automatically so users
+    //    don't have to — `update` resolves the graph-wide union into the root lock.
     //    - Under --locked the branch is skipped and the staleness check below
     //      reports the drift (this also makes drift win under --frozen).
     //    - Under --offline auto-resolving is forbidden outright: `update`
     //      fetches POMs and klibs from Maven Central, so an unresolved dep is
     //      a hard error here instead of a silent network access.
-    let lockfile = match first_unresolved_maven_dep(&manifest, &lockfile) {
+    let lockfile = match first_unresolved_graph_maven_dep(
+        std::iter::once(&manifest).chain(dep_graph.order.iter().map(|d| &d.manifest)),
+        &lockfile,
+    ) {
         Some(name) => {
             resolver.resolve_missing_maven_dependencies(project_root, &lockfile_path, name)?
         }
         _ => lockfile,
     };
 
-    // In --locked mode, verify the lockfile is complete and consistent
-    // with what konvoy.toml specifies before doing any work.
-    resolver.require_manifest_artifacts_resolvable(&manifest, &lockfile)?;
+    // In --locked mode, verify the lockfile is complete and consistent with what
+    // the whole graph's konvoy.toml files specify before doing any work.
+    resolver.require_graph_artifacts_resolvable(
+        &manifest,
+        dep_graph.order.iter().map(|d| &d.manifest),
+        &lockfile,
+    )?;
 
     // 4. Resolve target.
     let target = resolve_target(&options.target)?;
@@ -373,16 +389,9 @@ pub(crate) fn resolve_build_context(
         )?;
     }
 
-    // 6. Resolve the dependency graph up front. Plugin pinning spans the WHOLE
-    //    graph (root + path-deps), so every dependency's manifest must be known
-    //    before plugins are resolved and the lockfile is predicted.
-    //    `resolve_dependencies` only reads dep manifests + source hashes (no
-    //    toolchain/plugin state), so running it here — earlier than the build
-    //    loop below — is safe.
-    let dep_graph = resolve_dependencies(project_root, &manifest)?;
-
-    // 6a. Resolve + ensure plugin artifacts graph-wide, then pre-stabilize the
-    //     lockfile for cache-key consistency (issue #133).
+    // 6. Resolve + ensure plugin artifacts graph-wide (the dependency graph was
+    //    resolved up front at step 2a), then pre-stabilize the lockfile for
+    //    cache-key consistency (issue #133).
     //
     // When `konvoy.lock` does not exist (first build) or the toolchain version
     // has changed, the lockfile read at step 2 will differ from what
@@ -434,7 +443,32 @@ pub(crate) fn resolve_build_context(
         resolver,
     );
 
-    // 7. Build path dependencies in topological order.
+    // 7. Resolve & download the graph-wide Maven klib union ONCE, up front, so
+    //    each project's own compile (root or path-dep) can be handed the klibs
+    //    it links. Each klib comes back with a precomputed sha256 from
+    //    `download_artifact`, reused by the cache-key code. The union is keyed by
+    //    lock-entry name so a per-project subset can be assembled below.
+    let all_maven_entries: Vec<&DependencyLock> = effective_lockfile.dependencies.iter().collect();
+    let all_maven_klibs = resolve_maven_klibs(&all_maven_entries, &target, resolver)?;
+    let klib_by_name: HashMap<&str, LibraryInput> = effective_lockfile
+        .dependencies
+        .iter()
+        .filter(|d| matches!(&d.source, DepSource::Maven { .. }))
+        .map(|d| d.name.as_str())
+        .zip(all_maven_klibs.iter().cloned())
+        .collect();
+
+    // Index path-deps by name so a project's path-dep SUBTREE can be walked for
+    // its transitive Maven closure (a klib that exposes a Maven type in its API
+    // forces every dependent's compile to also see that Maven klib — verified:
+    // compiling against a klib whose API returns `Flow` needs coroutines.klib).
+    let dep_by_name: HashMap<&str, &ResolvedDep> = dep_graph
+        .order
+        .iter()
+        .map(|dep| (dep.name.as_str(), dep))
+        .collect();
+
+    // 8. Build path dependencies in topological order.
     let lockfile_content = lockfile_toml_content(&effective_lockfile)?;
 
     let levels = parallel_levels(&dep_graph);
@@ -443,7 +477,7 @@ pub(crate) fn resolve_build_context(
     for level in &levels {
         // Path-deps don't carry a pre-computed hash through the build pipeline,
         // so the cache-key code rehashes them as needed.
-        let lib_inputs: Vec<LibraryInput> = completed
+        let completed_path_klibs: Vec<LibraryInput> = completed
             .values()
             .cloned()
             .map(LibraryInput::unhashed)
@@ -451,6 +485,20 @@ pub(crate) fn resolve_build_context(
         let results: Vec<Result<(String, PathBuf, BuildOutcome), EngineError>> = level
             .par_iter()
             .map(|dep| {
+                // This dep links the path-dep klibs built so far plus the Maven
+                // closure of ITS OWN subtree — the `[dependencies]` analogue of
+                // deriving each project's own `-Xplugin` set (#293). A path-dep
+                // is thus compiled against exactly the klibs it (transitively)
+                // declares: identical to building it standalone (parity), and its
+                // cache key is not perturbed by unrelated deps elsewhere.
+                let mut lib_inputs = completed_path_klibs.clone();
+                let subtree =
+                    collect_subtree_manifests(&dep.manifest, &dep.dep_names, &dep_by_name);
+                lib_inputs.extend(project_maven_klibs(
+                    &subtree,
+                    &effective_lockfile,
+                    &klib_by_name,
+                ));
                 let dep_cc = CompileContext {
                     konanc: &konanc,
                     jre_home: jre_home.as_deref(),
@@ -482,11 +530,10 @@ pub(crate) fn resolve_build_context(
         .map(LibraryInput::unhashed)
         .collect();
 
-    // 7a. Resolve and download Maven dependency klibs for the current target.
-    //     Each Maven klib comes back with a precomputed sha256 from
-    //     `download_artifact`, which the cache-key code reuses to skip rehashing.
-    let maven_klibs = resolve_maven_deps(&effective_lockfile, &target, resolver)?;
-    library_inputs.extend(maven_klibs);
+    // The root links every path-dep klib (above) plus the FULL Maven union: the
+    // root's subtree is the whole graph, so its closure is the entire union —
+    // exactly what the root linked before this change.
+    library_inputs.extend(all_maven_klibs);
 
     let store = ArtifactStore::new(project_root);
 
@@ -920,16 +967,146 @@ struct PreparedKlib<'a> {
     needs_download: bool,
 }
 
-pub(crate) fn resolve_maven_deps(
+/// Compute a project's Maven dependency **closure** within the graph-wide union
+/// recorded in the root lock: the project's own direct Maven deps plus
+/// everything they transitively require.
+///
+/// Seeding matches by Maven **coordinate** (`group:artifactId`), not by the lock
+/// entry's `name`: the union dedups by coordinate and may keep another project's
+/// konvoy key for a shared dep, so a name match would miss it. Transitive
+/// expansion follows the lockfile's `required_by` (which lists requirer *names*).
+///
+/// This is the `[dependencies]` analogue of deriving each project's own
+/// `-Xplugin` set (#293): a path-dep is compiled against exactly the klibs it
+/// declares — identical to building it standalone (parity) — and its cache key
+/// is not perturbed by unrelated deps elsewhere in the graph.
+pub(crate) fn project_maven_closure<'a>(
+    manifest: &Manifest,
+    lockfile: &'a Lockfile,
+) -> Vec<&'a DependencyLock> {
+    use std::collections::BTreeSet;
+
+    // The project's direct Maven coordinates (group:artifactId), from its manifest.
+    let direct_coords: BTreeSet<&str> = manifest
+        .dependencies
+        .values()
+        .filter_map(|spec| spec.as_maven_coord().map(|(coord, _)| coord))
+        .collect();
+
+    // Seed the closure with lock entries whose coordinate the project declares.
+    let mut in_closure: BTreeSet<&str> = BTreeSet::new();
+    for dep in &lockfile.dependencies {
+        if let DepSource::Maven { maven, .. } = &dep.source {
+            if direct_coords.contains(maven.as_str()) {
+                in_closure.insert(dep.name.as_str());
+            }
+        }
+    }
+
+    // Expand transitively: a Maven entry is in the closure if any of its
+    // `required_by` requirers is already in the closure. Iterate to a fixpoint
+    // (the dependency graph is small, so a simple pass-until-stable is fine).
+    loop {
+        let mut grew = false;
+        for dep in &lockfile.dependencies {
+            if in_closure.contains(dep.name.as_str()) {
+                continue;
+            }
+            if let DepSource::Maven { required_by, .. } = &dep.source {
+                if required_by.iter().any(|r| in_closure.contains(r.as_str())) {
+                    in_closure.insert(dep.name.as_str());
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    lockfile
+        .dependencies
+        .iter()
+        .filter(|d| {
+            matches!(&d.source, DepSource::Maven { .. }) && in_closure.contains(d.name.as_str())
+        })
+        .collect()
+}
+
+/// Collect the manifests in a project's path-dependency **subtree**: the project
+/// itself plus every path-dep transitively reachable through `dep_names`.
+///
+/// A project's compile must see the Maven closure of its whole subtree, not just
+/// its own direct deps: a path-dep whose public API exposes a Maven type forces
+/// every dependent's compile to also resolve that Maven klib (konanc rejects a
+/// klib reference whose transitive deps aren't on the library path).
+fn collect_subtree_manifests<'a>(
+    start_manifest: &'a Manifest,
+    start_dep_names: &[String],
+    by_name: &HashMap<&str, &'a ResolvedDep>,
+) -> Vec<&'a Manifest> {
+    use std::collections::BTreeSet;
+    let mut out = vec![start_manifest];
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut stack: Vec<&str> = start_dep_names.iter().map(String::as_str).collect();
+    while let Some(name) = stack.pop() {
+        if !seen.insert(name) {
+            continue;
+        }
+        if let Some(dep) = by_name.get(name) {
+            out.push(&dep.manifest);
+            stack.extend(dep.dep_names.iter().map(String::as_str));
+        }
+    }
+    out
+}
+
+/// The Maven klibs a project links: the union of [`project_maven_closure`] over
+/// its `subtree` manifests, resolved against the already-downloaded
+/// `klib_by_name`. Deduped by lock-entry name.
+fn project_maven_klibs(
+    subtree: &[&Manifest],
     lockfile: &Lockfile,
+    klib_by_name: &HashMap<&str, LibraryInput>,
+) -> Vec<LibraryInput> {
+    use std::collections::BTreeSet;
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for manifest in subtree {
+        for entry in project_maven_closure(manifest, lockfile) {
+            names.insert(entry.name.clone());
+        }
+    }
+    names
+        .iter()
+        .filter_map(|n| klib_by_name.get(n.as_str()).cloned())
+        .collect()
+}
+
+/// Resolve every Maven entry in a lockfile (test convenience). Production builds
+/// resolve per-project subsets via [`project_maven_closure`] +
+/// [`resolve_maven_klibs`]; this whole-lockfile wrapper keeps the focused
+/// download/offline/hash tests independent of closure computation.
+#[cfg(test)]
+fn resolve_maven_deps(
+    lockfile: &Lockfile,
+    target: &Target,
+    resolver: crate::common::ArtifactResolver<'_>,
+) -> Result<Vec<LibraryInput>, EngineError> {
+    let entries: Vec<&DependencyLock> = lockfile.dependencies.iter().collect();
+    resolve_maven_klibs(&entries, target, resolver)
+}
+
+/// Download the per-target klibs for a specific set of lockfile Maven entries
+/// (a project's [`project_maven_closure`]). Non-Maven entries are ignored.
+pub(crate) fn resolve_maven_klibs(
+    entries: &[&DependencyLock],
     target: &Target,
     resolver: crate::common::ArtifactResolver<'_>,
 ) -> Result<Vec<LibraryInput>, EngineError> {
     use rayon::prelude::IndexedParallelIterator;
 
     // Filter to Maven entries AND extract their fields in one pass.
-    let maven_locks: Vec<MavenLockView> = lockfile
-        .dependencies
+    let maven_locks: Vec<MavenLockView> = entries
         .iter()
         .filter_map(|d| match &d.source {
             DepSource::Maven {
@@ -1045,10 +1222,13 @@ fn download_one_klib(
     resolver.resolve_maven_klib(p.entry.name, &p.url, &p.dest, p.expected_sha256, maybe_bar)
 }
 
-/// Returns the name of the first manifest Maven dep that has no matching
-/// lockfile entry, or `None` when everything is resolved. Used to trigger the
-/// automatic `konvoy update` during build — or, under `--offline`, to refuse
-/// it with the offending dependency named in the error.
+/// Returns the konvoy key of the first manifest Maven dep that has no matching
+/// lockfile pin (by COORDINATE + version), or `None` when everything is
+/// resolved. Used to trigger the automatic `konvoy update` during build — or,
+/// under `--offline`, to refuse it with the offending dependency named.
+///
+/// Coordinate matching (not name) lets a path-dep's Maven dep be recognized as
+/// resolved even when the union pinned it under another project's konvoy key.
 pub(crate) fn first_unresolved_maven_dep(
     manifest: &Manifest,
     lockfile: &Lockfile,
@@ -1056,8 +1236,24 @@ pub(crate) fn first_unresolved_maven_dep(
     manifest
         .dependencies
         .iter()
-        .find(|(name, spec)| spec.is_maven() && !lockfile.has_maven_entry(name))
+        .find(|(_, spec)| {
+            spec.as_maven_coord()
+                .is_some_and(|(maven, version)| !lockfile.has_maven_coord(maven, version))
+        })
         .map(|(name, _)| name.clone())
+}
+
+/// Graph-wide [`first_unresolved_maven_dep`]: the first unresolved Maven dep
+/// across the root **and every path-dependency** manifest. A path-dep's
+/// `[dependencies]` must be resolved into the root lock too, so an unresolved
+/// one triggers the same auto-update / `--offline` refusal as the root's.
+pub(crate) fn first_unresolved_graph_maven_dep<'a>(
+    manifests: impl IntoIterator<Item = &'a Manifest>,
+    lockfile: &Lockfile,
+) -> Option<String> {
+    manifests
+        .into_iter()
+        .find_map(|m| first_unresolved_maven_dep(m, lockfile))
 }
 
 /// Check that the lockfile is complete and consistent with the manifest.
@@ -1105,14 +1301,44 @@ pub(crate) fn check_lockfile_staleness(
         }
     }
 
-    // If the manifest has Maven dependencies (maven + version set), the lockfile must
-    // have matching Maven entries for each.
-    for (dep_name, dep_spec) in &manifest.dependencies {
-        if dep_spec.is_maven() && !lockfile.has_maven_entry(dep_name) {
-            return Err(EngineError::LockfileUpdateRequired);
+    // If the manifest has Maven dependencies (maven + version set), the lockfile
+    // must pin each (by coordinate + version).
+    manifest_maven_deps_resolved(manifest, lockfile)?;
+
+    Ok(())
+}
+
+/// Each Maven dep declared by `manifest` must be pinned in `lockfile` (by
+/// coordinate + version). Shared by the root staleness check and the per-path-dep
+/// graph staleness check so both agree on what "resolved" means.
+fn manifest_maven_deps_resolved(
+    manifest: &Manifest,
+    lockfile: &Lockfile,
+) -> Result<(), EngineError> {
+    for spec in manifest.dependencies.values() {
+        if let Some((maven, version)) = spec.as_maven_coord() {
+            if !lockfile.has_maven_coord(maven, version) {
+                return Err(EngineError::LockfileUpdateRequired);
+            }
         }
     }
+    Ok(())
+}
 
+/// Graph-wide staleness: the full root check plus, for every path-dependency,
+/// that its `[dependencies]` Maven deps are pinned in the (shared) root lock.
+/// Path-deps' toolchain is enforced equal to the root's by `resolve_dependencies`
+/// and their plugins are gated by the graph-wide ensure, so only their Maven deps
+/// add a new `--locked` staleness condition here.
+pub(crate) fn check_graph_lockfile_staleness<'a>(
+    manifest: &Manifest,
+    dep_manifests: impl IntoIterator<Item = &'a Manifest>,
+    lockfile: &Lockfile,
+) -> Result<(), EngineError> {
+    check_lockfile_staleness(manifest, lockfile)?;
+    for dep_manifest in dep_manifests {
+        manifest_maven_deps_resolved(dep_manifest, lockfile)?;
+    }
     Ok(())
 }
 
@@ -4177,6 +4403,173 @@ mod tests {
             result.is_empty(),
             "expected empty vec for path-only deps, got: {result:?}"
         );
+    }
+
+    fn maven_lock(name: &str, coord: &str, version: &str, required_by: &[&str]) -> DependencyLock {
+        DependencyLock {
+            name: name.to_owned(),
+            source: DepSource::Maven {
+                version: version.to_owned(),
+                maven: coord.to_owned(),
+                targets: std::collections::BTreeMap::new(),
+                required_by: required_by.iter().map(|s| (*s).to_owned()).collect(),
+                classifier: None,
+            },
+            source_hash: "h".to_owned(),
+        }
+    }
+
+    fn closure_names(manifest: &Manifest, lockfile: &Lockfile) -> Vec<String> {
+        let mut names: Vec<String> = project_maven_closure(manifest, lockfile)
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn project_maven_closure_includes_own_direct_and_transitive_only() {
+        // The graph-wide root lock holds the UNION across projects. A given
+        // project's compile must link only ITS OWN closure (direct + transitive),
+        // not another project's deps — otherwise standalone != as-dependency and
+        // its cache key is perturbed by unrelated deps.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"p\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.2.0\"\n\n[dependencies]\na = { maven = \"g:a\", version = \"1.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.2.0");
+        lockfile.dependencies = vec![
+            maven_lock("a", "g:a", "1.0", &[]),    // this project's direct dep
+            maven_lock("b", "g:b", "1.0", &["a"]), // transitive of a -> in closure
+            maven_lock("c", "g:c", "1.0", &[]),    // ANOTHER project's direct dep
+            maven_lock("d", "g:d", "1.0", &["c"]), // transitive of c -> excluded
+        ];
+
+        assert_eq!(
+            closure_names(&manifest, &lockfile),
+            vec!["a".to_owned(), "b".to_owned()],
+            "closure must be the project's own direct + transitive deps only"
+        );
+    }
+
+    #[test]
+    fn project_maven_closure_matches_by_coordinate_not_lock_name() {
+        // The project declares the dep under a different konvoy key than the lock
+        // entry's name (the union dedups by coordinate and may keep another
+        // project's name). Seeding must match by the maven COORDINATE, not the name.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"p\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.2.0\"\n\n[dependencies]\nmy-coroutines = { maven = \"org.jetbrains.kotlinx:kotlinx-coroutines-core\", version = \"1.8.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.2.0");
+        // Lock entry uses a DIFFERENT name (e.g. another project declared it first).
+        lockfile.dependencies = vec![maven_lock(
+            "coroutines",
+            "org.jetbrains.kotlinx:kotlinx-coroutines-core",
+            "1.8.0",
+            &[],
+        )];
+
+        assert_eq!(
+            closure_names(&manifest, &lockfile),
+            vec!["coroutines".to_owned()],
+            "closure must match by coordinate even when the lock name differs"
+        );
+    }
+
+    #[test]
+    fn first_unresolved_graph_maven_dep_finds_path_dep_unresolved() {
+        // The root has its Maven dep pinned; a path-dep declares one that ISN'T
+        // in the lockfile. The graph-wide check must surface it (so auto-update /
+        // --offline refusal covers path-dep Maven deps too).
+        let root = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"app\"\nkind = \"bin\"\n\n[toolchain]\nkotlin = \"2.2.0\"\n\n[dependencies]\ndatetime = { maven = \"org.jetbrains.kotlinx:kotlinx-datetime\", version = \"0.6.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let dep = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"models\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.2.0\"\n\n[dependencies]\ncoroutines = { maven = \"org.jetbrains.kotlinx:kotlinx-coroutines-core\", version = \"1.8.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.2.0");
+        // Only the root's datetime is pinned; the dep's coroutines is missing.
+        lockfile.dependencies = vec![maven_lock(
+            "datetime",
+            "org.jetbrains.kotlinx:kotlinx-datetime",
+            "0.6.0",
+            &[],
+        )];
+
+        // Root alone: nothing unresolved.
+        assert!(first_unresolved_maven_dep(&root, &lockfile).is_none());
+        // Graph-wide: the dep's coroutines surfaces.
+        assert_eq!(
+            first_unresolved_graph_maven_dep([&root, &dep], &lockfile).as_deref(),
+            Some("coroutines"),
+        );
+    }
+
+    #[test]
+    fn check_graph_lockfile_staleness_flags_unpinned_path_dep_maven() {
+        // Root passes its own staleness, but a path-dep's Maven dep is unpinned →
+        // graph staleness must fail (so --locked refuses an incomplete lock).
+        let root = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"app\"\nkind = \"bin\"\n\n[toolchain]\nkotlin = \"2.2.0\"\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let dep = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"models\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.2.0\"\n\n[dependencies]\ncoroutines = { maven = \"org.jetbrains.kotlinx:kotlinx-coroutines-core\", version = \"1.8.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let lockfile = Lockfile::with_toolchain("2.2.0");
+
+        // Root-only staleness passes (root declares no Maven deps).
+        assert!(check_lockfile_staleness(&root, &lockfile).is_ok());
+        // Graph staleness fails on the dep's unpinned Maven dep.
+        assert!(check_graph_lockfile_staleness(&root, [&dep], &lockfile).is_err());
+    }
+
+    #[test]
+    fn check_graph_lockfile_staleness_passes_when_path_dep_maven_pinned_by_coord() {
+        // The dep's Maven dep is pinned in the union under a DIFFERENT konvoy key
+        // (coordinate match) — graph staleness must accept it.
+        let root = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"app\"\nkind = \"bin\"\n\n[toolchain]\nkotlin = \"2.2.0\"\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let dep = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"models\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.2.0\"\n\n[dependencies]\nmy-coroutines = { maven = \"org.jetbrains.kotlinx:kotlinx-coroutines-core\", version = \"1.8.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.2.0");
+        lockfile.dependencies = vec![maven_lock(
+            "coroutines", // different konvoy key than the dep's "my-coroutines"
+            "org.jetbrains.kotlinx:kotlinx-coroutines-core",
+            "1.8.0",
+            &[],
+        )];
+
+        assert!(check_graph_lockfile_staleness(&root, [&dep], &lockfile).is_ok());
+    }
+
+    #[test]
+    fn project_maven_closure_empty_when_no_maven_deps() {
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"p\"\nkind = \"bin\"\n\n[toolchain]\nkotlin = \"2.2.0\"\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.2.0");
+        lockfile.dependencies = vec![maven_lock("a", "g:a", "1.0", &[])];
+        assert!(project_maven_closure(&manifest, &lockfile).is_empty());
     }
 
     #[test]

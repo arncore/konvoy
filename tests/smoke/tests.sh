@@ -1241,6 +1241,181 @@ KOTLIN
     assert_file_contains konvoy.lock "maven ="
 }
 
+test_path_dep_maven_dep_build_lifecycle() {
+    # A path-dep that declares its OWN Maven dependency must be compiled WITH that
+    # dep's klib — the [dependencies] analogue of the path-dep [plugins] fix. The
+    # union (incl. transitives) is resolved into the ROOT lock; the dep checkout
+    # is never written to. Before this change the dep compiled with no Maven
+    # klibs and failed with "unresolved reference".
+    konvoy init --name md-lib --lib >/dev/null 2>&1
+    konvoy init --name md-app >/dev/null 2>&1
+    cat >> md-lib/konvoy.toml << 'TOML'
+
+[dependencies]
+kotlinx-datetime = { maven = "org.jetbrains.kotlinx:kotlinx-datetime", version = "0.6.0" }
+TOML
+    # The lib's source USES its Maven dep — this only compiles if the dep's klib
+    # is on the lib's compile path.
+    cat > md-lib/src/lib.kt << 'KOTLIN'
+package mdlib
+
+import kotlinx.datetime.Clock
+
+fun stampLen(): Int = Clock.System.now().toString().length
+KOTLIN
+    cat >> md-app/konvoy.toml << 'TOML'
+
+[dependencies]
+md-lib = { path = "../md-lib" }
+TOML
+    cat > md-app/src/main.kt << 'KOTLIN'
+import mdlib.stampLen
+
+fun main() {
+    println("stamp-len=" + stampLen())
+}
+KOTLIN
+    cd md-app
+
+    # First build auto-resolves the graph-wide Maven union (the dep's datetime +
+    # its transitive) into the root lock, then compiles the dep WITH its klib.
+    local out1
+    out1=$(konvoy build 2>&1)
+    assert_contains "$out1" "Compiling md-lib"
+    assert_contains "$out1" "Compiling md-app"
+
+    # The binary links + runs end-to-end (proves the dep's Maven klib was both
+    # compiled against AND linked into the final binary).
+    local run_out
+    run_out=$(konvoy run 2>&1)
+    assert_contains "$run_out" "stamp-len="
+
+    # The dep's Maven dep (and its transitive) are pinned in the ROOT lock; the
+    # dep checkout is never written to.
+    assert_file_contains konvoy.lock "kotlinx-datetime"
+    assert_file_contains konvoy.lock "maven ="
+    if [ -f ../md-lib/konvoy.lock ]; then
+        echo "    root build must not write a lockfile into the dep checkout" >&2
+        return 1
+    fi
+
+    # Second build is fully cached (the union is folded into the cache key).
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "(cached)"
+    assert_not_contains "$out2" "Compiling"
+
+    # --locked is satisfied by the path-dep's pinned Maven dep (matched by
+    # coordinate, even though the lock aggregates it in the root lock).
+    local out3
+    out3=$(konvoy build --locked 2>&1)
+    assert_contains "$out3" "(cached)"
+}
+
+test_path_dep_maven_version_conflict_surfaced() {
+    # Two path-deps require DIFFERENT versions of the same Maven artifact. Maven
+    # libraries are linked, so this is a hard error to surface (not distinct
+    # pins) — consistent with how the transitive resolver already surfaces
+    # conflicts. The error names both requirers and gives an actionable hint.
+    konvoy init --name cf-liba --lib >/dev/null 2>&1
+    konvoy init --name cf-libb --lib >/dev/null 2>&1
+    konvoy init --name cf-app >/dev/null 2>&1
+    cat >> cf-liba/konvoy.toml << 'TOML'
+
+[dependencies]
+coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.8.0" }
+TOML
+    cat >> cf-libb/konvoy.toml << 'TOML'
+
+[dependencies]
+coroutines = { maven = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version = "1.7.3" }
+TOML
+    cat >> cf-app/konvoy.toml << 'TOML'
+
+[dependencies]
+cf-liba = { path = "../cf-liba" }
+cf-libb = { path = "../cf-libb" }
+TOML
+    cd cf-app
+    local output
+    if output=$(konvoy build 2>&1); then
+        echo "    expected a version conflict across the two path-deps" >&2
+        return 1
+    fi
+    assert_contains "$output" "version conflict"
+    assert_contains "$output" "kotlinx-coroutines-core"
+    assert_contains "$output" "1.8.0"
+    assert_contains "$output" "1.7.3"
+}
+
+test_path_dep_serialization_roundtrip() {
+    # End-to-end gold test: a path-dep uses BOTH the serialization compiler plugin
+    # AND its serialization runtime Maven deps, defines a @Serializable type, and
+    # round-trips it. The app links the dep and runs it. This exercises the whole
+    # stack the PR fixes at once — the dep's [plugins] are applied to its compile
+    # (#293) and the dep's [dependencies] (Maven) flow into the dep's compile and
+    # the final link. Impossible before this PR (the dep got neither).
+    konvoy init --name ser-models --lib >/dev/null 2>&1
+    konvoy init --name ser-app >/dev/null 2>&1
+    cat >> ser-models/konvoy.toml << 'TOML'
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+
+[dependencies]
+kotlinx-serialization-core = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-core", version = "1.7.3" }
+kotlinx-serialization-json = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-json", version = "1.7.3" }
+TOML
+    cat > ser-models/src/lib.kt << 'KOTLIN'
+package sermodels
+
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.encodeToString
+
+@Serializable
+data class User(val name: String, val age: Int)
+
+fun roundTrip(): String {
+    val json = Json.encodeToString(User("Alice", 30))
+    val back = Json.decodeFromString<User>(json)
+    return "name=${back.name} age=${back.age}"
+}
+KOTLIN
+    cat >> ser-app/konvoy.toml << 'TOML'
+
+[dependencies]
+ser-models = { path = "../ser-models" }
+TOML
+    cat > ser-app/src/main.kt << 'KOTLIN'
+import sermodels.roundTrip
+
+fun main() {
+    println(roundTrip())
+}
+KOTLIN
+    cd ser-app
+
+    konvoy build 2>&1
+
+    # The round-trip executes through the dep — proving the dep's serializers were
+    # generated (plugin applied) and its serialization runtime was linked.
+    local run_out
+    run_out=$(konvoy run 2>&1)
+    assert_contains "$run_out" "name=Alice age=30"
+
+    # The dep's plugin and Maven deps are all pinned in the ROOT lock.
+    assert_file_contains konvoy.lock "kotlin-serialization-compiler-plugin"
+    assert_file_contains konvoy.lock "kotlinx-serialization-core"
+    assert_file_contains konvoy.lock "kotlinx-serialization-json"
+
+    # Second build is fully cached across the whole stack.
+    local out2
+    out2=$(konvoy build 2>&1)
+    assert_contains "$out2" "(cached)"
+    assert_not_contains "$out2" "Compiling"
+}
+
 test_doctor_maven_dep_checks() {
     # Doctor should check Maven deps and lockfile entries.
     konvoy init --name doc-maven >/dev/null 2>&1
@@ -2470,6 +2645,9 @@ run_test test_build_maven_dep_without_update_succeeds
 run_test test_build_maven_dep_locked_without_update_fails
 run_test test_maven_dep_build_lifecycle
 run_test test_maven_dep_mixed_with_path_dep_build
+run_test test_path_dep_maven_dep_build_lifecycle
+run_test test_path_dep_maven_version_conflict_surfaced
+run_test test_path_dep_serialization_roundtrip
 run_test test_doctor_maven_dep_checks
 run_test test_doctor_missing_lockfile_entry_warns
 run_test test_doctor_no_lockfile_warns

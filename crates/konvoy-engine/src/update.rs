@@ -197,31 +197,27 @@ pub fn update(
         });
     }
 
-    // 2. Collect Maven deps (those with `maven` + `version` set).
-    let maven_deps: Vec<(&String, &str, &str)> = manifest
-        .dependencies
-        .iter()
-        .filter_map(|(name, spec)| spec.as_maven_coord().map(|(m, v)| (name, m, v)))
-        .collect();
+    // 2. Collect the DIRECT Maven deps as the deduped union across the whole
+    //    build graph — the root plus every path-dependency. A path-dep's
+    //    `[dependencies]` must be resolved and pinned in the root lock too,
+    //    because the dep's own compile links the klibs it declares (the
+    //    `[dependencies]` analogue of the path-dep `[plugins]` fix, #293).
+    //    `resolve_dependencies` only reads dep manifests + source hashes, so it
+    //    is safe to run here; it also enforces the shared Kotlin version. Cross-
+    //    project version clashes are surfaced (libraries are linked).
+    let dep_graph = crate::resolve::resolve_dependencies(project_root, &manifest)?;
+    let mut projects: Vec<(&str, &Manifest)> = vec![("konvoy.toml", &manifest)];
+    projects.extend(
+        dep_graph
+            .order
+            .iter()
+            .map(|dep| (dep.name.as_str(), &dep.manifest)),
+    );
+    let direct_deps = collect_graph_direct_maven_deps(projects)?;
 
-    if maven_deps.is_empty() {
+    if direct_deps.is_empty() {
         lockfile.write_to(&lockfile_path)?;
         return Ok(UpdateResult { updated_count: 0 });
-    }
-
-    // 3. Build the set of direct deps with their maven coordinates.
-    let mut direct_deps: Vec<ResolvedMavenDep> = Vec::new();
-    for (dep_name, maven, version) in &maven_deps {
-        let (group_id, artifact_id) = crate::common::split_maven_coordinate(maven)?;
-
-        direct_deps.push(ResolvedMavenDep {
-            name: (*dep_name).clone(),
-            group_id: group_id.to_owned(),
-            artifact_id: artifact_id.to_owned(),
-            version: (*version).to_owned(),
-            required_by: Vec::new(),
-            classifier: None,
-        });
     }
 
     // 4. Resolve transitive dependencies via BFS on POM files.
@@ -419,6 +415,76 @@ struct BfsState {
     metadata_cache: HashMap<String, ArtifactMetadata>,
     required_by_map: HashMap<String, BTreeSet<String>>,
     queue: VecDeque<BfsEntry>,
+}
+
+/// Collect the deduped union of **direct** Maven dependencies across the build
+/// graph — the root manifest plus every path-dependency — surfacing a version
+/// conflict when two projects declare the same `group:artifact` at different
+/// versions.
+///
+/// Each `(label, manifest)` pair is a project; `label` names it in conflict
+/// messages (e.g. `"konvoy.toml"` for the root, or a path-dep's name). A
+/// path-dep's `[dependencies]` must be resolved and pinned just like the root's,
+/// because each project's own compile links the klibs it declares — the
+/// `[dependencies]` analogue of the path-dep `[plugins]` fix (#293).
+///
+/// Unlike compiler plugins (applied per-compilation, so multiple versions are
+/// benign), Maven libraries are linked into a shared artifact graph, so a
+/// cross-graph version clash is a hard error here — consistent with how the
+/// transitive resolver already surfaces conflicts rather than auto-picking.
+///
+/// # Errors
+/// Returns [`EngineError::MavenVersionConflict`] on a cross-project version
+/// clash, or a coordinate-parse error for a malformed `maven` value.
+fn collect_graph_direct_maven_deps<'a>(
+    projects: impl IntoIterator<Item = (&'a str, &'a Manifest)>,
+) -> Result<Vec<ResolvedMavenDep>, EngineError> {
+    // Keyed by `group:artifact` (the dedup/conflict key), value carries the dep
+    // plus the label of the project that first declared it (for the message).
+    let mut by_key: BTreeMap<String, (ResolvedMavenDep, String)> = BTreeMap::new();
+
+    for (label, manifest) in projects {
+        for (dep_name, spec) in &manifest.dependencies {
+            let Some((maven, version)) = spec.as_maven_coord() else {
+                continue; // path dep or incomplete — not a Maven dep
+            };
+            let (group_id, artifact_id) = crate::common::split_maven_coordinate(maven)?;
+            let dep = ResolvedMavenDep {
+                name: dep_name.clone(),
+                group_id: group_id.to_owned(),
+                artifact_id: artifact_id.to_owned(),
+                version: version.to_owned(),
+                required_by: Vec::new(),
+                classifier: None,
+            };
+            let key = dep.key();
+
+            match by_key.get(&key) {
+                Some((existing, existing_label)) if existing.version != dep.version => {
+                    let hint_version = if dep.version.as_str() > existing.version.as_str() {
+                        dep.version.clone()
+                    } else {
+                        existing.version.clone()
+                    };
+                    return Err(EngineError::MavenVersionConflict {
+                        maven: key,
+                        details: format!(
+                            "  {existing_label} requires {}\n  {label} requires {}",
+                            existing.version, dep.version
+                        ),
+                        hint_name: artifact_id.replace('.', "-"),
+                        hint_version,
+                    });
+                }
+                Some(_) => { /* identical declaration — dedup */ }
+                None => {
+                    by_key.insert(key, (dep, label.to_owned()));
+                }
+            }
+        }
+    }
+
+    Ok(by_key.into_values().map(|(dep, _)| dep).collect())
 }
 
 /// Check for a version conflict between a newly resolved dep and one already seen.
@@ -840,6 +906,20 @@ mod tests {
         tmp
     }
 
+    /// Create a nested `lib` path-dependency under `project/<name>` so
+    /// `update` (which now resolves the whole graph) can find it. Nested rather
+    /// than a `/tmp` sibling so parallel tests don't collide on a shared path.
+    fn add_nested_lib_dep(project: &std::path::Path, name: &str, kotlin: &str) {
+        let dep = project.join(name);
+        fs::create_dir_all(dep.join("src")).unwrap();
+        fs::write(
+            dep.join("konvoy.toml"),
+            format!("[package]\nname = \"{name}\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"{kotlin}\"\n"),
+        )
+        .unwrap();
+        fs::write(dep.join("src/lib.kt"), "package dep\nfun f() = 1\n").unwrap();
+    }
+
     #[test]
     fn update_no_maven_deps_is_noop() {
         let project = make_project(
@@ -851,15 +931,16 @@ name = "my-app"
 kotlin = "2.1.0"
 
 [dependencies]
-my-utils = { path = "../my-utils" }
+my-utils = { path = "my-utils" }
 "#,
         );
+        add_nested_lib_dep(project.path(), "my-utils", "2.1.0");
         // Write an initial lockfile with a path dep.
         let mut lockfile = Lockfile::with_toolchain("2.1.0");
         lockfile.dependencies.push(DependencyLock {
             name: "my-utils".to_owned(),
             source: DepSource::Path {
-                path: "../my-utils".to_owned(),
+                path: "my-utils".to_owned(),
             },
             source_hash: "abcdef".to_owned(),
         });
@@ -887,15 +968,16 @@ name = "my-app"
 kotlin = "2.1.0"
 
 [dependencies]
-my-utils = { path = "../my-utils" }
+my-utils = { path = "my-utils" }
 "#,
         );
+        add_nested_lib_dep(project.path(), "my-utils", "2.1.0");
         // Pre-populate lockfile with a path dep.
         let mut lockfile = Lockfile::with_toolchain("2.1.0");
         lockfile.dependencies.push(DependencyLock {
             name: "my-utils".to_owned(),
             source: DepSource::Path {
-                path: "../my-utils".to_owned(),
+                path: "my-utils".to_owned(),
             },
             source_hash: "path-hash".to_owned(),
         });
@@ -911,7 +993,7 @@ my-utils = { path = "../my-utils" }
         let dep = &reparsed.dependencies[0];
         assert_eq!(dep.name, "my-utils");
         match &dep.source {
-            DepSource::Path { path } => assert_eq!(path, "../my-utils"),
+            DepSource::Path { path } => assert_eq!(path, "my-utils"),
             other => panic!("expected Path source, got: {other:?}"),
         }
     }
@@ -1579,5 +1661,94 @@ atomicfu = { maven = "org.jetbrains.kotlinx:atomicfu", version = "0.23.1" }
             DepSource::Maven { classifier, .. } => assert!(classifier.is_none()),
             other => panic!("expected Maven source, got: {other:?}"),
         }
+    }
+
+    // -- graph-wide direct Maven dep collection (#293 analogue for [dependencies]) --
+
+    fn manifest_with_deps(deps: &[(&str, &str, &str)]) -> Manifest {
+        let mut toml = String::from(
+            "[package]\nname = \"p\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.2.0\"\n\n[dependencies]\n",
+        );
+        for (name, maven, version) in deps {
+            toml.push_str(&format!(
+                "{name} = {{ maven = \"{maven}\", version = \"{version}\" }}\n"
+            ));
+        }
+        Manifest::from_str(&toml, "konvoy.toml").unwrap()
+    }
+
+    #[test]
+    fn collect_graph_direct_maven_deps_unions_and_dedupes() {
+        // The root and a path-dep both declare coroutines (identical → dedup); the
+        // dep also declares datetime. The union has both, exactly once each.
+        let root = manifest_with_deps(&[(
+            "coroutines",
+            "org.jetbrains.kotlinx:kotlinx-coroutines-core",
+            "1.8.0",
+        )]);
+        let dep = manifest_with_deps(&[
+            (
+                "coroutines",
+                "org.jetbrains.kotlinx:kotlinx-coroutines-core",
+                "1.8.0",
+            ),
+            (
+                "datetime",
+                "org.jetbrains.kotlinx:kotlinx-datetime",
+                "0.6.0",
+            ),
+        ]);
+
+        let union =
+            collect_graph_direct_maven_deps([("konvoy.toml", &root), ("models", &dep)]).unwrap();
+        let ids: Vec<String> = union
+            .iter()
+            .map(|d| format!("{}:{}", d.key(), d.version))
+            .collect();
+        assert_eq!(union.len(), 2, "identical declarations must dedup to one");
+        assert!(ids.contains(&"org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.0".to_owned()));
+        assert!(ids.contains(&"org.jetbrains.kotlinx:kotlinx-datetime:0.6.0".to_owned()));
+    }
+
+    #[test]
+    fn collect_graph_direct_maven_deps_surfaces_cross_project_conflict() {
+        // Libraries are linked, so the same artifact at two versions across the
+        // graph is a conflict to surface — not distinct pins (unlike plugins).
+        let root = manifest_with_deps(&[(
+            "coroutines",
+            "org.jetbrains.kotlinx:kotlinx-coroutines-core",
+            "1.8.0",
+        )]);
+        let dep = manifest_with_deps(&[(
+            "coroutines",
+            "org.jetbrains.kotlinx:kotlinx-coroutines-core",
+            "1.7.3",
+        )]);
+
+        let err = collect_graph_direct_maven_deps([("konvoy.toml", &root), ("models", &dep)])
+            .unwrap_err();
+        match err {
+            EngineError::MavenVersionConflict { details, maven, .. } => {
+                assert_eq!(maven, "org.jetbrains.kotlinx:kotlinx-coroutines-core");
+                assert!(details.contains("1.8.0"), "details: {details}");
+                assert!(
+                    details.contains("models requires 1.7.3"),
+                    "conflict must name the declaring project: {details}"
+                );
+            }
+            other => panic!("expected MavenVersionConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collect_graph_direct_maven_deps_ignores_path_deps() {
+        // A path-dep entry in a manifest is not a Maven dep and must be skipped.
+        let root = Manifest::from_str(
+            "[package]\nname = \"p\"\nkind = \"bin\"\n\n[toolchain]\nkotlin = \"2.2.0\"\n\n[dependencies]\nmodels = { path = \"../models\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let union = collect_graph_direct_maven_deps([("konvoy.toml", &root)]).unwrap();
+        assert!(union.is_empty(), "path deps are not Maven deps");
     }
 }

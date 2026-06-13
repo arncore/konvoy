@@ -162,6 +162,21 @@ impl Lockfile {
             .iter()
             .any(|d| d.name == dep_name && matches!(&d.source, DepSource::Maven { .. }))
     }
+
+    /// Whether the lockfile pins a Maven dependency at the given
+    /// `groupId:artifactId` coordinate and version.
+    ///
+    /// Matches by COORDINATE, not by konvoy key: the graph-wide union dedups a
+    /// shared dependency under whichever project declared it first, so a path-dep
+    /// that declares the same artifact under a different key is still resolved.
+    /// A name match would spuriously report it unresolved/stale.
+    #[must_use]
+    pub fn has_maven_coord(&self, maven: &str, version: &str) -> bool {
+        self.dependencies.iter().any(|d| {
+            matches!(&d.source, DepSource::Maven { maven: m, version: v, .. }
+                if m == maven && v == version)
+        })
+    }
 }
 
 /// Errors produced when reading, parsing, or writing a `konvoy.lock` lockfile.
