@@ -1877,6 +1877,17 @@ atomicfu = { maven = "org.jetbrains.kotlinx:atomicfu", version = "0.23.1" }
             child_requirer_name(&None, "com.example", "missing", &resolved),
             "unknown"
         );
+        // requirer Some takes PRECEDENCE over the resolved-name fallback, even
+        // when they differ.
+        assert_eq!(
+            child_requirer_name(
+                &Some("explicit".to_owned()),
+                "org.jetbrains.kotlinx",
+                "kotlinx-coroutines-core",
+                &resolved,
+            ),
+            "explicit"
+        );
     }
 
     #[test]
@@ -1915,6 +1926,128 @@ atomicfu = { maven = "org.jetbrains.kotlinx:atomicfu", version = "0.23.1" }
             compare_maven_versions("2.0.0-beta", "1.0.0"),
             Ordering::Greater
         );
+    }
+
+    #[test]
+    fn compare_maven_versions_reflexive_and_antisymmetric() {
+        use std::cmp::Ordering;
+        for v in ["1.0.0", "1.2", "0.6.1", "1.0.0-beta", "2.0"] {
+            assert_eq!(compare_maven_versions(v, v), Ordering::Equal);
+        }
+        // a < b  <=>  b > a, across mixed numeric/suffix cases.
+        for (a, b) in [
+            ("1.9.0", "1.10.0"),
+            ("1.0.0-beta", "1.0.0"),
+            ("0.6.0", "0.6.1"),
+        ] {
+            assert_eq!(compare_maven_versions(a, b), Ordering::Less);
+            assert_eq!(compare_maven_versions(b, a), Ordering::Greater);
+        }
+    }
+
+    #[test]
+    fn compare_maven_versions_non_numeric_segment_falls_back_lexically() {
+        use std::cmp::Ordering;
+        // A non-numeric core segment can't be parsed → byte comparison for that
+        // segment (best effort; the function is hint-only).
+        assert_eq!(compare_maven_versions("1.x.0", "1.y.0"), Ordering::Less);
+        // Trailing zeros don't change ordering.
+        assert_eq!(compare_maven_versions("1", "1.0.0.0"), Ordering::Equal);
+    }
+
+    #[test]
+    fn maven_version_conflict_munges_hint_name_and_picks_existing_when_higher() {
+        // hint_name turns dots into dashes (the konvoy.toml key convention); when
+        // the existing pin is the higher version, it's the suggested one.
+        let err = maven_version_conflict(
+            "org.jetbrains.kotlinx:atomicfu",
+            "org.jetbrains.kotlinx.atomicfu",
+            "konvoy.toml",
+            "0.24.0",
+            "models",
+            "0.23.1",
+        );
+        match err {
+            EngineError::MavenVersionConflict {
+                maven,
+                hint_name,
+                hint_version,
+                details,
+            } => {
+                assert_eq!(maven, "org.jetbrains.kotlinx:atomicfu");
+                assert_eq!(hint_name, "org-jetbrains-kotlinx-atomicfu");
+                assert_eq!(hint_version, "0.24.0", "existing is higher → suggested");
+                assert!(details.contains("konvoy.toml requires 0.24.0"));
+                assert!(details.contains("models requires 0.23.1"));
+            }
+            other => panic!("expected MavenVersionConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finalize_required_by_accumulates_and_sorts_multiple_requirers() {
+        // A transitive dep pulled in by two parents records BOTH, sorted (the
+        // map is a BTreeSet, so order is deterministic).
+        let dep = ResolvedMavenDep {
+            name: "shared".to_owned(),
+            group_id: "g".to_owned(),
+            artifact_id: "shared".to_owned(),
+            version: "1.0".to_owned(),
+            required_by: Vec::new(),
+            classifier: None,
+        };
+        let mut resolved = HashMap::new();
+        resolved.insert(dep.key(), dep.clone());
+        let mut required_by_map: HashMap<String, BTreeSet<String>> = HashMap::new();
+        required_by_map.insert(
+            dep.key(),
+            BTreeSet::from(["zed".to_owned(), "alpha".to_owned()]),
+        );
+
+        finalize_required_by(&mut resolved, &required_by_map);
+        assert_eq!(
+            resolved.get(&dep.key()).unwrap().required_by,
+            vec!["alpha".to_owned(), "zed".to_owned()],
+            "requirers are deterministic (sorted)"
+        );
+    }
+
+    #[test]
+    fn collect_graph_direct_maven_deps_three_projects_dedup_keeps_first_declarer() {
+        // root, libA, libB. root and libA declare coroutines under DIFFERENT
+        // konvoy keys (same coord+version) — dedup keeps the FIRST declarer's
+        // name (root). libB adds a distinct dep.
+        let root = manifest_with_deps(&[(
+            "coroutines",
+            "org.jetbrains.kotlinx:kotlinx-coroutines-core",
+            "1.8.0",
+        )]);
+        let lib_a = manifest_with_deps(&[(
+            "my-coroutines",
+            "org.jetbrains.kotlinx:kotlinx-coroutines-core",
+            "1.8.0",
+        )]);
+        let lib_b = manifest_with_deps(&[(
+            "datetime",
+            "org.jetbrains.kotlinx:kotlinx-datetime",
+            "0.6.0",
+        )]);
+
+        let union = collect_graph_direct_maven_deps([
+            ("konvoy.toml", &root),
+            ("libA", &lib_a),
+            ("libB", &lib_b),
+        ])
+        .unwrap();
+        let by_key: std::collections::BTreeMap<String, &str> =
+            union.iter().map(|d| (d.key(), d.name.as_str())).collect();
+        assert_eq!(union.len(), 2, "the shared coordinate dedups to one entry");
+        assert_eq!(
+            by_key.get("org.jetbrains.kotlinx:kotlinx-coroutines-core"),
+            Some(&"coroutines"),
+            "the first declarer's (root's) konvoy key wins"
+        );
+        assert!(by_key.contains_key("org.jetbrains.kotlinx:kotlinx-datetime"));
     }
 
     #[test]

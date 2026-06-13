@@ -4615,6 +4615,163 @@ mod tests {
     }
 
     #[test]
+    fn predicted_dependency_locks_empty_graph_and_lockfile_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        assert!(predicted_dependency_locks(&Lockfile::default(), &graph, tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn predicted_dependency_locks_preserves_path_source_hash_and_maven_verbatim() {
+        // The path dep carries its source_hash; the Maven entry is preserved
+        // byte-for-byte (build never edits Maven locks — only `konvoy update` does).
+        let tmp = tempfile::tempdir().unwrap();
+        let mut dep = resolved_dep("models", &[]);
+        dep.project_root = tmp.path().join("models");
+        dep.source_hash = "src-hash-123".to_owned();
+        let graph = crate::resolve::ResolvedGraph { order: vec![dep] };
+        let maven = maven_lock(
+            "coroutines",
+            "org.jetbrains.kotlinx:kotlinx-coroutines-core",
+            "1.8.0",
+            &["x"],
+        );
+        let mut lockfile = Lockfile::default();
+        lockfile.dependencies.push(maven.clone());
+
+        let locks = predicted_dependency_locks(&lockfile, &graph, tmp.path());
+        // The path dep keeps its source hash and a Path source.
+        let models = locks.iter().find(|d| d.name == "models").unwrap();
+        assert_eq!(models.source_hash, "src-hash-123");
+        assert!(matches!(&models.source, DepSource::Path { .. }));
+        // The Maven entry is carried over identically.
+        let cor = locks.iter().find(|d| d.name == "coroutines").unwrap();
+        assert_eq!(cor, &maven);
+    }
+
+    #[test]
+    fn predicted_dependency_locks_only_maven_no_path_deps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph = crate::resolve::ResolvedGraph { order: Vec::new() };
+        let mut lockfile = Lockfile::default();
+        lockfile
+            .dependencies
+            .push(maven_lock("b", "g:b", "1.0", &[]));
+        lockfile
+            .dependencies
+            .push(maven_lock("a", "g:a", "1.0", &[]));
+
+        let locks = predicted_dependency_locks(&lockfile, &graph, tmp.path());
+        let names: Vec<&str> = locks.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["a", "b"],
+            "Maven entries are sorted by name too"
+        );
+    }
+
+    #[test]
+    fn maven_coord_key_distinguishes_classifiers() {
+        let main = DependencyLock {
+            name: "atomicfu".to_owned(),
+            source: DepSource::Maven {
+                version: "0.23.1".to_owned(),
+                maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                targets: std::collections::BTreeMap::new(),
+                required_by: Vec::new(),
+                classifier: None,
+            },
+            source_hash: "h".to_owned(),
+        };
+        let mut cinterop = main.clone();
+        if let DepSource::Maven { classifier, .. } = &mut cinterop.source {
+            *classifier = Some("cinterop-interop".to_owned());
+        }
+        // Same coordinate + version, different classifier → distinct keys, so
+        // both klibs survive in the coord-keyed map.
+        assert_ne!(maven_coord_key(&main), maven_coord_key(&cinterop));
+    }
+
+    #[test]
+    fn project_maven_closure_includes_cinterop_via_required_by() {
+        // A cinterop entry (classifier set) is required_by its parent; when the
+        // parent is in a project's closure, the cinterop klib must be too.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"p\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.2.0\"\n\n[dependencies]\natomicfu = { maven = \"org.jetbrains.kotlinx:atomicfu\", version = \"0.23.1\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.2.0");
+        lockfile.dependencies = vec![
+            maven_lock("atomicfu", "org.jetbrains.kotlinx:atomicfu", "0.23.1", &[]),
+            // cinterop sibling, pulled in by atomicfu
+            DependencyLock {
+                name: "atomicfu-cinterop-interop".to_owned(),
+                source: DepSource::Maven {
+                    version: "0.23.1".to_owned(),
+                    maven: "org.jetbrains.kotlinx:atomicfu".to_owned(),
+                    targets: std::collections::BTreeMap::new(),
+                    required_by: vec!["atomicfu".to_owned()],
+                    classifier: Some("cinterop-interop".to_owned()),
+                },
+                source_hash: "h".to_owned(),
+            },
+        ];
+        assert_eq!(
+            closure_names(&manifest, &lockfile),
+            vec![
+                "atomicfu".to_owned(),
+                "atomicfu-cinterop-interop".to_owned()
+            ],
+            "the cinterop klib must ride along with its parent"
+        );
+    }
+
+    #[test]
+    fn project_maven_closure_walks_deep_chain_and_merges_multiple_requirers() {
+        // p declares a; a→b→c (3 levels), and c is ALSO required by a second
+        // direct dep d. Closure of {a, d} = {a, b, c, d}.
+        let manifest = konvoy_config::manifest::Manifest::from_str(
+            "[package]\nname = \"p\"\nkind = \"lib\"\n\n[toolchain]\nkotlin = \"2.2.0\"\n\n[dependencies]\na = { maven = \"g:a\", version = \"1.0\" }\nd = { maven = \"g:d\", version = \"1.0\" }\n",
+            "konvoy.toml",
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::with_toolchain("2.2.0");
+        lockfile.dependencies = vec![
+            maven_lock("a", "g:a", "1.0", &[]),
+            maven_lock("b", "g:b", "1.0", &["a"]),
+            maven_lock("c", "g:c", "1.0", &["b", "d"]), // required by both b and d
+            maven_lock("d", "g:d", "1.0", &[]),
+        ];
+        assert_eq!(
+            closure_names(&manifest, &lockfile),
+            vec![
+                "a".to_owned(),
+                "b".to_owned(),
+                "c".to_owned(),
+                "d".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_descendant_deps_skips_unknown_names_and_survives_cycles() {
+        // a -> {b, ghost}; b -> a (cycle). `ghost` isn't in by_name → skipped;
+        // the cycle must terminate via the `seen` set.
+        let a = resolved_dep("a", &["b", "ghost"]);
+        let b = resolved_dep("b", &["a"]);
+        let by_name: HashMap<&str, &ResolvedDep> = [("a", &a), ("b", &b)].into_iter().collect();
+
+        let mut names: Vec<&str> = collect_descendant_deps(&["a".to_owned()], &by_name)
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        names.sort();
+        // `a` and `b` (the cycle), no panic, no `ghost`.
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
     fn collect_descendant_deps_walks_transitively_and_dedupes_diamond() {
         // Graph: parent -> {child, sibling}; child -> grandchild; sibling -> grandchild
         // (a diamond). parent's transitive descendants are child, sibling, and
