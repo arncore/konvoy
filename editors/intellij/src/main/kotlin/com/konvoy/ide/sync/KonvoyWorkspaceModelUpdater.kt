@@ -22,6 +22,8 @@ import org.jetbrains.kotlin.platform.konan.NativePlatforms
 import com.intellij.facet.FacetManager
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
+import org.jetbrains.jps.model.java.JavaSourceRootType
+import org.jetbrains.jps.model.java.JpsJavaExtensionService
 import java.io.File
 
 /**
@@ -110,10 +112,30 @@ object KonvoyWorkspaceModelUpdater {
             contentEntry.addSourceFolder(testDir, true)
         }
 
-        // Exclude build output directory
-        val buildDir = projectDir.findChild(".konvoy")
-        if (buildDir != null) {
-            contentEntry.addExcludeFolder(buildDir)
+        // .konvoy/ holds build artifacts (excluded) plus, when codegen has run,
+        // generated sources under .konvoy/gen/<generator>/ that must be indexed so
+        // generated code resolves in the editor. Register those as generated source
+        // roots and exclude the rest of .konvoy/; if nothing has been generated,
+        // exclude .konvoy/ wholesale as before.
+        val konvoyDir = projectDir.findChild(".konvoy")
+        if (konvoyDir != null) {
+            val genDirs = KonvoyGeneratedSources.generatedSourceDirs(File(basePath))
+            if (genDirs.isEmpty()) {
+                contentEntry.addExcludeFolder(konvoyDir)
+            } else {
+                konvoyDir.children.forEach { child ->
+                    if (child.isDirectory && child.name != "gen") {
+                        contentEntry.addExcludeFolder(child)
+                    }
+                }
+                val props =
+                    JpsJavaExtensionService.getInstance().createSourceRootProperties("", true)
+                val lfs = LocalFileSystem.getInstance()
+                genDirs.forEach { dir ->
+                    val vDir = lfs.refreshAndFindFileByPath(dir.path) ?: return@forEach
+                    contentEntry.addSourceFolder(vDir, JavaSourceRootType.SOURCE, props)
+                }
+            }
         }
 
         model.commit()
@@ -273,12 +295,19 @@ object KonvoyWorkspaceModelUpdater {
         depPath: String,
     ) {
         val srcDir = File(depPath, "src")
-        if (!srcDir.exists()) return
+        // Include the dependency's generated sources too (when it has codegen), so a
+        // path-dep's generated classes resolve in the consuming project.
+        val genDirs = KonvoyGeneratedSources.generatedSourceDirs(File(depPath))
+        if (!srcDir.exists() && genDirs.isEmpty()) return
 
         val lib = tableModel.createLibrary(name)
         val libModel = lib.modifiableModel
-        val url = VfsUtil.getUrlForLibraryRoot(srcDir)
-        libModel.addRoot(url, OrderRootType.SOURCES)
+        if (srcDir.exists()) {
+            libModel.addRoot(VfsUtil.getUrlForLibraryRoot(srcDir), OrderRootType.SOURCES)
+        }
+        genDirs.forEach { gen ->
+            libModel.addRoot(VfsUtil.getUrlForLibraryRoot(gen), OrderRootType.SOURCES)
+        }
         libModel.commit()
         moduleModel.addLibraryEntry(lib)
     }
