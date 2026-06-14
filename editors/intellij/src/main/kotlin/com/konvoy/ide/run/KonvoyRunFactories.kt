@@ -31,3 +31,11 @@ class KonvoyLintFactory(type: KonvoyConfigurationType) : ConfigurationFactory(ty
     override fun createTemplateConfiguration(project: Project): RunConfiguration =
         KonvoyRunConfiguration(project, this, "konvoy lint").also { it.command = KonvoyCommand.LINT }
 }
+
+class KonvoyGenerateFactory(type: KonvoyConfigurationType) : ConfigurationFactory(type) {
+    override fun getId(): String = "KonvoyGenerate"
+    override fun getName(): String = "Generate"
+    override fun createTemplateConfiguration(project: Project): RunConfiguration =
+        KonvoyRunConfiguration(project, this, "konvoy generate")
+            .also { it.command = KonvoyCommand.GENERATE }
+}

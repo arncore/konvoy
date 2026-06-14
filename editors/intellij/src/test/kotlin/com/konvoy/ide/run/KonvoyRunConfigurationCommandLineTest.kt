@@ -64,10 +64,22 @@ class KonvoyRunConfigurationCommandLineTest : TestCase() {
         assertEquals(listOf("lint", "--verbose"), cmd.parametersList.parameters)
     }
 
+    fun testCommandLineDoesNotAddTargetForGenerate() {
+        val cmd = createKonvoyCommandLine(
+            File("/tmp/project"),
+            KonvoyCommand.GENERATE,
+            KonvoyTarget.LINUX_X64,
+            "--verbose",
+        )
+
+        assertEquals(listOf("generate", "--verbose"), cmd.parametersList.parameters)
+    }
+
     fun testTargetSelectorIsOnlyEnabledForCommandsThatAcceptTargets() {
         assertTrue(isTargetSelectorEnabled(KonvoyCommand.BUILD))
         assertTrue(isTargetSelectorEnabled(KonvoyCommand.RUN))
         assertTrue(isTargetSelectorEnabled(KonvoyCommand.TEST))
         assertFalse(isTargetSelectorEnabled(KonvoyCommand.LINT))
+        assertFalse(isTargetSelectorEnabled(KonvoyCommand.GENERATE))
     }
 }
