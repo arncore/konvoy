@@ -35,6 +35,8 @@ class KonvoyTomlDocumentationProvider : AbstractDocumentationProvider() {
                 sectionName == "toolchain" -> "<b>[toolchain]</b><br/>Toolchain versions: Kotlin/Native compiler and optional tools."
                 sectionName == "dependencies" -> "<b>[dependencies]</b><br/>Project dependencies — path-based or Maven-based."
                 sectionName == "plugins" -> "<b>[plugins]</b><br/>Compiler plugins (e.g., kotlinx-serialization)."
+                sectionName == "codegen" || sectionName == "codegen.openapi" ->
+                    "<b>[codegen.openapi]</b><br/>OpenAPI code generation via Fabrikt — generates Kotlin models from an OpenAPI spec before compilation."
                 else -> null
             }
         }
