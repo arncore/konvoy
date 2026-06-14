@@ -105,5 +105,12 @@
                 icon="AllIcons.Actions.Refresh">
             <add-to-group group-id="BuildMenu" anchor="first"/>
         </action>
+        <action id="Konvoy.Generate"
+                class="com.konvoy.ide.sync.KonvoyGenerateAction"
+                text="Generate Konvoy Sources"
+                description="Run konvoy generate to (re)generate sources from specs"
+                icon="AllIcons.Actions.Compile">
+            <add-to-group group-id="BuildMenu" anchor="after" relative-to-action="Konvoy.SyncProject"/>
+        </action>
     </actions>
 </idea-plugin>

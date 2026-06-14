@@ -7,7 +7,7 @@ import javax.swing.Icon
 
 /**
  * Registers Konvoy run configuration type in IntelliJ's run configuration UI.
- * Provides factories for build, run, test, and lint configurations.
+ * Provides factories for build, run, test, lint, and generate configurations.
  */
 class KonvoyConfigurationType : ConfigurationType {
     override fun getDisplayName(): String = "Konvoy"
@@ -20,6 +20,7 @@ class KonvoyConfigurationType : ConfigurationType {
         KonvoyBuildFactory(this),
         KonvoyTestFactory(this),
         KonvoyLintFactory(this),
+        KonvoyGenerateFactory(this),
     )
 
     companion object {

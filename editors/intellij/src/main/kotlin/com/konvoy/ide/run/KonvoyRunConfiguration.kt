@@ -64,10 +64,12 @@ enum class KonvoyCommand(val displayName: String, val subcommand: String) {
     RUN("Run", "run"),
     TEST("Test", "test"),
     LINT("Lint", "lint"),
+    GENERATE("Generate", "generate"),
 }
 
+// `lint` and `generate` are target-agnostic — they take no --target.
 internal val KonvoyCommand.supportsTarget: Boolean
-    get() = this != KonvoyCommand.LINT
+    get() = this != KonvoyCommand.LINT && this != KonvoyCommand.GENERATE
 
 enum class KonvoyTarget(val displayName: String, val cliValue: String?) {
     HOST("Host", null),
