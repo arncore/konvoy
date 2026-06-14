@@ -277,34 +277,34 @@ pub fn run_codegen(
 ) -> Result<Vec<PathBuf>, EngineError> {
     let mut generated = Vec::new();
     for generator in generators {
-        generated.extend(run_one_generator(
-            project_root,
-            generator.as_ref(),
-            jre_home,
-            verbose,
-        )?);
+        let (_, files) = run_one_generator(project_root, generator.as_ref(), jre_home, verbose)?;
+        generated.extend(files);
     }
     Ok(generated)
 }
 
-/// Run a single generator and return the `.kt` files it emitted.
+/// Run a single generator, returning its output directory and the `.kt` files it
+/// emitted.
 ///
 /// Generators may nest their output (e.g. Fabrikt writes under
 /// `<output_dir>/src/main/kotlin/`); a generator that legitimately produced no
-/// output directory (emitted nothing) yields an empty list rather than erroring.
+/// output directory (emitted nothing) yields an empty file list rather than
+/// erroring. The output directory is returned (rather than recomputed by callers)
+/// so `generate` can report it without re-deriving the path.
 fn run_one_generator(
     project_root: &Path,
     generator: &dyn CodeGenerator,
     jre_home: Option<&Path>,
     verbose: bool,
-) -> Result<Vec<PathBuf>, EngineError> {
+) -> Result<(PathBuf, Vec<PathBuf>), EngineError> {
     let output_dir = generator_output_dir(project_root, generator.name());
     generator.generate(project_root, &output_dir, jre_home, verbose)?;
-    if output_dir.is_dir() {
-        Ok(konvoy_util::fs::collect_files(&output_dir, "kt")?)
+    let files = if output_dir.is_dir() {
+        konvoy_util::fs::collect_files(&output_dir, "kt")?
     } else {
-        Ok(Vec::new())
-    }
+        Vec::new()
+    };
+    Ok((output_dir, files))
 }
 
 /// One generator's result from a [`generate`] run.
@@ -356,14 +356,11 @@ pub fn generate(
         return Err(EngineError::CodegenNotConfigured);
     }
 
-    // Validate every generator's declared inputs up front — the same input pass
-    // `konvoy build` runs while hashing them for the cache key. This makes a
-    // missing spec fail fast with an actionable `CodegenInputNotFound` (identical
-    // to `build`) *before* any toolchain/tool download, rather than letting the
-    // generator process fail later with an opaque tool error. The hashes
-    // themselves are not needed here (generate has no cache key), so they are
-    // discarded.
-    compute_codegen_hashes(root, &generators)?;
+    // Validate every generator's declared inputs up front, so a missing spec fails
+    // fast with an actionable `CodegenInputNotFound` (as `konvoy build` reports it)
+    // *before* any toolchain/tool download — rather than letting the generator
+    // process fail later with an opaque tool error.
+    validate_generator_inputs(root, &generators)?;
 
     let lockfile = konvoy_config::lockfile::Lockfile::from_path(&root.join("konvoy.lock"))?;
 
@@ -378,14 +375,46 @@ pub fn generate(
 
     let mut outputs = Vec::with_capacity(generators.len());
     for generator in &generators {
-        let files = run_one_generator(root, generator.as_ref(), Some(&jre_home), verbose)?;
+        let (output_dir, files) =
+            run_one_generator(root, generator.as_ref(), Some(&jre_home), verbose)?;
         outputs.push(GeneratedOutput {
             display_name: generator.display_name().to_owned(),
             file_count: files.len(),
-            output_dir: generator_output_dir(root, generator.name()),
+            output_dir,
         });
     }
     Ok(GenerateResult { outputs })
+}
+
+/// Validate that every generator's declared inputs exist, mapping a missing input
+/// to the actionable [`EngineError::CodegenInputNotFound`].
+///
+/// This is the cheap counterpart to [`compute_codegen_hashes`]: `konvoy build`
+/// validates inputs *while* reading and hashing them for the cache key, but
+/// `konvoy generate` has no cache key — it only needs to confirm the declared
+/// inputs are present (a `stat`, not a full content read) before doing any
+/// toolchain/tool work. (The cache-key portability checks in
+/// [`compute_generator_hash`] are likewise build-only and not repeated here.)
+///
+/// # Errors
+/// [`EngineError::CodegenInputNotFound`] if a declared input is missing, plus any
+/// error from enumerating a generator's inputs (e.g. a missing spec directory).
+fn validate_generator_inputs(
+    project_root: &Path,
+    generators: &[Box<dyn CodeGenerator>],
+) -> Result<(), EngineError> {
+    for generator in generators {
+        for input in generator.input_files(project_root)? {
+            let full_path = project_root.join(&input);
+            if !full_path.exists() {
+                return Err(EngineError::CodegenInputNotFound {
+                    name: generator.name().to_owned(),
+                    path: full_path.display().to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn compute_generator_hash(

@@ -601,20 +601,16 @@ fn check_codegen(manifest: &konvoy_config::Manifest) -> u32 {
     for generator in konvoy_engine::codegen::active_generators(&manifest.codegen) {
         let tool = generator.managed_tool();
         let label = generator.display_name();
-        match tool.is_installed() {
-            Ok(true) => match tool.artifact_path() {
-                Ok(path) => eprintln!(
-                    "  [ok] {label} ({}): {} ({})",
-                    tool.id(),
-                    tool.version(),
-                    path.display()
-                ),
-                Err(e) => {
-                    eprintln!("  [!!] {label} ({}): {e}", tool.id());
-                    issues = issues.saturating_add(1);
-                }
-            },
-            Ok(false) => eprintln!(
+        // `artifact_path()` is the same path `is_installed()` checks; compute it
+        // once and `.exists()` it, rather than resolving the path twice.
+        match tool.artifact_path() {
+            Ok(path) if path.exists() => eprintln!(
+                "  [ok] {label} ({}): {} ({})",
+                tool.id(),
+                tool.version(),
+                path.display()
+            ),
+            Ok(_) => eprintln!(
                 "  [--] {label} ({}): {} not downloaded — will download on first `konvoy generate` or `konvoy build`",
                 tool.id(),
                 tool.version()
