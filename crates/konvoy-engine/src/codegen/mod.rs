@@ -342,8 +342,9 @@ pub struct GenerateResult {
 ///
 /// # Errors
 /// Returns [`EngineError::CodegenNotConfigured`] when no `[codegen]` is configured,
-/// or any error from staleness checking, JRE/tool resolution, or a generator
-/// process.
+/// [`EngineError::CodegenInputNotFound`] when a declared input (e.g. the spec) is
+/// missing, or any error from staleness checking, JRE/tool resolution, or a
+/// generator process.
 pub fn generate(
     root: &Path,
     verbose: bool,
@@ -354,6 +355,15 @@ pub fn generate(
     if generators.is_empty() {
         return Err(EngineError::CodegenNotConfigured);
     }
+
+    // Validate every generator's declared inputs up front — the same input pass
+    // `konvoy build` runs while hashing them for the cache key. This makes a
+    // missing spec fail fast with an actionable `CodegenInputNotFound` (identical
+    // to `build`) *before* any toolchain/tool download, rather than letting the
+    // generator process fail later with an opaque tool error. The hashes
+    // themselves are not needed here (generate has no cache key), so they are
+    // discarded.
+    compute_codegen_hashes(root, &generators)?;
 
     let lockfile = konvoy_config::lockfile::Lockfile::from_path(&root.join("konvoy.lock"))?;
 
@@ -1130,6 +1140,30 @@ mod tests {
         ) {
             Err(EngineError::CodegenNotConfigured) => {}
             other => panic!("expected CodegenNotConfigured, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generate_with_missing_spec_is_codegen_input_not_found() {
+        // A configured spec that doesn't exist must fail fast with
+        // CodegenInputNotFound (the same input validation `build` does) BEFORE any
+        // toolchain/tool resolution — so the resolver policy is irrelevant here.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("konvoy.toml"),
+            "[package]\nname = \"demo\"\n\n[toolchain]\nkotlin = \"2.2.0\"\n\n\
+             [codegen.openapi]\nversion = \"20.0.0\"\nspec = \"specs/api.yaml\"\n\
+             base_package = \"com.example.gen\"\n",
+        )
+        .unwrap();
+
+        match generate(
+            tmp.path(),
+            false,
+            crate::common::test_resolver(false, false),
+        ) {
+            Err(EngineError::CodegenInputNotFound { name, .. }) => assert_eq!(name, "openapi"),
+            other => panic!("expected CodegenInputNotFound, got {other:?}"),
         }
     }
 }

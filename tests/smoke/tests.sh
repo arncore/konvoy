@@ -1384,6 +1384,150 @@ test_codegen_generate_command() {
     assert_contains "$out" "Generated"
 }
 
+# Expected: `konvoy generate --verbose` exercises the verbose plumbing end-to-end
+# (the generator runs with output shown) and still materializes sources.
+test_codegen_generate_verbose() {
+    konvoy init --name cg-gen-v --lib >/dev/null 2>&1
+    rm -rf cg-gen-v/src
+    _append_codegen_config cg-gen-v/konvoy.toml
+    _write_openapi_spec cg-gen-v/specs/api.yaml
+    cd cg-gen-v
+    local out
+    out=$(konvoy generate --verbose 2>&1)
+    assert_contains "$out" "Generated"
+    _assert_generated_kt .konvoy/gen/openapi
+}
+
+# Expected (generate -> build handoff): `generate` materializes sources WITHOUT a
+# pin; a subsequent `build` compiles them AND writes the [[codegen_tools]] pin (the
+# pin is owned by build, not generate). The binary then runs with the generated
+# model linked in.
+test_codegen_generate_then_build_handoff() {
+    konvoy init --name cg-gen-build >/dev/null 2>&1
+    _append_codegen_config cg-gen-build/konvoy.toml
+    _write_openapi_spec cg-gen-build/specs/api.yaml
+    cat > cg-gen-build/src/main.kt << 'KOTLIN'
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.encodeToString
+
+@Serializable
+data class Cfg(val name: String)
+
+fun main() {
+    println("cfg=" + Json.encodeToString(Cfg("ok")))
+}
+KOTLIN
+    cd cg-gen-build
+
+    local gen_out
+    gen_out=$(konvoy generate 2>&1)
+    assert_contains "$gen_out" "Generated"
+    _assert_generated_kt .konvoy/gen/openapi
+    if [ -f konvoy.lock ] && grep -q '\[\[codegen_tools\]\]' konvoy.lock; then
+        echo "    generate must not pin the codegen tool" >&2
+        return 1
+    fi
+
+    local build_out
+    build_out=$(konvoy build 2>&1)
+    assert_contains "$build_out" "Compiling"
+    assert_file_contains konvoy.lock "[[codegen_tools]]"
+    assert_file_contains konvoy.lock "fabrikt"
+
+    local run_out
+    run_out=$(konvoy run 2>&1)
+    assert_contains "$run_out" "cfg="
+}
+
+# Expected (the post-build flag matrix, from a pinned + cached state): one build
+# pins the Fabrikt tool and caches the JAR; then `generate --locked` (pin present →
+# no drift), `generate --offline` (tool + JRE present), and `generate --locked
+# --offline` (frozen) all succeed.
+test_codegen_generate_locked_and_offline_after_build() {
+    konvoy init --name cg-gen-frozen --lib >/dev/null 2>&1
+    rm -rf cg-gen-frozen/src
+    _append_codegen_config cg-gen-frozen/konvoy.toml
+    _write_openapi_spec cg-gen-frozen/specs/api.yaml
+    cd cg-gen-frozen
+
+    konvoy build >/dev/null 2>&1
+    assert_file_contains konvoy.lock "[[codegen_tools]]"
+
+    local out_locked
+    out_locked=$(konvoy generate --locked 2>&1)
+    assert_contains "$out_locked" "Generated"
+    _assert_generated_kt .konvoy/gen/openapi
+
+    local out_offline
+    out_offline=$(konvoy generate --offline 2>&1)
+    assert_contains "$out_offline" "Generated"
+
+    local out_frozen
+    out_frozen=$(konvoy generate --locked --offline 2>&1)
+    assert_contains "$out_frozen" "Generated"
+}
+
+# Expected: `konvoy clean --all` removes .konvoy/ (including generated sources);
+# `generate` recreates them cleanly.
+test_codegen_generate_after_clean_regenerates() {
+    konvoy init --name cg-gen-clean --lib >/dev/null 2>&1
+    rm -rf cg-gen-clean/src
+    _append_codegen_config cg-gen-clean/konvoy.toml
+    _write_openapi_spec cg-gen-clean/specs/api.yaml
+    cd cg-gen-clean
+
+    konvoy generate >/dev/null 2>&1
+    _assert_generated_kt .konvoy/gen/openapi
+
+    konvoy clean --all >/dev/null 2>&1
+    if [ -d .konvoy/gen ]; then
+        echo "    konvoy clean --all should remove .konvoy/gen" >&2
+        return 1
+    fi
+
+    local out
+    out=$(konvoy generate 2>&1)
+    assert_contains "$out" "Generated"
+    _assert_generated_kt .konvoy/gen/openapi
+}
+
+# Expected (root-scoped): the root AND a path-dep BOTH declare codegen. `generate`
+# is root-scoped — it runs ONLY the root's generators and never touches the
+# dependency's checkout (the dep's sources are generated when it is built).
+test_codegen_generate_is_root_scoped() {
+    konvoy init --name cg-rs-dep --lib >/dev/null 2>&1
+    konvoy init --name cg-rs-root --lib >/dev/null 2>&1
+    rm -rf cg-rs-root/src
+    _append_codegen_config cg-rs-dep/konvoy.toml
+    _write_openapi_spec cg-rs-dep/specs/api.yaml
+    _write_openapi_spec cg-rs-root/specs/api.yaml
+    # Root needs no plugins/runtime deps (generate doesn't compile): a bare codegen
+    # section + the path dependency (one [dependencies] table) is enough.
+    cat >> cg-rs-root/konvoy.toml << 'TOML'
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.root"
+
+[dependencies]
+cg-rs-dep = { path = "../cg-rs-dep" }
+TOML
+    cd cg-rs-root
+
+    local out
+    out=$(konvoy generate 2>&1)
+    assert_contains "$out" "Generated"
+    _assert_generated_kt .konvoy/gen/openapi
+
+    # The dependency's generators are NOT run by a root `generate`.
+    if [ -d ../cg-rs-dep/.konvoy/gen ]; then
+        echo "    konvoy generate must be root-scoped (dep .konvoy/gen was created)" >&2
+        return 1
+    fi
+}
+
 # Unexpected: `konvoy generate` on a project with no [codegen] fails fast with a
 # clear "not configured" message, before any network or JRE work.
 test_codegen_generate_no_codegen_fails() {
@@ -1395,6 +1539,126 @@ test_codegen_generate_no_codegen_fails() {
         return 1
     fi
     assert_contains "$output" "no codegen configured"
+}
+
+# Unexpected: `generate --locked` without a codegen pin is lockfile drift. (A spec
+# is present so input validation passes and the resolver's drift gate is reached.)
+test_codegen_generate_locked_no_pin_fails() {
+    konvoy init --name cg-gen-locked --lib >/dev/null 2>&1
+    cat >> cg-gen-locked/konvoy.toml << 'TOML'
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.gen"
+TOML
+    _write_openapi_spec cg-gen-locked/specs/api.yaml
+    cd cg-gen-locked
+    printf '[toolchain]\nkonanc_version = "2.2.0"\n' > konvoy.lock
+    local output
+    if output=$(konvoy generate --locked 2>&1); then
+        echo "    expected generate --locked to fail without a codegen pin" >&2
+        return 1
+    fi
+    assert_contains "$output" "lockfile"
+}
+
+# Unexpected: `generate --offline` with an uncached Fabrikt JAR is a hard error
+# naming the tool. The toolchain JRE IS present (pre-installed), so this reaches the
+# codegen-tool gate; a unique version guarantees the JAR is never cached (no race).
+test_codegen_generate_offline_tool_absent_fails() {
+    konvoy init --name cg-gen-offtool --lib >/dev/null 2>&1
+    cat >> cg-gen-offtool/konvoy.toml << 'TOML'
+
+[codegen.openapi]
+version = "97.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.gen"
+TOML
+    _write_openapi_spec cg-gen-offtool/specs/api.yaml
+    cd cg-gen-offtool
+    local output
+    if output=$(konvoy generate --offline 2>&1); then
+        echo "    expected generate --offline to fail with an absent codegen tool" >&2
+        return 1
+    fi
+    assert_contains "$output" 'codegen tool `fabrikt`'
+    assert_contains "$output" "--offline prevents downloads"
+}
+
+# Unexpected: `generate --offline` when the toolchain (and thus its bundled JRE) is
+# absent fails at JRE resolution with the tool-agnostic toolchain error — NOT a
+# detekt-branded one. An uninstalled, never-cached toolchain version forces the gate.
+test_codegen_generate_offline_jre_absent_fails() {
+    konvoy init --name cg-gen-offjre --lib >/dev/null 2>&1
+    sed -i 's/^kotlin = .*/kotlin = "9.9.9"/' cg-gen-offjre/konvoy.toml
+    cat >> cg-gen-offjre/konvoy.toml << 'TOML'
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.gen"
+TOML
+    _write_openapi_spec cg-gen-offjre/specs/api.yaml
+    cd cg-gen-offjre
+    local output
+    if output=$(konvoy generate --offline 2>&1); then
+        echo "    expected generate --offline to fail with the toolchain JRE absent" >&2
+        return 1
+    fi
+    assert_contains "$output" "9.9.9"
+    assert_contains "$output" "--offline prevents downloads"
+}
+
+# Unexpected: a declared-but-missing spec fails fast with the same actionable
+# CodegenInputNotFound `konvoy build` gives — BEFORE any toolchain/tool work.
+test_codegen_generate_missing_spec_fails() {
+    konvoy init --name cg-gen-nospec --lib >/dev/null 2>&1
+    cat >> cg-gen-nospec/konvoy.toml << 'TOML'
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.gen"
+TOML
+    cd cg-gen-nospec
+    local output
+    if output=$(konvoy generate 2>&1); then
+        echo "    expected generate to fail with a missing spec file" >&2
+        return 1
+    fi
+    assert_contains "$output" "codegen input for"
+    assert_contains "$output" "not found"
+}
+
+# Unexpected: `konvoy generate` outside a project (no konvoy.toml) errors clearly.
+test_codegen_generate_outside_project_fails() {
+    local output
+    if output=$(konvoy generate 2>&1); then
+        echo "    expected generate to fail outside a project" >&2
+        return 1
+    fi
+    assert_contains "$output" "no konvoy.toml"
+}
+
+# Unexpected: manifest validation (shared with build) also blocks generate — an
+# absolute spec path is rejected at parse time, before any work.
+test_codegen_generate_absolute_spec_rejected() {
+    konvoy init --name cg-gen-abs --lib >/dev/null 2>&1
+    cat >> cg-gen-abs/konvoy.toml << 'TOML'
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "/etc/api.yaml"
+base_package = "com.example.gen"
+TOML
+    cd cg-gen-abs
+    local output
+    if output=$(konvoy generate 2>&1); then
+        echo "    expected generate to reject an absolute spec path" >&2
+        return 1
+    fi
+    assert_contains "$output" "relative path inside the project"
 }
 
 # Expected (doctor, not-downloaded path): `konvoy doctor` reports each configured
@@ -3234,7 +3498,18 @@ run_test test_codegen_bad_spec_extension_rejected
 run_test test_codegen_old_fabrikt_version_rejected
 run_test test_codegen_unknown_tool_rejected
 run_test test_codegen_generate_command
+run_test test_codegen_generate_verbose
+run_test test_codegen_generate_then_build_handoff
+run_test test_codegen_generate_locked_and_offline_after_build
+run_test test_codegen_generate_after_clean_regenerates
+run_test test_codegen_generate_is_root_scoped
 run_test test_codegen_generate_no_codegen_fails
+run_test test_codegen_generate_locked_no_pin_fails
+run_test test_codegen_generate_offline_tool_absent_fails
+run_test test_codegen_generate_offline_jre_absent_fails
+run_test test_codegen_generate_missing_spec_fails
+run_test test_codegen_generate_outside_project_fails
+run_test test_codegen_generate_absolute_spec_rejected
 run_test test_codegen_doctor_reports_not_downloaded
 run_test test_codegen_doctor_reports_installed
 
