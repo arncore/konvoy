@@ -256,7 +256,7 @@ pub fn lint(
     // with the toolchain absent), and a failed lint must not leave a rewritten
     // konvoy.lock behind. This is also the last read of `lockfile`, so the
     // persist below can consume it without a clone.
-    let jre_home = resolver.resolve_detekt_jre(&manifest.toolchain.kotlin, &lockfile)?;
+    let jre_home = resolver.resolve_jre(&manifest.toolchain.kotlin, &lockfile)?;
 
     // Persist the freshly-resolved hash to the lockfile if it was not pinned.
     if let Some(actual_sha256) = detekt_hash_to_persist {
@@ -671,9 +671,9 @@ src/main.kt:3:5: Magic number. [MagicNumber]
         assert!(
             matches!(
                 result,
-                Err(crate::error::EngineError::DetektJreOffline { .. })
+                Err(crate::error::EngineError::ToolchainJreOffline { .. })
             ),
-            "expected DetektJreOffline, got: {result:?}"
+            "expected ToolchainJreOffline, got: {result:?}"
         );
         let err = result.unwrap_err().to_string();
         assert!(

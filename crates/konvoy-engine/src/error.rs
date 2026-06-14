@@ -116,13 +116,17 @@ pub enum EngineError {
     #[error("cannot run tool `{tool}`: {message}")]
     ToolExecFailed { tool: String, message: String },
 
-    /// No JRE available to run detekt.
-    #[error("jre not available for running detekt — run `konvoy toolchain install` first")]
-    DetektNoJre,
+    /// No JRE available in the Kotlin/Native toolchain (needed to run JVM tools
+    /// such as detekt and codegen generators).
+    #[error(
+        "no JRE available in the Kotlin/Native toolchain — run `konvoy toolchain install` first"
+    )]
+    ToolchainNoJre,
 
-    /// The toolchain providing detekt's JRE is missing and --offline prevents installing it.
-    #[error("Kotlin/Native toolchain {version} is not installed (detekt needs its JRE) and --offline prevents downloads — run `konvoy toolchain install` first, or drop --offline")]
-    DetektJreOffline { version: String },
+    /// The Kotlin/Native toolchain providing the bundled JRE is missing and
+    /// --offline prevents installing it.
+    #[error("Kotlin/Native toolchain {version} is not installed (its bundled JRE is needed to run JVM tools) and --offline prevents downloads — run `konvoy toolchain install` first, or drop --offline")]
+    ToolchainJreOffline { version: String },
 
     /// Detekt jar hash mismatch.
     #[error("detekt {version} jar hash mismatch — expected {expected}, got {actual}; this may indicate a tampered or corrupted download — delete ~/.konvoy/tools/detekt/{version}/ and re-run `konvoy lint` to re-download, or verify the hash at the detekt release page")]
@@ -135,6 +139,10 @@ pub enum EngineError {
     /// Lint not configured.
     #[error("detekt not configured — add `detekt = \"1.23.7\"` to [toolchain] in konvoy.toml")]
     LintNotConfigured,
+
+    /// `konvoy generate` invoked on a project with no codegen configured.
+    #[error("no codegen configured — add a `[codegen.openapi]` section to konvoy.toml")]
+    CodegenNotConfigured,
 
     /// A configured codegen input file is missing.
     #[error("codegen input for `{name}` not found at {path} — create the file, or fix the inputs configured in [codegen.{name}]")]

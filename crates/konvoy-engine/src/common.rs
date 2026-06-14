@@ -100,8 +100,15 @@ impl<'a> ArtifactResolver<'a> {
         Ok((!was_pinned).then_some(actual_sha256))
     }
 
-    /// Resolve the JRE used to run detekt.
-    pub(crate) fn resolve_detekt_jre(
+    /// Resolve the Kotlin/Native toolchain's bundled JRE, used to run managed JVM
+    /// tools (detekt and the JVM codegen generators).
+    ///
+    /// Only the JRE is needed here — not the `konanc` compiler — so this is lighter
+    /// than full toolchain resolution; it installs the toolchain solely to obtain
+    /// its bundled JRE when absent. The errors are tool-agnostic on purpose
+    /// (`ToolchainJreOffline` / `ToolchainNoJre`): both `lint` and `generate` share
+    /// this path.
+    pub(crate) fn resolve_jre(
         self,
         kotlin_version: &str,
         lockfile: &Lockfile,
@@ -110,7 +117,7 @@ impl<'a> ArtifactResolver<'a> {
             self.resolve_artifact(
                 || has_required_toolchain_artifact_pins(lockfile, kotlin_version),
                 false,
-                || EngineError::DetektJreOffline {
+                || EngineError::ToolchainJreOffline {
                     version: kotlin_version.to_owned(),
                 },
             )?;
@@ -120,7 +127,7 @@ impl<'a> ArtifactResolver<'a> {
 
         let jre_home = konvoy_konanc::toolchain::jre_home_path(kotlin_version)?;
         if !jre_home.join("bin").join("java").exists() {
-            return Err(EngineError::DetektNoJre);
+            return Err(EngineError::ToolchainNoJre);
         }
         Ok(jre_home)
     }
@@ -720,29 +727,29 @@ mod tests {
     }
 
     #[test]
-    fn resolve_detekt_jre_reports_locked_drift_when_toolchain_hashes_missing() {
-        let version = "0.0.0-resolver-detekt-jre-drift";
+    fn resolve_jre_reports_locked_drift_when_toolchain_hashes_missing() {
+        let version = "0.0.0-resolver-jre-drift";
         let lockfile = lockfile_with_toolchain(version, None, None);
 
         let result = with_resolver(false, true, |resolver| {
-            resolver.resolve_detekt_jre(version, &lockfile)
+            resolver.resolve_jre(version, &lockfile)
         });
 
         assert!(matches!(result, Err(EngineError::LockfileUpdateRequired)));
     }
 
     #[test]
-    fn resolve_detekt_jre_reports_offline_when_pinned_but_absent() {
-        let version = "0.0.0-resolver-detekt-jre-offline";
+    fn resolve_jre_reports_offline_when_pinned_but_absent() {
+        let version = "0.0.0-resolver-jre-offline";
         let lockfile = lockfile_with_toolchain(version, Some("konanc-sha"), Some("jre-sha"));
 
         let result = with_resolver(true, false, |resolver| {
-            resolver.resolve_detekt_jre(version, &lockfile)
+            resolver.resolve_jre(version, &lockfile)
         });
 
         assert!(matches!(
             result,
-            Err(EngineError::DetektJreOffline { version: got }) if got == version
+            Err(EngineError::ToolchainJreOffline { version: got }) if got == version
         ));
     }
 

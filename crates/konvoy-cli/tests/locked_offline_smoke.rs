@@ -288,7 +288,7 @@ fn offline_lint_errors_when_detekt_jar_absent() {
 
 /// Regression guard: a `lint --offline` that fails at JRE resolution (detekt JAR
 /// is cached, but the toolchain providing the JRE is not) must report
-/// `DetektJreOffline` AND must NOT leave a rewritten konvoy.lock behind — the
+/// `ToolchainJreOffline` AND must NOT leave a rewritten konvoy.lock behind — the
 /// detekt-hash persist happens only after the JRE resolves successfully.
 #[test]
 fn offline_lint_jre_failure_leaves_lockfile_untouched() {
