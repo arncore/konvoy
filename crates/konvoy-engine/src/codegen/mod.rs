@@ -21,17 +21,6 @@ pub mod openapi;
 // the engine root (`crate::managed_tool`); re-exported here for codegen callers.
 pub use crate::managed_tool::ManagedToolSpec;
 
-/// Display metadata for a configured generator.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GeneratorSummary {
-    /// Stable generator name used in paths and cache key tags.
-    pub name: String,
-    /// Human-readable generator label.
-    pub display_name: String,
-    /// Directory containing this generator's outputs.
-    pub output_dir: PathBuf,
-}
-
 /// A configured code generator.
 ///
 /// Implemented by each concrete generator (OpenAPI/Fabrikt today; gRPC etc.
@@ -98,31 +87,6 @@ pub fn active_generators(codegen: &Codegen) -> Vec<Box<dyn CodeGenerator>> {
         generators.push(Box::new(openapi::OpenApiGenerator::new(openapi.clone())));
     }
     generators
-}
-
-/// Return display summaries for the given generators.
-#[must_use]
-pub fn generator_summaries(
-    project_root: &Path,
-    generators: &[Box<dyn CodeGenerator>],
-) -> Vec<GeneratorSummary> {
-    generators
-        .iter()
-        .map(|generator| GeneratorSummary {
-            name: generator.name().to_owned(),
-            display_name: generator.display_name().to_owned(),
-            output_dir: generator_output_dir(project_root, generator.name()),
-        })
-        .collect()
-}
-
-/// Return the managed tools required by the given generators.
-#[must_use]
-pub fn managed_tools(generators: &[Box<dyn CodeGenerator>]) -> Vec<ManagedToolSpec> {
-    generators
-        .iter()
-        .map(|generator| generator.managed_tool())
-        .collect()
 }
 
 /// Compute `(generator name, input hash)` pairs for the given generators, in the
@@ -910,24 +874,6 @@ mod tests {
     fn output_dir_is_under_dot_konvoy_gen() {
         let dir = generator_output_dir(Path::new("/proj"), "openapi");
         assert_eq!(dir, PathBuf::from("/proj/.konvoy/gen/openapi"));
-    }
-
-    #[test]
-    fn summaries_and_managed_tools_reflect_the_given_generators() {
-        let gens = vec![
-            fake_full("demo", "Demo Label", &[], &[]),
-            fake("other", &[], &[]),
-        ];
-        let summaries = generator_summaries(Path::new("/proj"), &gens);
-        assert_eq!(summaries.len(), 2);
-        assert_eq!(summaries[0].name, "demo");
-        assert_eq!(summaries[0].display_name, "Demo Label");
-        assert_eq!(
-            summaries[0].output_dir,
-            PathBuf::from("/proj/.konvoy/gen/demo")
-        );
-        assert_eq!(summaries[1].name, "other");
-        assert_eq!(managed_tools(&gens).len(), 2);
     }
 
     // ---- ensure_codegen_tools (download/pin orchestration) ------------------
