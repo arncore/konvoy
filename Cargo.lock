@@ -506,6 +506,7 @@ dependencies = [
  "konvoy-konanc",
  "konvoy-targets",
  "konvoy-util",
+ "serde_json",
  "tempfile",
 ]
 

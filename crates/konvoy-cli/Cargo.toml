@@ -18,6 +18,7 @@ konvoy-engine.workspace = true
 konvoy-konanc.workspace = true
 konvoy-targets.workspace = true
 konvoy-util.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

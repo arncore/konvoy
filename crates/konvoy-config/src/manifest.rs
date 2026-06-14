@@ -558,6 +558,124 @@ pub enum ManifestError {
     },
 }
 
+/// Severity of a configuration [`Diagnostic`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    /// A problem that prevents the project from building.
+    Error,
+}
+
+/// A single `konvoy.toml` diagnostic in a machine-readable form, produced by
+/// [`Manifest::check_str`] and emitted by `konvoy check` for editors to render.
+///
+/// Editors are thin clients: they consume these diagnostics rather than
+/// re-implementing any validation. `key_path` is the dotted TOML path the
+/// diagnostic concerns (e.g. `codegen.openapi` or `dependencies.foo`), so an
+/// editor can locate the offending table/key via its own PSI without knowing the
+/// rules. `line`/`column` (1-based) are filled in for TOML *syntax* errors, which
+/// carry a source span; semantic errors carry `key_path` instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Diagnostic {
+    /// How severe the problem is.
+    pub severity: Severity,
+    /// Human-readable description (the same text the CLI prints).
+    pub message: String,
+    /// Dotted TOML path the diagnostic concerns, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<String>,
+    /// 1-based line of a syntax error, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    /// 1-based column of a syntax error, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<usize>,
+}
+
+impl Manifest {
+    /// Validate a `konvoy.toml` string and return its diagnostics.
+    ///
+    /// Returns an empty vector when the manifest is valid. Reports the first
+    /// validation error (mirroring [`from_str`](Self::from_str), so a `konvoy
+    /// check` never disagrees with a `konvoy build`); the structured form lets
+    /// `konvoy check` and the IDE plugins surface it without re-implementing any
+    /// validation.
+    #[must_use]
+    pub fn check_str(content: &str, path: &str) -> Vec<Diagnostic> {
+        match Self::from_str(content, path) {
+            Ok(_) => Vec::new(),
+            Err(e) => vec![e.to_diagnostic(content)],
+        }
+    }
+}
+
+impl ManifestError {
+    /// Render this error as a structured [`Diagnostic`], locating it in the source
+    /// (`key_path` for semantic errors; `line`/`column` for syntax errors that
+    /// carry a span).
+    fn to_diagnostic(&self, content: &str) -> Diagnostic {
+        let (key_path, line, column) = self.locate(content);
+        Diagnostic {
+            severity: Severity::Error,
+            message: self.to_string(),
+            key_path,
+            line,
+            column,
+        }
+    }
+
+    /// Best-effort source location: the dotted TOML path this error concerns, and
+    /// a 1-based line/column for syntax errors that carry a span.
+    fn locate(&self, content: &str) -> (Option<String>, Option<usize>, Option<usize>) {
+        let key = |path: String| (Some(path), None, None);
+        match self {
+            ManifestError::Parse { source, .. } => match source.span() {
+                Some(span) => {
+                    let (line, column) = offset_to_line_col(content, span.start);
+                    (None, Some(line), Some(column))
+                }
+                None => (None, None, None),
+            },
+            ManifestError::EmptyName { .. } | ManifestError::InvalidName { .. } => {
+                key("package.name".to_owned())
+            }
+            ManifestError::InvalidEntrypoint { .. } => key("package.entrypoint".to_owned()),
+            ManifestError::InvalidToolchain { .. } => key("toolchain".to_owned()),
+            ManifestError::DependencyNoSource { name, .. }
+            | ManifestError::DependencyMavenWithPath { name, .. }
+            | ManifestError::DependencyMavenWithoutVersion { name, .. }
+            | ManifestError::DependencyVersionWithoutMaven { name, .. }
+            | ManifestError::DependencyEmptyVersion { name, .. }
+            | ManifestError::DependencyInvalidMaven { name, .. }
+            | ManifestError::DependencyInvalidName { name, .. }
+            | ManifestError::DependencySelfReference { name, .. } => {
+                key(format!("dependencies.{name}"))
+            }
+            ManifestError::InvalidPluginConfig { name, .. } => key(format!("plugins.{name}")),
+            ManifestError::InvalidCodegenConfig { name, .. } => key(format!("codegen.{name}")),
+            ManifestError::Read { .. } | ManifestError::Serialize { .. } => (None, None, None),
+        }
+    }
+}
+
+/// Convert a 0-based byte offset into `content` to a 1-based `(line, column)`.
+fn offset_to_line_col(content: &str, offset: usize) -> (usize, usize) {
+    let mut line = 1;
+    let mut column = 1;
+    for (i, ch) in content.char_indices() {
+        if i >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -2391,5 +2509,58 @@ version = "1.0"
         assert_eq!(maven_only.as_maven_coord(), None);
         assert_eq!(version_only.as_maven_coord(), None);
         assert_eq!(neither.as_maven_coord(), None);
+    }
+
+    // ---- check_str (structured diagnostics for `konvoy check`) --------------
+
+    #[test]
+    fn check_str_valid_manifest_has_no_diagnostics() {
+        let toml = format!("[package]\nname = \"ok\"\n{TOOLCHAIN}");
+        assert!(Manifest::check_str(&toml, "konvoy.toml").is_empty());
+    }
+
+    #[test]
+    fn check_str_semantic_error_carries_key_path_not_line() {
+        // An invalid [codegen.openapi] is a *semantic* error: it should locate via
+        // the dotted key path (so an editor can find the table) and NOT a span.
+        let toml = format!(
+            "[package]\nname = \"ok\"\n{TOOLCHAIN}\n\
+             [codegen.openapi]\nversion = \"20.0.0\"\nspec = \"a.txt\"\nbase_package = \"com.x\"\n"
+        );
+        let diags = Manifest::check_str(&toml, "konvoy.toml");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert_eq!(diags[0].key_path.as_deref(), Some("codegen.openapi"));
+        assert_eq!(diags[0].line, None);
+        assert!(diags[0].message.contains(".yaml"));
+    }
+
+    #[test]
+    fn check_str_dependency_error_keys_on_the_dependency() {
+        let toml = format!(
+            "[package]\nname = \"ok\"\n{TOOLCHAIN}\n[dependencies]\nfoo = {{ maven = \"g:a\" }}\n"
+        );
+        let diags = Manifest::check_str(&toml, "konvoy.toml");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].key_path.as_deref(), Some("dependencies.foo"));
+    }
+
+    #[test]
+    fn check_str_syntax_error_carries_line_and_column() {
+        // A TOML *syntax* error carries a source span → 1-based line/column, no key.
+        let toml = "[package\nname = \"ok\"\n";
+        let diags = Manifest::check_str(toml, "konvoy.toml");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].line, Some(1));
+        assert!(diags[0].column.is_some());
+        assert_eq!(diags[0].key_path, None);
+    }
+
+    #[test]
+    fn check_str_empty_name_keys_on_package_name() {
+        let toml = format!("[package]\nname = \"\"\n{TOOLCHAIN}");
+        let diags = Manifest::check_str(&toml, "konvoy.toml");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].key_path.as_deref(), Some("package.name"));
     }
 }
