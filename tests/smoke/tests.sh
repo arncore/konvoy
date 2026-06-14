@@ -264,6 +264,251 @@ test_doctor_all_ok() {
 }
 
 # ---------------------------------------------------------------------------
+# Tests: konvoy check (manifest validation / structured diagnostics)
+#
+# `konvoy check` is pure manifest validation — no toolchain, network, or build —
+# so these are fast. `--format json` always exits 0 (diagnostics are the payload);
+# the default human format exits non-zero when issues are found.
+# ---------------------------------------------------------------------------
+
+# Expected: a valid manifest reports no issues — human prints a clean line (exit 0),
+# json prints an empty array (exit 0).
+test_check_valid_clean() {
+    konvoy init --name chk-ok >/dev/null 2>&1
+    cd chk-ok
+    local human
+    human=$(konvoy check 2>&1)
+    assert_contains "$human" "No issues found"
+    local json
+    json=$(konvoy check --format json)
+    if [ "$json" != "[]" ]; then
+        echo "    expected empty json array for a valid manifest, got: $json" >&2
+        return 1
+    fi
+}
+
+# Expected: a manifest exercising every section (package, toolchain, plugins,
+# dependencies, codegen) validates cleanly. check never resolves plugins/deps or
+# reads the spec file — it only validates the manifest structure.
+test_check_valid_full_manifest_clean() {
+    mkdir -p chk-full && cd chk-full
+    cat > konvoy.toml << 'TOML'
+[package]
+name = "chk-full"
+kind = "bin"
+
+[toolchain]
+kotlin = "2.2.0"
+detekt = "1.23.7"
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "2.2.0" }
+
+[dependencies]
+kotlinx-serialization-core = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-core", version = "1.7.3" }
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.api"
+extra_spec_dirs = ["specs"]
+TOML
+    local json
+    json=$(konvoy check --format json)
+    if [ "$json" != "[]" ]; then
+        echo "    expected a clean full manifest, got: $json" >&2
+        return 1
+    fi
+}
+
+# Unexpected: an invalid [codegen.openapi] (bad spec extension). Human reports it and
+# exits non-zero; json reports it keyed on `codegen.openapi` and still exits 0.
+test_check_invalid_codegen_both_formats() {
+    mkdir -p chk-cg && cd chk-cg
+    cat > konvoy.toml << 'TOML'
+[package]
+name = "chk-cg"
+
+[toolchain]
+kotlin = "2.2.0"
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.txt"
+base_package = "com.example.api"
+TOML
+    local human
+    if human=$(konvoy check 2>&1); then
+        echo "    expected human check to exit non-zero on an invalid manifest" >&2
+        return 1
+    fi
+    assert_contains "$human" ".yaml, .yml, or .json"
+
+    local json
+    json=$(konvoy check --format json)
+    assert_contains "$json" '"severity":"error"'
+    assert_contains "$json" '"key_path":"codegen.openapi"'
+}
+
+# Unexpected (syntax): a TOML parse error carries line/column (no key path) in json,
+# and a file:line:col prefix in human output.
+test_check_syntax_error_line_col() {
+    mkdir -p chk-syn && cd chk-syn
+    printf '[package\nname = "x"\n' > konvoy.toml
+    local json
+    json=$(konvoy check --format json)
+    assert_contains "$json" '"line":'
+    assert_contains "$json" '"column":'
+    assert_not_contains "$json" '"key_path"'
+
+    local human
+    if human=$(konvoy check 2>&1); then
+        echo "    expected non-zero exit on a syntax error" >&2
+        return 1
+    fi
+    assert_contains "$human" "konvoy.toml:1:"
+}
+
+# Unexpected: an invalid package name keys the diagnostic on package.name.
+test_check_invalid_package_name() {
+    mkdir -p chk-name && cd chk-name
+    cat > konvoy.toml << 'TOML'
+[package]
+name = "bad name!"
+
+[toolchain]
+kotlin = "2.2.0"
+TOML
+    local json
+    json=$(konvoy check --format json)
+    assert_contains "$json" '"key_path":"package.name"'
+    assert_contains "$json" '"severity":"error"'
+}
+
+# Unexpected: a malformed dependency keys on dependencies.<name>.
+test_check_dependency_error() {
+    mkdir -p chk-dep && cd chk-dep
+    cat > konvoy.toml << 'TOML'
+[package]
+name = "chk-dep"
+
+[toolchain]
+kotlin = "2.2.0"
+
+[dependencies]
+foo = { maven = "g:a" }
+TOML
+    local json
+    json=$(konvoy check --format json)
+    assert_contains "$json" '"key_path":"dependencies.foo"'
+}
+
+# Unexpected: a malformed plugin keys on plugins.<name>.
+test_check_plugin_error() {
+    mkdir -p chk-plg && cd chk-plg
+    cat > konvoy.toml << 'TOML'
+[package]
+name = "chk-plg"
+
+[toolchain]
+kotlin = "2.2.0"
+
+[plugins]
+p = { version = "1.0.0" }
+TOML
+    local json
+    json=$(konvoy check --format json)
+    assert_contains "$json" '"key_path":"plugins.p"'
+}
+
+# Unexpected: an unknown table is rejected (deny_unknown_fields) as a parse-level
+# diagnostic carrying a location, with the offending field named.
+test_check_unknown_field_rejected() {
+    mkdir -p chk-unk && cd chk-unk
+    cat > konvoy.toml << 'TOML'
+[package]
+name = "chk-unk"
+
+[toolchain]
+kotlin = "2.2.0"
+
+[codegen.grpc]
+version = "1.0.0"
+TOML
+    local json
+    json=$(konvoy check --format json)
+    assert_contains "$json" "unknown field"
+    assert_contains "$json" "grpc"
+    assert_contains "$json" '"line":'
+}
+
+# Unexpected: an absolute spec path is rejected, keyed on codegen.openapi.
+test_check_absolute_spec_rejected() {
+    mkdir -p chk-abs && cd chk-abs
+    cat > konvoy.toml << 'TOML'
+[package]
+name = "chk-abs"
+
+[toolchain]
+kotlin = "2.2.0"
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "/etc/api.yaml"
+base_package = "com.example.api"
+TOML
+    local json
+    json=$(konvoy check --format json)
+    assert_contains "$json" '"key_path":"codegen.openapi"'
+    assert_contains "$json" "relative path inside the project"
+}
+
+# Edge: `konvoy check` outside a project (no konvoy.toml) fails clearly — the project
+# precondition fails before validation, in BOTH formats (so --format json does not
+# emit JSON here; that is the documented exception to "json always exits 0").
+test_check_no_manifest_fails() {
+    mkdir -p chk-empty && cd chk-empty
+    local output
+    if output=$(konvoy check 2>&1); then
+        echo "    expected konvoy check to fail with no konvoy.toml" >&2
+        return 1
+    fi
+    assert_contains "$output" "no konvoy.toml"
+    if konvoy check --format json >/dev/null 2>&1; then
+        echo "    expected konvoy check --format json to also fail with no konvoy.toml" >&2
+        return 1
+    fi
+}
+
+# Edge: check reports the FIRST error only (mirroring `konvoy build`), so a manifest
+# with multiple problems yields exactly one diagnostic — the earliest (package name,
+# validated before codegen).
+test_check_reports_first_error_only() {
+    mkdir -p chk-first && cd chk-first
+    cat > konvoy.toml << 'TOML'
+[package]
+name = "bad name!"
+
+[toolchain]
+kotlin = "2.2.0"
+
+[codegen.openapi]
+version = "20.0.0"
+spec = "api.txt"
+base_package = "com.example.api"
+TOML
+    local json
+    json=$(konvoy check --format json)
+    local count
+    count=$(echo "$json" | grep -o '"severity"' | wc -l | tr -d ' ')
+    if [ "$count" != "1" ]; then
+        echo "    expected exactly 1 diagnostic (first error only), got $count: $json" >&2
+        return 1
+    fi
+    assert_contains "$json" '"key_path":"package.name"'
+}
+
+# ---------------------------------------------------------------------------
 # Tests: build lifecycle (combined to minimize konanc invocations)
 # ---------------------------------------------------------------------------
 
@@ -3534,6 +3779,18 @@ run_test test_path_dep_undeclared_sibling_fails
 run_test test_doctor_maven_dep_checks
 run_test test_doctor_missing_lockfile_entry_warns
 run_test test_doctor_no_lockfile_warns
+# check command
+run_test test_check_valid_clean
+run_test test_check_valid_full_manifest_clean
+run_test test_check_invalid_codegen_both_formats
+run_test test_check_syntax_error_line_col
+run_test test_check_invalid_package_name
+run_test test_check_dependency_error
+run_test test_check_plugin_error
+run_test test_check_unknown_field_rejected
+run_test test_check_absolute_spec_rejected
+run_test test_check_no_manifest_fails
+run_test test_check_reports_first_error_only
 # test command
 run_test test_test_lifecycle
 run_test test_test_no_test_dir_fails

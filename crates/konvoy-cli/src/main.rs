@@ -143,11 +143,27 @@ enum Command {
     },
     /// Check environment and toolchain setup
     Doctor,
+    /// Validate konvoy.toml and report configuration issues
+    Check {
+        /// Output format: human-readable text, or JSON (for editors/tools)
+        #[arg(long, value_enum, default_value_t = CheckFormat::Human)]
+        format: CheckFormat,
+    },
     /// Manage Kotlin/Native toolchains
     Toolchain {
         #[command(subcommand)]
         action: ToolchainAction,
     },
+}
+
+/// Output format for `konvoy check`.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum CheckFormat {
+    /// Human-readable lines on stderr (non-zero exit if issues are found).
+    Human,
+    /// A JSON array of diagnostics on stdout (always exits 0 — the issues are the
+    /// data). Stable contract for editor integrations.
+    Json,
 }
 
 #[derive(Debug, Subcommand)]
@@ -252,6 +268,7 @@ fn main() {
         Command::Update => with_resolver(false, false, cmd_update),
         Command::Clean { all } => cmd_clean(all),
         Command::Doctor => cmd_doctor(),
+        Command::Check { format } => cmd_check(format),
         Command::Toolchain { action } => {
             cmd_toolchain(action, &konvoy_util::net::NetworkClient::new(false))
         }
@@ -724,6 +741,39 @@ fn cmd_doctor() -> CliResult {
     } else {
         eprintln!("All checks passed");
         Ok(())
+    }
+}
+
+fn cmd_check(format: CheckFormat) -> CliResult {
+    let root = project_root()?;
+    let path = root.join("konvoy.toml");
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let diagnostics = konvoy_config::Manifest::check_str(&content, &path.display().to_string());
+
+    match format {
+        // Machine contract for editors: a JSON array on stdout, always exit 0 — the
+        // diagnostics are the payload, not a process failure.
+        CheckFormat::Json => {
+            let json = serde_json::to_string(&diagnostics)
+                .map_err(|e| format!("cannot serialize diagnostics: {e}"))?;
+            println!("{json}");
+            Ok(())
+        }
+        CheckFormat::Human => {
+            if diagnostics.is_empty() {
+                eprintln!("    No issues found in konvoy.toml");
+                return Ok(());
+            }
+            for d in &diagnostics {
+                let loc = match (d.line, d.column) {
+                    (Some(line), Some(col)) => format!("konvoy.toml:{line}:{col}: "),
+                    _ => String::new(),
+                };
+                eprintln!("  {loc}{}", d.message);
+            }
+            Err(format!("{} issue(s) found in konvoy.toml", diagnostics.len()).into())
+        }
     }
 }
 
@@ -1410,10 +1460,43 @@ mod tests {
             "update",
             "clean",
             "doctor",
+            "check",
             "toolchain",
         ] {
             assert!(help.contains(subcommand));
         }
+    }
+
+    // ── Check parsing ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_check_defaults_to_human() {
+        let cli = Cli::try_parse_from(["konvoy", "check"]).unwrap();
+        match cli.command {
+            Command::Check { format } => assert!(matches!(format, CheckFormat::Human)),
+            other => panic!("expected Check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_check_json() {
+        let cli = Cli::try_parse_from(["konvoy", "check", "--format", "json"]).unwrap();
+        match cli.command {
+            Command::Check { format } => assert!(matches!(format, CheckFormat::Json)),
+            other => panic!("expected Check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_check_rejects_unknown_format() {
+        let err = Cli::try_parse_from(["konvoy", "check", "--format", "xml"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn help_flag_on_check() {
+        let err = Cli::try_parse_from(["konvoy", "check", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
     }
 
     // ── Passthrough edge cases ─────────────────────────────────────
