@@ -7,6 +7,7 @@ import {
   classifyPullRequest,
   extractPullRequestNumbers,
   filterPullRequests,
+  isExcludedFromNotes,
 } from "./release-notes.mjs";
 
 const owner = "arncore";
@@ -75,21 +76,64 @@ test("keeps IntelliJ documentation-only root edits out of CLI release notes", ()
   assert.equal(classifyPullRequest(pullRequest, "intellij"), true);
 });
 
-test("filters pull requests by release stream", () => {
+test("filters by release stream and drops version-bump PRs", () => {
   const pullRequests = [
     pr(251, "Add gutter run icons", ["editors/intellij/src/main/kotlin/Main.kt"]),
     pr(274, "Fix Rust dependency advisories", ["Cargo.toml"]),
+    // Touches both surfaces, but a version bump → excluded from both streams' notes.
     pr(275, "Bump release versions", ["Cargo.toml", "editors/intellij/gradle.properties"]),
     pr(201, "Update VS Code extension", ["editors/code/package.json"]),
   ];
 
   assert.deepEqual(
     filterPullRequests(pullRequests, "cli").map((pullRequest) => pullRequest.number),
-    [274, 275],
+    [274],
   );
   assert.deepEqual(
     filterPullRequests(pullRequests, "intellij").map((pullRequest) => pullRequest.number),
-    [251, 275],
+    [251],
+  );
+});
+
+test("excludes version-bump PRs but not feature PRs", () => {
+  assert.equal(
+    isExcludedFromNotes(pr(308, "Bump release versions: CLI 1.3.0, IntelliJ plugin 1.1.0", ["Cargo.toml"])),
+    true,
+  );
+  assert.equal(
+    isExcludedFromNotes(pr(283, "codegen (1/5): [codegen.openapi] manifest schema + validation", ["x"])),
+    false,
+  );
+});
+
+test("categorizes codegen/generate feature titles as Enhancements", () => {
+  assert.equal(
+    categoryForPullRequest(
+      pr(283, "codegen (1/5): [codegen.openapi] manifest schema + validation", [
+        "crates/konvoy-config/src/manifest.rs",
+      ]),
+    ).title,
+    "Enhancements",
+  );
+  assert.equal(
+    categoryForPullRequest(
+      pr(306, "intellij: `konvoy generate` run configuration + Build-menu action", [
+        "editors/intellij/src/main/kotlin/X.kt",
+      ]),
+    ).title,
+    "Enhancements",
+  );
+});
+
+test("override keeps the codegen docs PR out of Bug Fixes", () => {
+  // #301's title contains "regression fix" but it's a docs/polish PR.
+  assert.equal(
+    categoryForPullRequest(
+      pr(301, "codegen (5/5): docs + polish (README, error/doc copy, smoke regression fix)", [
+        "README.md",
+      ]),
+    ).title,
+    "Other Changes",
   );
 });
 

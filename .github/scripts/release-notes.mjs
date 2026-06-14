@@ -36,6 +36,12 @@ const CATEGORY_OVERRIDES = new Map([
   [273, "Other Changes"],
   [274, "Security"],
   [275, "Other Changes"],
+  // CLI 1.3.0 / IntelliJ 1.1.0 — codegen + editor support. Titles the keyword
+  // heuristic can't place correctly:
+  [297, "Enhancements"], // --locked / --offline split (Cargo's model)
+  [299, "Bug Fixes"], // path-dep [plugins]/[dependencies] dropped when built as a dep
+  [301, "Other Changes"], // codegen docs + polish (title trips the "fix" heuristic)
+  [304, "Enhancements"], // IntelliJ: konvoy.toml validation via `konvoy check`
 ]);
 
 function parseArgs(argv) {
@@ -95,7 +101,15 @@ export function classifyPullRequest(pullRequest, stream) {
 }
 
 export function filterPullRequests(pullRequests, stream) {
-  return pullRequests.filter((pullRequest) => classifyPullRequest(pullRequest, stream));
+  return pullRequests.filter(
+    (pullRequest) =>
+      classifyPullRequest(pullRequest, stream) && !isExcludedFromNotes(pullRequest),
+  );
+}
+
+/** Release plumbing (e.g. version-bump PRs) is not a user-facing change. */
+export function isExcludedFromNotes(pullRequest) {
+  return /^bump\b.*\bversions?\b/i.test(pullRequest.title);
 }
 
 function categoryByLabel(pullRequest) {
@@ -124,7 +138,7 @@ function categoryByTitle(pullRequest) {
   }
 
   if (
-    /\b(add|support|parallelize|perf|performance|typed|type-safety|enum|progress|diagnostics|completion|clickable)\b/.test(
+    /\b(add|support|parallelize|perf|performance|typed|type-safety|enum|progress|diagnostics|completion|clickable|codegen|openapi|generate)\b/.test(
       title,
     )
   ) {
