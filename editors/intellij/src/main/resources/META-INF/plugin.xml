@@ -69,9 +69,11 @@
         <completion.contributor
                 language="TOML"
                 implementationClass="com.konvoy.ide.toml.KonvoyTomlCompletionContributor"/>
-        <annotator
+        <!-- Validation is delegated to the konvoy backend (`konvoy check`); the
+             plugin only renders the diagnostics it reports. -->
+        <externalAnnotator
                 language="TOML"
-                implementationClass="com.konvoy.ide.toml.KonvoyTomlAnnotator"/>
+                implementationClass="com.konvoy.ide.toml.KonvoyTomlCheckAnnotator"/>
         <lang.documentationProvider
                 language="TOML"
                 implementationClass="com.konvoy.ide.toml.KonvoyTomlDocumentationProvider"/>
