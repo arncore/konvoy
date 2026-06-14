@@ -3035,7 +3035,7 @@ TOML
         echo "    expected lint --offline to fail at JRE resolution" >&2
         return 1
     fi
-    assert_contains "$output" "detekt needs its JRE"
+    assert_contains "$output" "bundled JRE is needed to run JVM tools"
     assert_contains "$output" "--offline prevents downloads"
     assert_files_identical konvoy.lock lock.bak
 }

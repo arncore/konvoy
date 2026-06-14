@@ -67,7 +67,9 @@ pub struct DependencySpec {
     pub maven: Option<String>,
 }
 
-/// Code generation tools configured for this project.
+/// Code generation tools configured for this project (the `[codegen]` section of
+/// `konvoy.toml`). Each field is one generator type; only `[codegen.openapi]` is
+/// supported today.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Codegen {
@@ -88,7 +90,8 @@ impl Codegen {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenApiCodegen {
-    /// Fabrikt version to use.
+    /// Fabrikt version to use. Must be 18.0.0 or newer — earlier releases lack the
+    /// `--serialization-library` flag Konvoy always passes.
     pub version: String,
     /// Project-relative path to the OpenAPI spec file.
     pub spec: String,

@@ -36,6 +36,7 @@ Konvoy avoids Gradle/Maven-style complexity by providing:
 - [Testing](#testing)
 - [Managed toolchains](#managed-toolchains)
 - [Linting](#linting)
+- [Code generation](#code-generation)
 - [Editor support](#editor-support)
 - [Development](#development)
 
@@ -257,14 +258,14 @@ Transitive dependencies are tracked automatically with a `required_by` field lis
 
 ### Reproducible builds: `--locked` and `--offline`
 
-`build`, `run`, `test`, and `lint` accept two **orthogonal** reproducibility flags, mirroring Cargo:
+`build`, `run`, `test`, `lint`, and `generate` accept two **orthogonal** reproducibility flags, mirroring Cargo:
 
-- **`--locked`** — *reproducible install.* Never modify `konvoy.lock`. Pinned artifacts (the toolchain, plugins, the detekt JAR) are still **downloaded and verified against their pinned SHA-256** when missing from the local cache; the only failure is **lockfile drift** — a missing or mismatched pin — which errors with `lockfile is out of date`. This is the flag for clean-CI builds: check out the repo (with its committed `konvoy.lock`) and `konvoy build --locked` reproducibly, downloading whatever the lockfile pins.
+- **`--locked`** — *reproducible install.* Never modify `konvoy.lock`. Pinned artifacts (the toolchain, plugins, the detekt JAR, codegen tools) are still **downloaded and verified against their pinned SHA-256** when missing from the local cache; the only failure is **lockfile drift** — a missing or mismatched pin — which errors with `lockfile is out of date`. This is the flag for clean-CI builds: check out the repo (with its committed `konvoy.lock`) and `konvoy build --locked` reproducibly, downloading whatever the lockfile pins.
 - **`--offline`** — *no network.* Every managed artifact must already be present under `~/.konvoy`; an absent artifact is a hard error (e.g. `… is not installed and --offline prevents downloads`). Nothing is fetched.
 
 The two combine freely. `--locked --offline` together is the strictest mode (Cargo's `--frozen`): no lockfile changes **and** no network. When both are set and the lockfile is also drifting, the drift is reported first — it is the actionable root cause.
 
-All managed artifacts — the konanc toolchain, Maven dependency klibs, compiler plugins, and the detekt JAR + its JRE — obey these two flags identically. (`--offline` also refuses the automatic `konvoy update` that resolves missing Maven deps, since that fetches from Maven Central.)
+All managed artifacts — the konanc toolchain, Maven dependency klibs, compiler plugins, the detekt JAR + its JRE, and codegen tools — obey these two flags identically. (`--offline` also refuses the automatic `konvoy update` that resolves missing Maven deps, since that fetches from Maven Central.)
 
 ### Plugins
 
@@ -356,6 +357,57 @@ To customize detekt rules, place a `detekt.yml` file in the project root or pass
 konvoy lint                        # run with defaults or detekt.yml
 konvoy lint --config my-rules.yml  # use custom config
 konvoy lint --verbose              # show raw detekt output
+```
+
+## Code generation
+
+Konvoy can generate Kotlin sources from [OpenAPI](https://www.openapis.org/) specs before compilation, using [Fabrikt](https://github.com/cjbooms/fabrikt) as a managed tool (like detekt). The generated `@Serializable` data classes are compiled into your project alongside your hand-written code.
+
+Enable it with a `[codegen.openapi]` section. The generated models use `kotlinx.serialization`, so add the serialization compiler plugin and runtime libraries as well:
+
+```toml
+[package]
+name = "my-app"
+
+[toolchain]
+kotlin = "2.2.0"
+
+[plugins]
+kotlin-serialization = { maven = "org.jetbrains.kotlin:kotlin-serialization-compiler-plugin", version = "{kotlin}" }
+
+[dependencies]
+kotlinx-serialization-core = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-core", version = "1.7.3" }
+kotlinx-serialization-json = { maven = "org.jetbrains.kotlinx:kotlinx-serialization-json", version = "1.7.3" }
+
+[codegen.openapi]
+version = "20.0.0"                # Fabrikt version (18.0.0 or newer)
+spec = "specs/api.yaml"           # project-relative path to the spec (.yaml, .yml, or .json)
+base_package = "com.example.api"  # Kotlin package for the generated code
+```
+
+Generation runs automatically as part of `konvoy build`: sources are written to `.konvoy/gen/openapi/` and compiled in. The output is **ephemeral** — never commit it; `konvoy clean --all` removes it with the rest of `.konvoy/`. Generation is folded into the build cache by hashing the spec, so an unchanged spec is a full cache hit (no regeneration, no recompilation) and editing the spec triggers a rebuild.
+
+To generate **without** compiling — to inspect the output or feed an editor's indexer — run `konvoy generate`:
+
+```
+konvoy generate            # run all configured generators
+konvoy generate --verbose  # show raw generator output
+```
+
+The Fabrikt JAR is downloaded to `~/.konvoy/tools/fabrikt/<version>/` on first use, and its SHA-256 is pinned in `konvoy.lock` (under `[[codegen_tools]]`) by `konvoy build`. (`konvoy generate` downloads it under the same `--locked`/`--offline` policy but does not write the lockfile — `build` owns the pins.) It runs on the JRE bundled with the managed Kotlin/Native toolchain, so no separate Java installation is needed. `konvoy doctor` reports whether each configured tool is downloaded.
+
+Code generation also works for [path dependencies](#path-dependencies): a dependency that configures `[codegen.openapi]` generates its own sources when it is built, and its Fabrikt tool is pinned once in the root project's `konvoy.lock`.
+
+### Multi-file specs
+
+When a spec is split across multiple files via `$ref`, list the directories holding the referenced files in `extra_spec_dirs` so a change to any of them regenerates sources (Fabrikt resolves `$ref`s internally but never reports which files it read, so Konvoy cannot discover them on its own):
+
+```toml
+[codegen.openapi]
+version = "20.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.api"
+extra_spec_dirs = ["specs"]
 ```
 
 ## Editor support
