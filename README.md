@@ -137,6 +137,7 @@ hello/
 - `konvoy update` — resolve Maven dependencies (including transitives via POM) and update `konvoy.lock`
 - `konvoy clean` — remove build artifacts
 - `konvoy doctor` — check environment, toolchain, and dependency setup
+- `konvoy check [--format human|json]` — validate `konvoy.toml` and report configuration issues (JSON output is a stable contract for editors/tools)
 - `konvoy toolchain install [<version>]` — install a Kotlin/Native version
 - `konvoy toolchain list` — list installed toolchain versions
 
