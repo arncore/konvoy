@@ -338,7 +338,8 @@ pub struct GenerateResult {
 /// project graph; a root-scoped `generate` must not clobber a path-dependency's
 /// pin with a subset. Generation is therefore read-only w.r.t. the lockfile: under
 /// `--locked` a missing pin still surfaces as drift via the resolver, and a normal
-/// run downloads (without persisting) exactly what the next `build` will pin.
+/// run downloads and verifies the required tool (so generation succeeds) but does
+/// not update `konvoy.lock` — the next `konvoy build` writes the pin.
 ///
 /// # Errors
 /// Returns [`EngineError::CodegenNotConfigured`] when no `[codegen]` is configured,

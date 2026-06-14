@@ -394,7 +394,7 @@ konvoy generate            # run all configured generators
 konvoy generate --verbose  # show raw generator output
 ```
 
-The Fabrikt JAR is downloaded to `~/.konvoy/tools/fabrikt/<version>/` on first use and its SHA-256 is pinned in `konvoy.lock` (under `[[codegen_tools]]`), exactly like the detekt JAR. It runs on the JRE bundled with the managed Kotlin/Native toolchain, so no separate Java installation is needed. `konvoy doctor` reports whether each configured tool is downloaded.
+The Fabrikt JAR is downloaded to `~/.konvoy/tools/fabrikt/<version>/` on first use, and its SHA-256 is pinned in `konvoy.lock` (under `[[codegen_tools]]`) by `konvoy build`. (`konvoy generate` downloads it under the same `--locked`/`--offline` policy but does not write the lockfile — `build` owns the pins.) It runs on the JRE bundled with the managed Kotlin/Native toolchain, so no separate Java installation is needed. `konvoy doctor` reports whether each configured tool is downloaded.
 
 Code generation also works for [path dependencies](#path-dependencies): a dependency that configures `[codegen.openapi]` generates its own sources when it is built, and its Fabrikt tool is pinned once in the root project's `konvoy.lock`.
 

@@ -161,7 +161,7 @@ pub enum EngineError {
     },
 
     /// A codegen tool artifact hash does not match the lockfile.
-    #[error("codegen tool `{name}` {version} hash mismatch — expected {expected}, got {actual}; delete ~/.konvoy/tools/{name}/{version}/ and re-run `konvoy generate`, or verify the artifact upstream")]
+    #[error("codegen tool `{name}` {version} hash mismatch — expected {expected}, got {actual}; delete ~/.konvoy/tools/{name}/{version}/ and re-run `konvoy build` (or `konvoy generate`), or verify the artifact upstream")]
     CodegenHashMismatch {
         name: String,
         version: String,
