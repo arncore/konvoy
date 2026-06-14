@@ -13,7 +13,7 @@ object KonvoyTomlSchema {
     )
 
     /** Top-level sections that can appear in konvoy.toml. */
-    val SECTIONS = setOf("package", "toolchain", "dependencies", "plugins")
+    val SECTIONS = setOf("package", "toolchain", "dependencies", "plugins", "codegen")
 
     /** Keys within each section. */
     val SECTION_KEYS: Map<String, Map<String, KeyInfo>> = mapOf(
@@ -26,6 +26,18 @@ object KonvoyTomlSchema {
         "toolchain" to mapOf(
             "kotlin" to KeyInfo("Kotlin/Native version", required = true),
             "detekt" to KeyInfo("Detekt linter version"),
+        ),
+        // OpenAPI code generation via Fabrikt (the [codegen.openapi] sub-table).
+        "codegen.openapi" to mapOf(
+            "version" to KeyInfo("Fabrikt version (18.0.0 or newer)", required = true),
+            "spec" to KeyInfo(
+                "Project-relative path to the OpenAPI spec (.yaml, .yml, or .json)",
+                required = true,
+            ),
+            "base_package" to KeyInfo("Kotlin package for the generated sources", required = true),
+            "extra_spec_dirs" to KeyInfo(
+                "Optional: extra directories holding \$ref'd spec files to watch for changes",
+            ),
         ),
     )
 
