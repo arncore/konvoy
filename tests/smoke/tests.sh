@@ -1350,6 +1350,97 @@ TOML
     assert_contains "$output" "grpc"
 }
 
+# Expected: `konvoy generate` runs the configured generators WITHOUT compiling. It
+# materializes the .kt sources and prints a per-generator summary, but does not
+# produce a build artifact and is read-only w.r.t. konvoy.lock (the graph-wide
+# [[codegen_tools]] pins are owned by `konvoy build`). Re-running is idempotent.
+test_codegen_generate_command() {
+    konvoy init --name cg-gen --lib >/dev/null 2>&1
+    rm -rf cg-gen/src
+    _append_codegen_config cg-gen/konvoy.toml
+    _write_openapi_spec cg-gen/specs/api.yaml
+    cd cg-gen
+
+    local out
+    out=$(konvoy generate 2>&1)
+    assert_contains "$out" "Generated"
+    assert_contains "$out" "OpenAPI"
+    _assert_generated_kt .konvoy/gen/openapi
+
+    # generate must NOT compile.
+    if [ -d .konvoy/build ]; then
+        echo "    konvoy generate must not compile (.konvoy/build exists)" >&2
+        return 1
+    fi
+
+    # generate is read-only w.r.t. the lockfile: it writes no [[codegen_tools]] pin.
+    if [ -f konvoy.lock ] && grep -q '\[\[codegen_tools\]\]' konvoy.lock; then
+        echo "    konvoy generate must not write codegen pins to konvoy.lock" >&2
+        return 1
+    fi
+
+    # Re-running regenerates cleanly.
+    out=$(konvoy generate 2>&1)
+    assert_contains "$out" "Generated"
+}
+
+# Unexpected: `konvoy generate` on a project with no [codegen] fails fast with a
+# clear "not configured" message, before any network or JRE work.
+test_codegen_generate_no_codegen_fails() {
+    konvoy init --name cg-none >/dev/null 2>&1
+    cd cg-none
+    local output
+    if output=$(konvoy generate 2>&1); then
+        echo "    expected generate to fail when no codegen is configured" >&2
+        return 1
+    fi
+    assert_contains "$output" "no codegen configured"
+}
+
+# Expected (doctor, not-downloaded path): `konvoy doctor` reports each configured
+# codegen tool. A unique version (never in the shared ~/.konvoy cache) guarantees
+# the "not downloaded" line deterministically. Doctor exits non-zero here (the
+# toolchain isn't installed), so the status is ignored and only output is asserted;
+# doctor performs no downloads.
+test_codegen_doctor_reports_not_downloaded() {
+    konvoy init --name cg-doc-missing --lib >/dev/null 2>&1
+    cat >> cg-doc-missing/konvoy.toml << 'TOML'
+
+[codegen.openapi]
+version = "98.0.0"
+spec = "specs/api.yaml"
+base_package = "com.example.gen"
+TOML
+    cd cg-doc-missing
+    local out
+    out=$(konvoy doctor 2>&1 || true)
+    assert_contains "$out" "OpenAPI"
+    assert_contains "$out" "fabrikt"
+    assert_contains "$out" "98.0.0"
+    assert_contains "$out" "not downloaded"
+}
+
+# Expected (doctor, installed path): after a build downloads Fabrikt, `konvoy
+# doctor` reports the codegen tool as [ok] with its version and on-disk path.
+test_codegen_doctor_reports_installed() {
+    konvoy init --name cg-doc-ok --lib >/dev/null 2>&1
+    rm -rf cg-doc-ok/src
+    _append_codegen_config cg-doc-ok/konvoy.toml
+    _write_openapi_spec cg-doc-ok/specs/api.yaml
+    cd cg-doc-ok
+
+    konvoy build >/dev/null 2>&1
+
+    local out
+    out=$(konvoy doctor 2>&1 || true)
+    assert_contains "$out" "20.0.0"
+    # The fabrikt line is specifically [ok] (not [--]/[!!]).
+    if ! echo "$out" | grep -q '\[ok\].*fabrikt'; then
+        echo "    expected doctor to report fabrikt [ok] after a build: $out" >&2
+        return 1
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Tests: Maven dependencies
 # ---------------------------------------------------------------------------
@@ -3142,6 +3233,10 @@ run_test test_codegen_absolute_spec_rejected
 run_test test_codegen_bad_spec_extension_rejected
 run_test test_codegen_old_fabrikt_version_rejected
 run_test test_codegen_unknown_tool_rejected
+run_test test_codegen_generate_command
+run_test test_codegen_generate_no_codegen_fails
+run_test test_codegen_doctor_reports_not_downloaded
+run_test test_codegen_doctor_reports_installed
 
 # Maven dependencies
 run_test test_update_help

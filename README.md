@@ -132,6 +132,7 @@ hello/
 - `konvoy run [--target <triple|host>] [--release] [--force] [--locked] [--offline] [-- <args…>]` — build and run
 - `konvoy test [--target <triple|host>] [--release] [--verbose] [--force] [--locked] [--offline] [--filter <pattern>]` — build and run tests
 - `konvoy lint [--verbose] [--config <path>] [--locked] [--offline]` — run detekt static analysis on Kotlin sources
+- `konvoy generate [--verbose] [--locked] [--offline]` — run the configured code generators (e.g. OpenAPI/Fabrikt) without compiling
 - `konvoy update` — resolve Maven dependencies (including transitives via POM) and update `konvoy.lock`
 - `konvoy clean` — remove build artifacts
 - `konvoy doctor` — check environment, toolchain, and dependency setup

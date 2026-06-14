@@ -119,6 +119,20 @@ enum Command {
         #[arg(long)]
         offline: bool,
     },
+    /// Run code generators (e.g. OpenAPI/Fabrikt) without compiling
+    Generate {
+        /// Show raw generator output
+        #[arg(long, short = 'v')]
+        verbose: bool,
+        /// Assert that konvoy.lock is up to date and never modify it (pinned
+        /// codegen tools may still be downloaded; only lockfile drift is an error)
+        #[arg(long)]
+        locked: bool,
+        /// Run without network access: every codegen tool and the JRE must
+        /// already be present locally, or generation fails
+        #[arg(long)]
+        offline: bool,
+    },
     /// Resolve Maven dependencies and update konvoy.lock
     Update,
     /// Remove build artifacts
@@ -228,6 +242,11 @@ fn main() {
         } => with_resolver(offline, locked, |resolver| {
             cmd_lint(verbose, config, resolver)
         }),
+        Command::Generate {
+            verbose,
+            locked,
+            offline,
+        } => with_resolver(offline, locked, |resolver| cmd_generate(verbose, resolver)),
         // `konvoy update` is inherently online and never locked: it exists to
         // (re)resolve dependencies and rewrite konvoy.lock.
         Command::Update => with_resolver(false, false, cmd_update),
@@ -456,6 +475,22 @@ fn cmd_lint(
     Err(format!("lint found {} issue(s)", result.finding_count).into())
 }
 
+fn cmd_generate(verbose: bool, resolver: konvoy_engine::ArtifactResolver<'_>) -> CliResult {
+    let root = project_root()?;
+
+    let result = konvoy_engine::generate(&root, verbose, resolver)?;
+
+    for output in &result.outputs {
+        eprintln!(
+            "    Generated {} file(s) for {} \u{2192} {}",
+            output.file_count,
+            output.display_name,
+            output.output_dir.display()
+        );
+    }
+    Ok(())
+}
+
 fn cmd_update(resolver: konvoy_engine::ArtifactResolver<'_>) -> CliResult {
     let root = project_root()?;
     // `konvoy update` is inherently online — resolving fetches POMs/klibs.
@@ -558,6 +593,41 @@ fn check_detekt(manifest: &konvoy_config::Manifest) -> u32 {
     }
 }
 
+/// Report the install status of each configured codegen tool. A not-yet-downloaded
+/// tool is informational (`[--]`, 0 issues) — it downloads on first use, like
+/// detekt; only a failure to inspect it counts as an issue.
+fn check_codegen(manifest: &konvoy_config::Manifest) -> u32 {
+    let mut issues = 0u32;
+    for generator in konvoy_engine::codegen::active_generators(&manifest.codegen) {
+        let tool = generator.managed_tool();
+        let label = generator.display_name();
+        match tool.is_installed() {
+            Ok(true) => match tool.artifact_path() {
+                Ok(path) => eprintln!(
+                    "  [ok] {label} ({}): {} ({})",
+                    tool.id(),
+                    tool.version(),
+                    path.display()
+                ),
+                Err(e) => {
+                    eprintln!("  [!!] {label} ({}): {e}", tool.id());
+                    issues = issues.saturating_add(1);
+                }
+            },
+            Ok(false) => eprintln!(
+                "  [--] {label} ({}): {} not downloaded — will download on first `konvoy generate` or `konvoy build`",
+                tool.id(),
+                tool.version()
+            ),
+            Err(e) => {
+                eprintln!("  [!!] {label} ({}): {e}", tool.id());
+                issues = issues.saturating_add(1);
+            }
+        }
+    }
+    issues
+}
+
 fn check_maven_deps(manifest: &konvoy_config::Manifest, cwd: &std::path::Path) -> u32 {
     let maven_deps: Vec<_> = manifest
         .dependencies
@@ -638,6 +708,7 @@ fn cmd_doctor() -> CliResult {
                 eprintln!("  [ok] Project: {}", manifest.package.name);
                 issues = issues.saturating_add(check_toolchain(&manifest));
                 issues = issues.saturating_add(check_detekt(&manifest));
+                issues = issues.saturating_add(check_codegen(&manifest));
                 issues = issues.saturating_add(check_maven_deps(&manifest, &cwd));
             }
             Err(e) => {
@@ -1339,6 +1410,7 @@ mod tests {
             "run",
             "test",
             "lint",
+            "generate",
             "update",
             "clean",
             "doctor",
@@ -1447,6 +1519,58 @@ mod tests {
             }
             other => panic!("expected Lint, got {other:?}"),
         }
+    }
+
+    // ── Generate parsing ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_generate_defaults() {
+        let cli = Cli::try_parse_from(["konvoy", "generate"]).unwrap();
+        match cli.command {
+            Command::Generate {
+                verbose,
+                locked,
+                offline,
+            } => {
+                assert!(!verbose);
+                assert!(!locked);
+                assert!(!offline);
+            }
+            other => panic!("expected Generate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_generate_verbose_short() {
+        let cli = Cli::try_parse_from(["konvoy", "generate", "-v"]).unwrap();
+        match cli.command {
+            Command::Generate { verbose, .. } => assert!(verbose),
+            other => panic!("expected Generate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_generate_all_flags() {
+        let cli = Cli::try_parse_from(["konvoy", "generate", "--verbose", "--locked", "--offline"])
+            .unwrap();
+        match cli.command {
+            Command::Generate {
+                verbose,
+                locked,
+                offline,
+            } => {
+                assert!(verbose);
+                assert!(locked);
+                assert!(offline);
+            }
+            other => panic!("expected Generate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn help_flag_on_generate() {
+        let err = Cli::try_parse_from(["konvoy", "generate", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
     }
 
     #[test]
